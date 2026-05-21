@@ -1,0 +1,46 @@
+[workspace]
+members = [
+    "crates/smartzip-core",
+    "crates/smartzip-archive",
+    "crates/smartzip-cli",
+    "crates/smartzip-config",
+    "crates/smartzip-db",
+    "crates/smartzip-encoding",
+    "crates/smartzip-engine",
+    "crates/smartzip-gui",
+    "crates/smartzip-passwords",
+    "crates/smartzip-platform",
+    "crates/smartzip-scanner",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+authors = ["charl"]
+rust-version = "1.80"
+
+[workspace.dependencies]
+async-trait = "0.1"
+binwalk = "3.1.0"
+chardetng = "0.1"
+clap = { version = "4.5", features = ["derive"] }
+directories = "6"
+gpui = "0.2"
+rusqlite = { version = "0.33", features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+smartzip-archive = { path = "crates/smartzip-archive" }
+smartzip-config = { path = "crates/smartzip-config" }
+smartzip-core = { path = "crates/smartzip-core" }
+smartzip-db = { path = "crates/smartzip-db" }
+smartzip-encoding = { path = "crates/smartzip-encoding" }
+smartzip-engine = { path = "crates/smartzip-engine" }
+smartzip-passwords = { path = "crates/smartzip-passwords" }
+smartzip-platform = { path = "crates/smartzip-platform" }
+smartzip-scanner = { path = "crates/smartzip-scanner" }
+thiserror = "2.0"
+tokio = { version = "1.45", features = ["macros", "process", "rt-multi-thread", "io-util"] }
+toml = "0.8"
+rstest = "0.25"
+tempfile = "3"

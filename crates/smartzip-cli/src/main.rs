@@ -1,0 +1,558 @@
+use async_trait::async_trait;
+use clap::{Parser, Subcommand, ValueEnum};
+use smartzip_archive::SevenZipBackend;
+use smartzip_core::EncodingMode;
+use smartzip_db::{password::PasswordRepository, SmartZipDb};
+use smartzip_engine::{DetectRequest, ExtractWorkflowRequest, InteractivePasswordPrompter, SmartZipEngine};
+use smartzip_passwords::{PasswordCandidateRequest, PasswordService};
+use smartzip_scanner::{Confidence, ScanMode, ScannerConfig};
+use smartzip_platform::PlatformPaths;
+use std::path::{Path, PathBuf};
+
+const DEFAULT_RECURSION_LIMIT: u8 = 3;
+
+#[derive(Debug, Parser)]
+#[command(name = "smartzip")]
+#[command(about = "SmartZip cross-platform archive helper")]
+struct Cli {
+    /// Path to database file. Defaults to in-memory if not set.
+    #[arg(long)]
+    db: Option<PathBuf>,
+
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Detect embedded archives or disguised archive data.
+    Detect {
+        path: PathBuf,
+
+        #[arg(long)]
+        deep: bool,
+
+        #[arg(long)]
+        json: bool,
+
+        #[arg(long)]
+        max_scan_bytes: Option<u64>,
+
+        #[arg(long, value_enum, default_value_t = ConfidenceArg::Medium)]
+        min_confidence: ConfidenceArg,
+    },
+
+    /// Extract archives, optionally with nested scanning.
+    Extract {
+        paths: Vec<PathBuf>,
+
+        /// Output directory. Defaults to first archive's parent directory.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+
+        /// Maximum nested archive depth.
+        #[arg(long, default_value_t = DEFAULT_RECURSION_LIMIT)]
+        recursion_limit: u8,
+
+        /// Password to try first. May be repeated.
+        #[arg(short = 'p', long)]
+        password: Vec<String>,
+
+        /// Read password from clipboard (platform-dependent placeholder).
+        #[arg(long)]
+        use_clipboard: bool,
+
+        /// Skip empty password attempt.
+        #[arg(long)]
+        no_empty: bool,
+
+        /// Use deep scan for nested archives.
+        #[arg(long)]
+        deep: bool,
+
+        /// Encoding for entry names: "auto", "UTF-8", "GB18030", "GBK", "Big5", "Shift_JIS", "EUC-JP", "EUC-KR".
+        #[arg(long, default_value = "auto")]
+        encoding: String,
+
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Placeholder for future compression implementation.
+    Compress { paths: Vec<PathBuf> },
+
+    /// Manage password database.
+    #[command(subcommand)]
+    Password(PasswordCmd),
+}
+
+#[derive(Debug, Subcommand)]
+enum PasswordCmd {
+    /// List passwords with statistics.
+    List {
+        #[arg(long)]
+        json: bool,
+        /// Only show top N passwords.
+        #[arg(long, default_value = "50")]
+        limit: usize,
+    },
+
+    /// Add a password to the database.
+    Add {
+        password: String,
+        /// Source label for this password (e.g. "manual", "import").
+        #[arg(long, default_value = "manual")]
+        source: String,
+        /// Pin this password so it always ranks at top.
+        #[arg(long)]
+        pin: bool,
+    },
+
+    /// Remove a password by id.
+    Remove { id: i64 },
+
+    /// Import passwords from a text file (one per line).
+    Import {
+        path: PathBuf,
+        #[arg(long, default_value = "import")]
+        source: String,
+    },
+
+    /// Export passwords to a text file.
+    Export {
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
+
+    /// Remove low-value passwords (long-failed, unused, over limit).
+    Cleanup {
+        /// Keep at most this many passwords.
+        #[arg(long, default_value = "500")]
+        max_passwords: usize,
+        /// Disable passwords that have not been used successfully in N days.
+        #[arg(long)]
+        stale_days: Option<u64>,
+        /// Also apply cleanup, not just preview.
+        #[arg(long)]
+        apply: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ConfidenceArg {
+    Low,
+    Medium,
+    High,
+}
+
+impl From<ConfidenceArg> for Confidence {
+    fn from(value: ConfidenceArg) -> Self {
+        match value {
+            ConfidenceArg::Low => Self::Low,
+            ConfidenceArg::Medium => Self::Medium,
+            ConfidenceArg::High => Self::High,
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    if let Err(error) = run().await {
+        eprintln!("error: {error}");
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let cli = Cli::parse();
+
+    match cli.command {
+        Command::Detect {
+            path,
+            deep,
+            json,
+            max_scan_bytes,
+            min_confidence,
+        } => detect(path, deep, json, max_scan_bytes, min_confidence),
+        Command::Extract {
+            paths,
+            output,
+            recursion_limit,
+            password: manual_passwords,
+            use_clipboard: _use_clipboard,
+            no_empty,
+            deep,
+            encoding,
+            json: _json,
+        } => {
+            let db = open_db(cli.db)?;
+            extract(
+                &db,
+                paths,
+                output,
+                recursion_limit,
+                manual_passwords,
+                no_empty,
+                deep,
+                &encoding,
+            )
+            .await
+        }
+        Command::Compress { paths } => {
+            println!(
+                "compress is not implemented yet; received {} path(s)",
+                paths.len()
+            );
+            Ok(())
+        }
+        Command::Password(cmd) => {
+            let db = open_db(cli.db)?;
+            password(&db, cmd)
+        }
+    }
+}
+
+fn open_db(path: Option<PathBuf>) -> Result<SmartZipDb, Box<dyn std::error::Error>> {
+    let db = match path {
+        Some(path) => SmartZipDb::open(&path).map_err(|e| {
+            eprintln!("warning: failed to open database at {}: {}", path.display(), e);
+            e
+        })?,
+        None => {
+            let paths = PlatformPaths::new();
+            paths.ensure_dirs()?;
+            let db_path = paths.db_path();
+            SmartZipDb::open(&db_path).map_err(|e| {
+                eprintln!("warning: failed to open database at {}: {}", db_path.display(), e);
+                e
+            })?
+        }
+    };
+
+    match db.db_path() {
+        Some(p) => eprintln!("Database: {}", p.display()),
+        None => eprintln!("warning: using in-memory database — passwords will NOT be saved to disk"),
+    }
+
+    Ok(db)
+}
+
+fn scanner_config(deep: bool, max_scan_bytes: Option<u64>) -> ScannerConfig {
+    ScannerConfig {
+        mode: if deep { ScanMode::Deep } else { ScanMode::Fast },
+        max_scan_bytes: max_scan_bytes.and_then(|value| (value != 0).then_some(value)),
+        ..ScannerConfig::default()
+    }
+}
+
+fn detect(
+    path: PathBuf,
+    deep: bool,
+    json: bool,
+    max_scan_bytes: Option<u64>,
+    min_confidence: ConfidenceArg,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = ScannerConfig {
+        min_confidence: min_confidence.into(),
+        ..scanner_config(deep, max_scan_bytes)
+    };
+    let engine = SmartZipEngine::with_scanner_config(config.clone());
+    let result = engine.detect(DetectRequest {
+        path,
+        scanner: config,
+    })?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&result.findings)?);
+    } else if result.findings.is_empty() {
+        println!("No embedded archives found.");
+    } else {
+        for finding in result.findings {
+            println!(
+                "{format} @ 0x{offset:X} size={size} confidence={confidence:?} {description}",
+                format = finding.format.as_str(),
+                offset = finding.offset,
+                size = finding
+                    .size
+                    .map(|size| size.to_string())
+                    .unwrap_or_else(|| "unknown".into()),
+                confidence = finding.confidence,
+                description = finding.description,
+            );
+        }
+    }
+
+    Ok(())
+}
+
+async fn extract(
+    db: &SmartZipDb,
+    paths: Vec<PathBuf>,
+    output: Option<PathBuf>,
+    recursion_limit: u8,
+    manual_passwords: Vec<String>,
+    no_empty: bool,
+    deep: bool,
+    encoding: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if paths.is_empty() {
+        return Err("no paths provided".into());
+    }
+
+    let encoding_mode = if encoding == "auto" {
+        EncodingMode::Auto
+    } else {
+        EncodingMode::Override(encoding.to_string())
+    };
+
+    let output_dir = output.unwrap_or_else(|| default_output_dir(paths.first().unwrap()));
+
+    let backend = SevenZipBackend::locate(&smartzip_archive::SevenZipLocator::default())?;
+    let service = PasswordService::new(PasswordRepository::new(db.connection()));
+    for password in &manual_passwords {
+        service.add_password(password, "manual", false)?;
+    }
+
+    let engine = SmartZipEngine::default();
+    let result = engine
+        .extract_recursive(
+            &backend,
+            &service,
+            ExtractWorkflowRequest {
+                inputs: paths,
+                output_dir,
+                recursion_limit,
+                scanner: scanner_config(deep, None),
+                encoding_mode,
+                password_candidates: PasswordCandidateRequest {
+                    manual: manual_passwords,
+                    clipboard: None,
+                    include_empty: !no_empty,
+                    limit: 128,
+                },
+            },
+            Some(&StdinPrompter),
+        )
+        .await?;
+
+    // Print per-archive progress from events.
+    for event in &result.events {
+        match &event.kind {
+            smartzip_core::TaskEventKind::Progress(progress) => {
+                println!("  {}", progress.message);
+            }
+            smartzip_core::TaskEventKind::EncodingDetected(detection) => {
+                let encoding = match &detection.selected {
+                    smartzip_core::EncodingMode::Auto => "auto",
+                    smartzip_core::EncodingMode::Override(s) => s.as_str(),
+                };
+                println!("  encoding: {encoding} (confidence: {:.0}%)", detection.confidence * 100.0);
+            }
+            smartzip_core::TaskEventKind::OutputCreated { path } => {
+                println!("  -> {}", path.display());
+            }
+            _ => {}
+        }
+    }
+
+    // Summary.
+    let processed_count = result.processed.len();
+    let skipped_count = result.skipped.len();
+    if processed_count > 0 {
+        println!("processed {} archive(s)", processed_count);
+    }
+    if skipped_count > 0 {
+        println!("skipped {} candidate(s)", skipped_count);
+        for skipped in &result.skipped {
+            println!("  - {} (depth {})", skipped.path.display(), skipped.depth);
+        }
+    }
+
+    // Warnings and failures.
+    for event in result.events.iter().filter(|event| {
+        matches!(
+            event.kind,
+            smartzip_core::TaskEventKind::Failed { .. }
+                | smartzip_core::TaskEventKind::Warning { .. }
+        )
+    }) {
+        match &event.kind {
+            smartzip_core::TaskEventKind::Failed { error } => {
+                eprintln!("  FAILED: {error}")
+            }
+            smartzip_core::TaskEventKind::Warning { message } => {
+                eprintln!("  warning: {message}")
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    Ok(())
+}
+
+fn password(db: &SmartZipDb, cmd: PasswordCmd) -> Result<(), Box<dyn std::error::Error>> {
+    let repo = PasswordRepository::new(db.connection());
+    let service = PasswordService::new(repo);
+
+    match cmd {
+        PasswordCmd::List { json, limit } => {
+            let repo = PasswordRepository::new(db.connection());
+            let passwords = repo.ranked_candidates(limit)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&passwords)?);
+            } else if passwords.is_empty() {
+                println!("No passwords in database.");
+            } else {
+                println!(
+                    "{:>6} {:>2} {:>4} {:>4} {:20} {:20} {:30}",
+                    "id", "P", "ok", "fail", "last_ok", "last_fail", "value"
+                );
+                for p in &passwords {
+                    let value = if p.value.len() > 30 {
+                        format!("{}...", &p.value[..27])
+                    } else {
+                        p.value.clone()
+                    };
+                    println!(
+                        "{:>6} {:>2} {:>4} {:>4} {:20} {:20} {}",
+                        p.id,
+                        if p.pinned { "*" } else { "" },
+                        p.success_count,
+                        p.failure_count,
+                        p.last_success_at.as_deref().unwrap_or("-"),
+                        p.last_failure_at.as_deref().unwrap_or("-"),
+                        value
+                    );
+                }
+            }
+        }
+        PasswordCmd::Add {
+            password,
+            source,
+            pin,
+        } => {
+            let id = service.add_password(&password, &source, pin)?;
+            println!("added password id={id}");
+        }
+        PasswordCmd::Remove { id } => {
+            let repo = PasswordRepository::new(db.connection());
+            repo.delete(id)?;
+            println!("removed password id={id}");
+        }
+        PasswordCmd::Import { path, source } => {
+            let content = std::fs::read_to_string(&path)?;
+            let mut count = 0u32;
+            for line in content.lines() {
+                let trimmed = line.trim();
+                if !trimmed.is_empty() {
+                    service.add_password(trimmed, &source, false)?;
+                    count += 1;
+                }
+            }
+            println!("imported {count} password(s) from {}", path.display());
+        }
+        PasswordCmd::Export { path } => {
+            let repo = PasswordRepository::new(db.connection());
+            let passwords = repo.ranked_candidates(usize::MAX)?;
+            let out_path = path.unwrap_or_else(|| PathBuf::from("smartzip-passwords.txt"));
+            let lines: Vec<String> = passwords.iter().map(|p| p.value.clone()).collect();
+            std::fs::write(&out_path, lines.join("\n") + "\n")?;
+            println!(
+                "exported {} password(s) to {}",
+                lines.len(),
+                out_path.display()
+            );
+        }
+        PasswordCmd::Cleanup {
+            max_passwords,
+            stale_days,
+            apply,
+        } => {
+            let repo = PasswordRepository::new(db.connection());
+            let all = repo.ranked_candidates(usize::MAX)?;
+            let mut to_disable = Vec::new();
+
+            for (idx, p) in all.iter().enumerate() {
+                if idx >= max_passwords && !p.pinned {
+                    to_disable.push(p.id);
+                }
+            }
+
+            if let Some(days) = stale_days {
+                let cutoff = chrono::Utc::now() - chrono::Duration::days(days as i64);
+                let cutoff_str = cutoff.format("%Y-%m-%d %H:%M:%S").to_string();
+                let already_disabled: Vec<i64> = to_disable.clone();
+                for p in all
+                    .iter()
+                    .filter(|p| !p.pinned && !already_disabled.contains(&p.id))
+                {
+                    let stale = match &p.last_success_at {
+                        Some(ts) => ts < &cutoff_str,
+                        None => true,
+                    };
+                    if stale {
+                        to_disable.push(p.id);
+                    }
+                }
+            }
+
+            if apply {
+                for id in &to_disable {
+                    repo.disable(*id)?;
+                }
+                println!("cleanup applied: {} disabled", to_disable.len());
+            } else {
+                println!(
+                    "cleanup preview: {} would be disabled. Use --apply to execute.",
+                    to_disable.len()
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn default_output_dir(first_path: &Path) -> PathBuf {
+    first_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf()
+}
+
+// ── Interactive password prompt via stdin ────────────────────────────────
+
+struct StdinPrompter;
+
+#[async_trait]
+impl InteractivePasswordPrompter for StdinPrompter {
+    async fn prompt(&self, archive_path: &Path) -> Option<String> {
+        let path = archive_path.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            use std::io::{self, IsTerminal, Write};
+
+            if !io::stdin().is_terminal() {
+                return None;
+            }
+
+            eprint!(
+                "\n  No matching password for \"{}\".\n  Enter password (or press Enter to skip): ",
+                path.display()
+            );
+            let _ = io::stderr().flush();
+
+            let mut pw = String::new();
+            io::stdin().read_line(&mut pw).ok()?;
+            let pw = pw.trim().to_string();
+
+            if pw.is_empty() {
+                eprintln!("  (skipped)");
+                None
+            } else {
+                Some(pw)
+            }
+        })
+        .await
+        .unwrap_or(None)
+    }
+}

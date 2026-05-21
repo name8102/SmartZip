@@ -1,0 +1,284 @@
+use crate::backend::ArchiveBackend;
+use crate::types::*;
+use async_trait::async_trait;
+use smartzip_core::{ArchiveFormat, Result, SmartZipError};
+use std::path::{Path, PathBuf};
+use tokio::process::Command;
+
+#[derive(Debug, Clone)]
+pub struct SevenZipLocator {
+    bundled: Option<PathBuf>,
+    candidates: Vec<String>,
+}
+
+impl Default for SevenZipLocator {
+    fn default() -> Self {
+        Self {
+            bundled: None,
+            candidates: vec!["7zz".into(), "7z".into()],
+        }
+    }
+}
+
+impl SevenZipLocator {
+    pub fn bundled(path: PathBuf) -> Self {
+        Self {
+            bundled: Some(path),
+            ..Default::default()
+        }
+    }
+
+    pub fn locate(&self) -> Option<PathBuf> {
+        if let Some(path) = &self.bundled {
+            if path.exists() {
+                return Some(path.clone());
+            }
+        }
+
+        self.candidates.iter().find_map(|candidate| {
+            std::env::var_os("PATH").and_then(|paths| {
+                std::env::split_paths(&paths)
+                    .map(|dir| dir.join(candidate))
+                    .find(|path| path.exists())
+            })
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SevenZipBackend {
+    executable: PathBuf,
+}
+
+impl SevenZipBackend {
+    pub fn new(executable: PathBuf) -> Self {
+        Self { executable }
+    }
+
+    pub fn locate(locator: &SevenZipLocator) -> Result<Self> {
+        locator
+            .locate()
+            .map(Self::new)
+            .ok_or_else(|| SmartZipError::BackendUnavailable {
+                backend: "7zz".into(),
+            })
+    }
+
+    pub fn executable(&self) -> &Path {
+        &self.executable
+    }
+
+    async fn run(&self, args: &[String]) -> Result<BackendCommandOutput> {
+        let output = Command::new(&self.executable)
+            .args(args)
+            .output()
+            .await
+            .map_err(|source| SmartZipError::io(Some(self.executable.clone()), source))?;
+
+        Ok(BackendCommandOutput {
+            status: output.status.code(),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        })
+    }
+
+    fn map_failure(&self, output: &BackendCommandOutput, path: &Path) -> SmartZipError {
+        let combined = format!("{}\n{}", output.stdout, output.stderr);
+        let lower = combined.to_lowercase();
+        if lower.contains("wrong password")
+            || (lower.contains("password") && lower.contains("error"))
+        {
+            SmartZipError::WrongPassword {
+                path: path.to_path_buf(),
+            }
+        } else if lower.contains("unsupported") {
+            SmartZipError::UnsupportedFormat {
+                path: path.to_path_buf(),
+                format: None,
+            }
+        } else {
+            SmartZipError::BackendFailed {
+                backend: "7zz".into(),
+                exit_code: output.status,
+                stderr: combined,
+            }
+        }
+    }
+
+    fn password_arg(password: &Option<String>) -> Option<String> {
+        password
+            .as_ref()
+            .map(|password| format!("-p{password}"))
+    }
+}
+
+#[async_trait]
+impl ArchiveBackend for SevenZipBackend {
+    async fn probe(&self, path: &Path) -> Result<ArchiveProbe> {
+        let request = TestRequest {
+            archive: path.to_path_buf(),
+            password: None,
+        };
+        let result = self.test(request).await;
+        Ok(ArchiveProbe {
+            path: path.to_path_buf(),
+            format: None,
+            encrypted: None,
+            supported: result.is_ok(),
+        })
+    }
+
+    async fn list(&self, request: ListRequest) -> Result<ArchiveListing> {
+        let mut args: Vec<String> = vec!["l".into(), "-slt".into()];
+        if let Some(pw) = Self::password_arg(&request.password) {
+            args.push(pw);
+        }
+        args.push(request.archive.to_string_lossy().into_owned());
+        let output = self.run(&args).await?;
+        if output.status != Some(0) {
+            return Err(self.map_failure(&output, &request.archive));
+        }
+        Ok(ArchiveListing {
+            format: None,
+            entries: parse_entries(&output.stdout),
+        })
+    }
+
+    async fn test(&self, request: TestRequest) -> Result<TestResult> {
+        let mut args: Vec<String> = vec!["t".into()];
+        if let Some(pw) = Self::password_arg(&request.password) {
+            args.push(pw);
+        }
+        args.push(request.archive.to_string_lossy().into_owned());
+        let output = self.run(&args).await?;
+        if output.status != Some(0) {
+            return Err(self.map_failure(&output, &request.archive));
+        }
+        Ok(TestResult {
+            ok: true,
+            encrypted: None,
+        })
+    }
+
+    async fn extract(&self, request: ExtractArchiveRequest) -> Result<ExtractArchiveResult> {
+        let mut args: Vec<String> = vec!["x".into(), "-y".into()];
+        if let Some(pw) = Self::password_arg(&request.password) {
+            args.push(pw);
+        }
+        args.push(format!("-o{}", request.output_dir.display()));
+        args.push(request.archive.to_string_lossy().into_owned());
+        let output = self.run(&args).await?;
+        if output.status != Some(0) {
+            return Err(self.map_failure(&output, &request.archive));
+        }
+        Ok(ExtractArchiveResult {
+            output_dir: request.output_dir,
+        })
+    }
+
+    async fn compress(&self, request: CompressArchiveRequest) -> Result<CompressArchiveResult> {
+        let mut args: Vec<String> = vec!["a".into()];
+        if let Some(pw) = Self::password_arg(&request.password) {
+            args.push(pw);
+        }
+        args.push(request.output.to_string_lossy().into_owned());
+        args.extend(
+            request
+                .inputs
+                .iter()
+                .map(|input| input.to_string_lossy().into_owned()),
+        );
+        let output = self.run(&args).await?;
+        if output.status != Some(0) {
+            return Err(self.map_failure(&output, &request.output));
+        }
+        Ok(CompressArchiveResult {
+            output: request.output,
+        })
+    }
+
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities {
+            can_extract: vec![
+                ArchiveFormat::Zip,
+                ArchiveFormat::SevenZip,
+                ArchiveFormat::Rar,
+                ArchiveFormat::Tar,
+                ArchiveFormat::Gzip,
+                ArchiveFormat::Bzip2,
+                ArchiveFormat::Xz,
+                ArchiveFormat::Cab,
+            ],
+            can_compress: vec![ArchiveFormat::Zip, ArchiveFormat::SevenZip],
+            supports_passwords: true,
+            supports_listing: true,
+            supports_test: true,
+        }
+    }
+}
+
+fn parse_entries(stdout: &str) -> Vec<ArchiveEntry> {
+    let mut entries = Vec::new();
+    let mut current_path: Option<PathBuf> = None;
+    let mut current_size: Option<u64> = None;
+    let mut current_is_dir = false;
+    let mut current_is_archive = false;
+
+    for line in stdout.lines() {
+        if let Some(path) = line.strip_prefix("Path = ") {
+            if let Some(path) = current_path.take() {
+                if !current_is_archive {
+                    entries.push(ArchiveEntry {
+                        path,
+                        size: current_size,
+                        is_dir: current_is_dir,
+                    });
+                }
+            }
+            current_path = Some(PathBuf::from(path));
+            current_size = None;
+            current_is_dir = false;
+            current_is_archive = false;
+        } else if let Some(_type) = line.strip_prefix("Type = ") {
+            current_is_archive = true;
+        } else if let Some(size) = line.strip_prefix("Size = ") {
+            current_size = size.parse().ok();
+        } else if let Some(attributes) = line.strip_prefix("Attributes = ") {
+            current_is_dir = attributes.contains('D');
+        }
+    }
+
+    if let Some(path) = current_path.take() {
+        if !current_is_archive {
+            entries.push(ArchiveEntry {
+                path,
+                size: current_size,
+                is_dir: current_is_dir,
+            });
+        }
+    }
+
+    entries
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn locator_finds_bundled_path() {
+        let path = std::env::current_exe().unwrap();
+        let locator = SevenZipLocator::bundled(path.clone());
+        assert_eq!(locator.locate(), Some(path));
+    }
+
+    #[test]
+    fn parses_slt_entries() {
+        let stdout = "Path = archive.zip\nType = zip\n\nPath = file.txt\nSize = 42\nAttributes = A\n\nPath = dir\nSize = 0\nAttributes = D\n";
+        let entries = parse_entries(stdout);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].path, PathBuf::from("file.txt"));
+        assert_eq!(entries[0].size, Some(42));
+        assert!(entries[1].is_dir);
+    }
+}

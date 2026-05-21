@@ -1,0 +1,262 @@
+{
+  "/home/charl/git/SmartZip/.pi/skills/rust-docs/scripts/rust-docs-mcp.sh": {
+    "mtime": 1779254185.5497952,
+    "ast_hash": "4a6a84476ebee79dd91482c95f965320",
+    "semantic_hash": "4a6a84476ebee79dd91482c95f965320"
+  },
+  "/home/charl/git/SmartZip/.pi/skills/rust-docs/scripts/mcp_client.py": {
+    "mtime": 1779254211.697321,
+    "ast_hash": "8c788953070fedbce2dd11c121b151bc",
+    "semantic_hash": "8c788953070fedbce2dd11c121b151bc"
+  },
+  "/home/charl/git/SmartZip/.tools/rustdocs-mcp-server/.crates2.json": {
+    "mtime": 1779253527.2878673,
+    "ast_hash": "d41d8cd98f00b204e9800998ecf8427e",
+    "semantic_hash": "d41d8cd98f00b204e9800998ecf8427e"
+  },
+  "/home/charl/git/SmartZip/.tools/rust-docs/.crates2.json": {
+    "mtime": 1779254431.6841886,
+    "ast_hash": "d45b6689fc836975ca9019aae412d9f7",
+    "semantic_hash": "d45b6689fc836975ca9019aae412d9f7"
+  },
+  "/home/charl/git/SmartZip/doc/test.json": {
+    "mtime": 1779254439.964401,
+    "ast_hash": "76289ad24ab571c9b0043ac9c297ef93",
+    "semantic_hash": "76289ad24ab571c9b0043ac9c297ef93"
+  },
+  "/home/charl/git/SmartZip/crates/smartzip-core/src/lib.rs": {
+    "mtime": 1779259985.137616,
+    "ast_hash": "90886a0721b0de80428bc9b5c7b8b2c3",
+    "semantic_hash": "90886a0721b0de80428bc9b5c7b8b2c3"
+  },
+  "/home/charl/git/SmartZip/crates/smartzip-core/src/error.rs": {
+    "mtime": 1779256237.3192809,
+    "ast_hash": "510864e39beee327abd6e42c34f723f2",
+    "semantic_hash": "510864e39beee327abd6e42c34f723f2"
+  },
+  "/home/charl/git/SmartZip/crates/smartzip-core/src/task.rs": {
+    "mtime": 1779256145.669052,
+    "ast_hash": "6e32c95e1156be47298d701a41a0c8fd",
+    "semantic_hash": "6e32c95e1156be47298d701a41a0c8fd"
+  },
+  "/home/charl/git/SmartZip/crates/smartzip-core/src/progress.rs": {
+    "mtime": 1779256237.320281,
+    "ast_hash": "db571712c94a0740c372c1826dd2044b",
+    "semantic_hash": "db571712c94a0740c372c1826dd2044b"
+  },
+  "/home/charl/git/SmartZip/crates/smartzip-scanner/src/lib.rs": {
+    "mtime": 1779256300.5998144,
+    "ast_hash": "7799b6087cbb249e83532bcfa3c0a466",
+    "semantic_hash": "7799b6087cbb249e83532bcfa3c0a466"
+  },
+  "/home/charl/git/SmartZip/crates/smartzip-archive/src/lib.rs": {
+    "mtime": 1779256584.0296395,
+    "ast_hash": "aea6e91f05b5b7246b53fdbac785e796",
+    "semantic_hash": "aea6e91f05b5b7246b53fdbac785e796"
+  },
+  "/home/charl/git/SmartZip/crates/smartzip-archive/src/types.rs": {
+    "mtime": 1779256603.368103,
+    "ast_hash": "3c4700ad2b9f765eccaf910fc8c494c8",
+    "semantic_hash": "3c4700ad2b9f765eccaf910fc8c494c8"
+  },
+  "/home/charl/git/SmartZip/crates/smartzip-archive/src/backend.rs": {
+    "mtime": 1779256621.9605508,
+    "ast_hash": "5e5b7fa75f73e022ad6ad0e4263b734e",
+    "semantic_hash": "5e5b7fa75f73e022ad6ad0e4263b734e"
+  },
+  "/home/charl/git/SmartZip/crates/smartzip-archive/src/sevenzz.rs": {
+    "mtime": 1779297315.8857534,
+    "ast_hash": "39a0e796b47b4045b49b58525d806418",
+    "semantic_hash": "39a0e796b47b4045b49b58525d806418"
+  },
+  "/home/charl/git/SmartZip/crates/smartzip-cli/src/main.rs": {
+    "mtime": 1779297292.1833184,
+    "ast_hash": "a1dcccb4f77b50c5b391fe713f1a7fe4",
+    "semantic_hash": "a1dcccb4f77b50c5b391fe713f1a7fe4"
+  },
+  "/home/charl/git/SmartZip/crates/smartzip-engine/src/lib.rs": {
+    "mtime": 1779297827.2768245,
+    "ast_hash": "b122f12c5b3c04192d051e5870927aac",
+    "semantic_hash": "b122f12c5b3c04192d051e5870927aac"
+  },
+  "/home/charl/git/SmartZip/crates/smartzip-engine/tests/smartzip_integration.rs": {
+    "mtime": 1779291899.999982,
+    "ast_hash": "7854abbf999e2af4f6340690df15ffa5",
+    "semantic_hash": "7854abbf999e2af4f6340690df15ffa5"
+  },
+  "/home/charl/git/SmartZip/crates/smartzip-db/src/lib.rs": {
+    "mtime": 1779291012.7938418,
+    "ast_hash": "af7fb558ab189006035a7fd524bed20c",
+    "semantic_hash": "af7fb558ab189006035a7fd524bed20c"
+  },
+  "/home/charl/git/SmartZip/crates/smartzip-db/src/schema.rs": {
+    "mtime": 1779257391.885004,
+    "ast_hash": "582b02c7ac892de87ac06dbc1ce9c3f0",
+    "semantic_hash": "582b02c7ac892de87ac06dbc1ce9c3f0"
+  },
+  "/home/charl/git/SmartZip/crates/smartzip-passwords/src/lib.rs": {
+    "mtime": 1779257472.827938,
+    "ast_hash": "d55143c36bad1ba6180ea56ea0291cba",
+    "semantic_hash": "d55143c36bad1ba6180ea56ea0291cba"
+  },
+  "/home/charl/git/SmartZip/crates/smartzip-encoding/src/lib.rs": {
+    "mtime": 1779289037.684515,
+    "ast_hash": "6bae88e8b478bbbf6c660e313290b900",
+    "semantic_hash": "6bae88e8b478bbbf6c660e313290b900"
+  },
+  "/home/charl/git/SmartZip/crates/smartzip-platform/src/lib.rs": {
+    "mtime": 1779259647.5808327,
+    "ast_hash": "6d158e193214717ea749f1284ae6a717",
+    "semantic_hash": "6d158e193214717ea749f1284ae6a717"
+  },
+  "/home/charl/git/SmartZip/crates/smartzip-config/src/lib.rs": {
+    "mtime": 1779259527.3958724,
+    "ast_hash": "7e2ed4d20cdee285ca244b676360a92e",
+    "semantic_hash": "7e2ed4d20cdee285ca244b676360a92e"
+  },
+  "/home/charl/git/SmartZip/crates/smartzip-gui/src/main.rs": {
+    "mtime": 1779298716.297618,
+    "ast_hash": "1c04e4fbcb9d2e59de5b3c15a4769ed0",
+    "semantic_hash": "1c04e4fbcb9d2e59de5b3c15a4769ed0"
+  },
+  "/home/charl/git/SmartZip/tests/fixtures/generate.py": {
+    "mtime": 1779287416.335989,
+    "ast_hash": "0915f755c516526777b825dac5f813be",
+    "semantic_hash": "0915f755c516526777b825dac5f813be"
+  },
+  "/home/charl/git/SmartZip/tests/fixtures/main.py": {
+    "mtime": 1779287217.3769822,
+    "ast_hash": "e99533b4c9bb88132d9beb1e09d8f02d",
+    "semantic_hash": "e99533b4c9bb88132d9beb1e09d8f02d"
+  },
+  "/home/charl/git/SmartZip/README.md": {
+    "mtime": 1779251941.6096916,
+    "ast_hash": "fcd791a1996ab1be7b40ac7bd1a0bedb",
+    "semantic_hash": "fcd791a1996ab1be7b40ac7bd1a0bedb"
+  },
+  "/home/charl/git/SmartZip/ini.md": {
+    "mtime": 1779251941.6101966,
+    "ast_hash": "24c7926670a8ce3021f9f7a9e4b708cb",
+    "semantic_hash": "24c7926670a8ce3021f9f7a9e4b708cb"
+  },
+  "/home/charl/git/SmartZip/CONTEXT.md": {
+    "mtime": 1779295203.839791,
+    "ast_hash": "9381ffeefd9003bf9e02fa26672b5960",
+    "semantic_hash": "9381ffeefd9003bf9e02fa26672b5960"
+  },
+  "/home/charl/git/SmartZip/.pi/skills/rust-docs/SKILL.md": {
+    "mtime": 1779254239.6262171,
+    "ast_hash": "8fd23e8a11bd07750d70be0d0c7af596",
+    "semantic_hash": "8fd23e8a11bd07750d70be0d0c7af596"
+  },
+  "/home/charl/git/SmartZip/docs/requirements.md": {
+    "mtime": 1779253087.5547454,
+    "ast_hash": "0b8a2ee3decda3289370945fc3037d96",
+    "semantic_hash": "0b8a2ee3decda3289370945fc3037d96"
+  },
+  "/home/charl/git/SmartZip/docs/tech-evaluation.md": {
+    "mtime": 1779253139.1750703,
+    "ast_hash": "9993110996794a76c2d824c5f7789ff9",
+    "semantic_hash": "9993110996794a76c2d824c5f7789ff9"
+  },
+  "/home/charl/git/SmartZip/docs/gpui-verification.md": {
+    "mtime": 1779254608.0656807,
+    "ast_hash": "db2b36747627fa7c8328195981ee18bc",
+    "semantic_hash": "db2b36747627fa7c8328195981ee18bc"
+  },
+  "/home/charl/git/SmartZip/docs/architecture.md": {
+    "mtime": 1779255072.9572563,
+    "ast_hash": "e7e5a7bad4be08e64c3ece6ea08b185a",
+    "semantic_hash": "e7e5a7bad4be08e64c3ece6ea08b185a"
+  },
+  "/home/charl/git/SmartZip/docs/design.md": {
+    "mtime": 1779257761.2488322,
+    "ast_hash": "d22561c8d76052fc15cd296d02823488",
+    "semantic_hash": "d22561c8d76052fc15cd296d02823488"
+  },
+  "/home/charl/git/SmartZip/docs/binwalk-evaluation.md": {
+    "mtime": 1779255738.831505,
+    "ast_hash": "fc60926c23fb7065b158998637f57cc8",
+    "semantic_hash": "fc60926c23fb7065b158998637f57cc8"
+  },
+  "/home/charl/git/SmartZip/docs/implementation-progress.md": {
+    "mtime": 1779262586.4264538,
+    "ast_hash": "394944da027cd4281e9db6f56354504e",
+    "semantic_hash": "394944da027cd4281e9db6f56354504e"
+  },
+  "/home/charl/git/SmartZip/docs/chat.md": {
+    "mtime": 1779257474.0,
+    "ast_hash": "88b1041ea753da736f66b4e48788b43c",
+    "semantic_hash": "88b1041ea753da736f66b4e48788b43c"
+  },
+  "/home/charl/git/SmartZip/docs/improvement.md": {
+    "mtime": 1779295309.5403037,
+    "ast_hash": "595ade611ee19fba25e6304010cd795b",
+    "semantic_hash": "595ade611ee19fba25e6304010cd795b"
+  },
+  "/home/charl/git/SmartZip/docs/implementation-plan.md": {
+    "mtime": 1779296154.3152864,
+    "ast_hash": "b751cf37c0406fadd2c98a3ec0a375a3",
+    "semantic_hash": "b751cf37c0406fadd2c98a3ec0a375a3"
+  },
+  "/home/charl/git/SmartZip/tests/fixtures/README.md": {
+    "mtime": 1779284328.066566,
+    "ast_hash": "f1ccff9001e6f4b228e744901ad126b6",
+    "semantic_hash": "f1ccff9001e6f4b228e744901ad126b6"
+  },
+  "/home/charl/git/SmartZip/R3493 V1.08.jpg.png": {
+    "mtime": 1779289785.9449966,
+    "ast_hash": "4346b43ddc37fff5ffed2b0b8d293f90",
+    "semantic_hash": "4346b43ddc37fff5ffed2b0b8d293f90"
+  },
+  "/home/charl/git/SmartZip/donate/alipay.jpg": {
+    "mtime": 1779251941.6096916,
+    "ast_hash": "4de512b8a2b3f8064f3d8159635e27d5",
+    "semantic_hash": "4de512b8a2b3f8064f3d8159635e27d5"
+  },
+  "/home/charl/git/SmartZip/donate/wexin.png": {
+    "mtime": 1779251941.6101966,
+    "ast_hash": "6c578640d7925a576454d4ff1941c885",
+    "semantic_hash": "6c578640d7925a576454d4ff1941c885"
+  },
+  "/home/charl/git/SmartZip/pic/addZip.jpg": {
+    "mtime": 1779251941.6101966,
+    "ast_hash": "4cc9a547eccf1e6e51e0b39b5e6ae303",
+    "semantic_hash": "4cc9a547eccf1e6e51e0b39b5e6ae303"
+  },
+  "/home/charl/git/SmartZip/pic/menu.jpg": {
+    "mtime": 1779251941.61073,
+    "ast_hash": "9f5013b29b60e628b048a14f212a3da5",
+    "semantic_hash": "9f5013b29b60e628b048a14f212a3da5"
+  },
+  "/home/charl/git/SmartZip/pic/set.gif": {
+    "mtime": 1779251941.6111965,
+    "ast_hash": "898e72ddb57b7e926fb6470280757ea4",
+    "semantic_hash": "898e72ddb57b7e926fb6470280757ea4"
+  },
+  "/home/charl/git/SmartZip/pic/unZip.jpg": {
+    "mtime": 1779251941.6121964,
+    "ast_hash": "80268fe13d8f72d6608849c4b703ce9b",
+    "semantic_hash": "80268fe13d8f72d6608849c4b703ce9b"
+  },
+  "/home/charl/git/SmartZip/pic/xc.jpg": {
+    "mtime": 1779251941.6121964,
+    "ast_hash": "482a17d841a3b1b9ba420f36d4219873",
+    "semantic_hash": "482a17d841a3b1b9ba420f36d4219873"
+  },
+  "/home/charl/git/SmartZip/tests/fixtures/video_zip.mp4": {
+    "mtime": 1779287423.9366467,
+    "ast_hash": "acd8bae4e17fc0fbc49560902818ed27",
+    "semantic_hash": "acd8bae4e17fc0fbc49560902818ed27"
+  },
+  "/home/charl/git/SmartZip/tests/fixtures/video_7z_pass.mp4": {
+    "mtime": 1779287424.0366533,
+    "ast_hash": "f2a77970201c99664b99a36f4b92194c",
+    "semantic_hash": "f2a77970201c99664b99a36f4b92194c"
+  },
+  "/home/charl/git/SmartZip/tests/fixtures/combo_video_nested.mp4": {
+    "mtime": 1779287424.0890417,
+    "ast_hash": "d6c171e8e839363ad7c1224f9aad60e8",
+    "semantic_hash": "d6c171e8e839363ad7c1224f9aad60e8"
+  }
+}
