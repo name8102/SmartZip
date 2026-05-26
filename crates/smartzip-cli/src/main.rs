@@ -3,7 +3,10 @@ use clap::{Parser, Subcommand, ValueEnum};
 use smartzip_archive::SevenZipBackend;
 use smartzip_core::EncodingMode;
 use smartzip_db::{password::PasswordRepository, SmartZipDb};
-use smartzip_engine::{DetectRequest, ExtractWorkflowRequest, InteractivePasswordPrompter, SmartZipEngine};
+use smartzip_engine::{
+    DetectRequest, ExtractWorkflowRequest, InteractiveOutputPrompter,
+    InteractivePasswordPrompter, OutputCollisionStrategy, SmartZipEngine,
+};
 use smartzip_passwords::{PasswordCandidateRequest, PasswordService};
 use smartzip_scanner::{Confidence, ScanMode, ScannerConfig};
 use smartzip_platform::PlatformPaths;
@@ -332,6 +335,7 @@ async fn extract(
                 },
             },
             Some(&StdinPrompter),
+            Some(&StdinOutputPrompter),
         )
         .await?;
 
@@ -554,5 +558,52 @@ impl InteractivePasswordPrompter for StdinPrompter {
         })
         .await
         .unwrap_or(None)
+    }
+}
+
+struct StdinOutputPrompter;
+
+#[async_trait]
+impl InteractiveOutputPrompter for StdinOutputPrompter {
+    async fn prompt(
+        &self,
+        archive_path: PathBuf,
+        output_path: PathBuf,
+    ) -> OutputCollisionStrategy {
+        tokio::task::spawn_blocking(move || {
+            use std::io::{self, IsTerminal, Write};
+
+            if !io::stdin().is_terminal() {
+                return OutputCollisionStrategy::Skip;
+            }
+
+            loop {
+                eprint!(
+                    "\n  Output already exists for \"{}\": {}\n  Choose [s]kip, [o]verwrite, [r]ename: ",
+                    archive_path.display(),
+                    output_path.display()
+                );
+                let _ = io::stderr().flush();
+
+                let mut choice = String::new();
+                if io::stdin().read_line(&mut choice).is_err() {
+                    return OutputCollisionStrategy::Skip;
+                }
+
+                match choice.trim().to_ascii_lowercase().as_str() {
+                    "s" | "skip" => {
+                        eprintln!("  (skipped)");
+                        return OutputCollisionStrategy::Skip;
+                    }
+                    "o" | "overwrite" => return OutputCollisionStrategy::Overwrite,
+                    "r" | "rename" => return OutputCollisionStrategy::Rename,
+                    _ => {
+                        eprintln!("  Please enter s, o, or r.");
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap_or(OutputCollisionStrategy::Skip)
     }
 }

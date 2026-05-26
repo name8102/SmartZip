@@ -3,6 +3,7 @@ use crate::types::*;
 use async_trait::async_trait;
 use smartzip_core::{ArchiveFormat, Result, SmartZipError};
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use tokio::process::Command;
 
 #[derive(Debug, Clone)]
@@ -71,6 +72,7 @@ impl SevenZipBackend {
     async fn run(&self, args: &[String]) -> Result<BackendCommandOutput> {
         let output = Command::new(&self.executable)
             .args(args)
+            .stdin(Stdio::null())
             .output()
             .await
             .map_err(|source| SmartZipError::io(Some(self.executable.clone()), source))?;
@@ -108,7 +110,13 @@ impl SevenZipBackend {
     fn password_arg(password: &Option<String>) -> Option<String> {
         password
             .as_ref()
-            .map(|password| format!("-p{password}"))
+            .map(|password| {
+                if password.is_empty() {
+                    "-p\"\"".to_string()
+                } else {
+                    format!("-p{password}")
+                }
+            })
     }
 }
 
@@ -117,14 +125,19 @@ impl ArchiveBackend for SevenZipBackend {
     async fn probe(&self, path: &Path) -> Result<ArchiveProbe> {
         let request = TestRequest {
             archive: path.to_path_buf(),
-            password: None,
+            password: Some(String::new()),
         };
         let result = self.test(request).await;
+        let (supported, encrypted) = match result {
+            Ok(result) => (result.ok, result.encrypted),
+            Err(SmartZipError::WrongPassword { .. }) => (true, Some(true)),
+            Err(_) => (false, None),
+        };
         Ok(ArchiveProbe {
             path: path.to_path_buf(),
             format: None,
-            encrypted: None,
-            supported: result.is_ok(),
+            encrypted,
+            supported,
         })
     }
 
@@ -280,5 +293,37 @@ mod tests {
         assert_eq!(entries[0].path, PathBuf::from("file.txt"));
         assert_eq!(entries[0].size, Some(42));
         assert!(entries[1].is_dir);
+    }
+
+    #[test]
+    fn empty_password_is_passed_explicitly() {
+        assert_eq!(SevenZipBackend::password_arg(&Some(String::new())), Some("-p\"\"".into()));
+    }
+
+    #[tokio::test]
+    async fn probe_handles_encrypted_archives_without_prompting() {
+        let root = std::env::temp_dir().join(format!("smartzip-probe-{}", std::process::id()));
+        let archive = root.join("secret.7z");
+        let file = root.join("hello.txt");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(&file, b"hello").unwrap();
+
+        let status = std::process::Command::new("7z")
+            .arg("a")
+            .arg("-psecret")
+            .arg(&archive)
+            .arg(&file)
+            .current_dir(&root)
+            .status()
+            .unwrap();
+        assert!(status.success(), "7z must be available in PATH");
+
+        let backend = SevenZipBackend::locate(&SevenZipLocator::default())
+            .expect("7z/7zz must be available");
+        let probe = backend.probe(&archive).await.unwrap();
+
+        assert!(probe.supported);
+        assert_eq!(probe.encrypted, Some(true));
+        let _ = std::fs::remove_dir_all(root);
     }
 }

@@ -293,6 +293,7 @@ async fn test_engine_extract_simple_utf8() {
                 password_candidates: PasswordCandidateRequest::default(),
             },
             None,
+            None,
         )
         .await;
 
@@ -333,6 +334,7 @@ async fn test_engine_extract_password_archive() {
                 scanner: ScannerConfig::default(),
                 password_candidates: PasswordCandidateRequest::default(),
             },
+            None,
             None,
         )
         .await;
@@ -380,6 +382,7 @@ async fn test_engine_respects_recursion_limit() {
                 password_candidates: PasswordCandidateRequest::default(),
             },
             None,
+            None,
         )
         .await;
 
@@ -399,6 +402,49 @@ async fn test_engine_respects_recursion_limit() {
     assert!(
         workflow_result.skipped.iter().any(|c| c.path.ends_with("L3.zip")),
         "L3.zip at depth 2 should be skipped due to recursion limit"
+    );
+}
+
+#[tokio::test]
+async fn test_engine_preserves_nested_archive_paths() {
+    let archive = fixture_path("nested_zip_in_zip.zip");
+    assert!(archive.exists(), "fixture missing: nested_zip_in_zip.zip");
+
+    let backend = backend();
+    let db = SmartZipDb::in_memory().unwrap();
+    let service = PasswordService::new(PasswordRepository::new(db.connection()));
+    let engine = SmartZipEngine::default();
+    let output = TempDir::new().unwrap();
+
+    let result = engine
+        .extract_recursive(
+            &backend,
+            &service,
+            ExtractWorkflowRequest {
+                inputs: vec![archive.clone()],
+                output_dir: output.path().to_path_buf(),
+                recursion_limit: 2,
+                encoding_mode: EncodingMode::Auto,
+                scanner: ScannerConfig::default(),
+                password_candidates: PasswordCandidateRequest::default(),
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result.processed.len(), 2, "outer and inner archives should be processed");
+
+    let nested_file = output
+        .path()
+        .join("nested_zip_in_zip-d0")
+        .join("inner-d1")
+        .join("hello.txt");
+    assert!(
+        nested_file.exists(),
+        "expected nested output at {}",
+        nested_file.display()
     );
 }
 

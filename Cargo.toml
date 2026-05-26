@@ -40,6 +40,7 @@ smartzip-passwords = { path = "crates/smartzip-passwords" }
 smartzip-platform = { path = "crates/smartzip-platform" }
 smartzip-scanner = { path = "crates/smartzip-scanner" }
 thiserror = "2.0"
+futures-util = "0.3"
 tokio = { version = "1.45", features = ["macros", "process", "rt-multi-thread", "io-util"] }
 toml = "0.8"
 rstest = "0.25"

@@ -1,12 +1,20 @@
 //! Application-level orchestration for SmartZip workflows.
 
 use async_trait::async_trait;
+use futures_util::FutureExt;
 use serde::{Deserialize, Serialize};
 use smartzip_archive::{ArchiveBackend, ExtractArchiveRequest, ListRequest, TestRequest};
 use smartzip_core::{ArchiveFormat, EncodingMode, TaskEvent, TaskEventKind, TaskId};
 use smartzip_passwords::{PasswordCandidate, PasswordCandidateRequest, PasswordService};
 use smartzip_scanner::{EmbeddedArchiveFinding, EmbeddedScanner, ScannerConfig};
-use std::collections::{HashSet, VecDeque};
+use std::any::Any;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs::File;
+use std::future::Future;
+use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
+use std::panic::AssertUnwindSafe;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::path::{Path, PathBuf};
 
 /// Allows interactive password prompting during extraction.
@@ -23,6 +31,29 @@ pub trait InteractivePasswordPrompter: Send + Sync {
     /// this archive. Implementations should use `spawn_blocking` for any
     /// blocking I/O (e.g. stdin reads) to avoid stalling the async runtime.
     async fn prompt(&self, archive_path: &Path) -> Option<String>;
+}
+
+/// Strategy used when the requested output path already exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OutputCollisionStrategy {
+    Skip,
+    Overwrite,
+    Rename,
+}
+
+/// Allows interactive resolution of output path collisions.
+#[async_trait]
+pub trait InteractiveOutputPrompter: Send + Sync {
+    /// Prompt the user for how to handle an existing output path.
+    ///
+    /// Implementations should use `spawn_blocking` for terminal I/O so the
+    /// async runtime can continue extracting unrelated archives while the
+    /// user decides.
+    async fn prompt(
+        &self,
+        archive_path: PathBuf,
+        output_path: PathBuf,
+    ) -> OutputCollisionStrategy;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -56,6 +87,7 @@ pub struct ExtractWorkflowRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExtractionCandidate {
     pub path: PathBuf,
+    pub relative_path: PathBuf,
     pub depth: u8,
     pub source: CandidateSource,
     pub detected_format: Option<ArchiveFormat>,
@@ -140,6 +172,7 @@ impl SmartZipEngine {
         passwords: &PasswordService<'_>,
         request: ExtractWorkflowRequest,
         password_prompter: Option<&dyn InteractivePasswordPrompter>,
+        output_prompter: Option<&dyn InteractiveOutputPrompter>,
     ) -> smartzip_core::Result<ExtractWorkflowResult> {
         let task_id = TaskId::new();
         let scanner = if request.scanner == *self.scanner.config() {
@@ -155,11 +188,16 @@ impl SmartZipEngine {
         let mut processed = Vec::new();
         let mut skipped = Vec::new();
         let mut enqueued = Vec::new();
+        let mut output_overrides: HashMap<String, PathBuf> = HashMap::new();
+        let mut deferred_output_conflicts = VecDeque::new();
+        let mut pending_output_conflict = None;
 
-        for input in request.inputs {
+        for input in &request.inputs {
+            let relative_path = archive_output_name(input);
             queue.push_back(ExtractionCandidate {
-                detected_format: format_from_extension(&input),
-                path: input,
+                detected_format: format_from_extension(input),
+                path: input.clone(),
+                relative_path,
                 depth: 0,
                 source: CandidateSource::RootInput,
                 embedded_offset: None,
@@ -176,7 +214,74 @@ impl SmartZipEngine {
                 stderr: error.to_string(),
             })?;
 
-        while let Some(mut candidate) = queue.pop_front() {
+        loop {
+            if let Some(mut pending) = pending_output_conflict.take() {
+                if let Some(strategy) = poll_pending_output_conflict(&mut pending) {
+                    apply_output_collision_strategy(
+                        &request,
+                        pending.candidate,
+                        pending.output_dir,
+                        strategy,
+                        &mut queue,
+                        &mut skipped,
+                        &mut output_overrides,
+                    )?;
+                    continue;
+                }
+                pending_output_conflict = Some(pending);
+            }
+
+            if queue.is_empty() && pending_output_conflict.is_none() {
+                if let Some(prompter) = output_prompter {
+                    if let Some(candidate) = deferred_output_conflicts.pop_front() {
+                        let output_dir = output_dir_for_candidate(&request.output_dir, &candidate);
+                        let candidate_path = candidate.path.clone();
+                        let output_path = output_dir.clone();
+                        let mut pending = PendingOutputConflict {
+                            candidate,
+                            output_dir,
+                            prompt: Box::pin(prompter.prompt(candidate_path, output_path)),
+                        };
+                        if let Some(strategy) = poll_pending_output_conflict(&mut pending) {
+                            apply_output_collision_strategy(
+                                &request,
+                                pending.candidate,
+                                pending.output_dir,
+                                strategy,
+                                &mut queue,
+                                &mut skipped,
+                                &mut output_overrides,
+                            )?;
+                        } else {
+                            pending_output_conflict = Some(pending);
+                        }
+                        continue;
+                    }
+                }
+            }
+
+            let Some(mut candidate) = queue.pop_front() else {
+                if let Some(pending) = pending_output_conflict.take() {
+                    let strategy = pending.prompt.await;
+                    apply_output_collision_strategy(
+                        &request,
+                        pending.candidate,
+                        pending.output_dir,
+                        strategy,
+                        &mut queue,
+                        &mut skipped,
+                        &mut output_overrides,
+                    )?;
+                    continue;
+                }
+
+                if let Some(candidate) = deferred_output_conflicts.pop_front() {
+                    queue.push_front(candidate);
+                    continue;
+                }
+
+                break;
+            };
             let key = candidate_key(&candidate);
             if !seen.insert(key)
                 || candidate.depth > request.recursion_limit
@@ -188,10 +293,11 @@ impl SmartZipEngine {
 
             // B1: magic-number (scanner) detection first, extension fallback
             let findings = scanner.scan_path(&candidate.path).unwrap_or_default();
-            if candidate.detected_format.is_none() {
-                candidate.detected_format = findings.first().map(|finding| finding.format.clone());
-            }
-            if candidate.detected_format.is_none() {
+            if let Some(finding) = findings.first() {
+                candidate.detected_format = Some(finding.format.clone());
+                candidate.embedded_offset = Some(finding.offset);
+                candidate.embedded_size = finding.size;
+            } else if candidate.detected_format.is_none() {
                 candidate.detected_format = format_from_extension(&candidate.path);
             }
 
@@ -199,6 +305,9 @@ impl SmartZipEngine {
                 skipped.push(candidate);
                 continue;
             }
+
+            let archive_input = materialize_archive_input(&candidate)?;
+            let archive_path = archive_input.path.clone();
 
             events.push(TaskEvent {
                 task_id: task_id.clone(),
@@ -213,8 +322,8 @@ impl SmartZipEngine {
             if request.encoding_mode == EncodingMode::Auto {
                 if let Ok(listing) = backend
                     .list(ListRequest {
-                        archive: candidate.path.clone(),
-                        password: None,
+                        archive: archive_path.clone(),
+                        password: Some(String::new()),
                         encoding: EncodingMode::Auto,
                     })
                     .await
@@ -250,18 +359,55 @@ impl SmartZipEngine {
                 }
             }
 
-            let output_dir = output_dir_for_candidate(&request.output_dir, &candidate);
+            let key = candidate_key(&candidate);
+            let output_dir = output_overrides
+                .remove(&key)
+                .unwrap_or_else(|| output_dir_for_candidate(&request.output_dir, &candidate));
+            if output_dir.exists() {
+                if let Some(prompter) = output_prompter {
+                    seen.remove(&key);
+                    if pending_output_conflict.is_none() {
+                        let candidate_path = candidate.path.clone();
+                        let output_path = output_dir.clone();
+                        pending_output_conflict = Some(PendingOutputConflict {
+                            candidate,
+                            output_dir,
+                            prompt: Box::pin(prompter.prompt(candidate_path, output_path)),
+                        });
+                        continue;
+                    }
+
+                    deferred_output_conflicts.push_back(candidate);
+                    continue;
+                }
+
+                let error = smartzip_core::SmartZipError::io(
+                    Some(output_dir.clone()),
+                    std::io::Error::new(
+                        ErrorKind::AlreadyExists,
+                        format!("output path already exists: {}", output_dir.display()),
+                    ),
+                );
+                events.push(TaskEvent::failed(task_id.clone(), &error));
+                skipped.push(candidate);
+                continue;
+            }
+
             let mut extracted = false;
             let mut last_error = None;
             for password in &password_candidates {
                 // B3: Test-first — use test() to check password, then extract once
                 let pw_value = password_value(password);
-                match backend
-                    .test(TestRequest {
-                        archive: candidate.path.clone(),
+                match backend_call(
+                    "archive-backend",
+                    "test",
+                    &archive_path,
+                    backend.test(TestRequest {
+                        archive: archive_path.clone(),
                         password: pw_value.clone(),
-                    })
-                    .await
+                    }),
+                )
+                .await
                 {
                     Ok(result) if result.ok => {
                         let _ = passwords.record_success(password);
@@ -270,13 +416,17 @@ impl SmartZipEngine {
                         if encoding_result.is_none()
                             && request.encoding_mode == EncodingMode::Auto
                         {
-                            if let Ok(listing) = backend
-                                .list(ListRequest {
-                                    archive: candidate.path.clone(),
+                            if let Ok(listing) = backend_call(
+                                "archive-backend",
+                                "list",
+                                &archive_path,
+                                backend.list(ListRequest {
+                                    archive: archive_path.clone(),
                                     password: pw_value.clone(),
                                     encoding: EncodingMode::Auto,
-                                })
-                                .await
+                                }),
+                            )
+                            .await
                             {
                                 let raw_names: Vec<u8> = listing
                                     .entries
@@ -322,14 +472,18 @@ impl SmartZipEngine {
                             .unwrap_or(EncodingMode::Auto);
 
                         // Single extract with the correct password + encoding
-                        match backend
-                            .extract(ExtractArchiveRequest {
-                                archive: candidate.path.clone(),
+                        match backend_call(
+                            "archive-backend",
+                            "extract",
+                            &archive_path,
+                            backend.extract(ExtractArchiveRequest {
+                                archive: archive_path.clone(),
                                 output_dir: output_dir.clone(),
                                 password: pw_value,
                                 encoding: encoding_to_use,
-                            })
-                            .await
+                            }),
+                        )
+                        .await
                         {
                             Ok(_) => {
                                 extracted = true;
@@ -362,8 +516,11 @@ impl SmartZipEngine {
                     if let Some(interactive_pw) = prompter.prompt(&candidate.path).await {
                         let pw = interactive_pw.trim().to_string();
                         if !pw.is_empty() {
-                            match backend
-                                .extract(ExtractArchiveRequest {
+                            match backend_call(
+                                "archive-backend",
+                                "extract",
+                                &candidate.path,
+                                backend.extract(ExtractArchiveRequest {
                                     archive: candidate.path.clone(),
                                     output_dir: output_dir.clone(),
                                     password: Some(pw.clone()),
@@ -371,8 +528,9 @@ impl SmartZipEngine {
                                         .as_ref()
                                         .map(|r| EncodingMode::Override(r.selected.clone()))
                                         .unwrap_or(EncodingMode::Auto),
-                                })
-                                .await
+                                }),
+                            )
+                            .await
                             {
                                 Ok(_) => {
                                     // Save the successful interactive password to DB
@@ -404,16 +562,21 @@ impl SmartZipEngine {
                 continue;
             }
 
-            let final_dir = collapse_single_output(&output_dir, &candidate).unwrap_or(output_dir);
             events.push(TaskEvent {
                 task_id: task_id.clone(),
                 kind: TaskEventKind::OutputCreated {
-                    path: final_dir.clone(),
+                    path: output_dir.clone(),
                 },
             });
 
             processed.push(candidate.clone());
-            for nested in discover_nested_candidates(scanner, &final_dir, candidate.depth + 1) {
+            let output_relative_path = candidate_output_relative_path(&candidate);
+            for nested in discover_nested_candidates(
+                scanner,
+                &output_dir,
+                candidate.depth + 1,
+                &output_relative_path,
+            ) {
                 enqueued.push(nested.clone());
                 queue.push_back(nested);
             }
@@ -449,7 +612,18 @@ fn confidence_score(confidence: smartzip_scanner::Confidence) -> f32 {
 }
 
 fn password_value(candidate: &PasswordCandidate) -> Option<String> {
-    (!candidate.value.is_empty()).then_some(candidate.value.clone())
+    Some(candidate.value.clone())
+}
+
+fn archive_output_name(path: &Path) -> PathBuf {
+    PathBuf::from(archive_stem(path))
+}
+
+fn archive_stem(path: &Path) -> std::ffi::OsString {
+    path.file_stem()
+        .or_else(|| path.file_name())
+        .map(|name| name.to_os_string())
+        .unwrap_or_else(|| std::ffi::OsString::from("archive"))
 }
 
 fn candidate_key(candidate: &ExtractionCandidate) -> String {
@@ -462,38 +636,171 @@ fn candidate_key(candidate: &ExtractionCandidate) -> String {
 }
 
 fn output_dir_for_candidate(base: &Path, candidate: &ExtractionCandidate) -> PathBuf {
-    let stem = candidate
-        .path
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .filter(|stem| !stem.is_empty())
-        .unwrap_or("archive");
-    base.join(format!("{}-d{}", stem, candidate.depth))
+    base.join(candidate_output_relative_path(candidate))
 }
 
-fn collapse_single_output(
-    extraction_dir: &Path,
-    _candidate: &ExtractionCandidate,
-) -> std::io::Result<PathBuf> {
-    let entries: Vec<_> = std::fs::read_dir(extraction_dir)?
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.file_name() != "." && entry.file_name() != "..")
-        .collect();
+fn candidate_output_relative_path(candidate: &ExtractionCandidate) -> PathBuf {
+    let mut relative = candidate.relative_path.clone();
+    let leaf = relative
+        .file_name()
+        .map(|name| name.to_owned())
+        .unwrap_or_else(|| std::ffi::OsString::from("archive"));
+    relative.set_file_name(format!("{}-d{}", leaf.to_string_lossy(), candidate.depth));
+    relative
+}
 
-    if entries.len() != 1 {
-        return Ok(extraction_dir.to_path_buf());
+struct ArchiveInput {
+    path: PathBuf,
+    _temp: Option<tempfile::NamedTempFile>,
+}
+
+struct PendingOutputConflict<'a> {
+    candidate: ExtractionCandidate,
+    output_dir: PathBuf,
+    prompt: Pin<Box<dyn Future<Output = OutputCollisionStrategy> + Send + 'a>>,
+}
+
+fn materialize_archive_input(candidate: &ExtractionCandidate) -> smartzip_core::Result<ArchiveInput> {
+    if let Some(offset) = candidate.embedded_offset.filter(|offset| *offset > 0) {
+        let temp = carve_embedded_archive(&candidate.path, offset, candidate.embedded_size)
+            .map_err(|source| smartzip_core::SmartZipError::io(Some(candidate.path.clone()), source))?;
+        let path = temp.path().to_path_buf();
+        Ok(ArchiveInput {
+            path,
+            _temp: Some(temp),
+        })
+    } else {
+        Ok(ArchiveInput {
+            path: candidate.path.clone(),
+            _temp: None,
+        })
+    }
+}
+
+fn output_relative_path_for(base: &Path, output_dir: &Path) -> PathBuf {
+    output_dir
+        .strip_prefix(base)
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            output_dir
+                .file_name()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("archive"))
+        })
+}
+
+fn poll_pending_output_conflict<'a>(
+    pending: &mut PendingOutputConflict<'a>,
+) -> Option<OutputCollisionStrategy> {
+    let waker = futures_util::task::noop_waker_ref();
+    let mut cx = Context::from_waker(waker);
+    match pending.prompt.as_mut().poll(&mut cx) {
+        Poll::Ready(strategy) => Some(strategy),
+        Poll::Pending => None,
+    }
+}
+
+fn remove_existing_output(path: &Path) -> smartzip_core::Result<()> {
+    if path.is_dir() {
+        std::fs::remove_dir_all(path)
+            .map_err(|source| smartzip_core::SmartZipError::io(Some(path.to_path_buf()), source))
+    } else {
+        std::fs::remove_file(path)
+            .map_err(|source| smartzip_core::SmartZipError::io(Some(path.to_path_buf()), source))
+    }
+}
+
+fn apply_output_collision_strategy(
+    request: &ExtractWorkflowRequest,
+    candidate: ExtractionCandidate,
+    output_dir: PathBuf,
+    strategy: OutputCollisionStrategy,
+    queue: &mut VecDeque<ExtractionCandidate>,
+    skipped: &mut Vec<ExtractionCandidate>,
+    output_overrides: &mut HashMap<String, PathBuf>,
+) -> smartzip_core::Result<()> {
+    match strategy {
+        OutputCollisionStrategy::Skip => {
+            skipped.push(candidate);
+        }
+        OutputCollisionStrategy::Overwrite => {
+            remove_existing_output(&output_dir)?;
+            output_overrides.insert(candidate_key(&candidate), output_dir);
+            queue.push_front(candidate);
+        }
+        OutputCollisionStrategy::Rename => {
+            let parent = output_dir.parent().unwrap_or_else(|| Path::new("."));
+            let file_name = output_dir
+                .file_name()
+                .unwrap_or_else(|| std::ffi::OsStr::new("archive"));
+            let renamed_output_dir = find_non_colliding_name(parent, file_name);
+            let mut candidate = candidate;
+            candidate.relative_path = output_relative_path_for(&request.output_dir, &renamed_output_dir);
+            output_overrides.insert(candidate_key(&candidate), renamed_output_dir);
+            queue.push_front(candidate);
+        }
     }
 
-    let entry_name = entries[0].file_name();
-    let parent = extraction_dir.parent().unwrap_or(Path::new("."));
-    let target = find_non_colliding_name(parent, &entry_name);
-    std::fs::rename(entries[0].path(), &target)?;
-    let _ = std::fs::remove_dir_all(extraction_dir);
-    Ok(target)
+    Ok(())
+}
+
+fn carve_embedded_archive(
+    source: &Path,
+    offset: u64,
+    size: Option<u64>,
+) -> std::io::Result<tempfile::NamedTempFile> {
+    let mut input = File::open(source)?;
+    input.seek(SeekFrom::Start(offset))?;
+
+    let mut output = tempfile::NamedTempFile::new()?;
+    match size {
+        Some(size) => {
+            std::io::copy(&mut input.take(size), &mut output)?;
+        }
+        None => {
+            std::io::copy(&mut input, &mut output)?;
+        }
+    }
+    output.flush()?;
+    Ok(output)
+}
+
+async fn backend_call<T, F>(
+    backend: &str,
+    action: &str,
+    path: &Path,
+    future: F,
+) -> smartzip_core::Result<T>
+where
+    F: Future<Output = smartzip_core::Result<T>>,
+{
+    match AssertUnwindSafe(future).catch_unwind().await {
+        Ok(result) => result,
+        Err(panic) => Err(smartzip_core::SmartZipError::BackendFailed {
+            backend: backend.to_string(),
+            exit_code: None,
+            stderr: format!(
+                "panic while {action} {}: {}",
+                path.display(),
+                panic_message(panic)
+            ),
+        }),
+    }
+}
+
+fn panic_message(panic: Box<dyn Any + Send>) -> String {
+    if let Some(message) = panic.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = panic.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "unknown panic payload".to_string()
+    }
 }
 
 /// Find a non-colliding target path. If `parent.join(name)` exists,
 /// append `_collided_N` until a free name is found.
+#[allow(dead_code)]
 fn find_non_colliding_name(parent: &Path, name: &std::ffi::OsStr) -> PathBuf {
     let base = parent.join(name);
     if !base.exists() {
@@ -513,6 +820,7 @@ fn discover_nested_candidates(
     scanner: &EmbeddedScanner,
     root: &Path,
     depth: u8,
+    prefix: &Path,
 ) -> Vec<ExtractionCandidate> {
     let mut candidates = Vec::new();
 
@@ -521,6 +829,7 @@ fn discover_nested_candidates(
         if let Some(format) = format_from_extension(root) {
             candidates.push(ExtractionCandidate {
                 path: root.to_path_buf(),
+                relative_path: prefix.join(archive_stem(root)),
                 depth,
                 source: CandidateSource::ExtractedFile,
                 detected_format: Some(format),
@@ -532,6 +841,7 @@ fn discover_nested_candidates(
         for finding in scanner.scan_path(root).unwrap_or_default() {
             candidates.push(ExtractionCandidate {
                 path: root.to_path_buf(),
+                relative_path: prefix.join(archive_stem(root)),
                 depth,
                 source: CandidateSource::EmbeddedFinding,
                 detected_format: Some(finding.format),
@@ -549,14 +859,20 @@ fn discover_nested_candidates(
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            candidates.extend(discover_nested_candidates(scanner, &path, depth));
+            let mut next_prefix = prefix.to_path_buf();
+            next_prefix.push(entry.file_name());
+            candidates.extend(discover_nested_candidates(scanner, &path, depth, &next_prefix));
             continue;
         }
 
         let detected_format = format_from_extension(&path);
+        let mut relative_path = prefix.to_path_buf();
+        relative_path.push(path.strip_prefix(root).unwrap_or(path.as_path()));
+        relative_path.set_file_name(archive_stem(&path));
         if detected_format.is_some() {
             candidates.push(ExtractionCandidate {
                 path: path.clone(),
+                relative_path,
                 depth,
                 source: CandidateSource::ExtractedFile,
                 detected_format,
@@ -569,6 +885,7 @@ fn discover_nested_candidates(
         for finding in scanner.scan_path(&path).unwrap_or_default() {
             candidates.push(ExtractionCandidate {
                 path: path.clone(),
+                relative_path: relative_path.clone(),
                 depth,
                 source: CandidateSource::EmbeddedFinding,
                 detected_format: Some(finding.format),
@@ -582,28 +899,40 @@ fn discover_nested_candidates(
 }
 
 pub fn is_first_volume(path: impl AsRef<std::path::Path>) -> bool {
+    let path = path.as_ref();
     let file_name = path
-        .as_ref()
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or_default()
         .to_ascii_lowercase();
 
-    if file_name.ends_with(".part1.rar") {
-        return true;
+    if let Some(volume_index) = rar_part_volume_index(&file_name) {
+        return volume_index == 1;
     }
 
-    if file_name.contains(".part") && file_name.ends_with(".rar") {
-        return false;
-    }
-
-    if let Some(extension) = path.as_ref().extension().and_then(|ext| ext.to_str()) {
-        if extension.len() == 3 && extension.chars().all(|ch| ch.is_ascii_digit()) {
-            return extension == "001";
-        }
+    if let Some(volume_index) = numeric_volume_index(path) {
+        return volume_index == 1;
     }
 
     true
+}
+
+fn rar_part_volume_index(file_name: &str) -> Option<u64> {
+    let stem = file_name.strip_suffix(".rar")?;
+    let part_index = stem.rfind(".part")?;
+    let suffix = &stem[part_index + ".part".len()..];
+    if suffix.is_empty() || !suffix.chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+    suffix.parse().ok()
+}
+
+fn numeric_volume_index(path: &Path) -> Option<u64> {
+    let extension = path.extension()?.to_str()?;
+    if extension.is_empty() || !extension.chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+    extension.parse().ok()
 }
 
 pub fn format_from_extension(path: impl AsRef<std::path::Path>) -> Option<ArchiveFormat> {
@@ -644,7 +973,11 @@ mod tests {
     use smartzip_passwords::{PasswordCandidateRequest, PasswordService};
     use smartzip_scanner::ScanMode;
     use rstest::*;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    };
+    use std::time::Duration;
 
     #[test]
     fn detects_empty_file_without_findings() {
@@ -675,6 +1008,7 @@ mod tests {
     #[test]
     fn recognizes_first_volume_rules() {
         assert!(is_first_volume("archive.part1.rar"));
+        assert!(is_first_volume("archive.part01.rar"));
         assert!(!is_first_volume("archive.part2.rar"));
         assert!(is_first_volume("archive.001"));
         assert!(!is_first_volume("archive.002"));
@@ -716,6 +1050,7 @@ mod tests {
 
     #[rstest]
     #[case("archive.part1.rar", true)]
+    #[case("archive.part01.rar", true)]
     #[case("archive.part2.rar", false)]
     #[case("archive.part5.rar", false)]
     #[case("archive.rar", true)]
@@ -770,6 +1105,7 @@ mod tests {
                     },
                 },
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -795,6 +1131,149 @@ mod tests {
             .ranked_candidates(10)
             .unwrap();
         assert_eq!(ranked[0].success_count, 2);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn extract_fails_when_output_target_already_exists() {
+        let root =
+            std::env::temp_dir().join(format!("smartzip-engine-collision-{}", std::process::id()));
+        let input = root.join("root.zip");
+        let output = root.join("out");
+        let target = output.join("root-d0");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(&input, b"not really a zip").unwrap();
+
+        let backend = FakeBackend::default();
+        let db = SmartZipDb::in_memory().unwrap();
+        let service = PasswordService::new(PasswordRepository::new(db.connection()));
+
+        let engine = SmartZipEngine::default();
+        let result = engine
+            .extract_recursive(
+                &backend,
+                &service,
+                ExtractWorkflowRequest {
+                    inputs: vec![input.clone()],
+                    output_dir: output,
+                    recursion_limit: 1,
+                    encoding_mode: EncodingMode::Auto,
+                    scanner: ScannerConfig::default(),
+                    password_candidates: PasswordCandidateRequest::default(),
+                },
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(backend.calls.lock().unwrap().is_empty());
+        assert!(result
+            .skipped
+            .iter()
+            .any(|candidate| candidate.path == input));
+        assert!(result.events.iter().any(|event| matches!(
+            event.kind,
+            TaskEventKind::Failed { ref error } if error.contains("output path already exists")
+        )));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[derive(Clone)]
+    struct DelayedOutputPrompter {
+        started: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl InteractiveOutputPrompter for DelayedOutputPrompter {
+        async fn prompt(
+            &self,
+            _archive_path: PathBuf,
+            _output_path: PathBuf,
+        ) -> OutputCollisionStrategy {
+            let started = self.started.clone();
+            tokio::task::spawn_blocking(move || {
+                started.store(true, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(200));
+                OutputCollisionStrategy::Skip
+            })
+            .await
+            .unwrap()
+        }
+    }
+
+    #[tokio::test]
+    async fn extract_keeps_other_archives_moving_while_prompt_waits() {
+        let root =
+            std::env::temp_dir().join(format!("smartzip-engine-prompt-{}", std::process::id()));
+        let conflict = root.join("conflict.zip");
+        let other = root.join("other.zip");
+        let output = root.join("out");
+        let conflict_target = output.join("conflict-d0");
+        std::fs::create_dir_all(&conflict_target).unwrap();
+        std::fs::write(&conflict, b"not really a zip").unwrap();
+        std::fs::write(&other, b"not really a zip either").unwrap();
+
+        let backend = FakeBackend::default();
+        let db = SmartZipDb::in_memory().unwrap();
+        let service = PasswordService::new(PasswordRepository::new(db.connection()));
+        let prompt_started = Arc::new(AtomicBool::new(false));
+        let output_prompter = DelayedOutputPrompter {
+            started: prompt_started.clone(),
+        };
+
+        let engine = SmartZipEngine::default();
+        let result = engine
+            .extract_recursive(
+                &backend,
+                &service,
+                ExtractWorkflowRequest {
+                    inputs: vec![conflict.clone(), other.clone()],
+                    output_dir: output,
+                    recursion_limit: 1,
+                    encoding_mode: EncodingMode::Auto,
+                    scanner: ScannerConfig::default(),
+                    password_candidates: PasswordCandidateRequest::default(),
+                },
+                None,
+                Some(&output_prompter),
+            );
+
+        let backend_calls = backend.calls.clone();
+        let observe_other = async {
+            while !prompt_started.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+            for _ in 0..500 {
+                if backend_calls
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|path| path.ends_with("other.zip"))
+                {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+            panic!("other.zip was not extracted while the prompt was waiting");
+        };
+
+        let (result, _) = tokio::join!(result, observe_other);
+        let result = result.unwrap();
+
+        let calls = backend.calls.lock().unwrap().clone();
+        assert!(calls.iter().any(|path| path.ends_with("other.zip")));
+        assert!(!calls.iter().any(|path| path.ends_with("conflict.zip")));
+        assert!(result
+            .skipped
+            .iter()
+            .any(|candidate| candidate.path == conflict));
+        assert!(result
+            .processed
+            .iter()
+            .any(|candidate| candidate.path == other));
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -915,6 +1394,7 @@ mod tests {
                     password_candidates: PasswordCandidateRequest::default(),
                 },
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -934,5 +1414,145 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn embedded_archive_is_carved_before_extraction_and_recurses() {
+        let root = std::env::temp_dir().join(format!("smartzip-embedded-{}", std::process::id()));
+        let archive = root.join("payload.zip");
+        let disguised = root.join("photo.jpg");
+        let output = root.join("out");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let payload = root.join("payload.txt");
+        std::fs::write(&payload, b"payload").unwrap();
+        let status = std::process::Command::new("7z")
+            .arg("a")
+            .arg(&archive)
+            .arg(&payload)
+            .current_dir(&root)
+            .status()
+            .unwrap();
+        assert!(status.success(), "7z must be available in PATH");
+
+        let mut composite = Vec::from(&b"JPEG-HEADER"[..]);
+        composite.extend_from_slice(&std::fs::read(&archive).unwrap());
+        std::fs::write(&disguised, composite).unwrap();
+
+        let backend = EmbeddedAwareFakeBackend::default();
+        let db = SmartZipDb::in_memory().unwrap();
+        let service = PasswordService::new(PasswordRepository::new(db.connection()));
+
+        let engine = SmartZipEngine::default();
+        let result = engine
+            .extract_recursive(
+                &backend,
+                &service,
+                ExtractWorkflowRequest {
+                    inputs: vec![disguised.clone()],
+                    output_dir: output.clone(),
+                    recursion_limit: 2,
+                    encoding_mode: EncodingMode::Auto,
+                    scanner: ScannerConfig::default(),
+                    password_candidates: PasswordCandidateRequest::default(),
+                },
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let calls = backend.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 2, "expected root archive and nested archive calls");
+        assert_ne!(calls[0].0, disguised.display().to_string());
+        assert!(calls[0].1, "carved archive should start with zip magic");
+        assert!(calls[1].0.ends_with("nested.zip"));
+        assert!(result
+            .enqueued
+            .iter()
+            .any(|candidate| candidate.path.ends_with("nested.zip")));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[derive(Default, Clone)]
+    struct EmbeddedAwareFakeBackend {
+        calls: Arc<Mutex<Vec<(String, bool)>>>,
+    }
+
+    #[async_trait]
+    impl ArchiveBackend for EmbeddedAwareFakeBackend {
+        async fn probe(&self, path: &std::path::Path) -> smartzip_core::Result<ArchiveProbe> {
+            Ok(ArchiveProbe {
+                path: path.to_path_buf(),
+                format: format_from_extension(path),
+                encrypted: Some(true),
+                supported: true,
+            })
+        }
+
+        async fn list(&self, _request: ListRequest) -> smartzip_core::Result<ArchiveListing> {
+            Ok(ArchiveListing {
+                format: Some(ArchiveFormat::Zip),
+                entries: Vec::new(),
+            })
+        }
+
+        async fn test(&self, _request: TestRequest) -> smartzip_core::Result<TestResult> {
+            Ok(TestResult {
+                ok: true,
+                encrypted: Some(true),
+            })
+        }
+
+        async fn extract(
+            &self,
+            request: ExtractArchiveRequest,
+        ) -> smartzip_core::Result<ExtractArchiveResult> {
+            let starts_with_zip = std::fs::read(&request.archive)
+                .map(|bytes| bytes.starts_with(b"PK"))
+                .unwrap_or(false);
+            self.calls
+                .lock()
+                .unwrap()
+                .push((request.archive.display().to_string(), starts_with_zip));
+            std::fs::create_dir_all(&request.output_dir).map_err(|source| {
+                smartzip_core::SmartZipError::io(Some(request.output_dir.clone()), source)
+            })?;
+            if self.calls.lock().unwrap().len() == 1 {
+                std::fs::write(request.output_dir.join("nested.zip"), b"nested").map_err(
+                    |source| {
+                        smartzip_core::SmartZipError::io(Some(request.output_dir.clone()), source)
+                    },
+                )?;
+                std::fs::write(request.output_dir.join("readme.txt"), b"readme").map_err(
+                    |source| {
+                        smartzip_core::SmartZipError::io(Some(request.output_dir.clone()), source)
+                    },
+                )?;
+            }
+            Ok(ExtractArchiveResult {
+                output_dir: request.output_dir,
+            })
+        }
+
+        async fn compress(
+            &self,
+            request: CompressArchiveRequest,
+        ) -> smartzip_core::Result<CompressArchiveResult> {
+            Ok(CompressArchiveResult {
+                output: request.output,
+            })
+        }
+
+        fn capabilities(&self) -> BackendCapabilities {
+            BackendCapabilities {
+                can_extract: vec![ArchiveFormat::Zip],
+                can_compress: vec![ArchiveFormat::Zip],
+                supports_passwords: true,
+                supports_listing: true,
+                supports_test: true,
+            }
+        }
     }
 }
