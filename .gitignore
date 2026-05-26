@@ -7,6 +7,9 @@ donate
 # Rust build output
 target/
 
+# Python virtual environment
+.venv/
+
 # Local tool installs generated during development
 .tools/
 graphify-out/cache/
