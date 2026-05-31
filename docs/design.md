@@ -1,10 +1,171 @@
 # SmartZip 跨平台重写正式方案
 
-> 状态：正式设计方案 v1  
-> 技术方向：Rust Core + Rust CLI + GPUI GUI + SQLite + 7zz/libarchive 后端抽象  
+> 状态：正式设计方案 v2
+> 技术方向：Rust Core + Rust CLI + GPUI GUI + SQLite + Native ZIP + 7zz fallback
 > 平台优先级：Linux / macOS 优先，Windows 后续兼顾  
 > 交付目标：GUI + CLI 共同交付  
 > 不兼容旧版配置：旧 `SmartZip.ini` 不迁移
+
+## 0. v2 设计基线
+
+本节是 2026-05-31 需求确认后的设计基线，覆盖后文中与其冲突的早期表述。
+
+SmartZip 的近期目标不是建设通用压缩平台，而是可靠处理来自互联网的不可信归档：复杂嵌套、遗忘密码、数万级密码表、混合加密方式、分卷、乱码文件名和伪装文件。
+
+保留现有 workspace crate 边界，不进行一次性整体迁移。核心工作采用渐进式演进：
+
+```text
+现有 BFS 解压循环
+-> 修复真实行为错误
+-> 在 smartzip-engine 内拆分策略对象
+-> 引入动态 ArchiveNode 状态
+-> 为 GUI 增加事件流和取消
+-> 按需要增加持久化恢复
+```
+
+暂不新增 `smartzip-graph`、`smartzip-scheduler`、`smartzip-events` 等独立 crate。只有当模块边界稳定且代码规模确实需要时再拆分。
+
+### 0.1 核心对象
+
+```rust
+struct ArchiveNode {
+    id: ArchiveId,
+    parent: Option<ArchiveId>,
+    source: ArchiveSource,
+    depth: u8,
+    detected_format: Option<ArchiveFormat>,
+    state: ArchiveState,
+    fingerprint: ArchiveFingerprint,
+    successful_password: Option<PasswordId>,
+}
+
+struct ExtractionLimits {
+    max_depth: u8,                    // default: 5
+    max_nested_archives: usize,       // default: 100
+    max_files: u64,                   // default: 500_000
+    min_free_bytes: FreeSpacePolicy,  // max(10 GB, available * 10%)
+    max_embedded_findings_per_file: usize, // default: 8
+}
+
+struct VolumeSet {
+    first_volume: PathBuf,
+    members: Vec<PathBuf>,
+    missing_indices: Vec<u32>,
+}
+```
+
+`ArchiveNode` 是动态增长的节点模型，不要求解压前得到完整 DAG。父归档成功解压后，其产物扫描结果才会产生新的节点。
+
+### 0.2 Engine 内部模块
+
+第一阶段在 `smartzip-engine` crate 内拆分模块，不新建 crate：
+
+```text
+engine/
+├── workflow.rs       # 批次、根任务和动态节点推进
+├── identity.rs       # 快速指纹、稳定指纹和内嵌片段身份
+├── passwords.rs      # PasswordResolver 与 worker pool
+├── limits.rs         # 磁盘、文件数、深度和候选预算
+├── materialize.rs    # 临时目录、校验、提交和回滚
+├── volumes.rs        # VolumeSet 识别与缺卷检查
+└── events.rs         # 实时事件、暂停、取消和用户决策
+```
+
+### 0.3 解压状态机
+
+```text
+Discovered
+-> WaitingForBudget | WaitingForPassword | WaitingForEncoding | WaitingForEmbeddedSelection
+-> Testing
+-> Extracting
+-> Verifying
+-> Committing
+-> Expanding
+-> Completed
+
+任意阶段
+-> Skipped | Cancelled | Failed
+```
+
+单个节点等待用户处理时，批次中的其他根任务和可执行分支继续运行。
+
+### 0.4 密码策略
+
+SQLite 保存成功密码、导入密码、命名密码表、关联关系和统计数据。默认自动尝试前 1000 条候选；深度模式继续分页遍历剩余候选。所有归档共享一个全局 worker pool。
+
+候选顺序：
+
+```text
+空密码
+-> 直接父密码
+-> 祖先链最近成功密码
+-> 当前批次最近命中密码
+-> 手动输入
+-> 剪贴板
+-> 置顶密码
+-> 历史成功密码
+-> 从未命中的导入密码
+-> 历史失败密码
+```
+
+自动模式和深度模式均以性能优先。ZIP 原生验证器默认使用全部可用逻辑核心；`7z` / `7zz` 子进程必须设置硬上限，初始不超过 16。仅明确 `WrongPassword` 时记录失败，且同一密码在同一归档指纹上最多惩罚一次。
+
+### 0.5 后端分工
+
+```text
+NativeZipBackend
+├── ZIP ZipCrypto / AES
+├── 原始文件名字节
+├── 两阶段密码验证：快速筛选 -> CRC / test 确认
+├── Zip Slip 与危险符号链接检查
+└── 输出统计
+
+SevenZipBackend
+├── 7z AES
+├── RAR4 / RAR5
+├── 分卷和复杂格式
+└── 个人使用阶段仅查找 PATH 中的 7zz / 7z
+```
+
+`ArchiveBackend::list()` 需要演进为可表达原始文件名字节的模型，例如 `RawArchiveEntry`。`PathBuf` 只能作为完成编码决策后的输出路径，不能作为归档元数据的唯一表示。
+
+### 0.6 事务式输出
+
+默认在目标目录同一文件系统中创建临时目录：
+
+```text
+extract -> verify -> conservative normalize -> commit
+```
+
+提交优先使用 rename，必要时回退 copy + delete。超大归档满足以下任一条件时提示用户切换快速模式：
+
+```text
+预估输出 >= 50 GB
+压缩包自身 >= 20 GB
+事务模式无法维持磁盘安全余量
+```
+
+根归档始终保留。内层归档仅在成功提交后移入回收站；高级设置可改为永久删除。
+
+### 0.7 内嵌归档扫描
+
+根输入表示用户明确希望解压，因此忽略扩展名限制，主动扫描 magic bytes。单个高置信度片段自动切片解压；多个片段交由用户选择。
+
+内层产物默认只自动处理明确归档后缀和分卷包。激进扫描由用户显式启用，并在扫描前应用已知容器排除列表、文件大小筛选和 finding 数量上限，避免展开 EPUB、APK、Office、PAK 等业务容器。
+
+### 0.8 近期交付边界
+
+第一阶段优先 Linux 与 macOS CLI：
+
+- 核心动态嵌套工作流。
+- 原生 ZIP backend。
+- `7z` / `7zz` fallback。
+- `smartzip list`。
+- 实时进度和取消。
+- 安全预算与事务式输出。
+- 命名密码表导入和智能 / 深度密码尝试。
+
+GUI 第一版聚焦任务工作台。压缩、完整预览、系统集成、John the Ripper / Hashcat 外部深度恢复后端、崩溃恢复和 `resume` 均后置。
 
 ## 1. 设计结论
 
@@ -16,7 +177,7 @@ SmartZip 新版采用 **Rust workspace 单仓库多 crate 架构**。
 2. **GUI 与 CLI 共享同一套核心引擎**：避免 GUI/CLI 行为分叉。
 3. **GPUI 只负责界面和交互**：不承载业务规则。
 4. **MVP 优先 Linux/macOS**：系统右键菜单等深度集成后置。
-5. **先 7zz 后混合后端**：MVP 优先通过外部 7zz 覆盖格式能力；后续引入 libarchive/zip 等库级后端。
+5. **Native ZIP + 7zz fallback**：第一阶段实现原生 ZIP 后端；7z AES、RAR、分卷和复杂格式继续使用外部 7zz。
 6. **SQLite 管理高频数据**：密码库、排序统计、任务历史、编码检测历史、内嵌检测历史使用 SQLite。
 
 ## 2. 总体架构

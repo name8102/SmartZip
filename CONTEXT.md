@@ -7,19 +7,23 @@
 | Term | Definition |
 |------|------------|
 | **ArchiveBackend** | 压缩后端抽象 trait。定义 `probe` / `list` / `test` / `extract` / `compress`。所有后端实现（Rust 原生 lib 或 7zz CLI）统一实现此 trait。 |
-| **NativeBackend** | 统一后端门面。内部按格式分派到对应 Rust 原生库（zip/tar/flate2/sevenz-rust 等），不支持格式回退 7zz CLI。对 engine 透明。 |
+| **NativeBackend** | 原生后端门面。第一阶段优先实现 `NativeZipBackend`，负责 ZIP ZipCrypto / AES、原始文件名字节、路径安全和高速密码验证。复杂格式通过独立 fallback 路由交给 `SevenZipBackend`。 |
 | **SmartZipEngine** | 解压/检测/压缩工作流编排器。自身不持有后端、密码服务等依赖——由调用方（CLI/GUI）注入。 |
 | **ExtractionCandidate** | 待解压候选条目。包含路径、深度、来源类型、检测格式、内嵌偏移等。 |
 | **CandidateSource** | 候选来源枚举：`RootInput`（用户直接输入）、`ExtractedFile`（解压产物中找到的）、`EmbeddedFinding`（扫描器在二进制偏移处发现的）。 |
 | **Recursive extraction** | BFS 队列驱动的递归解压。队列中每个候选经过同一管线：格式检测 → 编码检测 → 密码尝试 → 解压 → 输出扫描 → 嵌套候选入队。 |
 | **Collapse single output** | 解压产出唯一条目时的优化：将该条目提到父目录，去掉中间层空目录。 |
+| **ArchiveNode** | 下一阶段动态节点模型。记录父节点、来源、深度、状态、指纹和成功密码。节点在父归档解压后增量产生，不要求预先构造完整 DAG。 |
+| **VolumeSet** | 分卷归档集合。识别首卷、成员、缺卷和重复卷，仅将首卷交给后端。 |
+| **ExtractionLimits** | 不可信归档的资源预算：递归深度、内层候选数、文件数、磁盘安全余量和内嵌 finding 数量。 |
+| **OutputMaterializer** | 事务式输出策略：同盘临时目录解压、校验、保守整理、提交或回滚。 |
 
 ## Event Model
 
 | Term | Definition |
 |------|------------|
 | **TaskEvent** | 工作流中产生的事件：Started / Progress / PasswordTried / EncodingDetected / EmbeddedArchiveFound / OutputCreated / Warning / Failed / Completed。 |
-| **Event channel** | `tokio::sync::mpsc::UnboundedSender<TaskEvent>`。engine 在解压过程中实时推送事件，CLI/GUI 异步消费显示进度。与函数返回值（ExtractWorkflowResult）并存。 |
+| **Event channel** | 计划使用有界 `tokio::sync::mpsc`。engine 在解压过程中实时推送事件，CLI/GUI 异步消费显示进度，并支持取消和等待用户决策。与最终汇总结果并存。 |
 | **ExtractWorkflowResult** | `extract_recursive` 的返回值。包含 processed/skipped/enqueued 列表 + 完整事件集合。供调用方做最终统计和断言。 |
 
 ## Password Model
@@ -39,15 +43,15 @@
 **Trade-off**: 调用方代码略多；engine 可测试性不变（注入 mock 即可）。
 
 ### ADR-002: Real-time event streaming via mpsc
-**Decision**: `extract_recursive` 接受 `Option<UnboundedSender<TaskEvent>>`，事件即产即推。同时保留返回值。
+**Decision**: 下一阶段为 engine 增加有界 `mpsc` 事件流，事件即产即推。同时保留最终汇总结果。
 **Rationale**: 消除 CLI 的"卡死感"——用户实时看到进度。返回值保留供测试断言和最终统计。
-**Trade-off**: engine 代码中新增 channel send 调用点。
+**Trade-off**: 有界通道需要定义背压策略，不能让高频进度事件拖慢解压。
 
 ### ADR-003: Mixed backend — Rust libs + 7zz fallback
-**Decision**: 常用格式（zip/tar/gz/bz2/xz）用 Rust 原生库；rar/cab/iso/dmg 及其他复杂格式回退 7zz CLI。通过统一 NativeBackend 门面隐藏多后端。
-**Rationale**: 原生库消除命令行参数解析 bug、提供精确进度；7zz 覆盖 Rust 生态未支持的格式。
-**Trade-off**: 多后端增加代码量；NativeBackend 门面提供统一抽象。
+**Decision**: 第一阶段实现 `NativeZipBackend`；7z AES、rar、分卷和复杂格式继续通过 `SevenZipBackend` fallback。路由对 engine 透明。
+**Rationale**: ZIP 是编码恢复、路径安全和高性能密码表遍历的关键格式；7zz 覆盖 Rust 生态未支持的复杂格式。
+**Trade-off**: 多后端增加测试矩阵，同一功能在不同后端上的能力必须明确标记。
 
 ### ADR-004: Two-phase incremental implementation
-**Decision**: Phase 1 先加 channel 事件流（不动 backend）；Phase 2 建 NativeBackend 逐步替换 7zz。
-**Rationale**: 每步可独立测试、独立回滚。Phase 1 立即改善用户体验。
+**Decision**: 不整体迁移，不提前拆分新的 graph/scheduler/events crate。先修复现有行为错误和安全预算，再实现 Native ZIP、密码 worker pool、动态 ArchiveNode，最后接入事件流和 GUI。
+**Rationale**: 每步可独立测试和回滚，并优先解决复杂网络归档的真实风险。

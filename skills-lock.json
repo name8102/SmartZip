@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "skills": {
+    "article-writing": {
+      "source": "affaan-m/everything-claude-code",
+      "sourceType": "github",
+      "skillPath": "skills/article-writing/SKILL.md",
+      "computedHash": "a527a9f0a6d47bb5006c5a112e34843c64cb9d5fba67d392aa380ae6d79476f1"
+    },
+    "rust-patterns": {
+      "source": "affaan-m/everything-claude-code",
+      "sourceType": "github",
+      "skillPath": "skills/rust-patterns/SKILL.md",
+      "computedHash": "99cc1d840bb3e5d911051b115e5da518f3f3ca74f3a8a3e89369c6da9298afa1"
+    },
+    "rust-testing": {
+      "source": "affaan-m/everything-claude-code",
+      "sourceType": "github",
+      "skillPath": "skills/rust-testing/SKILL.md",
+      "computedHash": "8f6cab4bcbdc5bd8c19f179e893ca5d502604a03e4e443bd27ba7c3a88a93add"
+    }
+  }
+}

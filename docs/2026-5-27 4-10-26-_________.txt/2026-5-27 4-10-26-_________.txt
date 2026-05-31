@@ -1,0 +1,4179 @@
+# 代码审阅与修复建议
+
+https://chat.openai.com/c/6a15fe2a-b1f8-83a5-b7c9-553ab24c97dd
+
+>> USER: 你是一个rust专家和资深的软件工程师。这个代码仓库存在许多bug导致软件不能按照预期的方式正常工作，请审阅源代码，定位bug原因并给出修复建议。
+
+>> ASSISTANT: 可以，把仓库发我。  
+我可以从 Rust 工程实践、并发安全、生命周期、错误处理、架构设计、性能与稳定性几个层面系统审阅。
+
+请提供以下任意一种：
+
+- GitHub/GitLab 仓库链接
+- 压缩包源码
+- 具体 branch / commit
+- 某个模块目录
+- 报错日志 / panic stack trace
+- 复现步骤
+- 预期行为 vs 实际行为
+
+我会重点检查这类 Rust 项目里最常见、也最容易导致“功能看似正常但行为异常”的问题：
+
+- `Arc<Mutex<_>>` / `RwLock` 死锁或锁粒度错误
+- async runtime 混用（Tokio / async-std）
+- `spawn` 后任务 silently fail
+- channel 阻塞/消息丢失
+- 生命周期设计导致隐藏 clone 或悬垂逻辑
+- `unwrap()` / `expect()` 导致 panic
+- trait object 与泛型边界错误
+- `serde` 序列化字段不兼容
+- 文件 I/O 原子性问题
+- 缓存状态不同步
+- 状态机遗漏分支
+- `unsafe` UB 风险
+- 错误传播被吞掉（`Result<()>` ignored）
+- feature flag 条件编译导致行为不一致
+- Windows/Linux 路径兼容问题
+- 多线程下的数据竞争与逻辑竞争
+- 配置热加载失效
+- 性能退化（大量 clone、无界队列、阻塞 async）
+
+收到代码后，我会给你：
+
+1. Bug 根因定位  
+2. 影响范围分析  
+3. 修复方案  
+4. 是否属于架构缺陷  
+5. 推荐重构方式  
+6. 必要时直接给出 Rust patch/code diff  
+7. 风险等级与优先级排序
+
+如果仓库比较大，也可以先从最核心、最不稳定的模块开始。
+
+>> USER: https://github.com/name8102/SmartZip
+
+>> ASSISTANT: 我已经初步审阅了仓库核心逻辑，当前这个项目的问题并不是“单点 bug”，而是存在几个会导致行为不稳定、递归解压异常、密码逻辑失效、平台兼容性问题的系统性设计缺陷。
+
+我重点看了：
+
+- `smartzip-engine`
+- 工作区依赖结构
+- 递归解压主流程
+- 编码检测逻辑
+- 密码测试/提取流程
+
+仓库：urlSmartZiphttps://github.com/name8102/SmartZip
+
+其中最核心的问题集中在：
+
+- `crates/smartzip-engine/src/lib.rs`
+
+---
+
+# 一、最严重的问题：递归解压状态机存在逻辑缺陷
+
+你现在的核心循环：
+
+```rust
+while let Some(mut candidate) = queue.pop_front()
+```
+
+本质上是一个 BFS 递归解压状态机。
+
+但这里存在几个关键 bug。
+
+---
+
+# Bug 1：`seen` 去重策略错误
+
+当前：
+
+```rust
+fn candidate_key(candidate: &ExtractionCandidate) -> String {
+    format!(
+        "{}:{}:{:?}",
+        candidate.path.display(),
+        candidate.embedded_offset.unwrap_or(0),
+        candidate.source
+    )
+}
+```
+
+问题：
+
+- `path.display()` 不是 canonical path
+- Windows 下大小写不敏感
+- symlink / `..` / 相对路径会导致重复解压
+- extracted path 与 real path 可能不同
+- 同一路径不同 recursion context 会误判
+
+这会导致：
+
+- 无限递归
+- 重复解压
+- 某些 nested archive 被跳过
+- queue 爆炸增长
+
+这是非常典型的 archive crawler bug。
+
+---
+
+## 修复建议
+
+改成：
+
+```rust
+std::fs::canonicalize()
+```
+
+并使用：
+
+```rust
+(PathBuf, depth, offset)
+```
+
+作为 key。
+
+更好的是：
+
+```rust
+#[derive(Hash, Eq, PartialEq)]
+struct CandidateIdentity
+```
+
+不要用字符串拼接。
+
+---
+
+# Bug 2：recursive extraction depth 判断存在 off-by-one
+
+当前：
+
+```rust
+candidate.depth > request.recursion_limit
+```
+
+假设：
+
+```rust
+recursion_limit = 3
+```
+
+实际上：
+
+- depth=0 root
+- depth=1 nested
+- depth=2 nested
+- depth=3 nested
+
+仍然会继续进入处理逻辑。
+
+通常用户理解：
+
+```text
+max_depth = 3
+```
+
+应该最多处理到 3。
+
+现在的行为更接近：
+
+```text
+allow depth <= 3
+```
+
+很容易导致：
+
+- 深层 zip bomb
+- 多层递归失控
+
+---
+
+## 建议
+
+改成：
+
+```rust
+candidate.depth >= request.recursion_limit
+```
+
+或者明确文档定义 root 是否计数。
+
+---
+
+# Bug 3：编码检测逻辑 fundamentally 错误
+
+你现在：
+
+```rust
+entry.path.as_os_str().as_encoded_bytes()
+```
+
+这是严重问题。
+
+---
+
+## 原因
+
+Rust 的：
+
+```rust
+OsStr::as_encoded_bytes()
+```
+
+不是 archive 内原始 filename bytes。
+
+它是：
+
+> 当前平台编码后的 OS representation
+
+也就是说：
+
+- Linux 下 UTF-8
+- Windows 下 WTF-16 转换
+
+你已经丢失了 archive 内真实 bytes。
+
+---
+
+## 后果
+
+你的：
+
+```rust
+smartzip_encoding::ArchiveEncodingDetector
+```
+
+基本不可能正确工作。
+
+尤其：
+
+- Shift-JIS
+- GBK
+- CP437
+- Big5
+
+都会检测错误。
+
+---
+
+## 正确做法
+
+archive backend 必须返回：
+
+```rust
+raw_filename_bytes: Vec<u8>
+```
+
+而不是：
+
+```rust
+PathBuf
+```
+
+编码检测必须基于：
+
+```text
+archive metadata 原始字节
+```
+
+否则整个“自动编码识别”功能实际上是假的。
+
+这是目前仓库最核心的架构错误之一。
+
+---
+
+# Bug 4：interactive password fallback 不一致
+
+你现在：
+
+自动密码流程：
+
+```rust
+backend.test()
+```
+
+然后：
+
+```rust
+backend.extract()
+```
+
+但 interactive fallback：
+
+直接：
+
+```rust
+backend.extract()
+```
+
+没有 test。
+
+---
+
+## 后果
+
+某些 backend：
+
+- extract 失败不一定意味着密码错误
+- 可能是：
+  - CRC error
+  - partial archive
+  - unsupported method
+
+于是：
+
+用户输入正确密码也可能被误判。
+
+---
+
+## 修复
+
+统一：
+
+```rust
+test -> extract
+```
+
+所有密码路径必须一致。
+
+---
+
+# Bug 5：`record_failure()` 会污染密码排序
+
+当前：
+
+```rust
+let _ = passwords.record_failure(password);
+```
+
+在：
+
+```rust
+Err(error)
+```
+
+分支里也会调用。
+
+但：
+
+```rust
+Err(error)
+```
+
+不一定是 wrong password。
+
+可能：
+
+- backend 崩溃
+- IO error
+- unsupported archive
+- timeout
+
+结果：
+
+正确密码会被降权。
+
+时间久了密码数据库会越来越差。
+
+---
+
+## 修复
+
+只在：
+
+```rust
+WrongPassword
+```
+
+时记录 failure。
+
+---
+
+# Bug 6：extract output collapse 存在高风险 rename 行为
+
+这里：
+
+```rust
+std::fs::rename(entries[0].path(), &target)?;
+```
+
+风险极大。
+
+---
+
+## 问题
+
+### Windows
+
+跨盘符：
+
+```text
+rename EXDEV
+```
+
+失败。
+
+---
+
+### Linux/macOS
+
+如果：
+
+- extraction_dir 被 watcher 占用
+- antivirus 占用
+- GUI 正在扫描
+
+rename 会失败。
+
+---
+
+### 更严重
+
+你直接：
+
+```rust
+remove_dir_all(extraction_dir)
+```
+
+如果 target 实际进入 extraction_dir 内部：
+
+存在误删风险。
+
+---
+
+## 修复
+
+必须：
+
+- canonicalize
+- 防止 target 在 source 内
+- fallback copy+remove
+- 使用 tempfile + atomic move
+
+---
+
+# Bug 7：recursive scanner 每层都会重新扫描整个文件
+
+这里：
+
+```rust
+scanner.scan_path(&candidate.path)
+```
+
+以及：
+
+```rust
+discover_nested_candidates(scanner, ...)
+```
+
+会导致：
+
+- 巨大 IO 风暴
+- nested archive 指数级扫描
+- SSD 高负载
+- GUI 卡死
+
+---
+
+## 典型场景
+
+一个：
+
+```text
+game_modpack.zip
+```
+
+里面：
+
+- 2000 files
+- 50 nested zips
+
+现在复杂度可能接近：
+
+```text
+O(n²)
+```
+
+---
+
+# 建议
+
+建立：
+
+```rust
+ScanCache
+```
+
+或者：
+
+```rust
+DashMap<PathBuf, ScanResult>
+```
+
+---
+
+# Bug 8：async 设计并不真正 async
+
+你使用 Tokio：
+
+```toml
+tokio = { ... }
+```
+
+但大量：
+
+```rust
+std::fs
+```
+
+同步 IO：
+
+- read_dir
+- rename
+- remove_dir_all
+
+都在 async workflow 内。
+
+---
+
+## 后果
+
+Tokio worker thread 被阻塞。
+
+GUI/CLI 会：
+
+- 卡死
+- 吞吐下降
+- extraction queue stall
+
+---
+
+## 修复
+
+改成：
+
+```rust
+tokio::fs
+```
+
+或：
+
+```rust
+spawn_blocking
+```
+
+---
+
+# Bug 9：queue 无限增长风险（zip bomb）
+
+当前没有：
+
+- total extracted size limit
+- total file count limit
+- compression ratio limit
+
+---
+
+## 后果
+
+经典：
+
+```text
+42.zip
+```
+
+直接打爆磁盘。
+
+---
+
+## 必须增加
+
+```rust
+max_total_uncompressed_size
+max_files
+max_nested_archives
+max_depth
+```
+
+以及：
+
+```rust
+compression_ratio_threshold
+```
+
+---
+
+# Bug 10：错误传播被静默吞掉
+
+大量：
+
+```rust
+let _ = ...
+```
+
+例如：
+
+```rust
+let _ = passwords.record_success(password);
+```
+
+这会导致：
+
+- 数据库损坏无法发现
+- sqlite lock 被忽略
+- password persistence silently fail
+
+---
+
+# 建议
+
+至少：
+
+```rust
+tracing::warn!
+```
+
+---
+
+# 二、架构层面的根本问题
+
+现在 engine 其实承担了：
+
+- orchestration
+- recursion
+- extraction
+- password policy
+- encoding policy
+- scan policy
+- output normalization
+
+导致：
+
+```text
+God Object
+```
+
+已经开始形成。
+
+---
+
+# 建议重构方向
+
+建议拆：
+
+## 1. ExtractionScheduler
+
+负责：
+
+- BFS
+- queue
+- recursion
+- limits
+
+---
+
+## 2. PasswordResolver
+
+负责：
+
+- candidate ranking
+- retry policy
+- interactive prompt
+
+---
+
+## 3. EncodingResolver
+
+负责：
+
+- raw bytes
+- encoding detect
+
+---
+
+## 4. OutputMaterializer
+
+负责：
+
+- rename
+- collapse
+- collision
+
+---
+
+## 5. ArchiveSession
+
+负责：
+
+- test/list/extract 生命周期
+
+---
+
+# 三、当前最可能导致“软件不能正常工作”的直接原因
+
+如果你现在运行发现：
+
+- recursive extraction 不稳定
+- 某些压缩包乱码
+- 密码明明正确但失败
+- nested archive 被漏掉
+- GUI 卡死
+- CPU 飙升
+- 无限递归
+- 输出目录混乱
+
+那么根因大概率就是：
+
+## 1. 错误的 encoding pipeline
+## 2. recursive queue 状态设计缺陷
+## 3. 同步 IO 阻塞 async runtime
+## 4. scan/extract 重复扫描
+## 5. seen key 不可靠
+
+这几个叠加导致的。
+
+---
+
+这个仓库其实已经有不错的模块化基础了，但现在属于：
+
+```text
+功能很多
+架构开始成型
+但状态机和边界条件还没收敛
+```
+
+这是 Rust 中期工程非常典型的阶段。
+
+如果你愿意，我下一步可以继续帮你：
+
+- 深入审查 `smartzip-archive`
+- 审查 scanner 的 magic-number 检测
+- 检查 zip/7z backend
+- 定位 Windows 平台 bug
+- 做并发安全审查
+- 给出完整 refactor blueprint
+- 直接生成 patch / PR diff
+- 帮你建立 integration tests 与 fuzzing 方案
+
+>> USER: Windows平台的实现优先级靠后，对于解压的整体工作流设计，有没有改进建议？
+
+>> ASSISTANT: 有，而且我觉得你这个项目现在最值得优化的，其实不是某个 backend，而是：
+
+> “解压工作流”本身的架构模型。
+
+你现在的实现本质上是：
+
+```text
+scan -> detect -> test password -> extract -> rescan -> recurse
+```
+
+属于：
+
+```text
+边发现边执行（online recursive execution）
+```
+
+这种模型一开始写很快，但后面会越来越难控。
+
+尤其你的目标不是“简单 unzip”，而是：
+
+- recursive extraction
+- embedded archive
+- password management
+- encoding recovery
+- GUI orchestration
+- deep scan
+- future plugin backend
+
+那么现在最适合你的，其实是：
+
+# 一、从“递归函数”升级为“解压任务系统”
+
+你现在实际上已经接近：
+
+```text
+Archive Orchestrator
+```
+
+了。
+
+但还差一步：
+
+> “任务图（Task Graph）”
+
+---
+
+# 二、目前工作流的根本问题
+
+你现在的流程：
+
+```text
+发现一个 archive
+    ↓
+立即解压
+    ↓
+立即扫描输出
+    ↓
+发现 nested archive
+    ↓
+立即继续
+```
+
+这个模式的问题：
+
+---
+
+## 1. discovery 与 execution 强耦合
+
+导致：
+
+- scan 重复
+- extraction 重复
+- retry 困难
+- cache 难做
+- parallelization 困难
+
+---
+
+## 2. 没有全局视图
+
+系统不知道：
+
+```text
+到底有多少 archive
+依赖关系是什么
+哪些已经成功
+哪些是密码失败
+哪些只是待重试
+```
+
+于是：
+
+- queue 会越来越脆弱
+- event 难统一
+- GUI 很难做 tree view
+
+---
+
+## 3. 状态不可恢复
+
+现在如果：
+
+```text
+解压到第 300 个 nested archive 崩溃
+```
+
+你只能：
+
+```text
+重新开始
+```
+
+因为没有：
+
+```text
+persistent execution graph
+```
+
+---
+
+# 三、建议：改成“两阶段工作流”
+
+这是整个架构最关键的改进。
+
+---
+
+# 阶段 1：Discovery Phase（发现阶段）
+
+只做：
+
+```text
+识别 archive
+建立关系
+生成 extraction plan
+```
+
+不真正 extract。
+
+---
+
+## 输出：
+
+一个 DAG（有向图）
+
+例如：
+
+```text
+root.zip
+ ├── a.zip
+ │    ├── b.zip
+ │    └── c.zip
+ └── embedded.rar
+      └── game.7z
+```
+
+你真正应该维护的核心对象：
+
+```rust
+struct ArchiveNode
+```
+
+而不是：
+
+```rust
+ExtractionCandidate
+```
+
+---
+
+# ArchiveNode 应该包含：
+
+```rust
+struct ArchiveNode {
+    id: ArchiveId,
+
+    parent: Option<ArchiveId>,
+
+    source: ArchiveSource,
+
+    physical_path: PathBuf,
+
+    detected_format: ArchiveFormat,
+
+    depth: u32,
+
+    password_state: PasswordState,
+
+    encoding_state: EncodingState,
+
+    extraction_state: ExtractionState,
+
+    children: Vec<ArchiveId>,
+}
+```
+
+---
+
+# Discovery 阶段结束后：
+
+你得到：
+
+- archive tree
+- dependency graph
+- metadata
+- embedded relations
+- size estimation
+
+这时候：
+
+GUI 才能真正好用。
+
+---
+
+# 四、阶段 2：Execution Phase（执行阶段）
+
+现在才真正 extract。
+
+---
+
+## Scheduler 负责：
+
+### 1. password policy
+
+例如：
+
+```text
+parent password inheritance
+```
+
+很多 nested archive：
+
+密码其实相同。
+
+---
+
+### 2. retry strategy
+
+例如：
+
+```text
+wrong password
+→ interactive
+→ fallback dictionary
+→ remote provider
+```
+
+---
+
+### 3. concurrency
+
+你未来一定会想做：
+
+```text
+parallel extraction
+```
+
+但现在 queue 模型很难。
+
+Task graph 天然适合。
+
+---
+
+### 4. resource limits
+
+比如：
+
+- max extracted size
+- max depth
+- max files
+- max concurrent extraction
+
+这些都应该在 scheduler 层。
+
+---
+
+# 五、你现在最需要引入的概念
+
+# 1. ArchiveSession
+
+现在：
+
+```rust
+backend.list()
+backend.test()
+backend.extract()
+```
+
+都是分离调用。
+
+问题：
+
+- backend 反复打开 archive
+- 反复启动 7z/unrar
+- IO 巨大浪费
+
+---
+
+## 正确模型
+
+```rust
+trait ArchiveSession {
+    async fn list(...)
+    async fn test_password(...)
+    async fn extract(...)
+}
+```
+
+session 生命周期：
+
+```text
+open once
+reuse multiple ops
+close once
+```
+
+性能会提升非常大。
+
+---
+
+# 六、密码工作流建议（非常重要）
+
+你现在：
+
+```text
+for password in candidates
+```
+
+这是：
+
+```text
+brute-force iterator
+```
+
+但实际上：
+
+密码系统应该是：
+
+# PasswordResolver Pipeline
+
+---
+
+## 第一层：Inherited Password
+
+nested archive 最可能：
+
+```text
+使用父压缩包密码
+```
+
+命中率极高。
+
+应该优先。
+
+---
+
+## 第二层：Archive-specific cache
+
+例如：
+
+```text
+filename hash -> password
+```
+
+---
+
+## 第三层：domain heuristic
+
+比如：
+
+```text
+游戏资源包
+动漫资源包
+字幕组
+```
+
+密码分布有明显特征。
+
+---
+
+## 第四层：global DB ranking
+
+你现在已有。
+
+---
+
+## 第五层：interactive
+
+最后才 prompt。
+
+---
+
+# 七、编码系统应该完全重构
+
+这是我最强烈建议的。
+
+现在：
+
+```text
+EncodingMode::Auto
+```
+
+放在 engine 是不对的。
+
+---
+
+# 正确做法：
+
+编码属于：
+
+```text
+Archive Metadata Layer
+```
+
+而不是 orchestration layer。
+
+---
+
+# backend 应该返回：
+
+```rust
+struct RawArchiveEntry {
+    raw_filename: Vec<u8>,
+}
+```
+
+然后：
+
+```rust
+EncodingResolver
+```
+
+做：
+
+```text
+bytes -> decoded path
+```
+
+---
+
+# 八、输出目录（materialization）建议
+
+现在：
+
+```text
+extract directly into final dir
+```
+
+风险很大。
+
+---
+
+# 建议改成事务式：
+
+# 1. temp extraction dir
+
+例如：
+
+```text
+/tmp/smartzip/task-uuid/
+```
+
+---
+
+# 2. integrity verification
+
+例如：
+
+- crc
+- extracted file count
+- corruption check
+
+---
+
+# 3. commit phase
+
+最后：
+
+```text
+atomic move
+```
+
+到最终目录。
+
+---
+
+# 九、事件系统建议（非常关键）
+
+你已经有：
+
+```rust
+TaskEvent
+```
+
+这是好方向。
+
+但现在还不够事件化。
+
+---
+
+# 建议：
+
+不要：
+
+```text
+engine 直接控制 CLI/GUI
+```
+
+而是：
+
+# Engine = Event Producer
+
+---
+
+例如：
+
+```rust
+enum ExtractionEvent {
+    ArchiveDiscovered,
+    PasswordAttempted,
+    PasswordAccepted,
+    PasswordRejected,
+    ExtractionStarted,
+    ExtractionProgress,
+    ExtractionCompleted,
+    NestedArchiveQueued,
+    EncodingDetected,
+    ExtractionFailed,
+}
+```
+
+GUI：
+
+- 订阅事件
+- 更新 tree
+- 更新 progress
+
+CLI：
+
+- 订阅事件
+- 输出日志
+
+这样 engine 才真正独立。
+
+---
+
+# 十、最终推荐架构（你现在最适合）
+
+# Core Architecture
+
+```text
+Scheduler
+ ├── DiscoveryService
+ ├── ArchiveRegistry
+ ├── PasswordResolver
+ ├── EncodingResolver
+ ├── ExtractionExecutor
+ ├── Materializer
+ ├── EventBus
+ └── PolicyEngine
+```
+
+---
+
+# 十一、你这个项目未来最大的瓶颈是什么？
+
+不是：
+
+```text
+zip backend
+```
+
+而是：
+
+# “递归 archive orchestration”
+
+因为你已经不是：
+
+```text
+普通 unzip tool
+```
+
+而是在往：
+
+```text
+archive intelligence platform
+```
+
+方向走了。
+
+这类软件真正难的是：
+
+- task graph
+- recursion control
+- metadata flow
+- state consistency
+- password propagation
+- extraction transaction
+
+而不是：
+
+```text
+如何调用 7z
+```
+
+---
+
+我甚至建议你后面：
+
+# 引入 SQLite task graph
+
+因为你已经有：
+
+```text
+smartzip-db
+```
+
+了。
+
+那完全可以：
+
+- crash recovery
+- pause/resume
+- extraction history
+- retry failed nodes
+- GUI session restore
+
+都会自然很多。
+
+你这个项目已经到了：
+
+```text
+“该从工具脚本思维”
+升级成
+“workflow engine 思维”
+```
+
+的阶段了。
+
+>> USER: 有一个问题，部分嵌套压缩包的发现需要在解压完成后才能进行，如何将这部分接入工作流？
+
+>> ASSISTANT: 这其实是整个“递归解压系统”最核心的问题之一。
+
+你已经意识到了一件非常关键的事：
+
+> archive graph 并不是静态可预知的。
+
+因为很多 nested archive：
+
+```text
+只有 materialize（真正解压）之后
+才能被发现
+```
+
+比如：
+
+- installer 内部释放 zip
+- game resource pack
+- exe 自解压
+- split archives
+- embedded stream
+- packed assets
+- 某些伪装格式
+
+所以：
+
+# 你不能用“静态 DAG”
+
+必须升级成：
+
+# “动态扩展工作流（Dynamic Expansion Workflow）”
+
+这一步非常关键。
+
+---
+
+# 一、真正的问题是什么？
+
+你当前模型：
+
+```text
+scan
+→ discover nested archives
+→ recurse
+```
+
+隐含假设：
+
+```text
+所有 archive 在 extraction 前可见
+```
+
+但现实：
+
+```text
+extract 会产生新的 archive
+```
+
+也就是说：
+
+# extraction 本身会改变任务图
+
+这是根本。
+
+---
+
+# 二、正确模型：Growing Task Graph（动态增长任务图）
+
+你需要的不是：
+
+```text
+预先构建完整 DAG
+```
+
+而是：
+
+# “边执行边扩展图”
+
+但注意：
+
+这和你现在的“递归 queue”不是一回事。
+
+区别非常大。
+
+---
+
+# 三、当前 queue 模型的问题
+
+你现在实际上：
+
+```text
+extract()
+    -> discover_nested()
+        -> enqueue()
+```
+
+这是：
+
+```text
+执行逻辑内递归
+```
+
+问题：
+
+- execution 与 discovery 耦合
+- expansion 无法独立重试
+- scan 无法缓存
+- GUI 无法知道系统在“扩展”
+- 状态不可恢复
+- parallel 很困难
+
+---
+
+# 四、正确模型：Expansion Phase
+
+真正推荐的是：
+
+# extraction 不负责 recurse
+
+而是：
+
+```text
+extract
+    ↓
+产生 artifact
+    ↓
+触发 expansion task
+    ↓
+expansion 负责发现新 archive
+    ↓
+scheduler 再决定是否 extract
+```
+
+这是本质区别。
+
+---
+
+# 五、推荐的生命周期（非常重要）
+
+# ArchiveNode State Machine
+
+```text
+Discovered
+    ↓
+Planned
+    ↓
+Extracting
+    ↓
+Extracted
+    ↓
+Expanded
+    ↓
+Completed
+```
+
+---
+
+# Expanded 的意义
+
+很多人会漏掉这个状态。
+
+它表示：
+
+```text
+该 archive 的输出目录
+已经完成 nested scan
+```
+
+这非常重要。
+
+因为：
+
+```text
+Extracted != 已经发现所有 children
+```
+
+---
+
+# 六、真正应该引入的新概念
+
+# Artifact
+
+这是你架构里目前缺失的关键对象。
+
+现在系统里：
+
+```text
+archive
+extracted dir
+embedded data
+```
+
+混在一起。
+
+但实际上：
+
+# archive 会“产出 artifact”
+
+例如：
+
+```text
+foo.zip
+    ↓
+Artifact(directory)
+```
+
+或者：
+
+```text
+installer.exe
+    ↓
+Artifact(temp_fs)
+```
+
+---
+
+# Artifact 才是 expansion 的输入
+
+不是 ArchiveNode。
+
+---
+
+# 七、推荐的数据模型
+
+# ArchiveNode
+
+```rust
+struct ArchiveNode {
+    id: ArchiveId,
+
+    parent: Option<ArchiveId>,
+
+    source: ArchiveSource,
+
+    state: ArchiveState,
+
+    artifact_id: Option<ArtifactId>,
+}
+```
+
+---
+
+# Artifact
+
+```rust
+struct Artifact {
+    id: ArtifactId,
+
+    path: PathBuf,
+
+    kind: ArtifactKind,
+
+    produced_by: ArchiveId,
+}
+```
+
+---
+
+# 八、工作流应该这样
+
+# 1. Discovery
+
+发现 root archive：
+
+```text
+foo.zip
+```
+
+创建：
+
+```text
+ArchiveNode(root)
+```
+
+---
+
+# 2. Extraction
+
+scheduler：
+
+```text
+extract foo.zip
+```
+
+产生：
+
+```text
+Artifact(/tmp/foo/)
+```
+
+---
+
+# 3. Expansion
+
+系统自动：
+
+```text
+enqueue ExpansionTask(artifact)
+```
+
+Expansion 扫描：
+
+```text
+/tmp/foo/
+```
+
+发现：
+
+```text
+bar.rar
+game.7z
+embedded.pak
+```
+
+创建：
+
+```text
+ArchiveNode(child)
+```
+
+---
+
+# 4. Scheduler
+
+继续调度。
+
+---
+
+# 九、为什么这个架构非常重要？
+
+因为：
+
+# “发现 nested archive”
+
+本质上是：
+
+```text
+filesystem materialization side effect
+```
+
+不是：
+
+```text
+archive metadata traversal
+```
+
+这是完全不同的问题。
+
+---
+
+# 十、Expansion Queue 才是真正核心
+
+未来真正的中心应该是：
+
+```text
+Scheduler
+ ├── DiscoveryQueue
+ ├── ExtractionQueue
+ ├── ExpansionQueue
+ └── RetryQueue
+```
+
+其中：
+
+# ExpansionQueue
+
+是 recursive extraction 的灵魂。
+
+---
+
+# 十一、Expansion 必须幂等（非常重要）
+
+否则你会：
+
+- 重复扫描
+- 无限递归
+- 事件风暴
+
+---
+
+# 推荐：
+
+# Artifact Expansion Record
+
+```rust
+struct ExpansionRecord {
+    artifact_id: ArtifactId,
+
+    scanned_at: Instant,
+
+    content_hash: Option<Hash>,
+
+    expansion_version: u64,
+}
+```
+
+---
+
+# 十二、scan 不应该再是“即时递归”
+
+你现在：
+
+```text
+extract
+→ immediately recurse
+```
+
+未来建议：
+
+```text
+extract
+→ emit artifact
+→ expansion task
+→ new nodes
+→ scheduler
+```
+
+这会让系统突然稳定很多。
+
+---
+
+# 十三、你未来一定会需要的功能
+
+这个架构会自然支持：
+
+---
+
+## 1. pause / resume
+
+因为 graph 可持久化。
+
+---
+
+## 2. crash recovery
+
+恢复：
+
+```text
+哪些 expanded
+哪些没 expanded
+```
+
+---
+
+## 3. GUI tree
+
+你终于可以：
+
+```text
+实时显示 archive tree
+```
+
+---
+
+## 4. parallel extraction
+
+不同 subtree 可以并行。
+
+---
+
+## 5. selective extraction
+
+例如：
+
+```text
+只解压某个 subtree
+```
+
+---
+
+## 6. cache
+
+某 artifact 已 expanded：
+
+```text
+直接跳过
+```
+
+---
+
+# 十四、你现在最接近的其实不是 unzip 软件
+
+而是：
+
+# “递归文件系统构建器”
+
+这就是为什么：
+
+简单 BFS queue 开始不够用了。
+
+因为你已经进入：
+
+```text
+workflow engine territory
+```
+
+了。
+
+---
+
+# 十五、我最推荐你下一步做的事情
+
+不是继续加 backend。
+
+而是：
+
+# 先重构：
+
+## 1. ArchiveNode
+## 2. Artifact
+## 3. ExpansionTask
+## 4. Scheduler
+## 5. State machine
+
+这五个。
+
+一旦这部分稳定：
+
+后面：
+
+- GUI
+- 并发
+- 密码系统
+- cache
+- plugin
+- sandbox
+
+都会突然变容易。
+
+>> USER: 给出新的架构设计和重构方案
+
+>> ASSISTANT: # SmartZip 新架构设计与重构方案
+
+你这个项目现在已经不适合继续“修修补补”。
+
+因为它已经从：
+
+```text
+压缩包工具
+```
+
+演化成：
+
+```text
+递归 archive workflow engine
+```
+
+了。
+
+所以我下面给出的方案，不是“小重构”。
+
+而是：
+
+# 从“递归流程代码”
+升级为
+# “任务驱动架构”
+
+---
+
+# 一、当前架构的核心问题
+
+现在：
+
+```text
+SmartZipEngine
+```
+
+承担了：
+
+- discovery
+- recursion
+- scheduling
+- extraction
+- password policy
+- encoding policy
+- output management
+- retry
+- event emission
+
+这是典型：
+
+# God Object
+
+继续下去会：
+
+- bug 指数增长
+- queue 失控
+- 状态不可恢复
+- GUI 很难做
+- parallelization 极难
+- cache 无法引入
+
+---
+
+# 二、新架构目标
+
+新的架构必须满足：
+
+# Functional Goals
+
+- recursive extraction
+- embedded archive discovery
+- dynamic expansion
+- password inheritance
+- encoding resolution
+- transaction extraction
+- parallel execution
+- pause/resume
+- crash recovery
+- GUI tree model
+- future plugin backend
+
+---
+
+# 三、核心设计原则
+
+# 1. Discovery 与 Execution 解耦
+
+不要：
+
+```text
+extract -> recurse
+```
+
+而是：
+
+```text
+extract -> artifact -> expansion task
+```
+
+---
+
+# 2. Dynamic Graph
+
+archive graph 不是静态 DAG。
+
+而是：
+
+# Incrementally Growing DAG
+
+---
+
+# 3. Event-Driven
+
+engine 不直接控制 GUI/CLI。
+
+而是：
+
+```text
+emit events
+```
+
+---
+
+# 4. Artifact-Centric
+
+系统核心不是 archive。
+
+而是：
+
+# “archive 产生的 artifact”
+
+---
+
+# 5. Scheduler-Centric
+
+recursive traversal 不属于 extractor。
+
+属于：
+
+# Scheduler
+
+---
+
+# 四、新架构总览
+
+# High-Level Architecture
+
+```text
+Core Runtime
+ ├── Scheduler
+ ├── ArchiveGraph
+ ├── ArtifactStore
+ ├── EventBus
+ ├── PolicyEngine
+ └── PersistenceLayer
+
+Pipeline
+ ├── DiscoveryStage
+ ├── ExtractionStage
+ ├── ExpansionStage
+ ├── VerificationStage
+ └── MaterializationStage
+
+Services
+ ├── PasswordResolver
+ ├── EncodingResolver
+ ├── ScanService
+ ├── BackendRegistry
+ └── TempStorageManager
+```
+
+---
+
+# 五、核心数据模型（最重要）
+
+# 1. ArchiveNode
+
+替代现在：
+
+```rust
+ExtractionCandidate
+```
+
+---
+
+## 新设计
+
+```rust
+struct ArchiveNode {
+    id: ArchiveId,
+
+    parent: Option<ArchiveId>,
+
+    source: ArchiveSource,
+
+    detected_format: Option<ArchiveFormat>,
+
+    state: ArchiveState,
+
+    depth: u32,
+
+    artifact_id: Option<ArtifactId>,
+
+    password_state: PasswordState,
+
+    encoding_state: EncodingState,
+
+    metadata: ArchiveMetadata,
+}
+```
+
+---
+
+# 2. Artifact
+
+这是整个重构最关键的新对象。
+
+---
+
+## 为什么重要？
+
+因为：
+
+```text
+archive → extract → artifact
+```
+
+真正被 expansion 扫描的是：
+
+# artifact
+
+不是 archive。
+
+---
+
+## 设计
+
+```rust
+struct Artifact {
+    id: ArtifactId,
+
+    kind: ArtifactKind,
+
+    path: PathBuf,
+
+    produced_by: ArchiveId,
+
+    content_hash: Option<Hash>,
+
+    created_at: Instant,
+}
+```
+
+---
+
+# ArtifactKind
+
+```rust
+enum ArtifactKind {
+    Directory,
+    File,
+    Stream,
+    MemoryFs,
+}
+```
+
+---
+
+# 六、状态机设计（非常关键）
+
+# ArchiveState
+
+```rust
+enum ArchiveState {
+    Discovered,
+
+    Planned,
+
+    WaitingPassword,
+
+    Extracting,
+
+    Extracted,
+
+    Expanding,
+
+    Expanded,
+
+    Completed,
+
+    Failed,
+}
+```
+
+---
+
+# 为什么需要 Expanded？
+
+因为：
+
+```text
+Extracted != nested archive 已发现
+```
+
+这是当前架构缺失的关键状态。
+
+---
+
+# 七、Scheduler（系统核心）
+
+# Scheduler 才是真正的大脑
+
+不是 engine。
+
+---
+
+# Scheduler 职责
+
+## 1. task orchestration
+
+---
+
+## 2. retry
+
+---
+
+## 3. concurrency control
+
+---
+
+## 4. recursion policy
+
+---
+
+## 5. zip bomb prevention
+
+---
+
+## 6. event routing
+
+---
+
+# 推荐实现
+
+```rust
+struct Scheduler {
+    extraction_queue: TaskQueue,
+    expansion_queue: TaskQueue,
+    retry_queue: TaskQueue,
+
+    graph: ArchiveGraph,
+
+    policy: PolicyEngine,
+}
+```
+
+---
+
+# 八、Pipeline 分层（关键）
+
+---
+
+# 1. DiscoveryStage
+
+只负责：
+
+```text
+发现 archive
+```
+
+输出：
+
+```text
+ArchiveNode
+```
+
+---
+
+# 2. ExtractionStage
+
+只负责：
+
+```text
+archive -> artifact
+```
+
+绝不 recurse。
+
+---
+
+# 3. ExpansionStage（最重要）
+
+负责：
+
+```text
+artifact -> nested archive discovery
+```
+
+这是整个 recursive workflow 的灵魂。
+
+---
+
+# Expansion 输入
+
+```rust
+ExpansionTask {
+    artifact_id: ArtifactId
+}
+```
+
+---
+
+# Expansion 输出
+
+```text
+new ArchiveNodes
+```
+
+然后：
+
+```text
+enqueue scheduler
+```
+
+---
+
+# 九、事件系统（必须重构）
+
+现在 TaskEvent 太粗糙。
+
+---
+
+# 新事件模型
+
+```rust
+enum EngineEvent {
+    ArchiveDiscovered,
+
+    ExtractionQueued,
+
+    ExtractionStarted,
+
+    ExtractionProgress,
+
+    ExtractionCompleted,
+
+    ArtifactProduced,
+
+    ExpansionStarted,
+
+    NestedArchiveDiscovered,
+
+    PasswordRequested,
+
+    PasswordAccepted,
+
+    PasswordRejected,
+
+    VerificationFailed,
+
+    MaterializationCommitted,
+
+    ArchiveCompleted,
+
+    ArchiveFailed,
+}
+```
+
+---
+
+# GUI/CLI
+
+都只：
+
+```text
+subscribe(event_bus)
+```
+
+---
+
+# 十、密码系统重构（重要）
+
+现在：
+
+```text
+for password in candidates
+```
+
+太 primitive。
+
+---
+
+# 新设计
+
+# PasswordResolver Pipeline
+
+```rust
+trait PasswordProvider {
+    async fn resolve(
+        &self,
+        archive: &ArchiveNode,
+    ) -> PasswordDecision;
+}
+```
+
+---
+
+# Provider Chain
+
+```text
+InheritedPasswordProvider
+CachedPasswordProvider
+DatabasePasswordProvider
+HeuristicPasswordProvider
+InteractivePasswordProvider
+```
+
+---
+
+# 十一、编码系统重构（必须）
+
+现在：
+
+```rust
+PathBuf
+```
+
+做 encoding detect。
+
+这是错误架构。
+
+---
+
+# 正确设计
+
+backend 返回：
+
+```rust
+struct RawArchiveEntry {
+    raw_filename: Vec<u8>,
+}
+```
+
+---
+
+# EncodingResolver
+
+负责：
+
+```text
+raw bytes -> decoded path
+```
+
+---
+
+# 十二、Backend 重构（重要）
+
+现在 backend：
+
+```text
+list/test/extract
+```
+
+是 stateless。
+
+导致：
+
+- 重复打开 archive
+- 重复启动 7z
+- IO 浪费巨大
+
+---
+
+# 新设计
+
+# ArchiveSession
+
+```rust
+trait ArchiveSession {
+    async fn list(&mut self);
+
+    async fn test_password(&mut self);
+
+    async fn extract(&mut self);
+}
+```
+
+---
+
+# Session 生命周期
+
+```text
+open once
+reuse
+close once
+```
+
+---
+
+# 十三、Extraction Transaction（关键）
+
+不要：
+
+```text
+直接 extract 到 final dir
+```
+
+---
+
+# 正确设计
+
+## Phase 1
+
+```text
+extract -> temp dir
+```
+
+---
+
+## Phase 2
+
+```text
+verify
+```
+
+---
+
+## Phase 3
+
+```text
+commit
+```
+
+atomic move。
+
+---
+
+# 十四、Persistence Layer（未来关键）
+
+建议直接引入：
+
+# SQLite Task Graph
+
+你已经有：
+
+```text
+smartzip-db
+```
+
+了。
+
+非常适合。
+
+---
+
+# 存储：
+
+- archive graph
+- artifact
+- task state
+- retry
+- event log
+- expansion history
+
+---
+
+# 十五、推荐 crate 重构
+
+现在 crate 分层不够稳定。
+
+---
+
+# 推荐
+
+```text
+smartzip-core
+    domain types
+
+smartzip-graph
+    archive/artifact graph
+
+smartzip-scheduler
+    orchestration
+
+smartzip-pipeline
+    extraction pipeline
+
+smartzip-backend
+    archive sessions
+
+smartzip-events
+    event system
+
+smartzip-storage
+    persistence
+
+smartzip-policy
+    limits/security
+
+smartzip-runtime
+    tokio runtime glue
+```
+
+---
+
+# 十六、推荐重构顺序（非常重要）
+
+不要一次重写。
+
+---
+
+# Phase 1（最重要）
+
+## 引入：
+
+- ArchiveNode
+- Artifact
+- ArchiveState
+- ExpansionTask
+
+并：
+
+# 解耦：
+
+```text
+extract != recurse
+```
+
+---
+
+# Phase 2
+
+## 引入：
+
+- Scheduler
+- TaskQueue
+- EventBus
+
+---
+
+# Phase 3
+
+## 引入：
+
+- Persistence
+- Crash Recovery
+- Pause/Resume
+
+---
+
+# Phase 4
+
+## 引入：
+
+- parallel extraction
+- work stealing
+- cache
+- deduplication
+
+---
+
+# 十七、最终形态
+
+最终 SmartZip 会变成：
+
+# Archive Workflow Runtime
+
+而不是：
+
+```text
+unzip wrapper
+```
+
+---
+
+# 十八、我最强烈建议的核心改变
+
+如果只允许我选：
+
+# 一个最重要的架构升级
+
+那就是：
+
+# “Expansion Stage 独立化”
+
+即：
+
+```text
+extract produces artifact
+artifact expansion discovers children
+scheduler decides execution
+```
+
+这是整个系统从：
+
+```text
+递归脚本
+```
+
+升级为：
+
+```text
+可扩展 workflow engine
+```
+
+的分水岭。
+
+>> USER: 这是一个**极其精彩、专业且极具远见**的架构重构方案！
+
+作为一名资深软件工程师，我看完你的方案后，最直观的感受是：**你完全抓住了当前系统痛点的本质，并且给出了一套企业级（Enterprise-grade）的现代 Workflow Engine 设计。**
+
+你把一个原本线性的“解压脚本”抽象成了**基于 DAG（有向无环图）的任务调度系统**。这个方案不仅能彻底解决我们在上一轮 review 中发现的各种 Bug（比如死锁、编码丢失、密码重试失败），还为未来的并发、断点续传、GUI 树状视图铺平了道路。
+
+以下我对你这个方案的**高度肯定**，以及基于这个方案我补充的一些**潜在挑战与落地建议（Gotchas & Tips）**：
+
+### 🌟 方案中最惊艳的三个亮点 (The "Aha!" Moments)
+
+1. **Artifact-Centric 与 Expansion Stage 独立化**
+这是整个方案的灵魂！传统的解压工具总是试图 `extract -> detect -> recurse` 一气呵成，这在遇到嵌套压缩、分卷、多编码混合时必定崩溃。
+你引入 `Artifact` 的概念，将“解压产物”和“下一个压缩包的发现源”解耦。这意味着你可以对 `Artifact` 做哈希去重（防止循环解压）、做病毒扫描、做延迟展开（Lazy Expansion，这对于 GUI 树状浏览简直是神器）。
+2. **RawArchiveEntry 解决编码痛点**
+你敏锐地察觉到了目前 `PathBuf` 和 `String::from_utf8_lossy` 带来的灾难。明确要求 Backend 返回 `Vec<u8>`，然后通过 `EncodingResolver` 统一决策，这是实现跨平台/跨语言字符集（Shift_JIS, GBK 等）完美解压的**唯一正确路径**。
+3. **Transaction Extraction (三阶段提交)**
+解压到 Temp -> Verify -> Atomic Move。这个设计极其优雅，保证了系统的**幂等性（Idempotency）**。如果系统崩溃或用户取消，目标文件夹永远不会出现“解压了一半的残次品”。这对最终用户的体验提升是巨大的。
+
+---
+
+### ⚠️ 落地过程中的潜在挑战与避坑指南 (Constructive Critiques)
+
+你的架构宏图已经很完美了，但在 Rust 实际落地时，有几个点需要特别注意：
+
+#### 1. Backend `ArchiveSession` 的实现难点
+
+* **挑战**：你期望 backend 能有 `open once, reuse` 的 Session 能力，以减少 IO 浪费。但如果底层依赖的是 `7z` 的 CLI 进程（`tokio::process::Command`），**CLI 是无状态的**。你很难让一个 `7z` 进程一直活着并接受不同的指令（比如先 `l` 再 `x`）。
+* **建议**：
+* **方案 A (纯 Rust/FFI)**：逐渐废弃 CLI，引入 Rust 原生库（如 `sevenz-rust`, `zip`）或通过 C bindings 接入 `libarchive` / `7z.dll`。这样可以真正实现内存级的 Session 控制。
+* **方案 B (伪 Session/缓存机制)**：如果短期内必须用 CLI，`ArchiveSession` 可以在内部缓存 `list` 的结果。即第一次 `open` 时预读目录树，后续的 `extract` 依然起新进程，但规避了重复探查的开销。
+
+
+
+#### 2. TempStorage 的磁盘与 IO 惩罚 (The IO Penalty)
+
+* **挑战**：Transaction Extraction 机制要求先解压到 Temp 目录再 Move。如果一个压缩包有 50GB，临时目录（通常在 C 盘或 `/tmp`）可能会爆满；且跨文件系统/跨分区的 `Atomic Move` 实际上是昂贵的深拷贝（Copy + Delete）。
+* **建议**：
+* Temp 目录必须建立在**目标输出路径的同级目录**（例如 `target_dir/.smartzip_temp_xxx/`），这样 `commit` 时可以利用文件系统的硬链接或直接重命名（`fs::rename` 达到真正的原子操作 O(1) 开销）。
+* 提供一个 `FastPath` 或 `ZeroCopy` 策略开关：对于极大的文件，允许跳过 Temp 阶段直接写入（牺牲安全性换取性能）。
+
+
+
+#### 3. DAG 的环路检测与拉链炸弹 (Zip Bomb & Cycle Detection)
+
+* **挑战**：你的 `ArchiveGraph` 是一个动态增长的 DAG。恶意压缩包（42.zip，嵌套了数百万个压缩包）或者包含恶意符号链接（Symlink 指向上一级目录）的压缩包，会导致 `ExpansionQueue` 发生内存溢出（OOM）或无限递归。
+* **建议**：
+* 在 `ArtifactStore` 或 `Scheduler` 中必须引入 **Content Hash Deduplication** 和 **Depth Limit**。如果一个 `Artifact` 的 Hash 已经被处理过，直接在 Graph 中连线，拒绝重复入队。
+
+
+
+#### 4. 级联取消 (Cascading Cancellation)
+
+* **挑战**：基于状态机和队列的设计，如果用户在 GUI 点击了“取消某一个子任务”，或者父节点解压失败，如何干净地清理状态？
+* **建议**：
+* Rust 的 `tokio::task::JoinHandle` 和 `CancellationToken` 是绝配。建议为每一个 `ArchiveNode` 绑定一个衍生的 `CancellationToken` (Child Token)。父节点取消时，自动 cancel 所有子节点，触发 Cleanup 逻辑。
+
+
+
+---
+
+### 🛠️ 强烈赞同你的重构路线 (Actionable Plan)
+
+你提到的 **Phase 1 -> Phase 4** 的演进顺序极其理智。
+
+我完全同意**第一刀切在“Expansion Stage 独立化”上**。
+你现在的 `SmartZipEngine::extract_recursive` 是一个巨大的 `while let Some(candidate) = queue.pop_front()` 循环。
+第一步重构，不需要立刻引入 SQLite，也不需要立刻重写 Backend。你只需要：
+
+1. 把巨大的 loop 拆成 `ExtractionWorker` 和 `ExpansionWorker`。
+2. 用 `mpsc::channel` 把它们连起来（Extractor 产出 Artifact 丢给 Channel，Expander 从 Channel 拿 Artifact 去扫描并产出新的 Archive 丢回初始队列）。
+
+**总结：**
+不要犹豫，**请立刻按照这个设计图开工**。这个架构不仅能拯救 SmartZip，这甚至是一个可以作为标准开源库（`archive-workflow-engine`）独立发布的高水平架构。它具备了现代后台服务所需的所有特质：数据与执行解耦、事件驱动、容错容灾。祝重构顺利！需要针对某个具体的模块（比如 Scheduler 或 State Machine）写 Rust 伪代码时，随时叫我。
+
+
+你如何评价以上的建议？
+
+>> ASSISTANT: 我对这份反馈的评价是：
+
+# 非常高水平，而且是“真正做过大型系统的人”给出的反馈。
+
+不是泛泛而谈的“架构建议”，而是已经进入：
+
+```text
+runtime semantics
+resource lifetime
+failure model
+workflow topology
+```
+
+这一层了。
+
+里面有几条我认为尤其重要，甚至可以说是：
+
+# 会决定 SmartZip 后续上限的关键点。
+
+---
+
+# 一、我最认同的部分
+
+# 1. “Dynamic DAG” 的理解完全正确
+
+这里他说：
+
+> archive graph 是动态增长的 DAG
+
+这点非常关键。
+
+因为很多人第一次设计这种系统时，会下意识认为：
+
+```text
+recursive extraction = tree traversal
+```
+
+但实际上：
+
+# 这是“图演化系统（Graph Evolution System）”
+
+不是：
+
+```text
+DFS/BFS 算法题
+```
+
+这是本质区别。
+
+---
+
+# 2. “Artifact-Centric” 的价值被准确抓到了
+
+这一点我尤其认同。
+
+因为：
+
+# Artifact 是系统中的“稳定边界（stable boundary）”
+
+archive 本身：
+
+- 会失败
+- 会重试
+- 会重新调度
+- 可能密码变化
+- 可能 encoding 变化
+
+但：
+
+```text
+artifact once materialized
+```
+
+就变成：
+
+# 可观察现实（observable reality）
+
+后续：
+
+- scan
+- verify
+- hash
+- cache
+- GUI
+- dedup
+
+都建立在 artifact 上。
+
+这是整个系统从：
+
+```text
+命令式流程
+```
+
+转向：
+
+```text
+数据驱动 workflow
+```
+
+的核心。
+
+---
+
+# 3. “Expanded != Extracted”
+
+这个理解非常专业。
+
+因为：
+
+# Expansion 本质是 secondary discovery
+
+即：
+
+```text
+extract 只是生成了 filesystem state
+```
+
+但：
+
+```text
+nested archive discovery
+```
+
+是另一个阶段。
+
+很多工程师会把这俩混成一个步骤。
+
+然后：
+
+- 重复 scan
+- 无限 recurse
+- GUI 状态混乱
+- retry 不一致
+
+全都会出现。
+
+---
+
+# 4. 关于 Session 的 critique 非常准确
+
+这一段：
+
+> CLI backend 实际上很难做真正 session
+
+完全正确。
+
+这是：
+
+# Rust workflow engine 与 CLI integration 的经典矛盾。
+
+---
+
+## 为什么？
+
+因为：
+
+```text
+7z l archive.zip
+7z x archive.zip
+```
+
+本质是：
+
+# 两个独立进程
+
+不是：
+
+```text
+persistent handle
+```
+
+所以：
+
+# “Session abstraction”
+和
+# “真实 backend capability”
+
+之间存在 semantic mismatch。
+
+这是一个非常重要的架构现实。
+
+---
+
+# 二、我认为尤其重要的补充（关键）
+
+我认为这份反馈里：
+
+# 最重要的一句
+
+其实是：
+
+> “不要立刻引入 SQLite”
+
+这个建议非常对。
+
+---
+
+# 为什么？
+
+因为很多系统会死于：
+
+```text
+在 runtime model 还不稳定时
+过早持久化
+```
+
+---
+
+# 你现在真正缺的不是 persistence
+
+而是：
+
+# 正确的 runtime topology
+
+即：
+
+- task lifecycle
+- state transition
+- expansion semantics
+- ownership boundary
+
+这些先稳定。
+
+否则：
+
+```text
+错误架构 + SQLite
+```
+
+只会得到：
+
+# 更复杂的错误系统
+
+---
+
+# 三、关于 IO Penalty 的 critique（非常关键）
+
+这部分其实比看起来更严重。
+
+---
+
+# 问题本质
+
+现在：
+
+```text
+temp extract -> move
+```
+
+在大文件下：
+
+可能退化成：
+
+# 双倍 IO
+
+例如：
+
+```text
+50GB archive
+```
+
+实际：
+
+```text
+read 50GB
+write temp 50GB
+copy 50GB
+delete 50GB
+```
+
+最终：
+
+# 150GB+ IO
+
+SSD 会非常痛苦。
+
+---
+
+# 我会进一步建议：
+
+# “materialization policy”
+
+应该变成：
+
+```rust
+enum MaterializationMode {
+    AtomicSafe,
+    FastPath,
+    ZeroCopy,
+}
+```
+
+不同策略适配：
+
+- GUI 安全模式
+- CLI 高性能模式
+- 大文件模式
+
+---
+
+# 四、我认为还应该继续补充的点（重点）
+
+下面是我认为还可以继续增强的地方。
+
+---
+
+# 1. Scheduler 不只是 Queue Manager
+
+这一点非常关键。
+
+很多人会：
+
+```text
+Scheduler = queue.pop()
+```
+
+但真正成熟的 scheduler：
+
+# 是“资源协调器”
+
+它必须理解：
+
+- CPU
+- disk IO
+- memory pressure
+- decompression concurrency
+- backend limits
+
+---
+
+# 举个例子
+
+RAR 解压：
+
+```text
+CPU heavy
+```
+
+ZIP：
+
+```text
+IO heavy
+```
+
+7z：
+
+```text
+memory heavy
+```
+
+scheduler 后面一定需要：
+
+# Resource-Aware Scheduling
+
+---
+
+# 2. Artifact 未来会变成内容寻址（Content Addressed）
+
+这一点非常重要。
+
+后期：
+
+```text
+ArtifactId
+```
+
+最好不是 UUID。
+
+而是：
+
+# content hash
+
+例如：
+
+```text
+blake3
+```
+
+这样：
+
+- dedup
+- cache
+- loop detect
+- incremental extraction
+
+都会简单很多。
+
+---
+
+# 3. Expansion 实际上应该有“策略层”
+
+不是所有 artifact 都应该立即 expand。
+
+例如：
+
+# Lazy Expansion
+
+GUI：
+
+```text
+用户点开树节点
+才 expand
+```
+
+这会极大减少：
+
+- IO
+- queue storm
+- memory
+
+---
+
+# 4. EventBus 最终需要 backpressure
+
+这是后期非常关键的问题。
+
+否则：
+
+```text
+10000 nested archives
+```
+
+会：
+
+# event storm
+
+GUI 卡死。
+
+---
+
+# 建议：
+
+事件系统最好：
+
+```text
+lossy + aggregatable
+```
+
+例如：
+
+```text
+ProgressUpdated
+```
+
+应该：
+
+# coalescing
+
+---
+
+# 5. 你未来会需要“Capability-Based Backend”
+
+这是一个很容易被忽略的高级问题。
+
+例如：
+
+不同 backend：
+
+| backend | test password | stream extract | list raw filename |
+|---|---|---|---|
+| zip-rs | yes | yes | yes |
+| 7z CLI | partial | no | maybe |
+| unrar | yes | partial | yes |
+
+所以：
+
+# backend capability matrix
+
+会非常重要。
+
+---
+
+# 五、我最赞同的战略建议
+
+就是：
+
+# “先拆 Expansion”
+
+这真的是：
+
+# 最正确的第一刀。
+
+因为它：
+
+- 风险最低
+- 收益最大
+- 能立刻降低复杂度
+- 不需要推翻 backend
+- 不需要重写 GUI
+- 不需要 persistence
+
+但：
+
+# 会立即改变系统 topology
+
+这是最值钱的。
+
+---
+
+# 六、我会如何进一步演进（推荐路线）
+
+# Phase 1（现在）
+
+## 目标：
+
+# topology stabilization
+
+即：
+
+- ExpansionTask
+- Artifact
+- Scheduler
+- State machine
+
+---
+
+# Phase 2
+
+## 目标：
+
+# execution isolation
+
+即：
+
+- worker pool
+- cancellation
+- retry
+- resource limits
+
+---
+
+# Phase 3
+
+## 目标：
+
+# persistence
+
+即：
+
+- SQLite graph
+- recovery
+- resume
+
+---
+
+# Phase 4
+
+## 目标：
+
+# intelligence layer
+
+即：
+
+- heuristic password
+- adaptive scheduling
+- content dedup
+- predictive extraction
+
+---
+
+# 七、我对整个方案的最终评价
+
+我会这样定义它：
+
+# “Archive Workflow Runtime”
+
+而不是：
+
+```text
+archive extractor
+```
+
+这是一个非常大的认知升级。
+
+因为：
+
+真正复杂的从来不是：
+
+```text
+怎么调用 unzip
+```
+
+而是：
+
+# “如何稳定地组织递归文件系统演化过程”
+
+这才是 SmartZip 真正的核心难题。
+
+>> USER: 这是一个非常务实且极具工程素养的推进策略。
+
+在大型系统演进中，**“切忌为了重构而长期忍受致命 Bug，也切忌在即将被推翻的代码上做复杂的屎山雕花”**。
+
+根据你的要求，我将之前梳理出的所有问题，结合“严重性”、“修复成本”以及“新架构重构计划”，制定了这套**融合实施优先级（T0 到 T3）**。
+
+---
+
+### T0 阶段：紧急止血热修复 (Hotfixes)
+
+**原则：** 只需要修改几行代码（修复成本极低），但能立刻解决“死锁、崩溃、核心功能完全失效”等致命问题。这些修改不会影响后续的重构，必须**今天**就提 PR 合并。
+
+* **[最高] Bug：`7z` 缺少 stdin 导致进程死锁挂起**
+* *影响：* 遇到加密包直接卡死整个程序。
+* *修复：* 1 行代码。在 `sevenzz.rs` 的 `Command::new` 链式调用中加上 `.stdin(Stdio::null())`。
+
+
+* **[极高] Bug：多卷压缩包正则漏洞 (`.part01.rar` 被跳过)**
+* *影响：* 包含前导零的大型分卷包被静默丢弃，永远不解压。
+* *修复：* 修改 `is_first_volume` 的匹配逻辑（1 行正则或逻辑判断）。
+
+
+* **[高] Bug：手动指定编码被静默丢弃 & 底层未传参**
+* *影响：* CLI 传了 `--encoding GBK` 依然乱码。
+* *修复：*
+1. 修复 engine 中的 `unwrap_or(EncodingMode::Auto)` 覆盖逻辑。
+2. 在 `sevenzz.rs` 中提取 `encoding` 字段，并根据值补充 `-mcp={CodePage}` 参数传给 7z 进程。
+
+
+
+
+* **[中] Bug：非密码错误导致正确密码被降权**
+* *影响：* 长期运行会导致用户的本地密码库被污染，好密码排名垫底。
+* *修复：* 在 `extract_recursive` 的 `Err(error)` 分支里加个判断，只有 `matches!(error, SmartZipError::WrongPassword)` 才调用 `record_failure`。
+
+
+
+---
+
+### T1 阶段：核心拓扑与数据结构重构 (Phase 1)
+
+**原则：** 解决由“旧模型设计缺陷”导致的系统性深水区 Bug。这一步是重构的基石，主要引入 `Artifact` 和 `ArchiveNode`。
+
+* **架构动作：** 剥离 Expansion 阶段，引入 `RawArchiveEntry` 和 `Artifact` 实体。
+* **一并解决的 Bug：**
+* **Bug：`from_utf8_lossy` 彻底破坏自动编码检测**
+* *为何在此修复：* 修复它需要修改 Backend 接口，让它返回原生的 `Vec<u8>` 而不是被转义过的 `String` 或 `PathBuf`。在引入 `RawArchiveEntry` 时顺手解决。
+
+
+* **Bug：`seen` 队列基于 `.display()` 去重导致的无限递归**
+* *为何在此修复：* 新架构将使用 `ArtifactId` (基于 Content Hash 或规范化路径) 替代脆弱的字符串拼接，从根本上消灭路径误判。
+
+
+* **Bug：Scanner 层层扫描导致 $O(n^2)$ 的 IO 风暴**
+* *为何在此修复：* 新架构中，解压产生 `Artifact` 后，只会对新增的 `Artifact` 触发一次 ExpansionTask，天然杜绝了重复扫描整个父文件的行为。
+
+
+* **Bug：递归深度判定 (Off-by-one) 越界**
+* *为何在此修复：* 将深度控制从 `while` 循环剥离，交给新的 Pipeline 状态机管理，逻辑自然理顺。
+
+
+
+
+
+---
+
+### T2 阶段：执行器与异步安全 (Phase 2)
+
+**原则：** 解决 Tokio 异步环境下的资源调度、并发安全和失控风险。引入 `Scheduler` 调度大脑。
+
+* **架构动作：** 引入 `TaskQueue`、资源感知调度 (Resource-Aware Scheduler) 和 `CancellationToken`。
+* **一并解决的 Bug：**
+* **Bug：Async 运行时内部夹杂 Sync IO 导致线程池阻塞**
+* *为何在此修复：* 引入 Worker Pool 时，必须全面梳理 IO，将 `std::fs` 彻底替换为 `tokio::fs` 或放入 `spawn_blocking`。
+
+
+* **Bug：没有 Cancellation 机制，GUI 无法取消大型任务**
+* *为何在此修复：* 新的 Scheduler 会为每个 `ArchiveNode` 颁发衍生的 CancellationToken，实现级联取消（一键杀停所有相关进程和子任务）。
+
+
+* **Bug：缺乏解压上限，易受 Zip Bomb (42.zip) 攻击**
+* *为何在此修复：* Scheduler 内部引入 PolicyEngine，统一拦截校验“最大文件数、最大解压体积、最大深度”，超出立刻阻断。
+
+
+
+
+
+---
+
+### T3 阶段：IO 安全与策略层完善 (Phase 3)
+
+**原则：** 收尾高风险的 IO 操作和体验一致性问题。此时系统底座已经非常稳固。
+
+* **架构动作：** 引入 `MaterializationMode` (三阶段事务解压)、完善 `PasswordResolver` 责任链。
+* **一并解决的 Bug：**
+* **Bug：`collapse_single_output` 中的跨盘符 Rename (EXDEV) 崩溃风险**
+* *为何在此修复：* 事务解压机制会统一管理 Temp 目录。通过将 Temp 与目标目录保持同盘，并在 Commit 阶段使用原子重命名 (Atomic Rename) 或回退到 Copy+Delete，彻底消灭 IO 异常。
+
+
+* **Bug：Interactive 密码流没有走 test 导致误判**
+* *为何在此修复：* 独立的 `PasswordResolver` 将统一密码校验接口。所有密码验证（不管是字典跑出来的还是手敲的）都会被强制通过 `ArchiveSession::test()` 进行一致性校验。
+
+
+* **Bug：错误处理吞噬 (`let _ =`) 导致静默失败**
+* *为何在此修复：* 结合 EventBus 的引入，所有不可恢复的 Error 都会转化为 `ArchiveFailed` 事件抛给前端，日志和错误传播链将变得严密。
+
+
+
+
+
+---
+
+### 💡 执行建议 (The Game Plan)
+
+你的第一梯队应该是：**今天下午花 2 个小时把 T0 阶段的代码改掉，发版。** 这样你现有的版本至少是一个“能稳定把主流压缩包解压出来”的可用工具。
+
+然后，拉出一个分支 `feature/workflow-engine`，**完全不碰其他地方，专心攻克 T1（解耦提取与扫描，重写 Backend 接口返回 Vec）**。这是最难啃但也最爽的一块骨头。只要 T1 完成，整个项目的代码气质就会发生脱胎换骨的变化。
+
+你如何评价以上的bug修复和重构计划？
+
+>> ASSISTANT: 我对这份计划的评价是：
+
+# 非常成熟，而且“工程化优先级”排得非常对。
+
+它最大的优点不是“分析全面”。
+
+而是：
+
+# 它真正考虑了“系统演进成本”。
+
+这是很多架构讨论里最缺的东西。
+
+很多方案会停留在：
+
+```text id="79p53s"
+理论上最优
+```
+
+但你的这个分层：
+
+```text id="ljlwm4"
+T0 → T1 → T2 → T3
+```
+
+已经开始具备：
+
+# 真正可执行的 roadmap 属性。
+
+这非常重要。
+
+---
+
+# 一、我最认可的部分
+
+# 1. “不要在即将被推翻的代码上雕花”
+
+这是整个计划里最正确的一句话。
+
+因为：
+
+# 现在最大的风险
+
+不是：
+
+```text id="mr5mb6"
+有 bug
+```
+
+而是：
+
+# “在错误 topology 上继续增加复杂度”
+
+这会导致：
+
+```text id="x7j03x"
+局部修复
+→ 新状态耦合
+→ 更难重构
+→ 最终冻结
+```
+
+这是很多中型 Rust 项目最后失控的原因。
+
+---
+
+# 2. T0/T1 的切割非常专业
+
+这个分层特别合理。
+
+---
+
+## T0
+
+只修：
+
+- deadlock
+- incorrect behavior
+- data corruption
+
+且：
+
+# 不改变 topology
+
+这是关键。
+
+---
+
+## T1
+
+第一次真正改变：
+
+# runtime semantics
+
+即：
+
+```text id="12m06s"
+extract != recurse
+```
+
+这一步才是：
+
+# 真正的系统升级
+
+---
+
+# 二、我尤其赞同的点
+
+# 1. “T0 必须 today merge”
+
+完全正确。
+
+尤其：
+
+```text id="qvxj6n"
+stdin(Stdio::null())
+```
+
+这种。
+
+---
+
+## 为什么这是 T0？
+
+因为：
+
+# 它属于：
+
+```text id="95v7zt"
+non-recoverable runtime hang
+```
+
+即：
+
+# 整个 runtime topology 被锁死
+
+这类问题：
+
+优先级永远最高。
+
+---
+
+# 2. encoding bug 被放进 T1 非常正确
+
+这是一个特别成熟的判断。
+
+很多人会冲动：
+
+```text id="1wwt87"
+立刻修 encoding
+```
+
+但：
+
+# 现在的 encoding bug 不是“逻辑 bug”
+
+而是：
+
+# 数据模型错误
+
+即：
+
+```text id="f2s9zb"
+PathBuf 不足以表达 archive metadata
+```
+
+这是：
+
+# schema problem
+
+不是：
+
+```text id="9n8r9l"
+if/else problem
+```
+
+---
+
+# 所以：
+
+只有：
+
+```text id="p7y4f7"
+RawArchiveEntry(Vec<u8>)
+```
+
+引入后。
+
+编码问题才能真正被解决。
+
+这是非常正确的 architectural sequencing。
+
+---
+
+# 3. “seen.display()” 被归类到 T1
+
+也非常合理。
+
+因为：
+
+# 它本质属于 identity model 错误
+
+不是：
+
+```text id="79e0ry"
+string comparison bug
+```
+
+真正的问题是：
+
+# “系统没有 stable identity”
+
+所以：
+
+```text id="ajw43x"
+ArtifactId
+```
+
+才是正确修复方向。
+
+---
+
+# 三、我认为最聪明的地方
+
+其实是：
+
+# “把 bug 修复映射到架构阶段”
+
+这非常高级。
+
+很多重构失败：
+
+就是因为：
+
+```text id="fiz9yc"
+先修 bug
+再重构
+```
+
+导致：
+
+# 修复成本被浪费
+
+---
+
+而你这个方案：
+
+```text id="10s5kn"
+某些 bug
+只有在 topology 变化后
+才值得修
+```
+
+这个判断非常专业。
+
+---
+
+# 四、我会补充的几个关键建议
+
+下面这些，是我认为可以继续增强的地方。
+
+---
+
+# 1. T0 还应该增加：
+
+# “panic containment”
+
+现在仓库里：
+
+```rust id="hwp6a8"
+unwrap()
+expect()
+```
+
+还很多。
+
+---
+
+# 我建议：
+
+T0 增加：
+
+```text id="7w7dn4"
+panic boundary
+```
+
+尤其：
+
+# backend worker
+
+必须：
+
+```rust id="qrb9vd"
+catch_unwind
+```
+
+否则：
+
+```text id="0bw72g"
+一个 backend panic
+```
+
+可能：
+
+# 杀死整个 extraction runtime
+
+---
+
+# 2. T1 最好立刻引入：
+
+# “NodeId != Path”
+
+这非常关键。
+
+---
+
+# 不然后面：
+
+```text id="dhmrfm"
+path normalization
+symlink
+hardlink
+rename
+temp extraction
+```
+
+会越来越痛苦。
+
+---
+
+# 推荐：
+
+```rust id="bzj9gx"
+struct ArchiveId(Uuid);
+struct ArtifactId(blake3::Hash);
+```
+
+路径只是 metadata。
+
+不是 identity。
+
+---
+
+# 3. T1 应该立刻引入：
+
+# “State Transition Validator”
+
+这个非常重要。
+
+否则：
+
+```text id="qvt5vj"
+ArchiveState
+```
+
+后面会：
+
+# 状态爆炸。
+
+---
+
+# 推荐：
+
+```rust id="wqok6v"
+fn transition(
+    from: ArchiveState,
+    to: ArchiveState,
+) -> Result<()>
+```
+
+显式控制：
+
+```text id="g9okga"
+Discovered -> Extracting
+```
+
+是否合法。
+
+---
+
+# 4. T2 的 Scheduler
+
+我建议：
+
+# 一开始不要做“智能 scheduler”
+
+---
+
+## 为什么？
+
+因为：
+
+# topology stabilization
+比
+# optimization
+
+重要得多。
+
+---
+
+# 推荐：
+
+Phase 2：
+
+只做：
+
+```text id="5uy0t0"
+bounded concurrency
+```
+
+例如：
+
+```rust id="63jlwm"
+Semaphore
+```
+
+控制：
+
+- extraction concurrency
+- expansion concurrency
+
+即可。
+
+---
+
+# 不要太早做：
+
+```text id="k0tx8s"
+resource-aware scheduling
+```
+
+否则：
+
+# complexity jump 会很大。
+
+---
+
+# 5. T2 建议加入：
+
+# “Task Ownership”
+
+这是非常关键的 runtime 概念。
+
+---
+
+# 每个 task：
+
+必须明确：
+
+```text id="vc41y4"
+谁创建
+谁取消
+谁 cleanup
+谁 emit event
+```
+
+否则：
+
+后面：
+
+```text id="vqvchd"
+CancellationToken
+```
+
+会开始混乱。
+
+---
+
+# 6. T3 的 Materialization
+
+我建议：
+
+# 不要默认 atomic move
+
+---
+
+## 为什么？
+
+因为：
+
+Linux：
+
+```text id="l9xov5"
+rename()
+```
+
+是 atomic。
+
+但：
+
+- overlayfs
+- docker bind mount
+- network fs
+
+不一定。
+
+---
+
+# 所以：
+
+真正需要的是：
+
+# “commit protocol”
+
+而不是：
+
+```text id="72t4hb"
+rename == atomic
+```
+
+---
+
+# 推荐：
+
+```rust id="09z26f"
+trait Materializer {
+    async fn prepare();
+
+    async fn commit();
+
+    async fn rollback();
+}
+```
+
+---
+
+# 五、我认为整个计划最优秀的地方
+
+是：
+
+# 它没有试图“一步到位”
+
+这是成熟工程师最明显的特征。
+
+---
+
+# 因为真正危险的是：
+
+```text id="qk9u6d"
+边修 bug
+边大重构
+边改 backend
+边改 async
+```
+
+最后：
+
+# 谁都不敢 merge。
+
+---
+
+# 六、我会如何进一步具体化
+
+我会把：
+
+# T1
+
+进一步拆成：
+
+---
+
+## T1-A
+
+### topology extraction
+
+引入：
+
+- Artifact
+- ExpansionTask
+- NodeId
+
+但：
+
+# 不动 backend
+
+---
+
+## T1-B
+
+### backend normalization
+
+引入：
+
+- RawArchiveEntry
+- raw filename bytes
+- encoding resolver
+
+---
+
+## T1-C
+
+### graph formalization
+
+引入：
+
+- ArchiveGraph
+- State machine
+- event pipeline
+
+---
+
+# 七、我最赞同的战略判断
+
+是：
+
+# “先把 runtime topology 纠正”
+
+不是：
+
+```text id="c3njlwm"
+先追求 feature completeness
+```
+
+因为：
+
+# topology 错了
+
+后面：
+
+- async
+- scheduler
+- persistence
+- GUI
+
+都会变成：
+
+# 放大器
+
+把问题指数级放大。
+
+---
+
+# 八、最终评价
+
+这个计划已经不是：
+
+```text id="xmm6v1"
+普通开源项目修 bug
+```
+
+了。
+
+而是：
+
+# 一个中型系统的架构演进路线图。
+
+而且：
+
+# 节奏感很好。
+
+既：
+
+- 不会长期忍受致命 bug
+- 又不会过早重写整个世界
+
+这是最难得的部分。
+
