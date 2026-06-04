@@ -42,6 +42,8 @@ GUI、压缩、预览和系统集成不阻塞核心迁移。
 - `.part01.rar` 已识别为首卷。
 - offset 内嵌归档已支持 carve 临时文件。
 - backend future panic 已隔离。
+- `7zz` / `7z` 的 `-scs` 参数实测应使用数字形式如 `-scs936`、`-scs932`、`-scs949`、`-scs950`；`-scsCP936` 这类写法会被新版和旧版 CLI 同时拒绝。
+- 当前外部 `7zz` 即使接受 `-scs{id}`，也仍不能可靠修正我们这些 legacy ZIP fixture 的文件名解码；因此 Phase 0 只修“显式 encoding 参数透传”，完整 ZIP 编码正确性留到 Phase 2 原生 ZIP 后端。
 
 ## Phase 1 - 安全预算与事务式输出
 
@@ -69,7 +71,9 @@ GUI、压缩、预览和系统集成不阻塞核心迁移。
 | P2-4 | 编码解析 | UTF-8、GBK / GB18030、Big5、Shift_JIS、EUC-KR；低置信度请求确认 |
 | P2-5 | 路径安全 | 默认拒绝 `../`、绝对路径、盘符路径和输出目录外部符号链接 |
 | P2-6 | `smartzip list` | 展示目录树、编码候选、加密状态、危险路径和预估大小 |
-| P2-7 | fallback 路由 | ZIP 优先原生后端；7z AES、RAR 和复杂格式继续使用 PATH 中的 `7zz` / `7z` |
+| P2-7 | fallback 路由 | 增加 `BackendRouter`：ZIP 优先 `NativeZipBackend`；RAR 优先 `UnrarBackend`，失败或不可用时回退 `SevenZipCliBackend`；复杂格式继续使用 PATH 中的 `7zz` / `7z` |
+| P2-8 | `UnrarBackend` | 评估 `unrar` crate 和 `unrar` CLI；覆盖 RAR4 / RAR5、加密 RAR、RAR 分卷的 list / test / extract；不支持 compress |
+| P2-9 | `NativeSevenZipBackend` 评估 | 先评估 `sevenz-rust2`，备选 `zesven`；仅在库能力实测覆盖后接入，复杂 7z 继续回退 `SevenZipCliBackend` |
 
 ## Phase 3 - 密码库与高性能尝试
 

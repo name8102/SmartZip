@@ -120,12 +120,26 @@ NativeZipBackend
 ├── Zip Slip 与危险符号链接检查
 └── 输出统计
 
-SevenZipBackend
+NativeSevenZipBackend
+├── 第一候选：sevenz-rust2
+├── 备选：zesven
+├── 仅覆盖库能力已验证的 7z 场景
+└── 不负责 RAR 和复杂分卷
+
+UnrarBackend
+├── 优先使用 unrar crate；若能力或平台覆盖不足，使用 unrar CLI
+├── 专门处理 RAR4 / RAR5、加密 RAR 和 RAR 分卷
+├── 作为 7zz 解压 RAR 部分失败时的优先 fallback
+└── 仅提供 list / test / extract，不提供 compress
+
+SevenZipCliBackend
 ├── 7z AES
-├── RAR4 / RAR5
-├── 分卷和复杂格式
-└── 个人使用阶段仅查找 PATH 中的 7zz / 7z
+├── RAR、分卷和复杂格式的最终 fallback
+├── 个人使用阶段仅查找 PATH 中的 7zz / 7z
+└── 保留为疑难格式和库级后端能力缺口的兜底
 ```
+
+后端路由以格式和能力为先，而不是固定单一后端：ZIP 优先 `NativeZipBackend`；RAR 优先 `UnrarBackend`，失败或不可用时回退 `SevenZipCliBackend`；7z 优先评估 `NativeSevenZipBackend`，未覆盖的 7z AES、分卷或复杂格式回退 `SevenZipCliBackend`。路由层需要记录实际使用的 backend、失败原因和 fallback 链路，便于诊断“部分文件失败”这类问题。
 
 `ArchiveBackend::list()` 需要演进为可表达原始文件名字节的模型，例如 `RawArchiveEntry`。`PathBuf` 只能作为完成编码决策后的输出路径，不能作为归档元数据的唯一表示。
 
@@ -177,7 +191,7 @@ SmartZip 新版采用 **Rust workspace 单仓库多 crate 架构**。
 2. **GUI 与 CLI 共享同一套核心引擎**：避免 GUI/CLI 行为分叉。
 3. **GPUI 只负责界面和交互**：不承载业务规则。
 4. **MVP 优先 Linux/macOS**：系统右键菜单等深度集成后置。
-5. **Native ZIP + 7zz fallback**：第一阶段实现原生 ZIP 后端；7z AES、RAR、分卷和复杂格式继续使用外部 7zz。
+5. **Native ZIP + format-specific fallback**：第一阶段实现原生 ZIP 后端；RAR 增加 `UnrarBackend`；7z 评估 `sevenz-rust2`，备选 `zesven`；复杂格式最终回退外部 7zz。
 6. **SQLite 管理高频数据**：密码库、排序统计、任务历史、编码检测历史、内嵌检测历史使用 SQLite。
 
 ## 2. 总体架构
@@ -307,7 +321,24 @@ pub trait ArchiveBackend: Send + Sync {
 MVP 后端：
 
 ```text
-SevenZipBackend
+BackendRouter
+├── 按格式和 capabilities 选择后端
+├── 记录实际后端、失败原因和 fallback 链路
+└── 对 engine 暴露统一 ArchiveBackend 行为
+
+NativeZipBackend
+├── zip crate
+├── ZIP ZipCrypto / AES
+├── 原始文件名字节和编码恢复
+└── 路径安全检查
+
+UnrarBackend
+├── unrar crate 或 unrar CLI
+├── RAR4 / RAR5、加密 RAR、RAR 分卷
+├── list / test / extract
+└── 作为 RAR 默认后端；失败或不可用时回退 SevenZipCliBackend
+
+SevenZipCliBackend
 ├── 查找 bundled 7zz
 ├── 查找系统 PATH 中的 7zz/7z
 ├── 解析 7zz list/test/extract 输出
@@ -317,8 +348,13 @@ SevenZipBackend
 后续后端：
 
 ```text
-LibArchiveBackend / ZipBackend
-├── zip/tar/gz/bz2/xz 等常见格式
+NativeSevenZipBackend
+├── 优先评估 sevenz-rust2
+├── 备选 zesven
+└── 覆盖已验证的 7z 场景，复杂 7z 继续回退 SevenZipCliBackend
+
+LibArchiveBackend
+├── tar/gz/bz2/xz 等常见格式
 ├── 更细粒度路径安全检查
 └── 用作 7zz 的补充或替代
 ```

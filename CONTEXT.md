@@ -47,10 +47,10 @@
 **Rationale**: 消除 CLI 的"卡死感"——用户实时看到进度。返回值保留供测试断言和最终统计。
 **Trade-off**: 有界通道需要定义背压策略，不能让高频进度事件拖慢解压。
 
-### ADR-003: Mixed backend — Rust libs + 7zz fallback
-**Decision**: 第一阶段实现 `NativeZipBackend`；7z AES、rar、分卷和复杂格式继续通过 `SevenZipBackend` fallback。路由对 engine 透明。
-**Rationale**: ZIP 是编码恢复、路径安全和高性能密码表遍历的关键格式；7zz 覆盖 Rust 生态未支持的复杂格式。
-**Trade-off**: 多后端增加测试矩阵，同一功能在不同后端上的能力必须明确标记。
+### ADR-003: Mixed backend — Rust libs + format-specific fallback
+**Decision**: 第一阶段实现 `NativeZipBackend`；RAR 增加 `UnrarBackend`，优先评估 `unrar` crate，必要时使用 `unrar` CLI；7z 增加 `NativeSevenZipBackend` 评估，先看 `sevenz-rust2`，备选 `zesven`；复杂格式和库级能力缺口继续通过 `SevenZipCliBackend` fallback。路由对 engine 透明。
+**Rationale**: ZIP 是编码恢复、路径安全和高性能密码表遍历的关键格式；RAR 在 7zz 解压中已出现部分失败，需要格式专用后端提高成功率和诊断质量；7zz 仍覆盖 Rust 生态未支持的复杂格式。
+**Trade-off**: 多后端增加测试矩阵，同一功能在不同后端上的能力必须明确标记，并记录实际后端、失败原因和 fallback 链路。
 
 ### ADR-004: Two-phase incremental implementation
 **Decision**: 不整体迁移，不提前拆分新的 graph/scheduler/events crate。先修复现有行为错误和安全预算，再实现 Native ZIP、密码 worker pool、动态 ArchiveNode，最后接入事件流和 GUI。

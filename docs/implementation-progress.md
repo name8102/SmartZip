@@ -163,20 +163,16 @@ Result: all 18 tests passed. CLI `extract` and `detect` commands render help cor
 - Offset-level embedded extraction is still detection-only; next stage can add extraction from embedded offsets.
 - `smartzip extract` at this point requires a working `7z`/`7zz` in PATH to process real archives.
 
-## 2026-05-20 — Stage 6: smart output + real 7z integration test
+## 2026-05-20 — Stage 6: real 7z integration test
 
 ### Scope
 
-- Add smart output structure decision after extraction: one entry → collapse to parent dir; multiple entries → keep directory.
 - Write a real end-to-end test that uses `7z` to create a zip, then runs `extract_recursive` through `SevenZipBackend`, `PasswordService`, and the engine.
 
 ### Changed
 
 - `crates/smartzip-engine`
-  - Added `collapse_single_output` function.
-  - Wired it into `extract_recursive` after extraction completes, before nested candidate discovery.
-  - Emits `TaskEventKind::OutputCreated` with the final (collapsed or original) path.
-  - Updated `FakeBackend` test to emit two output files to prevent unintended single-file collapse.
+  - Keeps extracted output at the candidate output directory and emits `TaskEventKind::OutputCreated`.
   - Added integration test `extract_via_real_seven_zip_with_smart_output`.
 
 ### Validation
@@ -192,14 +188,12 @@ Result: all 19 tests passed, including the real 7z integration test that creates
 7z a .../test.zip .../hello.txt   (creates zip)
     → engine.extract_recursive
     → SevenZipBackend (7z x ...)
-    → collapse_single_output
     → verify hello.txt exists in output
 ```
 
 ### Notes
 
-- The collapser moves a single extraction output to `parent/<archive-stem>`. For multiple outputs it leaves the extraction directory intact.
-- The real 7z test validates the full stack: 7z binary → `SevenZipBackend::extract` → `extract_recursive` → output decision.
+- The real 7z test validates the full stack: 7z binary → `SevenZipBackend::extract` → `extract_recursive`.
 
 ## 2026-05-20 — Stage 7: encoding detection via chardetng
 
@@ -291,6 +285,9 @@ Result: all 23 tests pass, 0 errors.
 
 - The encoding detection currently feeds all entry name bytes concatenated; for archives with mixed-encoding entries this may produce suboptimal results. Future improvement: per-entry encoding detection.
 - The encoding override `--encoding gb18030` skips detection entirely, useful for known-correct encodings.
+- 2026-06-04 re-verified on `7zz 26.01 (arm64)`: charset switches must use numeric `-scs{id}` forms such as `-scs936`, `-scs932`, `-scs949`, and `-scs950`. `-scsCP936` / `-scsCP932` / `-scsCP950` are rejected as unsupported charsets.
+- Even with accepted numeric `-scs{id}` switches, current `7zz` still does not correctly decode these non-UTF-8 ZIP entry names in our fixtures. Phase 0 therefore treats explicit encoding override as a backend request propagation fix, not as a full ZIP filename decoding fix.
+- Correct decoding of legacy ZIP filenames remains a Phase 2 concern under the native ZIP backend work.
 
 ## 2026-05-20 — Stage 10: password CLI subcommands
 
