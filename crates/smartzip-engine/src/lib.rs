@@ -13,9 +13,9 @@ use std::fs::File;
 use std::future::Future;
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::panic::AssertUnwindSafe;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use std::path::{Path, PathBuf};
 
 /// Allows interactive password prompting during extraction.
 ///
@@ -49,11 +49,7 @@ pub trait InteractiveOutputPrompter: Send + Sync {
     /// Implementations should use `spawn_blocking` for terminal I/O so the
     /// async runtime can continue extracting unrelated archives while the
     /// user decides.
-    async fn prompt(
-        &self,
-        archive_path: PathBuf,
-        output_path: PathBuf,
-    ) -> OutputCollisionStrategy;
+    async fn prompt(&self, archive_path: PathBuf, output_path: PathBuf) -> OutputCollisionStrategy;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -405,6 +401,7 @@ impl SmartZipEngine {
                     backend.test(TestRequest {
                         archive: archive_path.clone(),
                         password: pw_value.clone(),
+                        encoding: request.encoding_mode.clone(),
                     }),
                 )
                 .await
@@ -413,8 +410,7 @@ impl SmartZipEngine {
                         let _ = passwords.record_success(password);
 
                         // B2: If pre-list failed (encrypted archive), detect encoding now
-                        if encoding_result.is_none()
-                            && request.encoding_mode == EncodingMode::Auto
+                        if encoding_result.is_none() && request.encoding_mode == EncodingMode::Auto
                         {
                             if let Ok(listing) = backend_call(
                                 "archive-backend",
@@ -431,9 +427,7 @@ impl SmartZipEngine {
                                 let raw_names: Vec<u8> = listing
                                     .entries
                                     .iter()
-                                    .flat_map(|entry| {
-                                        entry.path.as_os_str().as_encoded_bytes()
-                                    })
+                                    .flat_map(|entry| entry.path.as_os_str().as_encoded_bytes())
                                     .copied()
                                     .collect();
                                 if !raw_names.is_empty() {
@@ -451,11 +445,9 @@ impl SmartZipEngine {
                                                 candidates: result
                                                     .candidates
                                                     .iter()
-                                                    .map(|c| {
-                                                        smartzip_core::EncodingCandidate {
-                                                            name: c.name.clone(),
-                                                            confidence: c.confidence,
-                                                        }
+                                                    .map(|c| smartzip_core::EncodingCandidate {
+                                                        name: c.name.clone(),
+                                                        confidence: c.confidence,
                                                     })
                                                     .collect(),
                                             },
@@ -469,7 +461,7 @@ impl SmartZipEngine {
                         let encoding_to_use = encoding_result
                             .as_ref()
                             .map(|r| EncodingMode::Override(r.selected.clone()))
-                            .unwrap_or(EncodingMode::Auto);
+                            .unwrap_or_else(|| request.encoding_mode.clone());
 
                         // Single extract with the correct password + encoding
                         match backend_call(
@@ -495,15 +487,15 @@ impl SmartZipEngine {
                         }
                     }
                     Ok(_) => {
-                        let _ = passwords.record_failure(password);
+                        // test returned non-ok result. Do not mark password as failed here
+                        // because non-ok can indicate corruption/IO rather than wrong pw.
                     }
                     Err(error) => {
-                        let _ = passwords.record_failure(password);
-                        // WrongPassword is expected during test — only save serious errors
-                        if !matches!(
-                            &error,
-                            smartzip_core::SmartZipError::WrongPassword { .. }
-                        ) {
+                        // Only record password failure when error explicitly indicates wrong password.
+                        if matches!(&error, smartzip_core::SmartZipError::WrongPassword { .. }) {
+                            let _ = passwords.record_failure(password);
+                        } else {
+                            // treat other errors as backend/IO failures, surface for reporting
                             last_error = Some(error);
                         }
                     }
@@ -511,40 +503,70 @@ impl SmartZipEngine {
             }
 
             if !extracted {
-                // Interactive fallback: prompt the user for a password
+                // Interactive fallback: prompt the user for a password. Use test->extract
+                // and reuse the materialized archive path (carved temp when embedded).
                 if let Some(prompter) = password_prompter {
                     if let Some(interactive_pw) = prompter.prompt(&candidate.path).await {
                         let pw = interactive_pw.trim().to_string();
                         if !pw.is_empty() {
+                            // Test first using the same archive_path used above
                             match backend_call(
                                 "archive-backend",
-                                "extract",
-                                &candidate.path,
-                                backend.extract(ExtractArchiveRequest {
-                                    archive: candidate.path.clone(),
-                                    output_dir: output_dir.clone(),
+                                "test",
+                                &archive_path,
+                                backend.test(TestRequest {
+                                    archive: archive_path.clone(),
                                     password: Some(pw.clone()),
-                                    encoding: encoding_result
-                                        .as_ref()
-                                        .map(|r| EncodingMode::Override(r.selected.clone()))
-                                        .unwrap_or(EncodingMode::Auto),
+                                    encoding: request.encoding_mode.clone(),
                                 }),
                             )
                             .await
                             {
+                                Ok(result) if result.ok => {
+                                    match backend_call(
+                                        "archive-backend",
+                                        "extract",
+                                        &archive_path,
+                                        backend.extract(ExtractArchiveRequest {
+                                            archive: archive_path.clone(),
+                                            output_dir: output_dir.clone(),
+                                            password: Some(pw.clone()),
+                                            encoding: encoding_result
+                                                .as_ref()
+                                                .map(|r| EncodingMode::Override(r.selected.clone()))
+                                                .unwrap_or_else(|| request.encoding_mode.clone()),
+                                        }),
+                                    )
+                                    .await
+                                    {
+                                        Ok(_) => {
+                                            // Save successful interactive password to DB
+                                            let _ = passwords.record_success(&PasswordCandidate {
+                                                id: None,
+                                                value: pw.clone(),
+                                                source: smartzip_passwords::PasswordSource::Manual,
+                                            });
+                                            extracted = true;
+                                        }
+                                        Err(error) => {
+                                            eprintln!(
+                                                "Interactive extract failed for {}: {}",
+                                                archive_path.display(),
+                                                error
+                                            );
+                                        }
+                                    }
+                                }
                                 Ok(_) => {
-                                    // Save the successful interactive password to DB
-                                    let _ = passwords.record_success(&PasswordCandidate {
-                                        id: None,
-                                        value: pw,
-                                        source: smartzip_passwords::PasswordSource::Manual,
-                                    });
-                                    extracted = true;
+                                    eprintln!(
+                                        "Interactive password did not validate for {}",
+                                        archive_path.display()
+                                    );
                                 }
                                 Err(error) => {
                                     eprintln!(
-                                        "Interactive password failed for {}: {}",
-                                        candidate.path.display(),
+                                        "Interactive password test failed for {}: {}",
+                                        archive_path.display(),
                                         error
                                     );
                                 }
@@ -660,10 +682,14 @@ struct PendingOutputConflict<'a> {
     prompt: Pin<Box<dyn Future<Output = OutputCollisionStrategy> + Send + 'a>>,
 }
 
-fn materialize_archive_input(candidate: &ExtractionCandidate) -> smartzip_core::Result<ArchiveInput> {
+fn materialize_archive_input(
+    candidate: &ExtractionCandidate,
+) -> smartzip_core::Result<ArchiveInput> {
     if let Some(offset) = candidate.embedded_offset.filter(|offset| *offset > 0) {
         let temp = carve_embedded_archive(&candidate.path, offset, candidate.embedded_size)
-            .map_err(|source| smartzip_core::SmartZipError::io(Some(candidate.path.clone()), source))?;
+            .map_err(|source| {
+                smartzip_core::SmartZipError::io(Some(candidate.path.clone()), source)
+            })?;
         let path = temp.path().to_path_buf();
         Ok(ArchiveInput {
             path,
@@ -735,7 +761,8 @@ fn apply_output_collision_strategy(
                 .unwrap_or_else(|| std::ffi::OsStr::new("archive"));
             let renamed_output_dir = find_non_colliding_name(parent, file_name);
             let mut candidate = candidate;
-            candidate.relative_path = output_relative_path_for(&request.output_dir, &renamed_output_dir);
+            candidate.relative_path =
+                output_relative_path_for(&request.output_dir, &renamed_output_dir);
             output_overrides.insert(candidate_key(&candidate), renamed_output_dir);
             queue.push_front(candidate);
         }
@@ -824,7 +851,7 @@ fn discover_nested_candidates(
 ) -> Vec<ExtractionCandidate> {
     let mut candidates = Vec::new();
 
-    // Handle single-file roots (produced by collapse_single_output).
+    // Handle single-file roots directly when a candidate resolves to one file.
     if root.is_file() {
         if let Some(format) = format_from_extension(root) {
             candidates.push(ExtractionCandidate {
@@ -861,7 +888,12 @@ fn discover_nested_candidates(
         if path.is_dir() {
             let mut next_prefix = prefix.to_path_buf();
             next_prefix.push(entry.file_name());
-            candidates.extend(discover_nested_candidates(scanner, &path, depth, &next_prefix));
+            candidates.extend(discover_nested_candidates(
+                scanner,
+                &path,
+                depth,
+                &next_prefix,
+            ));
             continue;
         }
 
@@ -964,6 +996,7 @@ pub fn format_from_extension(path: impl AsRef<std::path::Path>) -> Option<Archiv
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    use rstest::*;
     use smartzip_archive::{
         ArchiveBackend, ArchiveListing, ArchiveProbe, BackendCapabilities, CompressArchiveRequest,
         CompressArchiveResult, ExtractArchiveRequest, ExtractArchiveResult, ListRequest,
@@ -972,7 +1005,6 @@ mod tests {
     use smartzip_db::{password::PasswordRepository, SmartZipDb};
     use smartzip_passwords::{PasswordCandidateRequest, PasswordService};
     use smartzip_scanner::ScanMode;
-    use rstest::*;
     use std::sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
@@ -1044,7 +1076,10 @@ mod tests {
     #[case("no-extension", None)]
     #[case("a.ZIP", Some(ArchiveFormat::Zip))]
     #[case("A.7Z", Some(ArchiveFormat::SevenZip))]
-    fn format_from_extension_parametrized(#[case] path: &str, #[case] expected: Option<ArchiveFormat>) {
+    fn format_from_extension_parametrized(
+        #[case] path: &str,
+        #[case] expected: Option<ArchiveFormat>,
+    ) {
         assert_eq!(format_from_extension(path), expected);
     }
 
@@ -1225,21 +1260,20 @@ mod tests {
         };
 
         let engine = SmartZipEngine::default();
-        let result = engine
-            .extract_recursive(
-                &backend,
-                &service,
-                ExtractWorkflowRequest {
-                    inputs: vec![conflict.clone(), other.clone()],
-                    output_dir: output,
-                    recursion_limit: 1,
-                    encoding_mode: EncodingMode::Auto,
-                    scanner: ScannerConfig::default(),
-                    password_candidates: PasswordCandidateRequest::default(),
-                },
-                None,
-                Some(&output_prompter),
-            );
+        let result = engine.extract_recursive(
+            &backend,
+            &service,
+            ExtractWorkflowRequest {
+                inputs: vec![conflict.clone(), other.clone()],
+                output_dir: output,
+                recursion_limit: 1,
+                encoding_mode: EncodingMode::Auto,
+                scanner: ScannerConfig::default(),
+                password_candidates: PasswordCandidateRequest::default(),
+            },
+            None,
+            Some(&output_prompter),
+        );
 
         let backend_calls = backend.calls.clone();
         let observe_other = async {
@@ -1274,6 +1308,239 @@ mod tests {
             .processed
             .iter()
             .any(|candidate| candidate.path == other));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[derive(Clone, Default)]
+    struct EncodingAwareBackend {
+        seen_test_encodings: Arc<Mutex<Vec<EncodingMode>>>,
+        seen_extract_encodings: Arc<Mutex<Vec<EncodingMode>>>,
+    }
+
+    #[async_trait]
+    impl ArchiveBackend for EncodingAwareBackend {
+        async fn probe(&self, path: &std::path::Path) -> smartzip_core::Result<ArchiveProbe> {
+            Ok(ArchiveProbe {
+                path: path.to_path_buf(),
+                format: Some(ArchiveFormat::Zip),
+                encrypted: Some(false),
+                supported: true,
+            })
+        }
+
+        async fn list(&self, _request: ListRequest) -> smartzip_core::Result<ArchiveListing> {
+            Ok(ArchiveListing {
+                format: Some(ArchiveFormat::Zip),
+                entries: Vec::new(),
+            })
+        }
+
+        async fn test(&self, request: TestRequest) -> smartzip_core::Result<TestResult> {
+            self.seen_test_encodings
+                .lock()
+                .unwrap()
+                .push(request.encoding);
+            Ok(TestResult {
+                ok: true,
+                encrypted: Some(false),
+            })
+        }
+
+        async fn extract(
+            &self,
+            request: ExtractArchiveRequest,
+        ) -> smartzip_core::Result<ExtractArchiveResult> {
+            self.seen_extract_encodings
+                .lock()
+                .unwrap()
+                .push(request.encoding);
+            std::fs::create_dir_all(&request.output_dir).map_err(|source| {
+                smartzip_core::SmartZipError::io(Some(request.output_dir.clone()), source)
+            })?;
+            Ok(ExtractArchiveResult {
+                output_dir: request.output_dir,
+            })
+        }
+
+        async fn compress(
+            &self,
+            request: CompressArchiveRequest,
+        ) -> smartzip_core::Result<CompressArchiveResult> {
+            Ok(CompressArchiveResult {
+                output: request.output,
+            })
+        }
+
+        fn capabilities(&self) -> BackendCapabilities {
+            BackendCapabilities {
+                can_extract: vec![ArchiveFormat::Zip],
+                can_compress: vec![ArchiveFormat::Zip],
+                supports_passwords: true,
+                supports_listing: true,
+                supports_test: true,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_encoding_override_is_preserved_for_test_and_extract() {
+        let root =
+            std::env::temp_dir().join(format!("smartzip-engine-encoding-{}", std::process::id()));
+        let input = root.join("root.zip");
+        let output = root.join("out");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(&input, b"not really a zip").unwrap();
+
+        let backend = EncodingAwareBackend::default();
+        let db = SmartZipDb::in_memory().unwrap();
+        let service = PasswordService::new(PasswordRepository::new(db.connection()));
+
+        let engine = SmartZipEngine::default();
+        let result = engine
+            .extract_recursive(
+                &backend,
+                &service,
+                ExtractWorkflowRequest {
+                    inputs: vec![input.clone()],
+                    output_dir: output,
+                    recursion_limit: 0,
+                    encoding_mode: EncodingMode::Override("gbk".into()),
+                    scanner: ScannerConfig::default(),
+                    password_candidates: PasswordCandidateRequest::default(),
+                },
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.processed.len(), 1);
+        assert_eq!(
+            backend.seen_test_encodings.lock().unwrap().as_slice(),
+            &[EncodingMode::Override("gbk".into())]
+        );
+        assert_eq!(
+            backend.seen_extract_encodings.lock().unwrap().as_slice(),
+            &[EncodingMode::Override("gbk".into())]
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[derive(Clone, Default)]
+    struct FailingTestBackend;
+
+    #[async_trait]
+    impl ArchiveBackend for FailingTestBackend {
+        async fn probe(&self, path: &std::path::Path) -> smartzip_core::Result<ArchiveProbe> {
+            Ok(ArchiveProbe {
+                path: path.to_path_buf(),
+                format: Some(ArchiveFormat::Zip),
+                encrypted: Some(true),
+                supported: true,
+            })
+        }
+
+        async fn list(&self, _request: ListRequest) -> smartzip_core::Result<ArchiveListing> {
+            Ok(ArchiveListing {
+                format: Some(ArchiveFormat::Zip),
+                entries: Vec::new(),
+            })
+        }
+
+        async fn test(&self, request: TestRequest) -> smartzip_core::Result<TestResult> {
+            Err(smartzip_core::SmartZipError::BackendFailed {
+                backend: "test-backend".into(),
+                exit_code: Some(2),
+                stderr: format!("i/o failure while testing {}", request.archive.display()),
+            })
+        }
+
+        async fn extract(
+            &self,
+            request: ExtractArchiveRequest,
+        ) -> smartzip_core::Result<ExtractArchiveResult> {
+            Ok(ExtractArchiveResult {
+                output_dir: request.output_dir,
+            })
+        }
+
+        async fn compress(
+            &self,
+            request: CompressArchiveRequest,
+        ) -> smartzip_core::Result<CompressArchiveResult> {
+            Ok(CompressArchiveResult {
+                output: request.output,
+            })
+        }
+
+        fn capabilities(&self) -> BackendCapabilities {
+            BackendCapabilities {
+                can_extract: vec![ArchiveFormat::Zip],
+                can_compress: vec![ArchiveFormat::Zip],
+                supports_passwords: true,
+                supports_listing: true,
+                supports_test: true,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn backend_failures_do_not_record_password_failures() {
+        let root = std::env::temp_dir().join(format!(
+            "smartzip-engine-backend-fail-{}",
+            std::process::id()
+        ));
+        let input = root.join("root.zip");
+        let output = root.join("out");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(&input, b"not really a zip").unwrap();
+
+        let backend = FailingTestBackend;
+        let db = SmartZipDb::in_memory().unwrap();
+        let repo = PasswordRepository::new(db.connection());
+        let password_id = repo
+            .upsert(smartzip_db::password::NewPassword {
+                value: "candidate-password",
+                source: "test",
+                pinned: false,
+            })
+            .unwrap();
+        let service = PasswordService::new(PasswordRepository::new(db.connection()));
+
+        let engine = SmartZipEngine::default();
+        let result = engine
+            .extract_recursive(
+                &backend,
+                &service,
+                ExtractWorkflowRequest {
+                    inputs: vec![input],
+                    output_dir: output,
+                    recursion_limit: 0,
+                    encoding_mode: EncodingMode::Auto,
+                    scanner: ScannerConfig::default(),
+                    password_candidates: PasswordCandidateRequest {
+                        manual: Vec::new(),
+                        clipboard: None,
+                        include_empty: false,
+                        limit: 8,
+                    },
+                },
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.processed.is_empty());
+        let stored = PasswordRepository::new(db.connection())
+            .ranked_candidates(10)
+            .unwrap()
+            .into_iter()
+            .find(|record| record.id == password_id)
+            .unwrap();
+        assert_eq!(stored.failure_count, 0);
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -1463,7 +1730,11 @@ mod tests {
             .unwrap();
 
         let calls = backend.calls.lock().unwrap().clone();
-        assert_eq!(calls.len(), 2, "expected root archive and nested archive calls");
+        assert_eq!(
+            calls.len(),
+            2,
+            "expected root archive and nested archive calls"
+        );
         assert_ne!(calls[0].0, disguised.display().to_string());
         assert!(calls[0].1, "carved archive should start with zip magic");
         assert!(calls[1].0.ends_with("nested.zip"));

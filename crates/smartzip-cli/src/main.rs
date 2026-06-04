@@ -4,12 +4,12 @@ use smartzip_archive::SevenZipBackend;
 use smartzip_core::EncodingMode;
 use smartzip_db::{password::PasswordRepository, SmartZipDb};
 use smartzip_engine::{
-    DetectRequest, ExtractWorkflowRequest, InteractiveOutputPrompter,
-    InteractivePasswordPrompter, OutputCollisionStrategy, SmartZipEngine,
+    DetectRequest, ExtractWorkflowRequest, InteractiveOutputPrompter, InteractivePasswordPrompter,
+    OutputCollisionStrategy, SmartZipEngine,
 };
 use smartzip_passwords::{PasswordCandidateRequest, PasswordService};
-use smartzip_scanner::{Confidence, ScanMode, ScannerConfig};
 use smartzip_platform::PlatformPaths;
+use smartzip_scanner::{Confidence, ScanMode, ScannerConfig};
 use std::path::{Path, PathBuf};
 
 const DEFAULT_RECURSION_LIMIT: u8 = 3;
@@ -218,7 +218,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 fn open_db(path: Option<PathBuf>) -> Result<SmartZipDb, Box<dyn std::error::Error>> {
     let db = match path {
         Some(path) => SmartZipDb::open(&path).map_err(|e| {
-            eprintln!("warning: failed to open database at {}: {}", path.display(), e);
+            eprintln!(
+                "warning: failed to open database at {}: {}",
+                path.display(),
+                e
+            );
             e
         })?,
         None => {
@@ -226,7 +230,11 @@ fn open_db(path: Option<PathBuf>) -> Result<SmartZipDb, Box<dyn std::error::Erro
             paths.ensure_dirs()?;
             let db_path = paths.db_path();
             SmartZipDb::open(&db_path).map_err(|e| {
-                eprintln!("warning: failed to open database at {}: {}", db_path.display(), e);
+                eprintln!(
+                    "warning: failed to open database at {}: {}",
+                    db_path.display(),
+                    e
+                );
                 e
             })?
         }
@@ -234,7 +242,9 @@ fn open_db(path: Option<PathBuf>) -> Result<SmartZipDb, Box<dyn std::error::Erro
 
     match db.db_path() {
         Some(p) => eprintln!("Database: {}", p.display()),
-        None => eprintln!("warning: using in-memory database — passwords will NOT be saved to disk"),
+        None => {
+            eprintln!("warning: using in-memory database — passwords will NOT be saved to disk")
+        }
     }
 
     Ok(db)
@@ -312,9 +322,6 @@ async fn extract(
 
     let backend = SevenZipBackend::locate(&smartzip_archive::SevenZipLocator::default())?;
     let service = PasswordService::new(PasswordRepository::new(db.connection()));
-    for password in &manual_passwords {
-        service.add_password(password, "manual", false)?;
-    }
 
     let engine = SmartZipEngine::default();
     let result = engine
@@ -350,7 +357,10 @@ async fn extract(
                     smartzip_core::EncodingMode::Auto => "auto",
                     smartzip_core::EncodingMode::Override(s) => s.as_str(),
                 };
-                println!("  encoding: {encoding} (confidence: {:.0}%)", detection.confidence * 100.0);
+                println!(
+                    "  encoding: {encoding} (confidence: {:.0}%)",
+                    detection.confidence * 100.0
+                );
             }
             smartzip_core::TaskEventKind::OutputCreated { path } => {
                 println!("  -> {}", path.display());
@@ -391,7 +401,20 @@ async fn extract(
         }
     }
 
-    Ok(())
+    std::process::exit(extraction_exit_code(
+        result.processed.len(),
+        result.skipped.len(),
+    ));
+}
+
+fn extraction_exit_code(processed_count: usize, skipped_count: usize) -> i32 {
+    if processed_count > 0 && skipped_count == 0 {
+        0
+    } else if processed_count > 0 && skipped_count > 0 {
+        2
+    } else {
+        1
+    }
 }
 
 fn password(db: &SmartZipDb, cmd: PasswordCmd) -> Result<(), Box<dyn std::error::Error>> {
@@ -565,11 +588,7 @@ struct StdinOutputPrompter;
 
 #[async_trait]
 impl InteractiveOutputPrompter for StdinOutputPrompter {
-    async fn prompt(
-        &self,
-        archive_path: PathBuf,
-        output_path: PathBuf,
-    ) -> OutputCollisionStrategy {
+    async fn prompt(&self, archive_path: PathBuf, output_path: PathBuf) -> OutputCollisionStrategy {
         tokio::task::spawn_blocking(move || {
             use std::io::{self, IsTerminal, Write};
 
@@ -605,5 +624,26 @@ impl InteractiveOutputPrompter for StdinOutputPrompter {
         })
         .await
         .unwrap_or(OutputCollisionStrategy::Skip)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extraction_exit_code;
+
+    #[test]
+    fn exit_code_is_success_when_all_candidates_process() {
+        assert_eq!(extraction_exit_code(1, 0), 0);
+    }
+
+    #[test]
+    fn exit_code_is_partial_when_some_candidates_are_skipped() {
+        assert_eq!(extraction_exit_code(2, 1), 2);
+    }
+
+    #[test]
+    fn exit_code_is_failure_when_nothing_processes() {
+        assert_eq!(extraction_exit_code(0, 3), 1);
+        assert_eq!(extraction_exit_code(0, 0), 1);
     }
 }

@@ -32,10 +32,7 @@ impl SmartZipDb {
     pub fn in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         schema::migrate(&conn)?;
-        Ok(Self {
-            conn,
-            path: None,
-        })
+        Ok(Self { conn, path: None })
     }
 
     pub fn connection(&self) -> &Connection {

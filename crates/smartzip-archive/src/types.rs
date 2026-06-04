@@ -43,6 +43,7 @@ pub struct ArchiveListing {
 pub struct TestRequest {
     pub archive: PathBuf,
     pub password: Option<String>,
+    pub encoding: EncodingMode,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -303,8 +303,7 @@ mod tests {
             let result = detector.detect(case.data);
 
             let found = case.expected.iter().any(|enc| {
-                result.selected == *enc
-                    || result.candidates.iter().any(|c| c.name == *enc)
+                result.selected == *enc || result.candidates.iter().any(|c| c.name == *enc)
             });
 
             assert!(
@@ -313,7 +312,11 @@ mod tests {
                 case.label,
                 case.expected,
                 result.selected,
-                result.candidates.iter().map(|c| &c.name).collect::<Vec<_>>()
+                result
+                    .candidates
+                    .iter()
+                    .map(|c| &c.name)
+                    .collect::<Vec<_>>()
             );
         }
     }
@@ -334,16 +337,19 @@ mod tests {
         let mut detector = ArchiveEncodingDetector::new();
         let result = detector.detect(data);
 
-        let found = expected_list.iter().any(|enc| {
-            result.selected == *enc
-                || result.candidates.iter().any(|c| c.name == *enc)
-        });
+        let found = expected_list
+            .iter()
+            .any(|enc| result.selected == *enc || result.candidates.iter().any(|c| c.name == *enc));
 
         assert!(
             found,
             "{label}: expected one of {expected_list:?} — got selected='{}', candidates={:?}",
             result.selected,
-            result.candidates.iter().map(|c| &c.name).collect::<Vec<_>>()
+            result
+                .candidates
+                .iter()
+                .map(|c| &c.name)
+                .collect::<Vec<_>>()
         );
     }
 
@@ -356,9 +362,8 @@ mod tests {
         assert_eq!(r1.selected, "UTF-8");
 
         // Second detection — detector should be reset internally
-        let r2 = detector.detect(
-            b"\x93\xFA\x96{\x8C\xEA\x82\xCC\x83e\x83X\x83g\x83t\x83@\x83C\x83\x8B",
-        );
+        let r2 =
+            detector.detect(b"\x93\xFA\x96{\x8C\xEA\x82\xCC\x83e\x83X\x83g\x83t\x83@\x83C\x83\x8B");
         assert!(
             r2.candidates.iter().any(|c| c.name == "Shift_JIS"),
             "second detect: Shift_JIS should appear: {:?}",

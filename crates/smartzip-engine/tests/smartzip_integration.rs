@@ -5,6 +5,7 @@
 //! Run:
 //!   cargo test -p smartzip-engine --test smartzip_integration -- --test-threads=1
 
+use async_trait::async_trait;
 use rstest::*;
 use smartzip_archive::{
     ArchiveBackend, ExtractArchiveRequest, ListRequest, SevenZipBackend, SevenZipLocator,
@@ -13,7 +14,10 @@ use smartzip_archive::{
 use smartzip_core::{ArchiveFormat, EncodingMode};
 use smartzip_db::{password::PasswordRepository, SmartZipDb};
 use smartzip_encoding::ArchiveEncodingDetector;
-use smartzip_engine::{format_from_extension, is_first_volume, ExtractWorkflowRequest, SmartZipEngine};
+use smartzip_engine::{
+    format_from_extension, is_first_volume, ExtractWorkflowRequest, InteractivePasswordPrompter,
+    SmartZipEngine,
+};
 use smartzip_passwords::{PasswordCandidateRequest, PasswordService};
 use smartzip_scanner::{EmbeddedScanner, ScannerConfig};
 use std::path::{Path, PathBuf};
@@ -25,9 +29,9 @@ use tempfile::TempDir;
 fn fixture_dir() -> PathBuf {
     // CARGO_MANIFEST_DIR is .../SmartZip/crates/smartzip-engine
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()   // crates/
+        .parent() // crates/
         .unwrap()
-        .parent()   // project root
+        .parent() // project root
         .unwrap()
         .join("tests")
         .join("fixtures")
@@ -72,7 +76,10 @@ async fn test_extract_archive_no_password(#[case] fixture_name: &str) {
         .unwrap()
         .filter_map(|e| e.ok())
         .collect();
-    assert!(!entries.is_empty(), "extracted directory should contain files");
+    assert!(
+        !entries.is_empty(),
+        "extracted directory should contain files"
+    );
 }
 
 // ── Password-protected extraction ─────────────────────────────────────────
@@ -177,7 +184,10 @@ async fn test_extract_wrong_password_fails(
         })
         .await;
 
-    assert!(result.is_err(), "expected failure with wrong password, got: {result:?}");
+    assert!(
+        result.is_err(),
+        "expected failure with wrong password, got: {result:?}"
+    );
 }
 
 // ── Archive listing ───────────────────────────────────────────────────────
@@ -221,16 +231,51 @@ async fn test_list_archive_entries(
     }
 }
 
+#[rstest]
+#[case::gbk("enc_gbk.zip", "gbk", &["中文文件名测试.txt", "压缩包说明文档.doc"])]
+#[case::sjis("enc_sjis.zip", "Shift_JIS", &["日本語ファイル名テスト.txt", "資料/会議メモ.docx"])]
+#[case::euckr("enc_euckr.zip", "euc-kr", &["한글파일이름.txt", "보고서_2024.hwp"])]
+#[case::big5("enc_big5.zip", "Big5", &["繁體中文檔案名稱.txt", "會議記錄.doc"])]
+#[tokio::test]
+async fn test_list_archive_entries_with_explicit_encoding_override(
+    #[case] fixture_name: &str,
+    #[case] encoding: &str,
+    #[case] expected_filenames: &[&str],
+) {
+    let archive = fixture_path(fixture_name);
+    assert!(archive.exists(), "fixture missing: {fixture_name}");
+
+    let backend = backend();
+    let listing = backend
+        .list(ListRequest {
+            archive,
+            password: None,
+            encoding: EncodingMode::Override(encoding.to_string()),
+        })
+        .await
+        .expect("list with explicit encoding override should succeed");
+
+    assert_eq!(
+        listing.entries.len(),
+        expected_filenames.len(),
+        "explicit encoding override should keep the archive listable"
+    );
+    assert!(
+        listing
+            .entries
+            .iter()
+            .all(|entry| !entry.path.as_os_str().is_empty()),
+        "explicit encoding override should still return non-empty entry paths"
+    );
+}
+
 // ── Archive testing (integrity check) ─────────────────────────────────────
 
 #[rstest]
 #[case::plain("enc_utf8.zip", None)]
 #[case::encrypted("pass_cn.zip", Some("中文密码123"))]
 #[tokio::test]
-async fn test_archive_integrity_check(
-    #[case] fixture_name: &str,
-    #[case] password: Option<&str>,
-) {
+async fn test_archive_integrity_check(#[case] fixture_name: &str, #[case] password: Option<&str>) {
     let archive = fixture_path(fixture_name);
     assert!(archive.exists(), "fixture missing: {fixture_name}");
 
@@ -239,6 +284,7 @@ async fn test_archive_integrity_check(
         .test(TestRequest {
             archive: archive.clone(),
             password: password.map(str::to_string),
+            encoding: EncodingMode::Auto,
         })
         .await;
 
@@ -264,7 +310,10 @@ fn test_scanner_does_not_panic_on_archive_fixtures(#[case] fixture_name: &str) {
     let result = scanner.scan_path(&archive);
 
     // Scanner should not error on these fixtures
-    assert!(result.is_ok(), "scanner panicked on {fixture_name}: {result:?}");
+    assert!(
+        result.is_ok(),
+        "scanner panicked on {fixture_name}: {result:?}"
+    );
 }
 
 // ── Engine: full extract_recursive ────────────────────────────────────────
@@ -359,6 +408,150 @@ async fn test_engine_extract_password_archive() {
 }
 
 #[tokio::test]
+async fn test_engine_wrong_manual_password_is_not_saved_to_database() {
+    let archive = fixture_path("pass_cn.zip");
+    assert!(archive.exists(), "fixture missing: pass_cn.zip");
+
+    let backend = backend();
+    let db = SmartZipDb::in_memory().unwrap();
+    let service = PasswordService::new(PasswordRepository::new(db.connection()));
+    let engine = SmartZipEngine::default();
+    let output = TempDir::new().unwrap();
+
+    let result = engine
+        .extract_recursive(
+            &backend,
+            &service,
+            ExtractWorkflowRequest {
+                inputs: vec![archive],
+                output_dir: output.path().to_path_buf(),
+                recursion_limit: 1,
+                encoding_mode: EncodingMode::Auto,
+                scanner: ScannerConfig::default(),
+                password_candidates: PasswordCandidateRequest {
+                    manual: vec!["wrong-password".into()],
+                    clipboard: None,
+                    include_empty: false,
+                    limit: 8,
+                },
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert!(result.processed.is_empty());
+    assert_eq!(result.skipped.len(), 1);
+
+    let repo = PasswordRepository::new(db.connection());
+    assert!(repo.get_by_value("wrong-password").unwrap().is_none());
+}
+
+#[tokio::test]
+async fn test_engine_successful_manual_password_is_saved_to_database() {
+    let archive = fixture_path("pass_cn.zip");
+    assert!(archive.exists(), "fixture missing: pass_cn.zip");
+
+    let backend = backend();
+    let db = SmartZipDb::in_memory().unwrap();
+    let service = PasswordService::new(PasswordRepository::new(db.connection()));
+    let engine = SmartZipEngine::default();
+    let output = TempDir::new().unwrap();
+
+    let result = engine
+        .extract_recursive(
+            &backend,
+            &service,
+            ExtractWorkflowRequest {
+                inputs: vec![archive],
+                output_dir: output.path().to_path_buf(),
+                recursion_limit: 1,
+                encoding_mode: EncodingMode::Auto,
+                scanner: ScannerConfig::default(),
+                password_candidates: PasswordCandidateRequest {
+                    manual: vec!["中文密码123".into()],
+                    clipboard: None,
+                    include_empty: false,
+                    limit: 8,
+                },
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result.processed.len(), 1);
+
+    let repo = PasswordRepository::new(db.connection());
+    let saved = repo.get_by_value("中文密码123").unwrap();
+    assert!(
+        saved.is_some(),
+        "successful manual password should be persisted"
+    );
+}
+
+struct StaticPasswordPrompter {
+    password: String,
+}
+
+#[async_trait]
+impl InteractivePasswordPrompter for StaticPasswordPrompter {
+    async fn prompt(&self, _archive_path: &Path) -> Option<String> {
+        Some(self.password.clone())
+    }
+}
+
+#[tokio::test]
+async fn test_engine_interactive_password_reuses_carved_embedded_archive_path() {
+    let archive = fixture_path("video_7z_pass.mp4");
+    assert!(archive.exists(), "fixture missing: video_7z_pass.mp4");
+
+    let backend = backend();
+    let db = SmartZipDb::in_memory().unwrap();
+    let service = PasswordService::new(PasswordRepository::new(db.connection()));
+    let engine = SmartZipEngine::default();
+    let output = TempDir::new().unwrap();
+    let prompter = StaticPasswordPrompter {
+        password: "video-pass".into(),
+    };
+
+    let result = engine
+        .extract_recursive(
+            &backend,
+            &service,
+            ExtractWorkflowRequest {
+                inputs: vec![archive.clone()],
+                output_dir: output.path().to_path_buf(),
+                recursion_limit: 1,
+                encoding_mode: EncodingMode::Auto,
+                scanner: ScannerConfig::default(),
+                password_candidates: PasswordCandidateRequest {
+                    manual: Vec::new(),
+                    clipboard: None,
+                    include_empty: false,
+                    limit: 8,
+                },
+            },
+            Some(&prompter),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result.processed.len(), 1);
+    assert!(
+        result.processed[0].embedded_offset.is_some(),
+        "fixture should have been handled as an embedded archive"
+    );
+    assert!(
+        find_file(output.path(), "secret.txt").is_some(),
+        "interactive fallback should extract the embedded 7z payload"
+    );
+}
+
+#[tokio::test]
 async fn test_engine_respects_recursion_limit() {
     let archive = fixture_path("nested_multi_level.zip");
     assert!(archive.exists(), "fixture missing: nested_multi_level.zip");
@@ -397,10 +590,17 @@ async fn test_engine_respects_recursion_limit() {
     assert!(
         workflow_result.processed.len() >= 1,
         "should process at least the outer archive, got {:?}",
-        workflow_result.processed.iter().map(|c| c.path.display().to_string()).collect::<Vec<_>>()
+        workflow_result
+            .processed
+            .iter()
+            .map(|c| c.path.display().to_string())
+            .collect::<Vec<_>>()
     );
     assert!(
-        workflow_result.skipped.iter().any(|c| c.path.ends_with("L3.zip")),
+        workflow_result
+            .skipped
+            .iter()
+            .any(|c| c.path.ends_with("L3.zip")),
         "L3.zip at depth 2 should be skipped due to recursion limit"
     );
 }
@@ -434,7 +634,11 @@ async fn test_engine_preserves_nested_archive_paths() {
         .await
         .unwrap();
 
-    assert_eq!(result.processed.len(), 2, "outer and inner archives should be processed");
+    assert_eq!(
+        result.processed.len(),
+        2,
+        "outer and inner archives should be processed"
+    );
 
     let nested_file = output
         .path()
@@ -535,9 +739,9 @@ fn test_encoding_detection_from_fixture(
     let mut detector = ArchiveEncodingDetector::new();
     let result = detector.detect(&raw_names);
 
-    let found = expected_encodings.iter().any(|enc| {
-        result.selected == *enc || result.candidates.iter().any(|c| c.name == *enc)
-    });
+    let found = expected_encodings
+        .iter()
+        .any(|enc| result.selected == *enc || result.candidates.iter().any(|c| c.name == *enc));
 
     assert!(
         found,

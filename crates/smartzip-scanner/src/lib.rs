@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 use smartzip_core::ArchiveFormat;
 use std::fs;
+use std::io::Read;
 use std::path::Path;
 
 /// Minimum confidence threshold for scanner findings.
@@ -113,9 +114,13 @@ impl EmbeddedScanner {
         &self,
         path: impl AsRef<Path>,
     ) -> std::io::Result<Vec<EmbeddedArchiveFinding>> {
-        let mut data = fs::read(path)?;
+        let mut file = fs::File::open(path)?;
+        let mut data = Vec::new();
         if let Some(max_bytes) = self.config.max_scan_bytes {
-            data.truncate(max_bytes as usize);
+            let mut limited = file.take(max_bytes);
+            limited.read_to_end(&mut data)?;
+        } else {
+            file.read_to_end(&mut data)?;
         }
         Ok(self.scan_bytes(&data))
     }
@@ -198,6 +203,7 @@ fn format_to_binwalk_names(format: &ArchiveFormat) -> Vec<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn maps_known_binwalk_names() {
@@ -213,5 +219,51 @@ mod tests {
     fn scanner_respects_empty_input() {
         let scanner = EmbeddedScanner::default();
         assert!(scanner.scan_bytes(&[]).is_empty());
+    }
+
+    #[test]
+    fn scan_path_respects_max_scan_bytes() {
+        let root =
+            std::env::temp_dir().join(format!("smartzip-scanner-limit-{}", std::process::id()));
+        let payload_path = root.join("payload.bin");
+        fs::create_dir_all(&root).unwrap();
+
+        let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("tests")
+            .join("fixtures")
+            .join("enc_utf8.zip");
+        let mut payload = vec![0_u8; 4096];
+        payload.extend_from_slice(&fs::read(fixture).unwrap());
+        fs::write(&payload_path, payload).unwrap();
+
+        let limited_scanner = EmbeddedScanner::new(ScannerConfig {
+            max_scan_bytes: Some(1024),
+            min_confidence: Confidence::Low,
+            ..ScannerConfig::default()
+        });
+        let full_scanner = EmbeddedScanner::new(ScannerConfig {
+            max_scan_bytes: Some(8192),
+            min_confidence: Confidence::Low,
+            ..ScannerConfig::default()
+        });
+
+        let limited = limited_scanner.scan_path(&payload_path).unwrap();
+        let full = full_scanner.scan_path(&payload_path).unwrap();
+
+        assert!(
+            limited.is_empty(),
+            "signature past max_scan_bytes should be skipped"
+        );
+        assert!(
+            full.iter()
+                .any(|finding| finding.format == ArchiveFormat::Zip),
+            "scanner should find the zip signature once the read limit includes it"
+        );
+
+        let _ = fs::remove_dir_all(root);
     }
 }

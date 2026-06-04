@@ -84,6 +84,26 @@ impl SevenZipBackend {
         })
     }
 
+    fn encoding_arg(encoding: &smartzip_core::EncodingMode) -> Option<String> {
+        match encoding {
+            smartzip_core::EncodingMode::Override(s) => {
+                let normalized = s.trim().replace('-', "_").to_ascii_lowercase();
+                match normalized.as_str() {
+                    "utf_8" | "utf8" => Some("-scsUTF-8".to_string()),
+                    // p7zip accepts numeric code-page ids here; `CP936`-style values
+                    // are rejected as unsupported charset names.
+                    "gb18030" | "gbk" | "gb2312" => Some("-scs936".to_string()),
+                    "big5" => Some("-scs950".to_string()),
+                    "shift_jis" | "shiftjis" | "sjis" | "cp932" => Some("-scs932".to_string()),
+                    "euc_kr" | "euckr" | "cp949" => Some("-scs949".to_string()),
+                    "euc_jp" | "eucjp" => Some("-scs20932".to_string()),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
     fn map_failure(&self, output: &BackendCommandOutput, path: &Path) -> SmartZipError {
         let combined = format!("{}\n{}", output.stdout, output.stderr);
         let lower = combined.to_lowercase();
@@ -108,15 +128,13 @@ impl SevenZipBackend {
     }
 
     fn password_arg(password: &Option<String>) -> Option<String> {
-        password
-            .as_ref()
-            .map(|password| {
-                if password.is_empty() {
-                    "-p\"\"".to_string()
-                } else {
-                    format!("-p{password}")
-                }
-            })
+        password.as_ref().map(|password| {
+            if password.is_empty() {
+                "-p\"\"".to_string()
+            } else {
+                format!("-p{password}")
+            }
+        })
     }
 }
 
@@ -126,6 +144,7 @@ impl ArchiveBackend for SevenZipBackend {
         let request = TestRequest {
             archive: path.to_path_buf(),
             password: Some(String::new()),
+            encoding: smartzip_core::EncodingMode::Auto,
         };
         let result = self.test(request).await;
         let (supported, encrypted) = match result {
@@ -146,6 +165,9 @@ impl ArchiveBackend for SevenZipBackend {
         if let Some(pw) = Self::password_arg(&request.password) {
             args.push(pw);
         }
+        if let Some(enc) = Self::encoding_arg(&request.encoding) {
+            args.push(enc);
+        }
         args.push(request.archive.to_string_lossy().into_owned());
         let output = self.run(&args).await?;
         if output.status != Some(0) {
@@ -162,6 +184,9 @@ impl ArchiveBackend for SevenZipBackend {
         if let Some(pw) = Self::password_arg(&request.password) {
             args.push(pw);
         }
+        if let Some(enc) = Self::encoding_arg(&request.encoding) {
+            args.push(enc);
+        }
         args.push(request.archive.to_string_lossy().into_owned());
         let output = self.run(&args).await?;
         if output.status != Some(0) {
@@ -177,6 +202,9 @@ impl ArchiveBackend for SevenZipBackend {
         let mut args: Vec<String> = vec!["x".into(), "-y".into()];
         if let Some(pw) = Self::password_arg(&request.password) {
             args.push(pw);
+        }
+        if let Some(enc) = Self::encoding_arg(&request.encoding) {
+            args.push(enc);
         }
         args.push(format!("-o{}", request.output_dir.display()));
         args.push(request.archive.to_string_lossy().into_owned());
@@ -297,7 +325,28 @@ mod tests {
 
     #[test]
     fn empty_password_is_passed_explicitly() {
-        assert_eq!(SevenZipBackend::password_arg(&Some(String::new())), Some("-p\"\"".into()));
+        assert_eq!(
+            SevenZipBackend::password_arg(&Some(String::new())),
+            Some("-p\"\"".into())
+        );
+    }
+
+    #[test]
+    fn maps_supported_encoding_overrides_to_code_pages() {
+        use smartzip_core::EncodingMode;
+
+        assert_eq!(
+            SevenZipBackend::encoding_arg(&EncodingMode::Override("gbk".into())),
+            Some("-scs936".into())
+        );
+        assert_eq!(
+            SevenZipBackend::encoding_arg(&EncodingMode::Override("EUC-KR".into())),
+            Some("-scs949".into())
+        );
+        assert_eq!(
+            SevenZipBackend::encoding_arg(&EncodingMode::Override("Shift_JIS".into())),
+            Some("-scs932".into())
+        );
     }
 
     #[tokio::test]
@@ -318,8 +367,8 @@ mod tests {
             .unwrap();
         assert!(status.success(), "7z must be available in PATH");
 
-        let backend = SevenZipBackend::locate(&SevenZipLocator::default())
-            .expect("7z/7zz must be available");
+        let backend =
+            SevenZipBackend::locate(&SevenZipLocator::default()).expect("7z/7zz must be available");
         let probe = backend.probe(&archive).await.unwrap();
 
         assert!(probe.supported);
