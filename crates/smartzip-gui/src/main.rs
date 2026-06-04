@@ -1,7 +1,7 @@
-use gpui::{
-    App, Application, Bounds, ExternalPaths, WindowBounds, WindowOptions, div, px, rgb, size,
-};
 use gpui::prelude::*;
+use gpui::{
+    div, px, rgb, size, App, Application, Bounds, ExternalPaths, WindowBounds, WindowOptions,
+};
 use smartzip_engine::{DetectRequest, SmartZipEngine};
 use smartzip_scanner::ScannerConfig;
 use std::path::PathBuf;
@@ -109,8 +109,16 @@ fn sidebar(active: Tab) -> impl IntoElement {
                 .py_2()
                 .rounded_sm()
                 .text_sm()
-                .bg(if is_active { rgb(0x404040) } else { rgb(0x2c2c2c) })
-                .text_color(if is_active { rgb(0xffffff) } else { rgb(0xcccccc) })
+                .bg(if is_active {
+                    rgb(0x404040)
+                } else {
+                    rgb(0x2c2c2c)
+                })
+                .text_color(if is_active {
+                    rgb(0xffffff)
+                } else {
+                    rgb(0xcccccc)
+                })
                 .child(label.to_string())
         }))
 }
@@ -188,8 +196,16 @@ fn tasks_view(
                             .gap_2()
                             .text_sm()
                             .child(div().text_color(rgb(0x1565c0)).child(f.format.clone()))
-                            .child(div().text_color(rgb(0x666666)).child(format!("@ 0x{:X}", f.offset)))
-                            .child(div().text_color(rgb(0x666666)).child(format!("size={}", f.size)))
+                            .child(
+                                div()
+                                    .text_color(rgb(0x666666))
+                                    .child(format!("@ 0x{:X}", f.offset)),
+                            )
+                            .child(
+                                div()
+                                    .text_color(rgb(0x666666))
+                                    .child(format!("size={}", f.size)),
+                            )
                             .child(div().text_color(rgb(0x888888)).child(f.description.clone()))
                     })),
             )
@@ -217,51 +233,53 @@ fn drop_zone(
             |_app: &mut SmartZipApp, paths: &ExternalPaths, _window, cx| {
                 let new_files = paths.paths().to_vec();
                 // C4: spawn async detection to avoid blocking the GUI thread
-                cx.spawn(|entity: gpui::WeakEntity<SmartZipApp>, cx: &mut gpui::AsyncApp| {
-                    let mut async_cx = cx.clone();
-                    async move {
-                        let engine = SmartZipEngine::default();
-                        let mut new_findings = Vec::new();
-                        for path in &new_files {
-                            if let Ok(result) = engine.detect(DetectRequest {
-                                path: path.clone(),
-                                scanner: ScannerConfig::default(),
-                            }) {
-                                for f in &result.findings {
-                                    new_findings.push(DetectFinding {
-                                        format: f.format.as_str().into(),
-                                        offset: f.offset,
-                                        size: f
-                                            .size
-                                            .map(|s| s.to_string())
-                                            .unwrap_or_else(|| "?".into()),
-                                        description: f.description.clone(),
-                                    });
+                cx.spawn(
+                    |entity: gpui::WeakEntity<SmartZipApp>, cx: &mut gpui::AsyncApp| {
+                        let mut async_cx = cx.clone();
+                        async move {
+                            let engine = SmartZipEngine::default();
+                            let mut new_findings = Vec::new();
+                            for path in &new_files {
+                                if let Ok(result) = engine.detect(DetectRequest {
+                                    path: path.clone(),
+                                    scanner: ScannerConfig::default(),
+                                }) {
+                                    for f in &result.findings {
+                                        new_findings.push(DetectFinding {
+                                            format: f.format.as_str().into(),
+                                            offset: f.offset,
+                                            size: f
+                                                .size
+                                                .map(|s| s.to_string())
+                                                .unwrap_or_else(|| "?".into()),
+                                            description: f.description.clone(),
+                                        });
+                                    }
                                 }
                             }
+                            let file_count = new_files.len();
+                            let finding_count = new_findings.len();
+                            entity
+                                .update(&mut async_cx, move |app, cx| {
+                                    app.dropped_files = new_files;
+                                    app.detect_findings = new_findings;
+                                    if app.detect_findings.is_empty() {
+                                        app.status_line = format!(
+                                            "已接收 {} 个文件, 未检测到内嵌压缩包",
+                                            file_count
+                                        );
+                                    } else {
+                                        app.status_line = format!(
+                                            "已接收 {} 个文件, 检测到 {} 个内嵌压缩包",
+                                            file_count, finding_count
+                                        );
+                                    }
+                                    cx.notify();
+                                })
+                                .ok();
                         }
-                        let file_count = new_files.len();
-                        let finding_count = new_findings.len();
-                        entity
-                            .update(&mut async_cx, move |app, cx| {
-                                app.dropped_files = new_files;
-                                app.detect_findings = new_findings;
-                                if app.detect_findings.is_empty() {
-                                    app.status_line = format!(
-                                        "已接收 {} 个文件, 未检测到内嵌压缩包",
-                                        file_count
-                                    );
-                                } else {
-                                    app.status_line = format!(
-                                        "已接收 {} 个文件, 检测到 {} 个内嵌压缩包",
-                                        file_count, finding_count
-                                    );
-                                }
-                                cx.notify();
-                            })
-                            .ok();
-                    }
-                })
+                    },
+                )
                 .detach();
             },
         ))
@@ -382,7 +400,12 @@ fn setting_row(label: &str, value: &str) -> impl IntoElement {
         .border_1()
         .border_color(rgb(0xe8e8e8))
         .child(div().text_sm().child(label.to_string()))
-        .child(div().text_sm().text_color(rgb(0x666666)).child(value.to_string()))
+        .child(
+            div()
+                .text_sm()
+                .text_color(rgb(0x666666))
+                .child(value.to_string()),
+        )
 }
 
 fn main() {
