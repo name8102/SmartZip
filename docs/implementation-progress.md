@@ -329,7 +329,7 @@ crate              状态      设计覆盖
 ─────────────────────────────────────────
 smartzip-core      ✅ 完成    types, errors, events
 smartzip-scanner   ✅ 完成    binwalk wrapper, config
-smartzip-archive   ✅ 完成    trait, 7zz backend, locator
+smartzip-archive   ✅ 完成    trait, native ZIP, unrar, 7zz fallback, router
 smartzip-db        ✅ 完成    migration, passwords, password_matches
 smartzip-encoding  ✅ 完成    chardetng + CJK cross-check
 smartzip-passwords ✅ 完成    ranking, success/failure
@@ -347,7 +347,7 @@ packaging/         ❌ 未开始  AppImage, bundled 7zz
 | Slice | 内容 | 状态 |
 |-------|------|------|
 | 1 Workspace + 基础类型 | workspace, core types, errors, events | ✅ |
-| 2 7zz 后端 | ArchiveBackend trait, SevenZipBackend, locator | ✅ |
+| 2 后端与路由 | ArchiveBackend trait, Native ZIP, UnrarBackend, SevenZipBackend fallback, BackendRouter | ✅ |
 | 3 SQLite 数据层 | schema, passwords, password_matches, repository | ✅ |
 | 4 密码策略 | candidate generation, ranking, CLI password | ✅ |
 | 5 智能解压核心 | 递归队列, 分卷跳过, 密码循环, 智能输出, 嵌套入队 | ✅ |
@@ -376,14 +376,14 @@ packaging/         ❌ 未开始  AppImage, bundled 7zz
 | 格式检测（扩展名 + binwalk） | ✅ |
 | 编码自动检测 | ✅ |
 | 密码候选排序 | ✅ |
-| 逐候选 7z 解压 | ✅ |
+| 逐候选按检测格式路由解压 | ✅ |
 | 成功/失败记录 | ✅ |
 | 智能输出结构 | ✅ |
 | 扫描输出目录 | ✅ |
 | 嵌套压缩包入队 | ✅ |
 | 后处理规则（删除/重命名） | ❌ |
 | 临时目录安全提取 | ❌ |
-| Zip Slip 路径检查 | ❌ |
+| Zip Slip 路径检查 | 🟡 ZIP 原生后端已做安全路径检查 |
 | offset 级内嵌提取 | ❌ (检测已实现) |
 
 ### CLI 命令对照
@@ -412,8 +412,8 @@ packaging/         ❌ 未开始  AppImage, bundled 7zz
 | 1 | Linux GPUI GUI 启动 | ❌ |
 | 2 | GUI 拖拽文件 | ❌ |
 | 3 | CLI extract/compress/detect | 🟡 compress stub |
-| 4 | 7zz 解压 zip/7z/rar/tar/gz/bz2 | ✅ |
-| 5 | 创建 zip/7z | ❌ |
+| 4 | 后端路由解压 zip/7z/rar/tar/gz/bz2 | ✅ |
+| 5 | 创建 zip/7z | 🟡 原生 ZIP 已支持，7z 未支持 |
 | 6 | 读取剪贴板密码 | ❌ |
 | 7 | 密码成功/失败 + 排序 | ✅ |
 | 8 | 自动编码检测 + 置信度 | ✅ |
@@ -445,7 +445,7 @@ packaging/         ❌ 未开始  AppImage, bundled 7zz
 | Slice | 状态 |
 |-------|------|
 | 1 Workspace + 基础类型 | ✅ |
-| 2 7zz 后端 | ✅ |
+| 2 后端与路由 | ✅ |
 | 3 SQLite 数据层 | ✅ |
 | 4 密码策略 | ✅ |
 | 5 智能解压核心 | ✅ |
@@ -474,7 +474,7 @@ packaging/         ❌ 未开始  AppImage, bundled 7zz
 | 格式检测(扩展名+binwalk) | ✅ |
 | 编码自动检测 | ✅ |
 | 密码候选排序 | ✅ |
-| 逐候选 7z 解压 | ✅ |
+| 逐候选按检测格式路由解压 | ✅ |
 | 成功/失败记录 | ✅ |
 | 智能输出结构 | ✅ |
 | 扫描输出目录 | ✅ |
@@ -501,8 +501,8 @@ packaging/         ❌ 未开始  AppImage, bundled 7zz
 1. Linux GPUI GUI 启动 → ❌
 2. GUI 拖拽文件 → ❌
 3. CLI extract/compress/detect → 🟡 compress stub
-4. 7zz 解压 zip/7z/rar/tar/gz/bz2 → ✅
-5. 创建 zip/7z → ❌
+4. 后端路由解压 zip/7z/rar/tar/gz/bz2 → ✅
+5. 创建 zip/7z → 🟡 原生 ZIP 已支持，7z 未支持
 6. 读取剪贴板密码 → ❌
 7. 密码成功/失败 + 排序 → ✅
 8. 自动编码检测 + 置信度 → ✅
@@ -569,3 +569,51 @@ packaging/         ❌ 未开始  AppImage, bundled 7zz
 
 - Drag-and-drop with auto-detect is the primary interaction; tab switching remains cosmetic.
 - Next: on_click requires deeper GPUI entity patterns, deferred.
+
+## 2026-06-04 — Stage 13: native ZIP, unrar backend, and format-aware backend router
+
+### Scope
+
+- Add format-specific archive backends alongside the existing 7zz backend.
+- Route archive operations by upstream-detected archive format first, with extension-based routing only as a fallback.
+- Fix disguised or embedded RAR extraction where the carved temporary file has no useful extension.
+
+### Changed
+
+- `crates/smartzip-archive`
+  - Added `ZipBackend` using the Rust-native `async_zip` crate.
+  - Native ZIP backend supports list, test, extract, and ZIP compression.
+  - Native ZIP extraction rejects unsafe entry paths (`..`, absolute paths, platform prefixes) before writing.
+  - Added `UnrarBackend` using the system `unrar` CLI for RAR list/test/extract.
+  - Added `BackendRouter`:
+    - ZIP: `ZipBackend` first, then `SevenZipBackend` fallback.
+    - RAR: `UnrarBackend` first, then `SevenZipBackend` fallback.
+    - Other known archive formats: `SevenZipBackend`.
+    - Unknown format: try ZIP, unrar, then 7zz as a conservative fallback chain.
+  - Added `format: Option<ArchiveFormat>` to `ListRequest`, `TestRequest`, and `ExtractArchiveRequest`.
+- `crates/smartzip-engine`
+  - Passes `ExtractionCandidate::detected_format` into every backend list/test/extract request.
+  - Scanner/magic-byte findings now drive router selection even when the input has a misleading extension such as `.jpg` or a carved temporary filename without an extension.
+- `crates/smartzip-cli`
+  - Extract command now injects `BackendRouter` instead of directly using `SevenZipBackend`.
+
+### Validation
+
+- `cargo fmt`
+- `cargo test`
+
+Result: all 138 tests passed after introducing format hints and router coverage.
+
+Manual verification:
+
+```text
+smartzip extract R4056 V1.04.jpg -p '⑨'
+```
+
+The file is a disguised RAR payload. Before this stage, the embedded RAR was materialized as a temporary file without a `.rar` extension and router selection fell through to 7zz, producing `unsupported archive format`. After this stage, the scanner-detected `ArchiveFormat::Rar` is passed through the request and routes to `UnrarBackend`, allowing the outer archive and nested 7z payload to extract.
+
+### Notes
+
+- `async_zip` does not support encrypted ZIP; encrypted ZIP operations intentionally fall back to 7zz through the router.
+- RAR compression is not supported by `UnrarBackend`; RAR extraction/list/test are supported.
+- A later run exposed a separate recursion issue: some application `.pak` or test fixture `.zip` files inside extracted payloads can be detected as archives and then fail during deep recursive extraction. That is separate from the RAR routing bug and should be handled by extraction limits, format confidence, or skip rules.

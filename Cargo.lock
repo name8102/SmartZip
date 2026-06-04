@@ -5358,9 +5358,12 @@ name = "smartzip-archive"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "async_zip",
+ "futures-lite 2.6.1",
  "rstest",
  "serde",
  "smartzip-core",
+ "tempfile",
  "tokio",
 ]
 

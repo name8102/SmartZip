@@ -143,6 +143,7 @@ impl ArchiveBackend for SevenZipBackend {
     async fn probe(&self, path: &Path) -> Result<ArchiveProbe> {
         let request = TestRequest {
             archive: path.to_path_buf(),
+            format: None,
             password: Some(String::new()),
             encoding: smartzip_core::EncodingMode::Auto,
         };

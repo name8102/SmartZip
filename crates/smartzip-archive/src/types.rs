@@ -22,6 +22,7 @@ pub struct ArchiveProbe {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListRequest {
     pub archive: PathBuf,
+    pub format: Option<ArchiveFormat>,
     pub password: Option<String>,
     pub encoding: EncodingMode,
 }
@@ -42,6 +43,7 @@ pub struct ArchiveListing {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TestRequest {
     pub archive: PathBuf,
+    pub format: Option<ArchiveFormat>,
     pub password: Option<String>,
     pub encoding: EncodingMode,
 }
@@ -55,6 +57,7 @@ pub struct TestResult {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExtractArchiveRequest {
     pub archive: PathBuf,
+    pub format: Option<ArchiveFormat>,
     pub output_dir: PathBuf,
     pub password: Option<String>,
     pub encoding: EncodingMode,

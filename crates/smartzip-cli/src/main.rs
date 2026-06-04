@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use clap::{Parser, Subcommand, ValueEnum};
-use smartzip_archive::SevenZipBackend;
+use smartzip_archive::BackendRouter;
 use smartzip_core::EncodingMode;
 use smartzip_db::{password::PasswordRepository, SmartZipDb};
 use smartzip_engine::{
@@ -320,7 +320,7 @@ async fn extract(
 
     let output_dir = output.unwrap_or_else(|| default_output_dir(paths.first().unwrap()));
 
-    let backend = SevenZipBackend::locate(&smartzip_archive::SevenZipLocator::default())?;
+    let backend = BackendRouter::locate()?;
     let service = PasswordService::new(PasswordRepository::new(db.connection()));
 
     let engine = SmartZipEngine::default();

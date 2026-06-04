@@ -64,6 +64,7 @@ async fn test_extract_archive_no_password(#[case] fixture_name: &str) {
     backend
         .extract(ExtractArchiveRequest {
             archive: archive.clone(),
+            format: None,
             output_dir: output.path().to_path_buf(),
             password: None,
             encoding: EncodingMode::Auto,
@@ -104,6 +105,7 @@ async fn test_extract_with_unicode_password(
     let result = backend
         .extract(ExtractArchiveRequest {
             archive: archive.clone(),
+            format: None,
             output_dir: output.path().to_path_buf(),
             password: Some(password.to_string()),
             encoding: EncodingMode::Auto,
@@ -140,6 +142,7 @@ async fn test_extract_7z_unicode_password(
     let result = backend
         .extract(ExtractArchiveRequest {
             archive: archive.clone(),
+            format: None,
             output_dir: output.path().to_path_buf(),
             password: Some(password.to_string()),
             encoding: EncodingMode::Auto,
@@ -178,6 +181,7 @@ async fn test_extract_wrong_password_fails(
     let result = backend
         .extract(ExtractArchiveRequest {
             archive: archive.clone(),
+            format: None,
             output_dir: output.path().to_path_buf(),
             password: Some(wrong_password.to_string()),
             encoding: EncodingMode::Auto,
@@ -207,6 +211,7 @@ async fn test_list_archive_entries(
     let listing = backend
         .list(ListRequest {
             archive: archive.clone(),
+            format: None,
             password: None,
             encoding: EncodingMode::Auto,
         })
@@ -249,6 +254,7 @@ async fn test_list_archive_entries_with_explicit_encoding_override(
     let listing = backend
         .list(ListRequest {
             archive,
+            format: None,
             password: None,
             encoding: EncodingMode::Override(encoding.to_string()),
         })
@@ -283,6 +289,7 @@ async fn test_archive_integrity_check(#[case] fixture_name: &str, #[case] passwo
     let result = backend
         .test(TestRequest {
             archive: archive.clone(),
+            format: None,
             password: password.map(str::to_string),
             encoding: EncodingMode::Auto,
         })

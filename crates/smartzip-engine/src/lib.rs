@@ -319,6 +319,7 @@ impl SmartZipEngine {
                 if let Ok(listing) = backend
                     .list(ListRequest {
                         archive: archive_path.clone(),
+                        format: candidate.detected_format.clone(),
                         password: Some(String::new()),
                         encoding: EncodingMode::Auto,
                     })
@@ -400,6 +401,7 @@ impl SmartZipEngine {
                     &archive_path,
                     backend.test(TestRequest {
                         archive: archive_path.clone(),
+                        format: candidate.detected_format.clone(),
                         password: pw_value.clone(),
                         encoding: request.encoding_mode.clone(),
                     }),
@@ -418,6 +420,7 @@ impl SmartZipEngine {
                                 &archive_path,
                                 backend.list(ListRequest {
                                     archive: archive_path.clone(),
+                                    format: candidate.detected_format.clone(),
                                     password: pw_value.clone(),
                                     encoding: EncodingMode::Auto,
                                 }),
@@ -470,6 +473,7 @@ impl SmartZipEngine {
                             &archive_path,
                             backend.extract(ExtractArchiveRequest {
                                 archive: archive_path.clone(),
+                                format: candidate.detected_format.clone(),
                                 output_dir: output_dir.clone(),
                                 password: pw_value,
                                 encoding: encoding_to_use,
@@ -516,6 +520,7 @@ impl SmartZipEngine {
                                 &archive_path,
                                 backend.test(TestRequest {
                                     archive: archive_path.clone(),
+                                    format: candidate.detected_format.clone(),
                                     password: Some(pw.clone()),
                                     encoding: request.encoding_mode.clone(),
                                 }),
@@ -529,6 +534,7 @@ impl SmartZipEngine {
                                         &archive_path,
                                         backend.extract(ExtractArchiveRequest {
                                             archive: archive_path.clone(),
+                                            format: candidate.detected_format.clone(),
                                             output_dir: output_dir.clone(),
                                             password: Some(pw.clone()),
                                             encoding: encoding_result
