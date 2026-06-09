@@ -730,13 +730,7 @@ fn output_dir_for_candidate(base: &Path, candidate: &ExtractionCandidate) -> Pat
 }
 
 fn candidate_output_relative_path(candidate: &ExtractionCandidate) -> PathBuf {
-    let mut relative = candidate.relative_path.clone();
-    let leaf = relative
-        .file_name()
-        .map(|name| name.to_owned())
-        .unwrap_or_else(|| std::ffi::OsString::from("archive"));
-    relative.set_file_name(format!("{}-d{}", leaf.to_string_lossy(), candidate.depth));
-    relative
+    candidate.relative_path.clone()
 }
 
 struct ArchiveInput {
@@ -1189,7 +1183,7 @@ mod tests {
                 &service,
                 ExtractWorkflowRequest {
                     inputs: vec![input.clone(), root.join("skip.part2.rar")],
-                    output_dir: output,
+                    output_dir: output.clone(),
                     recursion_limit: 2,
                     encoding_mode: EncodingMode::Auto,
                     scanner: ScannerConfig::default(),
@@ -1213,6 +1207,14 @@ mod tests {
             .processed
             .iter()
             .any(|candidate| candidate.path == input));
+        assert!(
+            output.join("root").exists(),
+            "root archive should materialize without a depth suffix"
+        );
+        assert!(
+            !output.join("root-d0").exists(),
+            "depth is candidate state, not part of the output directory name"
+        );
         assert!(result
             .enqueued
             .iter()
@@ -1236,7 +1238,7 @@ mod tests {
             std::env::temp_dir().join(format!("smartzip-engine-collision-{}", std::process::id()));
         let input = root.join("root.zip");
         let output = root.join("out");
-        let target = output.join("root-d0");
+        let target = output.join("root");
         std::fs::create_dir_all(&target).unwrap();
         std::fs::write(&input, b"not really a zip").unwrap();
 
@@ -1306,7 +1308,7 @@ mod tests {
         let conflict = root.join("conflict.zip");
         let other = root.join("other.zip");
         let output = root.join("out");
-        let conflict_target = output.join("conflict-d0");
+        let conflict_target = output.join("conflict");
         std::fs::create_dir_all(&conflict_target).unwrap();
         std::fs::write(&conflict, b"not really a zip").unwrap();
         std::fs::write(&other, b"not really a zip either").unwrap();
@@ -1731,7 +1733,6 @@ mod tests {
         // Verify the extracted content exists somewhere under output.
         let candidates = [
             output.join("hello.txt"),
-            output.join("test-d0").join("hello.txt"),
             output.join("test").join("hello.txt"),
         ];
         assert!(

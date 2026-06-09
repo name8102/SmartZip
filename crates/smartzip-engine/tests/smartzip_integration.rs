@@ -649,8 +649,8 @@ async fn test_engine_preserves_nested_archive_paths() {
 
     let nested_file = output
         .path()
-        .join("nested_zip_in_zip-d0")
-        .join("inner-d1")
+        .join("nested_zip_in_zip")
+        .join("inner")
         .join("hello.txt");
     assert!(
         nested_file.exists(),
