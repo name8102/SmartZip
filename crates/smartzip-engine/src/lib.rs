@@ -1,7 +1,10 @@
 //! Application-level orchestration for SmartZip workflows.
 
+mod materialize;
+
 use async_trait::async_trait;
 use futures_util::FutureExt;
+use materialize::{CommitPolicy, MaterializeRequest, OutputMaterializer};
 use serde::{Deserialize, Serialize};
 use smartzip_archive::{ArchiveBackend, ExtractArchiveRequest, ListRequest, TestRequest};
 use smartzip_core::{ArchiveFormat, EncodingMode, TaskEvent, TaskEventKind, TaskId};
@@ -184,9 +187,10 @@ impl SmartZipEngine {
         let mut processed = Vec::new();
         let mut skipped = Vec::new();
         let mut enqueued = Vec::new();
-        let mut output_overrides: HashMap<String, PathBuf> = HashMap::new();
+        let mut output_overrides: HashMap<String, OutputPlan> = HashMap::new();
         let mut deferred_output_conflicts = VecDeque::new();
         let mut pending_output_conflict = None;
+        let output_materializer = OutputMaterializer::default();
 
         for input in &request.inputs {
             let relative_path = archive_output_name(input);
@@ -357,10 +361,11 @@ impl SmartZipEngine {
             }
 
             let key = candidate_key(&candidate);
-            let output_dir = output_overrides
-                .remove(&key)
-                .unwrap_or_else(|| output_dir_for_candidate(&request.output_dir, &candidate));
-            if output_dir.exists() {
+            let output_plan = output_overrides.remove(&key).unwrap_or_else(|| {
+                OutputPlan::new(output_dir_for_candidate(&request.output_dir, &candidate))
+            });
+            let output_dir = output_plan.output_dir.clone();
+            if output_dir.exists() && output_plan.commit_policy == CommitPolicy::FailIfExists {
                 if let Some(prompter) = output_prompter {
                     seen.remove(&key);
                     if pending_output_conflict.is_none() {
@@ -465,28 +470,56 @@ impl SmartZipEngine {
                             .as_ref()
                             .map(|r| EncodingMode::Override(r.selected.clone()))
                             .unwrap_or_else(|| request.encoding_mode.clone());
+                        let extract_archive_path = archive_path.clone();
+                        let extract_format = candidate.detected_format.clone();
+                        let extract_password = pw_value.clone();
+                        let extract_encoding = encoding_to_use.clone();
 
                         // Single extract with the correct password + encoding
-                        match backend_call(
-                            "archive-backend",
-                            "extract",
-                            &archive_path,
-                            backend.extract(ExtractArchiveRequest {
-                                archive: archive_path.clone(),
-                                format: candidate.detected_format.clone(),
-                                output_dir: output_dir.clone(),
-                                password: pw_value,
-                                encoding: encoding_to_use,
-                            }),
-                        )
-                        .await
-                        {
-                            Ok(_) => {
+                        let extract_result = output_materializer
+                            .materialize(
+                                MaterializeRequest {
+                                    output_dir: output_dir.clone(),
+                                    commit_policy: output_plan.commit_policy,
+                                },
+                                |temp_output_dir| async move {
+                                    backend_call(
+                                        "archive-backend",
+                                        "extract",
+                                        &extract_archive_path,
+                                        backend.extract(ExtractArchiveRequest {
+                                            archive: extract_archive_path.clone(),
+                                            format: extract_format,
+                                            output_dir: temp_output_dir,
+                                            password: extract_password,
+                                            encoding: extract_encoding,
+                                        }),
+                                    )
+                                    .await
+                                    .map(|_| ())
+                                },
+                            )
+                            .await;
+
+                        match extract_result {
+                            Ok(result) => {
+                                if result.output_dir != output_dir {
+                                    candidate.relative_path = output_relative_path_for(
+                                        &request.output_dir,
+                                        &result.output_dir,
+                                    );
+                                }
                                 extracted = true;
                                 break;
                             }
-                            Err(error) => {
-                                last_error = Some(error);
+                            Err(failure) => {
+                                if let Some(temp_dir) = &failure.preserved_temp_dir {
+                                    eprintln!(
+                                        "preserved failed extraction temp dir: {}",
+                                        temp_dir.display()
+                                    );
+                                }
+                                last_error = Some(failure.error);
                             }
                         }
                     }
@@ -528,24 +561,47 @@ impl SmartZipEngine {
                             .await
                             {
                                 Ok(result) if result.ok => {
-                                    match backend_call(
-                                        "archive-backend",
-                                        "extract",
-                                        &archive_path,
-                                        backend.extract(ExtractArchiveRequest {
-                                            archive: archive_path.clone(),
-                                            format: candidate.detected_format.clone(),
-                                            output_dir: output_dir.clone(),
-                                            password: Some(pw.clone()),
-                                            encoding: encoding_result
-                                                .as_ref()
-                                                .map(|r| EncodingMode::Override(r.selected.clone()))
-                                                .unwrap_or_else(|| request.encoding_mode.clone()),
-                                        }),
-                                    )
-                                    .await
-                                    {
-                                        Ok(_) => {
+                                    let encoding_to_use = encoding_result
+                                        .as_ref()
+                                        .map(|r| EncodingMode::Override(r.selected.clone()))
+                                        .unwrap_or_else(|| request.encoding_mode.clone());
+                                    let extract_archive_path = archive_path.clone();
+                                    let extract_format = candidate.detected_format.clone();
+                                    let extract_password = pw.clone();
+                                    let extract_encoding = encoding_to_use.clone();
+                                    let extract_result = output_materializer
+                                        .materialize(
+                                            MaterializeRequest {
+                                                output_dir: output_dir.clone(),
+                                                commit_policy: output_plan.commit_policy,
+                                            },
+                                            |temp_output_dir| async move {
+                                                backend_call(
+                                                    "archive-backend",
+                                                    "extract",
+                                                    &extract_archive_path,
+                                                    backend.extract(ExtractArchiveRequest {
+                                                        archive: extract_archive_path.clone(),
+                                                        format: extract_format,
+                                                        output_dir: temp_output_dir,
+                                                        password: Some(extract_password),
+                                                        encoding: extract_encoding,
+                                                    }),
+                                                )
+                                                .await
+                                                .map(|_| ())
+                                            },
+                                        )
+                                        .await;
+
+                                    match extract_result {
+                                        Ok(result) => {
+                                            if result.output_dir != output_dir {
+                                                candidate.relative_path = output_relative_path_for(
+                                                    &request.output_dir,
+                                                    &result.output_dir,
+                                                );
+                                            }
                                             // Save successful interactive password to DB
                                             let _ = passwords.record_success(&PasswordCandidate {
                                                 id: None,
@@ -554,11 +610,17 @@ impl SmartZipEngine {
                                             });
                                             extracted = true;
                                         }
-                                        Err(error) => {
+                                        Err(failure) => {
+                                            if let Some(temp_dir) = &failure.preserved_temp_dir {
+                                                eprintln!(
+                                                    "preserved failed extraction temp dir: {}",
+                                                    temp_dir.display()
+                                                );
+                                            }
                                             eprintln!(
                                                 "Interactive extract failed for {}: {}",
                                                 archive_path.display(),
-                                                error
+                                                failure.error
                                             );
                                         }
                                     }
@@ -593,7 +655,7 @@ impl SmartZipEngine {
             events.push(TaskEvent {
                 task_id: task_id.clone(),
                 kind: TaskEventKind::OutputCreated {
-                    path: output_dir.clone(),
+                    path: output_dir_for_candidate(&request.output_dir, &candidate),
                 },
             });
 
@@ -688,6 +750,21 @@ struct PendingOutputConflict<'a> {
     prompt: Pin<Box<dyn Future<Output = OutputCollisionStrategy> + Send + 'a>>,
 }
 
+#[derive(Debug, Clone)]
+struct OutputPlan {
+    output_dir: PathBuf,
+    commit_policy: CommitPolicy,
+}
+
+impl OutputPlan {
+    fn new(output_dir: PathBuf) -> Self {
+        Self {
+            output_dir,
+            commit_policy: CommitPolicy::FailIfExists,
+        }
+    }
+}
+
 fn materialize_archive_input(
     candidate: &ExtractionCandidate,
 ) -> smartzip_core::Result<ArchiveInput> {
@@ -732,16 +809,6 @@ fn poll_pending_output_conflict<'a>(
     }
 }
 
-fn remove_existing_output(path: &Path) -> smartzip_core::Result<()> {
-    if path.is_dir() {
-        std::fs::remove_dir_all(path)
-            .map_err(|source| smartzip_core::SmartZipError::io(Some(path.to_path_buf()), source))
-    } else {
-        std::fs::remove_file(path)
-            .map_err(|source| smartzip_core::SmartZipError::io(Some(path.to_path_buf()), source))
-    }
-}
-
 fn apply_output_collision_strategy(
     request: &ExtractWorkflowRequest,
     candidate: ExtractionCandidate,
@@ -749,27 +816,32 @@ fn apply_output_collision_strategy(
     strategy: OutputCollisionStrategy,
     queue: &mut VecDeque<ExtractionCandidate>,
     skipped: &mut Vec<ExtractionCandidate>,
-    output_overrides: &mut HashMap<String, PathBuf>,
+    output_overrides: &mut HashMap<String, OutputPlan>,
 ) -> smartzip_core::Result<()> {
     match strategy {
         OutputCollisionStrategy::Skip => {
             skipped.push(candidate);
         }
         OutputCollisionStrategy::Overwrite => {
-            remove_existing_output(&output_dir)?;
-            output_overrides.insert(candidate_key(&candidate), output_dir);
+            output_overrides.insert(
+                candidate_key(&candidate),
+                OutputPlan {
+                    output_dir,
+                    commit_policy: CommitPolicy::Overwrite,
+                },
+            );
             queue.push_front(candidate);
         }
         OutputCollisionStrategy::Rename => {
-            let parent = output_dir.parent().unwrap_or_else(|| Path::new("."));
-            let file_name = output_dir
-                .file_name()
-                .unwrap_or_else(|| std::ffi::OsStr::new("archive"));
-            let renamed_output_dir = find_non_colliding_name(parent, file_name);
             let mut candidate = candidate;
-            candidate.relative_path =
-                output_relative_path_for(&request.output_dir, &renamed_output_dir);
-            output_overrides.insert(candidate_key(&candidate), renamed_output_dir);
+            candidate.relative_path = output_relative_path_for(&request.output_dir, &output_dir);
+            output_overrides.insert(
+                candidate_key(&candidate),
+                OutputPlan {
+                    output_dir,
+                    commit_policy: CommitPolicy::Rename,
+                },
+            );
             queue.push_front(candidate);
         }
     }
@@ -829,24 +901,6 @@ fn panic_message(panic: Box<dyn Any + Send>) -> String {
     } else {
         "unknown panic payload".to_string()
     }
-}
-
-/// Find a non-colliding target path. If `parent.join(name)` exists,
-/// append `_collided_N` until a free name is found.
-#[allow(dead_code)]
-fn find_non_colliding_name(parent: &Path, name: &std::ffi::OsStr) -> PathBuf {
-    let base = parent.join(name);
-    if !base.exists() {
-        return base;
-    }
-    let name_str = name.to_string_lossy();
-    for n in 1..1000u32 {
-        let alt = parent.join(format!("{name_str}_collided_{n}"));
-        if !alt.exists() {
-            return alt;
-        }
-    }
-    parent.join(format!("{name_str}_{}", std::process::id()))
 }
 
 fn discover_nested_candidates(
