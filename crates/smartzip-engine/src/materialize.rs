@@ -106,11 +106,13 @@ impl OutputMaterializer {
             single_root_name_policy: request.single_root_name_policy,
         });
 
-        let commit_target = resolve_commit_target(&request.output_dir, request.commit_policy)
-            .map_err(|error| MaterializeFailure {
-                error,
-                preserved_temp_dir: None,
-            })?;
+        let commit_target =
+            resolve_commit_target(&layout_plan.target, request.commit_policy).map_err(
+                |error| MaterializeFailure {
+                    error,
+                    preserved_temp_dir: None,
+                },
+            )?;
         if commit_target.exists() {
             remove_existing_output(&commit_target).map_err(|error| MaterializeFailure {
                 error,
@@ -432,7 +434,11 @@ mod tests {
 
         let plan = result.layout_plan.as_ref().unwrap();
         assert_eq!(plan.kind, LayoutPlanKind::CommitWholeTempAsArchiveDir { name: "my-archive".to_string() });
-        assert!(output.join("files").exists());
-        assert_eq!(std::fs::read(output.join("files").join("a.txt")).unwrap(), b"alpha");
+        assert_eq!(result.output_dir, plan.target);
+        assert!(result.output_dir.join("files").exists());
+        assert_eq!(
+            std::fs::read(result.output_dir.join("files").join("a.txt")).unwrap(),
+            b"alpha"
+        );
     }
 }
