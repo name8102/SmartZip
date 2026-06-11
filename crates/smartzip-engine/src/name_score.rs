@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::path::Path;
 use unicode_normalization::UnicodeNormalization;
 
 /// Generic names that carry little information for output planning.
@@ -414,6 +415,26 @@ fn extract_tokens(name: &str) -> Vec<&str> {
         .collect()
 }
 
+/// Extract a display-friendly stem from an archive path.
+///
+/// Strips double extensions like `.tar` from compound suffixes
+/// (e.g. `foo.tar.gz` → `"foo"`, `foo.tar.bz2` → `"foo"`).
+/// Simple extensions like `.zip` are handled by `file_stem()` alone.
+pub fn archive_display_stem(path: &Path) -> String {
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("archive");
+    for suffix in &[".tar"] {
+        if let Some(inner) = stem.strip_suffix(suffix) {
+            if !inner.is_empty() {
+                return inner.to_string();
+            }
+        }
+    }
+    stem.to_string()
+}
+
 fn is_hash_like(name: &str) -> bool {
     let stem = name
         .rsplit_once('.')
@@ -608,5 +629,30 @@ mod tests {
         assert_eq!(classify_similarity(0.55), SimilarityLevel::Partial);
         assert_eq!(classify_similarity(0.54), SimilarityLevel::Different);
         assert_eq!(classify_similarity(0.0), SimilarityLevel::Different);
+    }
+
+    #[test]
+    fn archive_display_stem_tar_gz() {
+        assert_eq!(archive_display_stem(Path::new("foo.tar.gz")), "foo");
+    }
+
+    #[test]
+    fn archive_display_stem_zip() {
+        assert_eq!(archive_display_stem(Path::new("foo.zip")), "foo");
+    }
+
+    #[test]
+    fn archive_display_stem_tar() {
+        assert_eq!(archive_display_stem(Path::new("foo.tar")), "foo");
+    }
+
+    #[test]
+    fn archive_display_stem_tar_bz2() {
+        assert_eq!(archive_display_stem(Path::new("foo.tar.bz2")), "foo");
+    }
+
+    #[test]
+    fn archive_display_stem_plain_name() {
+        assert_eq!(archive_display_stem(Path::new("archive")), "archive");
     }
 }

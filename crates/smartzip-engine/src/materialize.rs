@@ -88,12 +88,7 @@ impl OutputMaterializer {
         }
 
         let archive_stem = request.archive_stem.unwrap_or_else(|| {
-            request
-                .output_dir
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("archive")
-                .to_string()
+            crate::name_score::archive_display_stem(&request.output_dir)
         });
 
         let shape = crate::layout::scan_visible_top_level(&temp_path);

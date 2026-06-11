@@ -721,10 +721,7 @@ fn archive_output_name(path: &Path) -> PathBuf {
 }
 
 fn archive_stem(path: &Path) -> std::ffi::OsString {
-    path.file_stem()
-        .or_else(|| path.file_name())
-        .map(|name| name.to_os_string())
-        .unwrap_or_else(|| std::ffi::OsString::from("archive"))
+    std::ffi::OsString::from(name_score::archive_display_stem(path))
 }
 
 fn candidate_key(candidate: &ExtractionCandidate) -> String {

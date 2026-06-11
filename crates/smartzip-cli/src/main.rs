@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use smartzip_archive::BackendRouter;
 use smartzip_core::EncodingMode;
 use smartzip_db::{password::PasswordRepository, SmartZipDb};
+use smartzip_engine::name_score;
 use smartzip_engine::{
     DetectRequest, ExtractWorkflowRequest, InteractiveOutputPrompter, InteractivePasswordPrompter,
     OutputCollisionStrategy, SmartZipEngine,
@@ -374,13 +375,12 @@ async fn extract(
 
     if dry_run {
         let output_dir = output.unwrap_or_else(|| default_output_dir(paths.first().unwrap()));
-        for path in &paths {
-            let stem = path.file_stem().map(|s| s.to_string_lossy()).unwrap_or_default();
-            let target = output_dir.join(&*stem);
-            println!("{} -> {}", path.display(), target.display());
-        }
-        println!("layout: {layout_policy:?}, single_root_name: {single_root_name_policy:?}");
-        println!("(dry run — no extraction performed)");
+        let archive_stem = name_score::archive_display_stem(paths.first().unwrap());
+        println!("Archive: {}", paths.first().unwrap().display());
+        println!("Archive stem: {archive_stem}");
+        println!("Layout policy: {layout_policy:?}");
+        println!("Note: --dry-run shows initial candidate path. Final layout depends on extracted content.");
+        println!("Planned output: {}", output_dir.join(&archive_stem).display());
         return Ok(());
     }
 

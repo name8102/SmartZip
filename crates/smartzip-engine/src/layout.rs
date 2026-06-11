@@ -173,6 +173,41 @@ pub fn plan_layout(req: &LayoutRequest) -> LayoutPlan {
         };
     }
 
+    if req.layout_policy == OutputLayoutPolicy::FlatSingle {
+        return match &req.shape {
+            TopLevelShape::Empty => LayoutPlan {
+                source: PlanSource::WholeTempDir,
+                kind: LayoutPlanKind::Empty,
+                target: req.output_root.clone(),
+                reason: LayoutDecisionReason::EmptyTempDir,
+                warnings: vec![],
+            },
+            TopLevelShape::SingleDir(item) => LayoutPlan {
+                source: PlanSource::SingleDir(item.path.clone()),
+                kind: LayoutPlanKind::CommitSingleDirAsInnerName,
+                target: req.output_root.clone(),
+                reason: LayoutDecisionReason::SingleDirGoodName,
+                warnings: vec![],
+            },
+            TopLevelShape::SingleFile(item) => LayoutPlan {
+                source: PlanSource::SingleFile(item.path.clone()),
+                kind: LayoutPlanKind::CommitSingleFileAsInnerName,
+                target: req.output_root.clone(),
+                reason: LayoutDecisionReason::SingleFileGoodName,
+                warnings: vec![],
+            },
+            TopLevelShape::Multiple { .. } => LayoutPlan {
+                source: PlanSource::WholeTempDir,
+                kind: LayoutPlanKind::CommitWholeTempAsArchiveDir {
+                    name: req.archive_stem.clone(),
+                },
+                target: req.output_root.join(&req.archive_stem),
+                reason: LayoutDecisionReason::MultipleTopLevelItems,
+                warnings: vec![],
+            },
+        };
+    }
+
     match &req.shape {
         TopLevelShape::Empty => LayoutPlan {
             source: PlanSource::WholeTempDir,
@@ -859,7 +894,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_flat_single_policy() {
+    fn plan_flat_single_policy_empty() {
         let req = make_request(
             TopLevelShape::Empty,
             "archive",
@@ -869,6 +904,115 @@ mod tests {
         let plan = plan_layout(&req);
         assert_eq!(plan.kind, LayoutPlanKind::Empty);
         assert_eq!(plan.reason, LayoutDecisionReason::EmptyTempDir);
+    }
+
+    #[test]
+    fn plan_flat_single_collapses_single_dir() {
+        let item = make_item("MyProject", true, &PathBuf::new());
+        let req = make_request(
+            TopLevelShape::SingleDir(item),
+            "archive",
+            OutputLayoutPolicy::FlatSingle,
+            SingleRootNamePolicy::Auto,
+        );
+        let plan = plan_layout(&req);
+        assert_eq!(plan.kind, LayoutPlanKind::CommitSingleDirAsInnerName);
+        assert_eq!(plan.source, PlanSource::SingleDir(PathBuf::from("MyProject")));
+        assert_eq!(plan.target, req.output_root);
+    }
+
+    #[test]
+    fn plan_flat_single_collapses_single_file() {
+        let item = make_item("document.pdf", false, &PathBuf::new());
+        let req = make_request(
+            TopLevelShape::SingleFile(item),
+            "archive",
+            OutputLayoutPolicy::FlatSingle,
+            SingleRootNamePolicy::Auto,
+        );
+        let plan = plan_layout(&req);
+        assert_eq!(plan.kind, LayoutPlanKind::CommitSingleFileAsInnerName);
+        assert_eq!(plan.source, PlanSource::SingleFile(PathBuf::from("document.pdf")));
+        assert_eq!(plan.target, req.output_root);
+    }
+
+    #[test]
+    fn plan_flat_single_wraps_multiple() {
+        let items = vec![
+            make_item("a.txt", false, &PathBuf::new()),
+            make_item("b.txt", false, &PathBuf::new()),
+        ];
+        let req = make_request(
+            TopLevelShape::Multiple { items: items.clone(), count: items.len() },
+            "archive",
+            OutputLayoutPolicy::FlatSingle,
+            SingleRootNamePolicy::Auto,
+        );
+        let plan = plan_layout(&req);
+        assert_eq!(plan.kind, LayoutPlanKind::CommitWholeTempAsArchiveDir { name: "archive".to_string() });
+        assert_eq!(plan.reason, LayoutDecisionReason::MultipleTopLevelItems);
+    }
+
+    #[test]
+    fn plan_prefer_archive_name_always_wraps_single_dir() {
+        let item = make_item("The Great Gatsby - F. Scott Fitzgerald", true, &PathBuf::new());
+        let req = make_request(
+            TopLevelShape::SingleDir(item),
+            "downloads",
+            OutputLayoutPolicy::Smart,
+            SingleRootNamePolicy::PreferArchiveName,
+        );
+        let plan = plan_layout(&req);
+        assert_eq!(
+            plan.kind,
+            LayoutPlanKind::CommitWholeTempAsArchiveDir {
+                name: "downloads".to_string()
+            }
+        );
+        assert_eq!(plan.source, PlanSource::WholeTempDir);
+    }
+
+    #[test]
+    fn plan_prefer_inner_name_always_collapses_dir() {
+        let item = make_item("downloads", true, &PathBuf::new());
+        let req = make_request(
+            TopLevelShape::SingleDir(item),
+            "The Great Gatsby",
+            OutputLayoutPolicy::Smart,
+            SingleRootNamePolicy::PreferInnerName,
+        );
+        let plan = plan_layout(&req);
+        assert_eq!(plan.kind, LayoutPlanKind::CommitSingleDirAsInnerName);
+        assert_eq!(plan.source, PlanSource::SingleDir(PathBuf::from("downloads")));
+        assert_eq!(plan.target, req.output_root);
+    }
+
+    #[test]
+    fn plan_prefer_archive_name_always_renames_single_file() {
+        let item = make_item("The Great Gatsby.pdf", false, &PathBuf::new());
+        let req = make_request(
+            TopLevelShape::SingleFile(item),
+            "downloads",
+            OutputLayoutPolicy::Smart,
+            SingleRootNamePolicy::PreferArchiveName,
+        );
+        let plan = plan_layout(&req);
+        assert_eq!(plan.kind, LayoutPlanKind::CommitSingleFileAsArchiveName);
+        assert_eq!(plan.target, req.output_root.join("downloads.pdf"));
+    }
+
+    #[test]
+    fn plan_prefer_inner_name_always_keeps_single_file() {
+        let item = make_item("downloads.pdf", false, &PathBuf::new());
+        let req = make_request(
+            TopLevelShape::SingleFile(item),
+            "The Great Gatsby",
+            OutputLayoutPolicy::Smart,
+            SingleRootNamePolicy::PreferInnerName,
+        );
+        let plan = plan_layout(&req);
+        assert_eq!(plan.kind, LayoutPlanKind::CommitSingleFileAsInnerName);
+        assert_eq!(plan.target, req.output_root);
     }
 
     #[test]
