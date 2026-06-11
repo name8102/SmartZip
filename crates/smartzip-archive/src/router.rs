@@ -1,22 +1,22 @@
 use crate::backend::ArchiveBackend;
+use crate::native_zip::NativeZipBackend;
 use crate::sevenzz::{SevenZipBackend, SevenZipLocator};
 use crate::types::*;
 use crate::unrar::{UnrarBackend, UnrarLocator};
-use crate::zip::ZipBackend;
 use async_trait::async_trait;
 use smartzip_core::{ArchiveFormat, Result, SmartZipError};
 use std::path::Path;
 
 #[derive(Debug, Clone)]
 pub struct BackendRouter {
-    zip: ZipBackend,
+    zip: NativeZipBackend,
     unrar: Option<UnrarBackend>,
     sevenzip: Option<SevenZipBackend>,
 }
 
 impl BackendRouter {
     pub fn new(
-        zip: ZipBackend,
+        zip: NativeZipBackend,
         unrar: Option<UnrarBackend>,
         sevenzip: Option<SevenZipBackend>,
     ) -> Self {
@@ -30,10 +30,10 @@ impl BackendRouter {
     pub fn locate() -> Result<Self> {
         let unrar = UnrarBackend::locate(&UnrarLocator::default()).ok();
         let sevenzip = SevenZipBackend::locate(&SevenZipLocator::default()).ok();
-        Ok(Self::new(ZipBackend::new(), unrar, sevenzip))
+        Ok(Self::new(NativeZipBackend::new(), unrar, sevenzip))
     }
 
-    pub fn zip(&self) -> &ZipBackend {
+    pub fn zip(&self) -> &NativeZipBackend {
         &self.zip
     }
 
@@ -254,7 +254,7 @@ mod tests {
     #[test]
     fn unknown_extension_routes_through_native_zip_unrar_then_sevenzip() {
         let router = BackendRouter::new(
-            ZipBackend::new(),
+            NativeZipBackend::new(),
             Some(UnrarBackend::new(Path::new("/usr/bin/unrar").to_path_buf())),
             Some(SevenZipBackend::new(
                 Path::new("/usr/bin/7zz").to_path_buf(),
@@ -267,7 +267,7 @@ mod tests {
     #[test]
     fn format_hint_routes_disguised_rar_to_unrar_first() {
         let router = BackendRouter::new(
-            ZipBackend::new(),
+            NativeZipBackend::new(),
             Some(UnrarBackend::new(Path::new("/usr/bin/unrar").to_path_buf())),
             Some(SevenZipBackend::new(
                 Path::new("/usr/bin/7zz").to_path_buf(),

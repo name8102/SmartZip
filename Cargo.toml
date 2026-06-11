@@ -18,7 +18,7 @@ resolver = "2"
 edition = "2021"
 license = "MIT"
 authors = ["charl"]
-rust-version = "1.80"
+rust-version = "1.88"
 
 [workspace.dependencies]
 async-trait = "0.1"
@@ -40,8 +40,6 @@ smartzip-engine = { path = "crates/smartzip-engine" }
 smartzip-passwords = { path = "crates/smartzip-passwords" }
 smartzip-platform = { path = "crates/smartzip-platform" }
 smartzip-scanner = { path = "crates/smartzip-scanner" }
-rc-zip = { version = "5.4", features = ["deflate"] }
-rc-zip-tokio = { version = "4.3", features = ["deflate"] }
 thiserror = "2.0"
 futures-util = "0.3"
 futures-lite = "2.6"
@@ -49,3 +47,4 @@ tokio = { version = "1.45", features = ["macros", "process", "rt-multi-thread", 
 toml = "0.8"
 rstest = "0.25"
 tempfile = "3"
+zip = { version = "8", default-features = false, features = ["aes-crypto", "deflate", "bzip2", "lzma", "xz", "zstd", "time"] }
