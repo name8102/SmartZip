@@ -261,9 +261,7 @@ fn extract_sync(
                         entry: String::from_utf8_lossy(raw_name).into_owned(),
                     }
                 })?;
-                crate::safety::safe_entry_path(decoded.as_bytes()).ok_or_else(|| {
-                    SmartZipError::UnsafeArchivePath { entry: decoded }
-                })?
+                crate::safety::safe_entry_path(decoded.as_bytes()).ok_or(SmartZipError::UnsafeArchivePath { entry: decoded })?
             }
             smartzip_core::EncodingMode::Auto => {
                 crate::safety::safe_entry_path(raw_name).ok_or_else(|| {
@@ -454,17 +452,12 @@ mod tests {
 
         let cd_size = (f.stream_position().unwrap() - cd_offset) as u32;
         f.write_all(b"PK\x05\x06").unwrap();
-        let _eocd: [u16; 7] = [
-            0, 0, entries.len() as u16, entries.len() as u16,
-            cd_size as u16, (cd_offset >> 16) as u16, 0,
-        ];
-        // EOCD has 12-byte fixed fields: disk_num(2), cd_disk(2), cd_entries_disk(2), cd_entries(2), cd_size(4), cd_offset(4), comment_len(2)
-        // Write it manually for correctness
+        // EOCD: 18-byte fixed payload (signature already written above)
         f.write_all(&0u16.to_le_bytes()).unwrap(); // disk number
         f.write_all(&0u16.to_le_bytes()).unwrap(); // CD disk number
         f.write_all(&(entries.len() as u16).to_le_bytes()).unwrap(); // CD entries this disk
         f.write_all(&(entries.len() as u16).to_le_bytes()).unwrap(); // CD entries total
-        f.write_all(&(cd_size as u32).to_le_bytes()).unwrap(); // CD size
+        f.write_all(&cd_size.to_le_bytes()).unwrap(); // CD size
         f.write_all(&(cd_offset as u32).to_le_bytes()).unwrap(); // CD offset
         f.write_all(&0u16.to_le_bytes()).unwrap(); // comment length
     }
@@ -538,7 +531,7 @@ mod tests {
         {
             let mut writer = ZipWriter::new(&mut buf);
             let options = SimpleFileOptions::default();
-            writer.add_directory("dir1/", options.clone()).unwrap();
+            writer.add_directory("dir1/", options).unwrap();
             writer.add_directory("dir1/subdir/", options).unwrap();
             writer.finish().unwrap();
         }
@@ -555,7 +548,7 @@ mod tests {
             for i in 0..1000 {
                 let name = format!("file_{:04}.txt", i);
                 writer.start_file(&name, options).unwrap();
-                write!(writer, "content of file {}\n", i).unwrap();
+                writeln!(writer, "content of file {}", i).unwrap();
             }
             writer.finish().unwrap();
         }
@@ -711,5 +704,414 @@ mod tests {
     async fn native_zip_capabilities_supports_passwords() {
         let backend = NativeZipBackend::new();
         assert!(backend.capabilities().supports_passwords);
+    }
+
+    // ── Restored: end-to-end compress → list → test → extract ────────
+
+    #[tokio::test]
+    async fn native_zip_can_compress_list_test_and_extract() {
+        let temp = tempfile::tempdir().unwrap();
+        let input_dir = temp.path().join("input");
+        let nested_dir = input_dir.join("nested");
+        std::fs::create_dir_all(&nested_dir).unwrap();
+        std::fs::write(input_dir.join("hello.txt"), "hello zip\n").unwrap();
+        std::fs::write(nested_dir.join("data.txt"), "nested data\n").unwrap();
+
+        let archive = temp.path().join("archive.zip");
+        let backend = NativeZipBackend::new();
+        backend
+            .compress(CompressArchiveRequest {
+                inputs: vec![input_dir.clone()],
+                output: archive.clone(),
+                format: ArchiveFormat::Zip,
+                level: CompressionLevel::Balanced,
+                password: None,
+            })
+            .await
+            .unwrap();
+
+        let listing = backend
+            .list(ListRequest {
+                archive: archive.clone(),
+                format: Some(ArchiveFormat::Zip),
+                password: None,
+                encoding: EncodingMode::Auto,
+            })
+            .await
+            .unwrap();
+        assert!(listing
+            .entries
+            .iter()
+            .any(|entry| entry.path.ends_with("input/hello.txt")));
+        assert!(
+            backend
+                .test(TestRequest {
+                    archive: archive.clone(),
+                    format: Some(ArchiveFormat::Zip),
+                    password: None,
+                    encoding: EncodingMode::Auto,
+                })
+                .await
+                .unwrap()
+                .ok
+        );
+
+        let output_dir = temp.path().join("output");
+        backend
+            .extract(ExtractArchiveRequest {
+                archive,
+                format: Some(ArchiveFormat::Zip),
+                output_dir: output_dir.clone(),
+                password: None,
+                encoding: EncodingMode::Auto,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(output_dir.join("input/hello.txt")).unwrap(),
+            "hello zip\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(output_dir.join("input/nested/data.txt")).unwrap(),
+            "nested data\n"
+        );
+    }
+
+    // ── Restored: probe tests ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn native_zip_probe_succeeds_for_valid_zip() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("test.zip");
+        std::fs::write(&archive, create_minimal_zip()).unwrap();
+
+        let backend = NativeZipBackend::new();
+        let probe = backend.probe(&archive).await.unwrap();
+        assert!(probe.supported);
+        assert_eq!(probe.format, Some(ArchiveFormat::Zip));
+        assert_eq!(probe.encrypted, Some(false));
+    }
+
+    #[tokio::test]
+    async fn native_zip_probe_detects_encrypted_archive() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("encrypted.zip");
+        create_encrypted_zip(&archive, "secret");
+
+        let backend = NativeZipBackend::new();
+        let probe = backend.probe(&archive).await.unwrap();
+        assert!(probe.supported);
+        assert_eq!(probe.format, Some(ArchiveFormat::Zip));
+        assert_eq!(probe.encrypted, Some(true));
+    }
+
+    // ── Tests: path safety ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn native_zip_extract_rejects_zip_slip() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("zipslip.zip");
+        create_zip_slip_zip(&archive);
+
+        let backend = NativeZipBackend::new();
+        let output_dir = temp.path().join("output");
+        let result = backend
+            .extract(ExtractArchiveRequest {
+                archive,
+                format: Some(ArchiveFormat::Zip),
+                output_dir,
+                password: None,
+                encoding: EncodingMode::Auto,
+            })
+            .await;
+        assert!(
+            matches!(result, Err(SmartZipError::UnsafeArchivePath { .. })),
+            "expected UnsafeArchivePath, got: {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn native_zip_extract_rejects_absolute_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("absolute.zip");
+        create_absolute_path_zip(&archive);
+
+        let backend = NativeZipBackend::new();
+        let output_dir = temp.path().join("output");
+        let result = backend
+            .extract(ExtractArchiveRequest {
+                archive,
+                format: Some(ArchiveFormat::Zip),
+                output_dir,
+                password: None,
+                encoding: EncodingMode::Auto,
+            })
+            .await;
+        assert!(
+            matches!(result, Err(SmartZipError::UnsafeArchivePath { .. })),
+            "expected UnsafeArchivePath, got: {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn native_zip_extract_rejects_windows_drive_letter() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("windrive.zip");
+        create_windows_drive_zip(&archive);
+
+        let backend = NativeZipBackend::new();
+        let output_dir = temp.path().join("output");
+        let result = backend
+            .extract(ExtractArchiveRequest {
+                archive,
+                format: Some(ArchiveFormat::Zip),
+                output_dir,
+                password: None,
+                encoding: EncodingMode::Auto,
+            })
+            .await;
+        assert!(
+            matches!(result, Err(SmartZipError::UnsafeArchivePath { .. })),
+            "expected UnsafeArchivePath, got: {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn native_zip_extract_rejects_backslash_traversal() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("backslash.zip");
+        create_backslash_traversal_zip(&archive);
+
+        let backend = NativeZipBackend::new();
+        let output_dir = temp.path().join("output");
+        let result = backend
+            .extract(ExtractArchiveRequest {
+                archive,
+                format: Some(ArchiveFormat::Zip),
+                output_dir,
+                password: None,
+                encoding: EncodingMode::Auto,
+            })
+            .await;
+        assert!(
+            matches!(result, Err(SmartZipError::UnsafeArchivePath { .. })),
+            "expected UnsafeArchivePath, got: {:?}",
+            result
+        );
+    }
+
+    // ── Tests: encoding (raw filename preservation) ───────────────────
+
+    #[tokio::test]
+    async fn native_zip_list_preserves_gbk_raw_name_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("gbk.zip");
+        // "测试文件.txt" in GBK
+        let gbk_name = b"\xb2\xe2\xca\xd4\xce\xc4\xbc\xfe.txt";
+        let content = b"hello";
+        create_raw_zip_with_encoding(&archive, &[(gbk_name, content)]);
+
+        let backend = NativeZipBackend::new();
+        let listing = backend
+            .list(ListRequest {
+                archive,
+                format: Some(ArchiveFormat::Zip),
+                password: None,
+                encoding: EncodingMode::Auto,
+            })
+            .await
+            .unwrap();
+        assert_eq!(listing.entries.len(), 1);
+        assert_eq!(listing.entries[0].raw_name, gbk_name);
+        // path is lossy-converted but raw_name preserves original bytes
+        assert!(listing.entries[0].raw_name == gbk_name);
+    }
+
+    #[tokio::test]
+    async fn native_zip_list_preserves_shift_jis_raw_name_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("sjis.zip");
+        // "テスト" in Shift_JIS
+        let sjis_name = b"\x83\x65\x83\x58\x83\x67.txt";
+        let content = b"hello";
+        create_raw_zip_with_encoding(&archive, &[(sjis_name, content)]);
+
+        let backend = NativeZipBackend::new();
+        let listing = backend
+            .list(ListRequest {
+                archive,
+                format: Some(ArchiveFormat::Zip),
+                password: None,
+                encoding: EncodingMode::Auto,
+            })
+            .await
+            .unwrap();
+        assert_eq!(listing.entries.len(), 1);
+        assert_eq!(listing.entries[0].raw_name, sjis_name);
+    }
+
+    #[tokio::test]
+    async fn native_zip_extract_override_encoding_gbk() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("gbk.zip");
+        // "测试" in GBK
+        let gbk_name = b"\xb2\xe2\xca\xd4";
+        let content = b"content";
+        create_raw_zip_with_encoding(&archive, &[(gbk_name, content)]);
+
+        let backend = NativeZipBackend::new();
+        let output_dir = temp.path().join("output");
+        backend
+            .extract(ExtractArchiveRequest {
+                archive,
+                format: Some(ArchiveFormat::Zip),
+                output_dir: output_dir.clone(),
+                password: None,
+                encoding: EncodingMode::Override("gb18030".into()),
+            })
+            .await
+            .unwrap();
+        // Should create file with decoded GBK name (not garbled)
+        let expected_name = smartzip_encoding::decode_name(gbk_name, "gb18030").unwrap();
+        assert!(output_dir.join(&expected_name).exists());
+        assert_eq!(
+            std::fs::read_to_string(output_dir.join(&expected_name)).unwrap(),
+            "content"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_zip_extract_override_encoding_shift_jis() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("sjis.zip");
+        // "テスト" in Shift_JIS
+        let sjis_name = b"\x83\x65\x83\x58\x83\x67";
+        let content = b"content";
+        create_raw_zip_with_encoding(&archive, &[(sjis_name, content)]);
+
+        let backend = NativeZipBackend::new();
+        let output_dir = temp.path().join("output");
+        backend
+            .extract(ExtractArchiveRequest {
+                archive,
+                format: Some(ArchiveFormat::Zip),
+                output_dir: output_dir.clone(),
+                password: None,
+                encoding: EncodingMode::Override("shift_jis".into()),
+            })
+            .await
+            .unwrap();
+        let expected_name = smartzip_encoding::decode_name(sjis_name, "shift_jis").unwrap();
+        assert!(output_dir.join(&expected_name).exists());
+        assert_eq!(
+            std::fs::read_to_string(output_dir.join(&expected_name)).unwrap(),
+            "content"
+        );
+    }
+
+    // ── Tests: structural edge cases ─────────────────────────────────
+
+    #[tokio::test]
+    async fn native_zip_extract_empty_dirs() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("empty_dirs.zip");
+        create_empty_dir_zip(&archive);
+
+        let backend = NativeZipBackend::new();
+        let output_dir = temp.path().join("output");
+        backend
+            .extract(ExtractArchiveRequest {
+                archive,
+                format: Some(ArchiveFormat::Zip),
+                output_dir: output_dir.clone(),
+                password: None,
+                encoding: EncodingMode::Auto,
+            })
+            .await
+            .unwrap();
+        assert!(output_dir.join("dir1").is_dir());
+        assert!(output_dir.join("dir1/subdir").is_dir());
+    }
+
+    #[tokio::test]
+    async fn native_zip_extract_many_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("many.zip");
+        create_many_entries_zip(&archive);
+
+        let backend = NativeZipBackend::new();
+        let output_dir = temp.path().join("output");
+        backend
+            .extract(ExtractArchiveRequest {
+                archive,
+                format: Some(ArchiveFormat::Zip),
+                output_dir: output_dir.clone(),
+                password: None,
+                encoding: EncodingMode::Auto,
+            })
+            .await
+            .unwrap();
+        for i in 0..1000 {
+            let name = format!("file_{:04}.txt", i);
+            assert!(output_dir.join(&name).exists(), "missing {name}");
+            assert!(std::fs::read_to_string(output_dir.join(&name))
+                .unwrap()
+                .contains(&format!("content of file {i}")));
+        }
+    }
+
+    // ── Tests: compression ratio ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn native_zip_extract_high_ratio_small_below_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("ratio_small.zip");
+        create_high_ratio_small_zip(&archive);
+
+        let backend = NativeZipBackend::new();
+        let output_dir = temp.path().join("output");
+        // 10000 bytes compressed to ~30 bytes → ratio ~333, well below 10_000
+        backend
+            .extract(ExtractArchiveRequest {
+                archive,
+                format: Some(ArchiveFormat::Zip),
+                output_dir: output_dir.clone(),
+                password: None,
+                encoding: EncodingMode::Auto,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(output_dir.join("small.txt")).unwrap().len(),
+            10000
+        );
+    }
+
+    #[tokio::test]
+    async fn native_zip_extract_high_ratio_large_below_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("ratio_large.zip");
+        create_high_ratio_large_zip(&archive);
+
+        let backend = NativeZipBackend::new();
+        let output_dir = temp.path().join("output");
+        // 1MB of identical bytes → ratio maybe a few hundred, below 10_000
+        backend
+            .extract(ExtractArchiveRequest {
+                archive,
+                format: Some(ArchiveFormat::Zip),
+                output_dir: output_dir.clone(),
+                password: None,
+                encoding: EncodingMode::Auto,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(output_dir.join("large.txt")).unwrap().len(),
+            1024 * 1024
+        );
     }
 }
