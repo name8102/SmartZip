@@ -253,6 +253,17 @@ fn extract_sync(
             });
         }
 
+        if total_written + uncompressed > limits.max_total_output_bytes {
+            return Err(SmartZipError::BackendFailed {
+                backend: "native-zip".into(),
+                exit_code: None,
+                stderr: format!(
+                    "projected total output {} bytes would exceed limit {}",
+                    total_written + uncompressed, limits.max_total_output_bytes
+                ),
+            });
+        }
+
         let raw_name = entry.name_raw();
         let relative_path = match &request.encoding {
             smartzip_core::EncodingMode::Override(enc) => {
@@ -588,6 +599,65 @@ mod tests {
             writer.finish().unwrap();
         }
         std::fs::write(path, buf.into_inner()).unwrap();
+    }
+
+    /// Create a raw ZIP where the central directory declares a much larger
+    /// uncompressed size than the actual content — simulates a zip bomb
+    /// with inflated declared sizes to trigger the compression ratio limit.
+    fn create_high_ratio_bomb_zip(path: &Path, declared_uncompressed: u32) {
+        use std::io::Seek;
+        let mut f = File::create(path).unwrap();
+        let content = b"X"; // 1 byte actual
+        let fname = b"bomb.bin";
+
+        // Local file header
+        let local_offset = f.stream_position().unwrap();
+        f.write_all(b"PK\x03\x04").unwrap();
+        f.write_all(&20u16.to_le_bytes()).unwrap(); // version needed
+        f.write_all(&0u16.to_le_bytes()).unwrap();   // flags
+        f.write_all(&0u16.to_le_bytes()).unwrap();   // method (stored)
+        f.write_all(&0u16.to_le_bytes()).unwrap();   // mod time
+        f.write_all(&0u16.to_le_bytes()).unwrap();   // mod date
+        let crc = crc32fast::hash(content);
+        f.write_all(&crc.to_le_bytes()).unwrap();
+        f.write_all(&(content.len() as u32).to_le_bytes()).unwrap(); // compressed = 1
+        f.write_all(&(content.len() as u32).to_le_bytes()).unwrap(); // uncompressed = 1
+        f.write_all(&(fname.len() as u16).to_le_bytes()).unwrap();  // name len
+        f.write_all(&0u16.to_le_bytes()).unwrap();   // extra len
+        f.write_all(fname).unwrap();
+        f.write_all(content).unwrap();
+
+        // Central directory — declare inflated uncompressed size
+        let cd_offset = f.stream_position().unwrap();
+        f.write_all(b"PK\x01\x02").unwrap();
+        f.write_all(&20u16.to_le_bytes()).unwrap(); // version made by
+        f.write_all(&20u16.to_le_bytes()).unwrap(); // version needed
+        f.write_all(&0u16.to_le_bytes()).unwrap();  // flags
+        f.write_all(&0u16.to_le_bytes()).unwrap();  // method
+        f.write_all(&0u16.to_le_bytes()).unwrap();  // mod time
+        f.write_all(&0u16.to_le_bytes()).unwrap();  // mod date
+        f.write_all(&crc.to_le_bytes()).unwrap();
+        f.write_all(&(content.len() as u32).to_le_bytes()).unwrap(); // compressed = 1
+        f.write_all(&declared_uncompressed.to_le_bytes()).unwrap();   // uncompressed = inflated
+        f.write_all(&(fname.len() as u16).to_le_bytes()).unwrap();   // name len
+        f.write_all(&0u16.to_le_bytes()).unwrap();  // extra len
+        f.write_all(&0u16.to_le_bytes()).unwrap();  // comment len
+        f.write_all(&0u16.to_le_bytes()).unwrap();  // disk start
+        f.write_all(&0u16.to_le_bytes()).unwrap();  // internal attrs
+        f.write_all(&0u32.to_le_bytes()).unwrap();  // external attrs
+        f.write_all(&(local_offset as u32).to_le_bytes()).unwrap(); // local header offset
+        f.write_all(fname).unwrap();
+
+        // EOCD
+        let cd_size = (f.stream_position().unwrap() - cd_offset) as u32;
+        f.write_all(b"PK\x05\x06").unwrap();
+        f.write_all(&0u16.to_le_bytes()).unwrap();
+        f.write_all(&0u16.to_le_bytes()).unwrap();
+        f.write_all(&1u16.to_le_bytes()).unwrap();  // CD entries this disk
+        f.write_all(&1u16.to_le_bytes()).unwrap();  // CD entries total
+        f.write_all(&cd_size.to_le_bytes()).unwrap();
+        f.write_all(&(cd_offset as u32).to_le_bytes()).unwrap();
+        f.write_all(&0u16.to_le_bytes()).unwrap();
     }
 
     // ── Tests: ZipCrypto ──────────────────────────────────────────────
@@ -1112,6 +1182,31 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(output_dir.join("large.txt")).unwrap().len(),
             1024 * 1024
+        );
+    }
+
+    #[tokio::test]
+    async fn native_zip_extract_rejects_high_ratio_bomb() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("bomb.zip");
+        // 1 byte actual, declared 100_001 uncompressed → ratio 100_001 > 10_000 limit
+        create_high_ratio_bomb_zip(&archive, 100_001);
+
+        let backend = NativeZipBackend::new();
+        let output_dir = temp.path().join("output");
+        let result = backend
+            .extract(ExtractArchiveRequest {
+                archive,
+                format: Some(ArchiveFormat::Zip),
+                output_dir,
+                password: None,
+                encoding: EncodingMode::Auto,
+            })
+            .await;
+        assert!(
+            matches!(result, Err(SmartZipError::BackendFailed { .. })),
+            "expected BackendFailed for compression ratio bomb, got: {:?}",
+            result
         );
     }
 }

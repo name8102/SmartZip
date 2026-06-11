@@ -1,21 +1,21 @@
 use std::path::{Component, PathBuf};
 
-/// Reject Windows drive-letter paths (`C:\...` or `C:/...`) and UNC paths (`\\...`).
-/// This check is platform-independent — it operates on the raw string before
-/// `Path::components()` normalizes it, so it works on Linux/macOS where
-/// `C:foo` would not produce a `Component::Prefix`.
+/// Reject Windows drive-letter paths and UNC/network paths in a
+/// platform-independent way. Operates on the **normalized** string
+/// (backslashes already converted to forward slashes).
+///
+/// Cases rejected:
+/// - `C:\foo`, `C:/foo`, `C:foo` — any `letter:` prefix
+/// - `\\server\share` → `//server/share` after normalization
+/// - Bare `//` (double slash without scheme, e.g. `//etc/passwd`)
 fn has_windows_prefix(s: &str) -> bool {
     let b = s.as_bytes();
-    // UNC: \\server\share
-    if b.len() >= 2 && b[0] == b'\\' && b[1] == b'\\' {
+    // UNC / double-slash: //server/share (already normalized from \\)
+    if b.len() >= 2 && b[0] == b'/' && b[1] == b'/' {
         return true;
     }
-    // Drive letter: C:\ or C:/
-    if b.len() >= 3
-        && b[0].is_ascii_alphabetic()
-        && b[1] == b':'
-        && (b[2] == b'/' || b[2] == b'\\')
-    {
+    // Drive letter: C: — covers C:\foo, C:/foo, and C:foo (drive-relative)
+    if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
         return true;
     }
     false
@@ -26,8 +26,8 @@ fn has_windows_prefix(s: &str) -> bool {
 /// Rejects:
 /// - Absolute paths (`/foo`)
 /// - Parent directory traversal (`../foo`)
-/// - Windows drive prefixes (`C:\foo`, `C:/foo`) — platform-independent
-/// - UNC paths (`\\server\share`) — platform-independent
+/// - Windows drive paths (`C:\foo`, `C:/foo`, `C:foo`) — all forms
+/// - UNC / double-slash paths (`\\server\share`, `//etc/passwd`)
 /// - NUL bytes
 /// - Empty paths
 pub fn safe_entry_path(raw_name: &[u8]) -> Option<PathBuf> {
@@ -103,9 +103,20 @@ mod tests {
     }
 
     #[test]
+    fn rejects_windows_drive_relative() {
+        assert_eq!(safe_entry_path(b"C:evil.txt"), None);
+        assert_eq!(safe_entry_path(b"Z:folder/file.txt"), None);
+    }
+
+    #[test]
     fn rejects_unc_paths() {
         assert_eq!(safe_entry_path(b"\\\\server\\share\\file.txt"), None);
         assert_eq!(safe_entry_path(b"\\\\192.168.1.1\\c$\\evil.txt"), None);
+    }
+
+    #[test]
+    fn rejects_double_slash() {
+        assert_eq!(safe_entry_path(b"//etc/passwd"), None);
     }
 
     #[test]
