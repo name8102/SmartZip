@@ -22,34 +22,65 @@ impl NativeZipBackend {
         ZipArchive::new(file).map_err(|source| map_zip_error(source, path))
     }
 
-    fn reject_password(path: &Path, password: &Option<String>) -> Result<()> {
-        if password
-            .as_ref()
-            .is_some_and(|password| !password.is_empty())
-        {
-            return Err(SmartZipError::UnsupportedFormat {
-                path: path.to_path_buf(),
-                format: Some("encrypted zip".into()),
-            });
+    /// Check if any entry in the archive is encrypted.
+    fn has_encrypted_entries(archive: &mut ZipArchive<File>) -> bool {
+        (0..archive.len()).any(|i| {
+            archive
+                .by_index_raw(i)
+                .ok()
+                .is_some_and(|e| e.encrypted())
+        })
+    }
+
+    /// Open an entry by index, using password if provided.
+    /// For encrypted entries without a password, returns PasswordRequired.
+    fn open_entry<'a>(
+        archive: &'a mut ZipArchive<File>,
+        index: usize,
+        password: &Option<String>,
+        archive_path: &Path,
+    ) -> Result<zip::read::ZipFile<'a, File>> {
+        let raw = archive
+            .by_index_raw(index)
+            .map_err(|source| map_zip_error(source, archive_path))?;
+        let is_encrypted = raw.encrypted();
+        drop(raw);
+
+        if is_encrypted {
+            match password.as_deref() {
+                None | Some("") => {
+                    return Err(SmartZipError::PasswordRequired {
+                        path: archive_path.to_path_buf(),
+                    });
+                }
+                Some(pw) => {
+                    return archive
+                        .by_index_decrypt(index, pw.as_bytes())
+                        .map_err(|source| map_zip_error(source, archive_path));
+                }
+            }
         }
-        Ok(())
+
+        archive
+            .by_index(index)
+            .map_err(|source| map_zip_error(source, archive_path))
     }
 }
 
 #[async_trait]
 impl ArchiveBackend for NativeZipBackend {
     async fn probe(&self, path: &Path) -> Result<ArchiveProbe> {
-        let supported = Self::open_archive_read(path).is_ok();
+        let mut archive = Self::open_archive_read(path)?;
+        let encrypted = Self::has_encrypted_entries(&mut archive);
         Ok(ArchiveProbe {
             path: path.to_path_buf(),
             format: Some(ArchiveFormat::Zip),
-            encrypted: None,
-            supported,
+            encrypted: Some(encrypted),
+            supported: true,
         })
     }
 
     async fn list(&self, request: ListRequest) -> Result<ArchiveListing> {
-        Self::reject_password(&request.archive, &request.password)?;
         let mut archive = Self::open_archive_read(&request.archive)?;
         let mut entries = Vec::new();
         for i in 0..archive.len() {
@@ -74,14 +105,18 @@ impl ArchiveBackend for NativeZipBackend {
     }
 
     async fn test(&self, request: TestRequest) -> Result<TestResult> {
-        Self::reject_password(&request.archive, &request.password)?;
         let mut archive = Self::open_archive_read(&request.archive)?;
+        let has_encrypted = Self::has_encrypted_entries(&mut archive);
         let len = archive.len();
         let mut buf = vec![0u8; 8192];
+
         for i in 0..len {
-            let mut entry = archive
-                .by_index(i)
-                .map_err(|source| map_zip_error(source, &request.archive))?;
+            let mut entry = Self::open_entry(
+                &mut archive,
+                i,
+                &request.password,
+                &request.archive,
+            )?;
             loop {
                 let n = entry
                     .read(&mut buf)
@@ -94,14 +129,14 @@ impl ArchiveBackend for NativeZipBackend {
 
         Ok(TestResult {
             ok: true,
-            encrypted: None,
+            encrypted: Some(has_encrypted),
         })
     }
 
     async fn extract(&self, request: ExtractArchiveRequest) -> Result<ExtractArchiveResult> {
-        Self::reject_password(&request.archive, &request.password)?;
         let path = request.archive.clone();
-        tokio::task::spawn_blocking(move || extract_sync(&path, &request))
+        let password = request.password.clone();
+        tokio::task::spawn_blocking(move || extract_sync(&path, &password, &request))
             .await
             .map_err(|e| SmartZipError::BackendFailed {
                 backend: "native-zip".into(),
@@ -117,7 +152,6 @@ impl ArchiveBackend for NativeZipBackend {
                 format: Some(request.format.as_str().to_string()),
             });
         }
-        Self::reject_password(&request.output, &request.password)?;
         let path = request.output.clone();
         tokio::task::spawn_blocking(move || compress_sync(&path, &request))
             .await
@@ -132,7 +166,7 @@ impl ArchiveBackend for NativeZipBackend {
         BackendCapabilities {
             can_extract: vec![ArchiveFormat::Zip],
             can_compress: vec![ArchiveFormat::Zip],
-            supports_passwords: false,
+            supports_passwords: true,
             supports_listing: true,
             supports_test: true,
         }
@@ -163,7 +197,11 @@ fn collect_files(input: &Path) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
-fn extract_sync(archive_path: &Path, request: &ExtractArchiveRequest) -> Result<ExtractArchiveResult> {
+fn extract_sync(
+    archive_path: &Path,
+    password: &Option<String>,
+    request: &ExtractArchiveRequest,
+) -> Result<ExtractArchiveResult> {
     let mut archive = NativeZipBackend::open_archive_read(archive_path)?;
     std::fs::create_dir_all(&request.output_dir)
         .map_err(|source| SmartZipError::io(Some(request.output_dir.clone()), source))?;
@@ -184,9 +222,12 @@ fn extract_sync(archive_path: &Path, request: &ExtractArchiveRequest) -> Result<
     }
 
     for i in 0..len {
-        let mut entry = archive
-            .by_index(i)
-            .map_err(|source| map_zip_error(source, archive_path))?;
+        let mut entry = NativeZipBackend::open_entry(
+            &mut archive,
+            i,
+            password,
+            archive_path,
+        )?;
 
         let uncompressed = entry.size();
         if uncompressed > limits.max_single_entry_bytes {
@@ -268,7 +309,10 @@ fn extract_sync(archive_path: &Path, request: &ExtractArchiveRequest) -> Result<
     })
 }
 
-fn compress_sync(output_path: &Path, request: &CompressArchiveRequest) -> Result<CompressArchiveResult> {
+fn compress_sync(
+    output_path: &Path,
+    request: &CompressArchiveRequest,
+) -> Result<CompressArchiveResult> {
     let file = File::create(output_path)
         .map_err(|source| SmartZipError::io(Some(output_path.to_path_buf()), source))?;
     let mut writer = ZipWriter::new(file);
@@ -330,6 +374,7 @@ mod tests {
     use super::*;
     use smartzip_core::{CompressionLevel, EncodingMode};
     use std::io::Write;
+    use zip::write::FileOptions;
 
     #[tokio::test]
     async fn native_zip_can_compress_list_test_and_extract() {
@@ -410,6 +455,125 @@ mod tests {
         let probe = backend.probe(&archive).await.unwrap();
         assert!(probe.supported);
         assert_eq!(probe.format, Some(ArchiveFormat::Zip));
+        assert_eq!(probe.encrypted, Some(false));
+    }
+
+    #[tokio::test]
+    async fn native_zip_probe_detects_encrypted_archive() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("encrypted.zip");
+        create_encrypted_zip(&archive, "secret");
+
+        let backend = NativeZipBackend::new();
+        let probe = backend.probe(&archive).await.unwrap();
+        assert!(probe.supported);
+        assert_eq!(probe.encrypted, Some(true));
+    }
+
+    #[tokio::test]
+    async fn native_zip_test_with_correct_password_succeeds() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("encrypted.zip");
+        create_encrypted_zip(&archive, "secret");
+
+        let backend = NativeZipBackend::new();
+        let result = backend
+            .test(TestRequest {
+                archive,
+                format: Some(ArchiveFormat::Zip),
+                password: Some("secret".into()),
+                encoding: EncodingMode::Auto,
+            })
+            .await
+            .unwrap();
+        assert!(result.ok);
+        assert_eq!(result.encrypted, Some(true));
+    }
+
+    #[tokio::test]
+    async fn native_zip_test_with_wrong_password_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("encrypted.zip");
+        create_encrypted_zip(&archive, "secret");
+
+        let backend = NativeZipBackend::new();
+        let result = backend
+            .test(TestRequest {
+                archive,
+                format: Some(ArchiveFormat::Zip),
+                password: Some("wrong".into()),
+                encoding: EncodingMode::Auto,
+            })
+            .await;
+        assert!(matches!(result, Err(SmartZipError::WrongPassword { .. })));
+    }
+
+    #[tokio::test]
+    async fn native_zip_test_encrypted_without_password_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("encrypted.zip");
+        create_encrypted_zip(&archive, "secret");
+
+        let backend = NativeZipBackend::new();
+        let result = backend
+            .test(TestRequest {
+                archive,
+                format: Some(ArchiveFormat::Zip),
+                password: None,
+                encoding: EncodingMode::Auto,
+            })
+            .await;
+        assert!(matches!(result, Err(SmartZipError::PasswordRequired { .. })));
+    }
+
+    #[tokio::test]
+    async fn native_zip_extract_encrypted_with_correct_password() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("encrypted.zip");
+        create_encrypted_zip(&archive, "secret");
+
+        let backend = NativeZipBackend::new();
+        let output_dir = temp.path().join("output");
+        backend
+            .extract(ExtractArchiveRequest {
+                archive,
+                format: Some(ArchiveFormat::Zip),
+                output_dir: output_dir.clone(),
+                password: Some("secret".into()),
+                encoding: EncodingMode::Auto,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(output_dir.join("hello.txt")).unwrap(),
+            "hello encrypted\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_zip_extract_encrypted_with_wrong_password_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("encrypted.zip");
+        create_encrypted_zip(&archive, "secret");
+
+        let backend = NativeZipBackend::new();
+        let output_dir = temp.path().join("output");
+        let result = backend
+            .extract(ExtractArchiveRequest {
+                archive,
+                format: Some(ArchiveFormat::Zip),
+                output_dir,
+                password: Some("wrong".into()),
+                encoding: EncodingMode::Auto,
+            })
+            .await;
+        assert!(matches!(result, Err(SmartZipError::WrongPassword { .. })));
+    }
+
+    #[tokio::test]
+    async fn native_zip_capabilities_supports_passwords() {
+        let backend = NativeZipBackend::new();
+        assert!(backend.capabilities().supports_passwords);
     }
 
     fn create_minimal_zip() -> Vec<u8> {
@@ -423,5 +587,16 @@ mod tests {
             writer.finish().unwrap();
         }
         buf.into_inner()
+    }
+
+    fn create_encrypted_zip(path: &Path, password: &str) {
+        let file = File::create(path).unwrap();
+        let mut writer = ZipWriter::new(file);
+        let options: FileOptions<'_, zip::write::ExtendedFileOptions> = FileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated)
+            .with_aes_encryption(zip::AesMode::Aes128, password);
+        writer.start_file("hello.txt", options).unwrap();
+        writer.write_all(b"hello encrypted\n").unwrap();
+        writer.finish().unwrap();
     }
 }
