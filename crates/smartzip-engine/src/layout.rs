@@ -21,80 +21,79 @@ const SCORE_MARGIN_THRESHOLD: f32 = 1.0;
 /// How to place extracted content into the output directory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OutputLayoutPolicy {
-    /// Smart layout: analyze temp dir contents and decide.
-    SmartArchive,
-    /// Raw: always create an archive-named directory, no smart decisions.
-    RawArchiveDir,
+    Smart,
+    Raw,
+    Conservative,
+    FlatSingle,
+}
+
+impl Default for OutputLayoutPolicy {
+    fn default() -> Self {
+        Self::Conservative
+    }
 }
 
 /// Policy for naming when there's a single root item.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SingleRootNamePolicy {
-    /// Use the archive file's name as the output directory name.
-    UseArchiveName,
-    /// Use the inner item's name when it's more informative.
-    UseInnerName,
-    /// Collapse the single item directly into the output.
-    Collapse,
+    PreferArchiveName,
+    PreferInnerName,
+    Auto,
+    PreserveBoth,
+    AskWhenAmbiguous,
+}
+
+impl Default for SingleRootNamePolicy {
+    fn default() -> Self {
+        Self::Auto
+    }
 }
 
 /// What was found at the top level of the extraction temp directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TopLevelShape {
-    /// Temp directory is empty or contains only metadata.
     Empty,
-    /// Exactly one file (non-metadata) at the top level.
     SingleFile(TopLevelItemSummary),
-    /// Exactly one directory (non-metadata) at the top level.
     SingleDir(TopLevelItemSummary),
-    /// Two or more non-metadata items at the top level.
-    Multiple(Vec<TopLevelItemSummary>),
+    Multiple { items: Vec<TopLevelItemSummary>, count: usize },
 }
 
 /// Summary of a single item found during top-level scan.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TopLevelItemSummary {
-    /// File name of the item.
     pub name: String,
-    /// Full path to the item.
     pub path: PathBuf,
-    /// Whether the item is a directory.
     pub is_dir: bool,
+    pub ext: Option<String>,
 }
 
 /// Input to the layout planning function.
 #[derive(Debug, Clone)]
 pub struct LayoutRequest {
-    /// The shape of the temp directory contents.
     pub shape: TopLevelShape,
-    /// Name of the original archive file (stem, no extension).
-    pub archive_name: String,
-    /// The output layout policy.
-    pub policy: OutputLayoutPolicy,
-    /// Single root naming policy (applies when shape is SingleDir or SingleFile).
-    pub single_root_policy: SingleRootNamePolicy,
+    pub archive_path: PathBuf,
+    pub archive_stem: String,
+    pub temp_dir: PathBuf,
+    pub output_root: PathBuf,
+    pub layout_policy: OutputLayoutPolicy,
+    pub single_root_name_policy: SingleRootNamePolicy,
 }
 
 /// The decided output layout.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LayoutPlan {
-    /// What kind of layout was decided.
     pub kind: LayoutPlanKind,
-    /// Human-readable reason for this decision.
+    pub target: PathBuf,
     pub reason: LayoutDecisionReason,
+    pub warnings: Vec<String>,
 }
 
 /// What layout strategy to use.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LayoutPlanKind {
-    /// Commit the entire temp directory under a wrapper directory.
-    /// The `name` field is the wrapper directory name.
     CommitWholeTempAsArchiveDir { name: String },
-    /// Collapse a single item directly into the output root.
     CollapseSingleItem,
-    /// Place content in a raw archive-named directory (no smart decisions).
     RawArchiveDir { name: String },
-    /// The temp directory was empty; nothing to commit.
     Empty,
 }
 
@@ -130,10 +129,21 @@ pub fn scan_visible_top_level(temp_dir: &Path) -> TopLevelShape {
             let name_str = name.to_string_lossy();
             !METADATA_ENTRIES.contains(&name_str.as_ref())
         })
-        .map(|e| TopLevelItemSummary {
-            name: e.file_name().to_string_lossy().to_string(),
-            path: e.path(),
-            is_dir: e.file_type().map(|ft| ft.is_dir()).unwrap_or(false),
+        .map(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            let ext = if e.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
+                Path::new(&name)
+                    .extension()
+                    .map(|s| s.to_string_lossy().to_string())
+            } else {
+                None
+            };
+            TopLevelItemSummary {
+                name,
+                path: e.path(),
+                is_dir: e.file_type().map(|ft| ft.is_dir()).unwrap_or(false),
+                ext,
+            }
         })
         .collect();
 
@@ -147,34 +157,37 @@ pub fn scan_visible_top_level(temp_dir: &Path) -> TopLevelShape {
                 TopLevelShape::SingleFile(item)
             }
         }
-        _ => TopLevelShape::Multiple(items),
+        n => TopLevelShape::Multiple { items, count: n },
     }
 }
 
 /// Plan the output layout for extracted content.
-///
-/// Takes a `LayoutRequest` containing the temp directory shape, archive name,
-/// and policy preferences. Returns a `LayoutPlan` describing what to do.
 pub fn plan_layout(req: &LayoutRequest) -> LayoutPlan {
-    if req.policy == OutputLayoutPolicy::RawArchiveDir {
+    if req.layout_policy == OutputLayoutPolicy::Raw {
         return LayoutPlan {
             kind: LayoutPlanKind::RawArchiveDir {
-                name: req.archive_name.clone(),
+                name: req.archive_stem.clone(),
             },
+            target: req.output_root.join(&req.archive_stem),
             reason: LayoutDecisionReason::RawPolicyForced,
+            warnings: vec![],
         };
     }
 
     match &req.shape {
         TopLevelShape::Empty => LayoutPlan {
             kind: LayoutPlanKind::Empty,
+            target: req.output_root.clone(),
             reason: LayoutDecisionReason::EmptyTempDir,
+            warnings: vec![],
         },
-        TopLevelShape::Multiple(_) => LayoutPlan {
+        TopLevelShape::Multiple { .. } => LayoutPlan {
             kind: LayoutPlanKind::CommitWholeTempAsArchiveDir {
-                name: req.archive_name.clone(),
+                name: req.archive_stem.clone(),
             },
+            target: req.output_root.join(&req.archive_stem),
             reason: LayoutDecisionReason::MultipleTopLevelItems,
+            warnings: vec![],
         },
         TopLevelShape::SingleDir(item) => decide_single_dir(req, item),
         TopLevelShape::SingleFile(item) => decide_single_file(req, item),
@@ -183,142 +196,214 @@ pub fn plan_layout(req: &LayoutRequest) -> LayoutPlan {
 
 fn decide_single_dir(req: &LayoutRequest, item: &TopLevelItemSummary) -> LayoutPlan {
     let dir_score = score_name(&item.name);
-    let archive_score = score_name(&req.archive_name);
+    let archive_score = score_name(&req.archive_stem);
 
-    let sim = name_similarity(&item.name, &req.archive_name);
+    let sim = name_similarity(&item.name, &req.archive_stem);
     let similarity = classify_similarity(sim);
 
     if similarity == SimilarityLevel::Equivalent {
         return LayoutPlan {
             kind: LayoutPlanKind::CollapseSingleItem,
+            target: req.output_root.clone(),
             reason: LayoutDecisionReason::SingleDirSimilarToArchive,
+            warnings: vec![],
         };
     }
 
     if archive_score.is_generic && !dir_score.is_generic {
         return LayoutPlan {
             kind: LayoutPlanKind::CollapseSingleItem,
+            target: req.output_root.clone(),
             reason: LayoutDecisionReason::SingleDirGoodName,
+            warnings: vec![],
         };
     }
 
     if dir_score.is_generic {
         return LayoutPlan {
             kind: LayoutPlanKind::CommitWholeTempAsArchiveDir {
-                name: req.archive_name.clone(),
+                name: req.archive_stem.clone(),
             },
+            target: req.output_root.join(&req.archive_stem),
             reason: LayoutDecisionReason::SingleDirGenericName,
+            warnings: vec![],
         };
     }
 
     if dir_score.total > archive_score.total + SCORE_MARGIN_THRESHOLD {
         return LayoutPlan {
             kind: LayoutPlanKind::CollapseSingleItem,
+            target: req.output_root.clone(),
             reason: LayoutDecisionReason::SingleDirGoodName,
+            warnings: vec![],
         };
     }
 
-    match req.single_root_policy {
-        SingleRootNamePolicy::Collapse => LayoutPlan {
+    match req.single_root_name_policy {
+        SingleRootNamePolicy::PreserveBoth => LayoutPlan {
             kind: LayoutPlanKind::CollapseSingleItem,
+            target: req.output_root.clone(),
             reason: LayoutDecisionReason::SingleDirGoodName,
+            warnings: vec![],
         },
-        SingleRootNamePolicy::UseInnerName => {
+        SingleRootNamePolicy::PreferInnerName => {
             if dir_score.total >= archive_score.total {
                 LayoutPlan {
                     kind: LayoutPlanKind::CollapseSingleItem,
+                    target: req.output_root.clone(),
                     reason: LayoutDecisionReason::SingleDirGoodName,
+                    warnings: vec![],
                 }
             } else {
                 LayoutPlan {
                     kind: LayoutPlanKind::CommitWholeTempAsArchiveDir {
-                        name: req.archive_name.clone(),
+                        name: req.archive_stem.clone(),
                     },
+                    target: req.output_root.join(&req.archive_stem),
                     reason: LayoutDecisionReason::DefaultConservative,
+                    warnings: vec![],
                 }
             }
         }
-        SingleRootNamePolicy::UseArchiveName => LayoutPlan {
+        SingleRootNamePolicy::PreferArchiveName => LayoutPlan {
             kind: LayoutPlanKind::CommitWholeTempAsArchiveDir {
-                name: req.archive_name.clone(),
+                name: req.archive_stem.clone(),
             },
+            target: req.output_root.join(&req.archive_stem),
             reason: LayoutDecisionReason::DefaultConservative,
+            warnings: vec![],
         },
+        SingleRootNamePolicy::Auto | SingleRootNamePolicy::AskWhenAmbiguous => {
+            if dir_score.total >= archive_score.total {
+                LayoutPlan {
+                    kind: LayoutPlanKind::CollapseSingleItem,
+                    target: req.output_root.clone(),
+                    reason: LayoutDecisionReason::SingleDirGoodName,
+                    warnings: vec![],
+                }
+            } else {
+                LayoutPlan {
+                    kind: LayoutPlanKind::CommitWholeTempAsArchiveDir {
+                        name: req.archive_stem.clone(),
+                    },
+                    target: req.output_root.join(&req.archive_stem),
+                    reason: LayoutDecisionReason::DefaultConservative,
+                    warnings: vec![],
+                }
+            }
+        }
     }
 }
 
 fn decide_single_file(req: &LayoutRequest, item: &TopLevelItemSummary) -> LayoutPlan {
     let file_score = score_name(&item.name);
-    let archive_score = score_name(&req.archive_name);
+    let archive_score = score_name(&req.archive_stem);
 
     let has_archive_ext = crate::format_from_extension(&item.path).is_some();
 
-    let sim = name_similarity(&item.name, &req.archive_name);
+    let sim = name_similarity(&item.name, &req.archive_stem);
     let similarity = classify_similarity(sim);
 
     if similarity == SimilarityLevel::Equivalent {
         return LayoutPlan {
             kind: LayoutPlanKind::CollapseSingleItem,
+            target: req.output_root.clone(),
             reason: LayoutDecisionReason::SingleDirSimilarToArchive,
+            warnings: vec![],
         };
     }
 
     if archive_score.is_generic && !file_score.is_generic {
         return LayoutPlan {
             kind: LayoutPlanKind::CollapseSingleItem,
+            target: req.output_root.clone(),
             reason: LayoutDecisionReason::SingleFileGoodName,
+            warnings: vec![],
         };
     }
 
     if file_score.is_generic {
         return LayoutPlan {
             kind: LayoutPlanKind::CommitWholeTempAsArchiveDir {
-                name: req.archive_name.clone(),
+                name: req.archive_stem.clone(),
             },
+            target: req.output_root.join(&req.archive_stem),
             reason: LayoutDecisionReason::SingleFileGenericName,
+            warnings: vec![],
         };
     }
 
     if has_archive_ext && file_score.total > archive_score.total {
         return LayoutPlan {
             kind: LayoutPlanKind::CollapseSingleItem,
+            target: req.output_root.clone(),
             reason: LayoutDecisionReason::SingleFileArchiveExtension,
+            warnings: vec![],
         };
     }
 
     if file_score.total > archive_score.total + SCORE_MARGIN_THRESHOLD {
         return LayoutPlan {
             kind: LayoutPlanKind::CollapseSingleItem,
+            target: req.output_root.clone(),
             reason: LayoutDecisionReason::SingleFileGoodName,
+            warnings: vec![],
         };
     }
 
-    match req.single_root_policy {
-        SingleRootNamePolicy::Collapse => LayoutPlan {
+    match req.single_root_name_policy {
+        SingleRootNamePolicy::PreserveBoth => LayoutPlan {
             kind: LayoutPlanKind::CollapseSingleItem,
+            target: req.output_root.clone(),
             reason: LayoutDecisionReason::SingleFileGoodName,
+            warnings: vec![],
         },
-        SingleRootNamePolicy::UseInnerName => {
+        SingleRootNamePolicy::PreferInnerName => {
             if file_score.total >= archive_score.total {
                 LayoutPlan {
                     kind: LayoutPlanKind::CollapseSingleItem,
+                    target: req.output_root.clone(),
                     reason: LayoutDecisionReason::SingleFileGoodName,
+                    warnings: vec![],
                 }
             } else {
                 LayoutPlan {
                     kind: LayoutPlanKind::CommitWholeTempAsArchiveDir {
-                        name: req.archive_name.clone(),
+                        name: req.archive_stem.clone(),
                     },
+                    target: req.output_root.join(&req.archive_stem),
                     reason: LayoutDecisionReason::DefaultConservative,
+                    warnings: vec![],
                 }
             }
         }
-        SingleRootNamePolicy::UseArchiveName => LayoutPlan {
+        SingleRootNamePolicy::PreferArchiveName => LayoutPlan {
             kind: LayoutPlanKind::CommitWholeTempAsArchiveDir {
-                name: req.archive_name.clone(),
+                name: req.archive_stem.clone(),
             },
+            target: req.output_root.join(&req.archive_stem),
             reason: LayoutDecisionReason::DefaultConservative,
+            warnings: vec![],
         },
+        SingleRootNamePolicy::Auto | SingleRootNamePolicy::AskWhenAmbiguous => {
+            if file_score.total >= archive_score.total {
+                LayoutPlan {
+                    kind: LayoutPlanKind::CollapseSingleItem,
+                    target: req.output_root.clone(),
+                    reason: LayoutDecisionReason::SingleFileGoodName,
+                    warnings: vec![],
+                }
+            } else {
+                LayoutPlan {
+                    kind: LayoutPlanKind::CommitWholeTempAsArchiveDir {
+                        name: req.archive_stem.clone(),
+                    },
+                    target: req.output_root.join(&req.archive_stem),
+                    reason: LayoutDecisionReason::DefaultConservative,
+                    warnings: vec![],
+                }
+            }
+        }
     }
 }
 
@@ -349,24 +434,37 @@ mod tests {
     }
 
     fn make_item(name: &str, is_dir: bool, parent: &Path) -> TopLevelItemSummary {
+        let ext = if is_dir {
+            None
+        } else {
+            Path::new(name)
+                .extension()
+                .map(|s| s.to_string_lossy().to_string())
+        };
         TopLevelItemSummary {
             name: name.to_string(),
             path: parent.join(name),
             is_dir,
+            ext,
         }
     }
 
     fn make_request(
         shape: TopLevelShape,
-        archive_name: &str,
+        archive_stem: &str,
         policy: OutputLayoutPolicy,
         single_policy: SingleRootNamePolicy,
     ) -> LayoutRequest {
+        let temp = temp_dir("plan");
+        let output = temp_dir("output");
         LayoutRequest {
             shape,
-            archive_name: archive_name.to_string(),
-            policy,
-            single_root_policy: single_policy,
+            archive_path: temp.join(format!("{archive_stem}.zip")),
+            archive_stem: archive_stem.to_string(),
+            temp_dir: temp,
+            output_root: output,
+            layout_policy: policy,
+            single_root_name_policy: single_policy,
         }
     }
 
@@ -405,6 +503,7 @@ mod tests {
             TopLevelShape::SingleFile(item) => {
                 assert_eq!(item.name, "real_file.txt");
                 assert!(!item.is_dir);
+                assert_eq!(item.ext.as_deref(), Some("txt"));
             }
             other => panic!("expected SingleFile, got {:?}", other),
         }
@@ -421,7 +520,8 @@ mod tests {
 
         let shape = scan_visible_top_level(&dir);
         match &shape {
-            TopLevelShape::Multiple(items) => {
+            TopLevelShape::Multiple { items, count } => {
+                assert_eq!(*count, 2);
                 assert_eq!(items.len(), 2);
                 let names: Vec<&str> = items.iter().map(|i| i.name.as_str()).collect();
                 assert!(names.contains(&"a.txt"));
@@ -442,6 +542,7 @@ mod tests {
             TopLevelShape::SingleDir(item) => {
                 assert_eq!(item.name, "MyProject");
                 assert!(item.is_dir);
+                assert!(item.ext.is_none());
             }
             other => panic!("expected SingleDir, got {:?}", other),
         }
@@ -457,10 +558,10 @@ mod tests {
             make_item("b.txt", false, &PathBuf::new()),
         ];
         let req = make_request(
-            TopLevelShape::Multiple(items),
+            TopLevelShape::Multiple { items: items.clone(), count: items.len() },
             "my-archive",
-            OutputLayoutPolicy::SmartArchive,
-            SingleRootNamePolicy::UseArchiveName,
+            OutputLayoutPolicy::Smart,
+            SingleRootNamePolicy::PreferArchiveName,
         );
         let plan = plan_layout(&req);
         assert_eq!(
@@ -479,10 +580,10 @@ mod tests {
             make_item("b.txt", false, &PathBuf::new()),
         ];
         let req = make_request(
-            TopLevelShape::Multiple(items),
+            TopLevelShape::Multiple { items: items.clone(), count: items.len() },
             "archive",
-            OutputLayoutPolicy::RawArchiveDir,
-            SingleRootNamePolicy::UseArchiveName,
+            OutputLayoutPolicy::Raw,
+            SingleRootNamePolicy::PreferArchiveName,
         );
         let plan = plan_layout(&req);
         assert_eq!(
@@ -499,8 +600,8 @@ mod tests {
         let req = make_request(
             TopLevelShape::Empty,
             "archive",
-            OutputLayoutPolicy::SmartArchive,
-            SingleRootNamePolicy::UseArchiveName,
+            OutputLayoutPolicy::Smart,
+            SingleRootNamePolicy::PreferArchiveName,
         );
         let plan = plan_layout(&req);
         assert_eq!(plan.kind, LayoutPlanKind::Empty);
@@ -513,8 +614,8 @@ mod tests {
         let req = make_request(
             TopLevelShape::SingleDir(item),
             "my-project-v2.0",
-            OutputLayoutPolicy::SmartArchive,
-            SingleRootNamePolicy::UseArchiveName,
+            OutputLayoutPolicy::Smart,
+            SingleRootNamePolicy::PreferArchiveName,
         );
         let plan = plan_layout(&req);
         assert_eq!(
@@ -532,8 +633,8 @@ mod tests {
         let req = make_request(
             TopLevelShape::SingleDir(item),
             "archive",
-            OutputLayoutPolicy::SmartArchive,
-            SingleRootNamePolicy::UseArchiveName,
+            OutputLayoutPolicy::Smart,
+            SingleRootNamePolicy::PreferArchiveName,
         );
         let plan = plan_layout(&req);
         assert_eq!(plan.kind, LayoutPlanKind::CollapseSingleItem);
@@ -546,8 +647,8 @@ mod tests {
         let req = make_request(
             TopLevelShape::SingleDir(item),
             "project-release",
-            OutputLayoutPolicy::SmartArchive,
-            SingleRootNamePolicy::UseArchiveName,
+            OutputLayoutPolicy::Smart,
+            SingleRootNamePolicy::PreferArchiveName,
         );
         let plan = plan_layout(&req);
         assert_eq!(plan.kind, LayoutPlanKind::CollapseSingleItem);
@@ -564,8 +665,8 @@ mod tests {
         let req = make_request(
             TopLevelShape::SingleDir(item),
             "book",
-            OutputLayoutPolicy::SmartArchive,
-            SingleRootNamePolicy::UseArchiveName,
+            OutputLayoutPolicy::Smart,
+            SingleRootNamePolicy::PreferArchiveName,
         );
         let plan = plan_layout(&req);
         assert_eq!(plan.kind, LayoutPlanKind::CollapseSingleItem);
@@ -578,8 +679,8 @@ mod tests {
         let req = make_request(
             TopLevelShape::SingleFile(item),
             "my-project",
-            OutputLayoutPolicy::SmartArchive,
-            SingleRootNamePolicy::UseArchiveName,
+            OutputLayoutPolicy::Smart,
+            SingleRootNamePolicy::PreferArchiveName,
         );
         let plan = plan_layout(&req);
         assert_eq!(
@@ -601,8 +702,8 @@ mod tests {
         let req = make_request(
             TopLevelShape::SingleFile(item),
             "archive",
-            OutputLayoutPolicy::SmartArchive,
-            SingleRootNamePolicy::UseArchiveName,
+            OutputLayoutPolicy::Smart,
+            SingleRootNamePolicy::PreferArchiveName,
         );
         let plan = plan_layout(&req);
         assert_eq!(plan.kind, LayoutPlanKind::CollapseSingleItem);
@@ -619,8 +720,8 @@ mod tests {
         let req = make_request(
             TopLevelShape::SingleFile(item),
             "abc",
-            OutputLayoutPolicy::SmartArchive,
-            SingleRootNamePolicy::UseArchiveName,
+            OutputLayoutPolicy::Smart,
+            SingleRootNamePolicy::PreferArchiveName,
         );
         let plan = plan_layout(&req);
         assert_eq!(plan.kind, LayoutPlanKind::CollapseSingleItem);
@@ -628,13 +729,13 @@ mod tests {
     }
 
     #[test]
-    fn plan_collapse_policy_collapses_single_dir() {
+    fn plan_preserve_both_policy_collapses_single_dir() {
         let item = make_item("MyProject", true, &PathBuf::new());
         let req = make_request(
             TopLevelShape::SingleDir(item),
             "archive",
-            OutputLayoutPolicy::SmartArchive,
-            SingleRootNamePolicy::Collapse,
+            OutputLayoutPolicy::Smart,
+            SingleRootNamePolicy::PreserveBoth,
         );
         let plan = plan_layout(&req);
         assert_eq!(plan.kind, LayoutPlanKind::CollapseSingleItem);
@@ -642,13 +743,13 @@ mod tests {
     }
 
     #[test]
-    fn plan_use_archive_name_policy_wraps() {
+    fn plan_prefer_archive_name_policy_wraps() {
         let item = make_item("MyProject", true, &PathBuf::new());
         let req = make_request(
             TopLevelShape::SingleDir(item),
             "my-archive",
-            OutputLayoutPolicy::SmartArchive,
-            SingleRootNamePolicy::UseArchiveName,
+            OutputLayoutPolicy::Smart,
+            SingleRootNamePolicy::PreferArchiveName,
         );
         let plan = plan_layout(&req);
         assert_eq!(
@@ -658,6 +759,45 @@ mod tests {
             }
         );
         assert_eq!(plan.reason, LayoutDecisionReason::DefaultConservative);
+    }
+
+    #[test]
+    fn plan_auto_policy_prefers_inner_name() {
+        let item = make_item("The Great Gatsby", true, &PathBuf::new());
+        let req = make_request(
+            TopLevelShape::SingleDir(item),
+            "archive",
+            OutputLayoutPolicy::Smart,
+            SingleRootNamePolicy::Auto,
+        );
+        let plan = plan_layout(&req);
+        assert_eq!(plan.kind, LayoutPlanKind::CollapseSingleItem);
+        assert_eq!(plan.reason, LayoutDecisionReason::SingleDirGoodName);
+    }
+
+    #[test]
+    fn plan_flat_single_policy() {
+        let req = make_request(
+            TopLevelShape::Empty,
+            "archive",
+            OutputLayoutPolicy::FlatSingle,
+            SingleRootNamePolicy::Auto,
+        );
+        let plan = plan_layout(&req);
+        assert_eq!(plan.kind, LayoutPlanKind::Empty);
+        assert_eq!(plan.reason, LayoutDecisionReason::EmptyTempDir);
+    }
+
+    #[test]
+    fn plan_layout_populates_warnings() {
+        let req = make_request(
+            TopLevelShape::Empty,
+            "archive",
+            OutputLayoutPolicy::Smart,
+            SingleRootNamePolicy::Auto,
+        );
+        let plan = plan_layout(&req);
+        assert!(plan.warnings.is_empty());
     }
 
     // ── pick_best_duplicate_name tests ────────────────────────────────────
