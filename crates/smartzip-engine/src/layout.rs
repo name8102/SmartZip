@@ -19,34 +19,26 @@ pub const METADATA_ENTRIES: &[&str] = &[
 const SCORE_MARGIN_THRESHOLD: f32 = 1.0;
 
 /// How to place extracted content into the output directory.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OutputLayoutPolicy {
     Smart,
     Raw,
+    #[default]
     Conservative,
+    /// Collapse a single top-level item directly into the output directory
+    /// without wrapping it in an archive-name subdirectory.
     FlatSingle,
 }
 
-impl Default for OutputLayoutPolicy {
-    fn default() -> Self {
-        Self::Conservative
-    }
-}
-
 /// Policy for naming when there's a single root item.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SingleRootNamePolicy {
     PreferArchiveName,
     PreferInnerName,
+    #[default]
     Auto,
     PreserveBoth,
     AskWhenAmbiguous,
-}
-
-impl Default for SingleRootNamePolicy {
-    fn default() -> Self {
-        Self::Auto
-    }
 }
 
 /// What was found at the top level of the extraction temp directory.
@@ -64,7 +56,6 @@ pub struct TopLevelItemSummary {
     pub name: String,
     pub path: PathBuf,
     pub is_dir: bool,
-    pub ext: Option<String>,
 }
 
 /// Input to the layout planning function.
@@ -73,7 +64,6 @@ pub struct LayoutRequest {
     pub shape: TopLevelShape,
     pub archive_path: PathBuf,
     pub archive_stem: String,
-    pub temp_dir: PathBuf,
     pub output_root: PathBuf,
     pub layout_policy: OutputLayoutPolicy,
     pub single_root_name_policy: SingleRootNamePolicy,
@@ -92,7 +82,10 @@ pub struct LayoutPlan {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LayoutPlanKind {
     CommitWholeTempAsArchiveDir { name: String },
-    CollapseSingleItem,
+    /// Flatten a single directory's contents into the target directory.
+    CommitSingleDirAsInnerName,
+    /// Rename/copy a single file into the target directory.
+    CommitSingleFileAsInnerName,
     RawArchiveDir { name: String },
     Empty,
 }
@@ -106,6 +99,7 @@ pub enum LayoutDecisionReason {
     SingleDirSimilarToArchive,
     SingleFileGoodName,
     SingleFileGenericName,
+    SingleFileSimilarToArchive,
     SingleFileArchiveExtension,
     RawPolicyForced,
     EmptyTempDir,
@@ -131,18 +125,10 @@ pub fn scan_visible_top_level(temp_dir: &Path) -> TopLevelShape {
         })
         .map(|e| {
             let name = e.file_name().to_string_lossy().to_string();
-            let ext = if e.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
-                Path::new(&name)
-                    .extension()
-                    .map(|s| s.to_string_lossy().to_string())
-            } else {
-                None
-            };
             TopLevelItemSummary {
                 name,
                 path: e.path(),
                 is_dir: e.file_type().map(|ft| ft.is_dir()).unwrap_or(false),
-                ext,
             }
         })
         .collect();
@@ -203,7 +189,7 @@ fn decide_single_dir(req: &LayoutRequest, item: &TopLevelItemSummary) -> LayoutP
 
     if similarity == SimilarityLevel::Equivalent {
         return LayoutPlan {
-            kind: LayoutPlanKind::CollapseSingleItem,
+            kind: LayoutPlanKind::CommitSingleDirAsInnerName,
             target: req.output_root.clone(),
             reason: LayoutDecisionReason::SingleDirSimilarToArchive,
             warnings: vec![],
@@ -212,7 +198,7 @@ fn decide_single_dir(req: &LayoutRequest, item: &TopLevelItemSummary) -> LayoutP
 
     if archive_score.is_generic && !dir_score.is_generic {
         return LayoutPlan {
-            kind: LayoutPlanKind::CollapseSingleItem,
+            kind: LayoutPlanKind::CommitSingleDirAsInnerName,
             target: req.output_root.clone(),
             reason: LayoutDecisionReason::SingleDirGoodName,
             warnings: vec![],
@@ -232,7 +218,7 @@ fn decide_single_dir(req: &LayoutRequest, item: &TopLevelItemSummary) -> LayoutP
 
     if dir_score.total > archive_score.total + SCORE_MARGIN_THRESHOLD {
         return LayoutPlan {
-            kind: LayoutPlanKind::CollapseSingleItem,
+            kind: LayoutPlanKind::CommitSingleDirAsInnerName,
             target: req.output_root.clone(),
             reason: LayoutDecisionReason::SingleDirGoodName,
             warnings: vec![],
@@ -241,7 +227,7 @@ fn decide_single_dir(req: &LayoutRequest, item: &TopLevelItemSummary) -> LayoutP
 
     match req.single_root_name_policy {
         SingleRootNamePolicy::PreserveBoth => LayoutPlan {
-            kind: LayoutPlanKind::CollapseSingleItem,
+            kind: LayoutPlanKind::CommitSingleDirAsInnerName,
             target: req.output_root.clone(),
             reason: LayoutDecisionReason::SingleDirGoodName,
             warnings: vec![],
@@ -249,7 +235,7 @@ fn decide_single_dir(req: &LayoutRequest, item: &TopLevelItemSummary) -> LayoutP
         SingleRootNamePolicy::PreferInnerName => {
             if dir_score.total >= archive_score.total {
                 LayoutPlan {
-                    kind: LayoutPlanKind::CollapseSingleItem,
+                    kind: LayoutPlanKind::CommitSingleDirAsInnerName,
                     target: req.output_root.clone(),
                     reason: LayoutDecisionReason::SingleDirGoodName,
                     warnings: vec![],
@@ -276,7 +262,7 @@ fn decide_single_dir(req: &LayoutRequest, item: &TopLevelItemSummary) -> LayoutP
         SingleRootNamePolicy::Auto | SingleRootNamePolicy::AskWhenAmbiguous => {
             if dir_score.total >= archive_score.total {
                 LayoutPlan {
-                    kind: LayoutPlanKind::CollapseSingleItem,
+                    kind: LayoutPlanKind::CommitSingleDirAsInnerName,
                     target: req.output_root.clone(),
                     reason: LayoutDecisionReason::SingleDirGoodName,
                     warnings: vec![],
@@ -306,16 +292,16 @@ fn decide_single_file(req: &LayoutRequest, item: &TopLevelItemSummary) -> Layout
 
     if similarity == SimilarityLevel::Equivalent {
         return LayoutPlan {
-            kind: LayoutPlanKind::CollapseSingleItem,
+            kind: LayoutPlanKind::CommitSingleFileAsInnerName,
             target: req.output_root.clone(),
-            reason: LayoutDecisionReason::SingleDirSimilarToArchive,
+            reason: LayoutDecisionReason::SingleFileSimilarToArchive,
             warnings: vec![],
         };
     }
 
     if archive_score.is_generic && !file_score.is_generic {
         return LayoutPlan {
-            kind: LayoutPlanKind::CollapseSingleItem,
+            kind: LayoutPlanKind::CommitSingleFileAsInnerName,
             target: req.output_root.clone(),
             reason: LayoutDecisionReason::SingleFileGoodName,
             warnings: vec![],
@@ -335,7 +321,7 @@ fn decide_single_file(req: &LayoutRequest, item: &TopLevelItemSummary) -> Layout
 
     if has_archive_ext && file_score.total > archive_score.total {
         return LayoutPlan {
-            kind: LayoutPlanKind::CollapseSingleItem,
+            kind: LayoutPlanKind::CommitSingleFileAsInnerName,
             target: req.output_root.clone(),
             reason: LayoutDecisionReason::SingleFileArchiveExtension,
             warnings: vec![],
@@ -344,7 +330,7 @@ fn decide_single_file(req: &LayoutRequest, item: &TopLevelItemSummary) -> Layout
 
     if file_score.total > archive_score.total + SCORE_MARGIN_THRESHOLD {
         return LayoutPlan {
-            kind: LayoutPlanKind::CollapseSingleItem,
+            kind: LayoutPlanKind::CommitSingleFileAsInnerName,
             target: req.output_root.clone(),
             reason: LayoutDecisionReason::SingleFileGoodName,
             warnings: vec![],
@@ -353,7 +339,7 @@ fn decide_single_file(req: &LayoutRequest, item: &TopLevelItemSummary) -> Layout
 
     match req.single_root_name_policy {
         SingleRootNamePolicy::PreserveBoth => LayoutPlan {
-            kind: LayoutPlanKind::CollapseSingleItem,
+            kind: LayoutPlanKind::CommitSingleFileAsInnerName,
             target: req.output_root.clone(),
             reason: LayoutDecisionReason::SingleFileGoodName,
             warnings: vec![],
@@ -361,7 +347,7 @@ fn decide_single_file(req: &LayoutRequest, item: &TopLevelItemSummary) -> Layout
         SingleRootNamePolicy::PreferInnerName => {
             if file_score.total >= archive_score.total {
                 LayoutPlan {
-                    kind: LayoutPlanKind::CollapseSingleItem,
+                    kind: LayoutPlanKind::CommitSingleFileAsInnerName,
                     target: req.output_root.clone(),
                     reason: LayoutDecisionReason::SingleFileGoodName,
                     warnings: vec![],
@@ -388,7 +374,7 @@ fn decide_single_file(req: &LayoutRequest, item: &TopLevelItemSummary) -> Layout
         SingleRootNamePolicy::Auto | SingleRootNamePolicy::AskWhenAmbiguous => {
             if file_score.total >= archive_score.total {
                 LayoutPlan {
-                    kind: LayoutPlanKind::CollapseSingleItem,
+                    kind: LayoutPlanKind::CommitSingleFileAsInnerName,
                     target: req.output_root.clone(),
                     reason: LayoutDecisionReason::SingleFileGoodName,
                     warnings: vec![],
@@ -434,18 +420,10 @@ mod tests {
     }
 
     fn make_item(name: &str, is_dir: bool, parent: &Path) -> TopLevelItemSummary {
-        let ext = if is_dir {
-            None
-        } else {
-            Path::new(name)
-                .extension()
-                .map(|s| s.to_string_lossy().to_string())
-        };
         TopLevelItemSummary {
             name: name.to_string(),
             path: parent.join(name),
             is_dir,
-            ext,
         }
     }
 
@@ -455,13 +433,11 @@ mod tests {
         policy: OutputLayoutPolicy,
         single_policy: SingleRootNamePolicy,
     ) -> LayoutRequest {
-        let temp = temp_dir("plan");
         let output = temp_dir("output");
         LayoutRequest {
             shape,
-            archive_path: temp.join(format!("{archive_stem}.zip")),
+            archive_path: output.join(format!("{archive_stem}.zip")),
             archive_stem: archive_stem.to_string(),
-            temp_dir: temp,
             output_root: output,
             layout_policy: policy,
             single_root_name_policy: single_policy,
@@ -503,7 +479,6 @@ mod tests {
             TopLevelShape::SingleFile(item) => {
                 assert_eq!(item.name, "real_file.txt");
                 assert!(!item.is_dir);
-                assert_eq!(item.ext.as_deref(), Some("txt"));
             }
             other => panic!("expected SingleFile, got {:?}", other),
         }
@@ -542,7 +517,6 @@ mod tests {
             TopLevelShape::SingleDir(item) => {
                 assert_eq!(item.name, "MyProject");
                 assert!(item.is_dir);
-                assert!(item.ext.is_none());
             }
             other => panic!("expected SingleDir, got {:?}", other),
         }
@@ -637,7 +611,7 @@ mod tests {
             SingleRootNamePolicy::PreferArchiveName,
         );
         let plan = plan_layout(&req);
-        assert_eq!(plan.kind, LayoutPlanKind::CollapseSingleItem);
+        assert_eq!(plan.kind, LayoutPlanKind::CommitSingleDirAsInnerName);
         assert_eq!(plan.reason, LayoutDecisionReason::SingleDirGoodName);
     }
 
@@ -651,7 +625,7 @@ mod tests {
             SingleRootNamePolicy::PreferArchiveName,
         );
         let plan = plan_layout(&req);
-        assert_eq!(plan.kind, LayoutPlanKind::CollapseSingleItem);
+        assert_eq!(plan.kind, LayoutPlanKind::CommitSingleDirAsInnerName);
         assert_eq!(plan.reason, LayoutDecisionReason::SingleDirSimilarToArchive);
     }
 
@@ -669,7 +643,7 @@ mod tests {
             SingleRootNamePolicy::PreferArchiveName,
         );
         let plan = plan_layout(&req);
-        assert_eq!(plan.kind, LayoutPlanKind::CollapseSingleItem);
+        assert_eq!(plan.kind, LayoutPlanKind::CommitSingleDirAsInnerName);
         assert_eq!(plan.reason, LayoutDecisionReason::SingleDirGoodName);
     }
 
@@ -706,7 +680,7 @@ mod tests {
             SingleRootNamePolicy::PreferArchiveName,
         );
         let plan = plan_layout(&req);
-        assert_eq!(plan.kind, LayoutPlanKind::CollapseSingleItem);
+        assert_eq!(plan.kind, LayoutPlanKind::CommitSingleFileAsInnerName);
         assert_eq!(plan.reason, LayoutDecisionReason::SingleFileGoodName);
     }
 
@@ -724,21 +698,21 @@ mod tests {
             SingleRootNamePolicy::PreferArchiveName,
         );
         let plan = plan_layout(&req);
-        assert_eq!(plan.kind, LayoutPlanKind::CollapseSingleItem);
+        assert_eq!(plan.kind, LayoutPlanKind::CommitSingleFileAsInnerName);
         assert_eq!(plan.reason, LayoutDecisionReason::SingleFileArchiveExtension);
     }
 
     #[test]
-    fn plan_preserve_both_policy_collapses_single_dir() {
-        let item = make_item("MyProject", true, &PathBuf::new());
+    fn plan_auto_policy_prefers_inner_name() {
+        let item = make_item("The Great Gatsby", true, &PathBuf::new());
         let req = make_request(
             TopLevelShape::SingleDir(item),
             "archive",
             OutputLayoutPolicy::Smart,
-            SingleRootNamePolicy::PreserveBoth,
+            SingleRootNamePolicy::Auto,
         );
         let plan = plan_layout(&req);
-        assert_eq!(plan.kind, LayoutPlanKind::CollapseSingleItem);
+        assert_eq!(plan.kind, LayoutPlanKind::CommitSingleDirAsInnerName);
         assert_eq!(plan.reason, LayoutDecisionReason::SingleDirGoodName);
     }
 
@@ -759,20 +733,6 @@ mod tests {
             }
         );
         assert_eq!(plan.reason, LayoutDecisionReason::DefaultConservative);
-    }
-
-    #[test]
-    fn plan_auto_policy_prefers_inner_name() {
-        let item = make_item("The Great Gatsby", true, &PathBuf::new());
-        let req = make_request(
-            TopLevelShape::SingleDir(item),
-            "archive",
-            OutputLayoutPolicy::Smart,
-            SingleRootNamePolicy::Auto,
-        );
-        let plan = plan_layout(&req);
-        assert_eq!(plan.kind, LayoutPlanKind::CollapseSingleItem);
-        assert_eq!(plan.reason, LayoutDecisionReason::SingleDirGoodName);
     }
 
     #[test]

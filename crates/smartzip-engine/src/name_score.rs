@@ -325,13 +325,13 @@ pub fn normalize_for_compare(s: &str) -> String {
     let halfwidth: String = s
         .chars()
         .map(|c| {
-            if c >= '\u{FF01}' && c <= '\u{FF5E}' {
+            if ('\u{FF01}'..='\u{FF5E}').contains(&c) {
                 // Fullwidth Latin characters: offset by 0xFEE0
                 char::from_u32(c as u32 - 0xFEE0).unwrap_or(c)
             } else if c == '\u{3000}' {
                 // Fullwidth space → ASCII space
                 ' '
-            } else if c >= '\u{FF10}' && c <= '\u{FF19}' {
+            } else if ('\u{FF10}'..='\u{FF19}').contains(&c) {
                 // Fullwidth digits (redundant with above range but explicit)
                 char::from_u32(c as u32 - 0xFEE0).unwrap_or(c)
             } else {
