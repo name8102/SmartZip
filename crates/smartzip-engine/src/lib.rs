@@ -400,6 +400,7 @@ impl SmartZipEngine {
 
             let mut extracted = false;
             let mut last_error = None;
+            let mut actual_output_dir = output_dir.clone();
             for password in &password_candidates {
                 // B3: Test-first — use test() to check password, then extract once
                 let pw_value = password_value(password);
@@ -514,6 +515,7 @@ impl SmartZipEngine {
                                         &result.output_dir,
                                     );
                                 }
+                                actual_output_dir = result.output_dir;
                                 extracted = true;
                                 break;
                             }
@@ -610,6 +612,7 @@ impl SmartZipEngine {
                                                     &result.output_dir,
                                                 );
                                             }
+                                            actual_output_dir = result.output_dir;
                                             // Save successful interactive password to DB
                                             let _ = passwords.record_success(&PasswordCandidate {
                                                 id: None,
@@ -663,7 +666,7 @@ impl SmartZipEngine {
             events.push(TaskEvent {
                 task_id: task_id.clone(),
                 kind: TaskEventKind::OutputCreated {
-                    path: output_dir_for_candidate(&request.output_dir, &candidate),
+                    path: actual_output_dir.clone(),
                 },
             });
 
@@ -671,7 +674,7 @@ impl SmartZipEngine {
             let output_relative_path = candidate_output_relative_path(&candidate);
             for nested in discover_nested_candidates(
                 scanner,
-                &output_dir,
+                &actual_output_dir,
                 candidate.depth + 1,
                 &output_relative_path,
             ) {
@@ -1754,6 +1757,7 @@ mod tests {
         let candidates = [
             output.join("hello.txt"),
             output.join("test").join("hello.txt"),
+            output.join("test.txt"),
         ];
         assert!(
             candidates.iter().any(|p| p.exists()),

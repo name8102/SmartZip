@@ -671,6 +671,8 @@ async fn test_engine_preserves_nested_archive_paths() {
         "expected nested output at {}",
         nested_file.display()
     );
+
+    let _ = std::fs::remove_dir_all(output.path().parent().unwrap());
 }
 
 // ── Format detection (rstest parametrized) ────────────────────────────────
