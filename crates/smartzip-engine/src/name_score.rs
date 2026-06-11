@@ -18,9 +18,11 @@ const GENERIC_NAMES: &[&str] = &[
     "folders",
     "temp",
     "tmp",
-    "new",
+    "new folder",
     "untitled",
     "新建文件夹",
+    "解压后",
+    "压缩包",
     "未命名",
     "backup",
     "backups",
@@ -52,7 +54,7 @@ const SEMANTIC_TOKENS: &[&str] = &[
     "press",
     "publishing",
     "records",
-    " productions",
+    "productions",
     "inc",
     "ltd",
     "llc",
@@ -84,11 +86,33 @@ const SEMANTIC_TOKENS: &[&str] = &[
     "chapter",
 ];
 
+/// Threshold: names at or above this similarity are considered Equivalent.
+pub const SIMILARITY_EQUIVALENT: f32 = 0.85;
+/// Threshold: names at or above this similarity (but below Equivalent) are Partial.
+pub const SIMILARITY_PARTIAL: f32 = 0.55;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SimilarityLevel {
+    Equivalent,
+    Partial,
+    Different,
+}
+
+pub fn classify_similarity(sim: f32) -> SimilarityLevel {
+    if sim >= SIMILARITY_EQUIVALENT {
+        SimilarityLevel::Equivalent
+    } else if sim >= SIMILARITY_PARTIAL {
+        SimilarityLevel::Partial
+    } else {
+        SimilarityLevel::Different
+    }
+}
+
 /// Version-like regex patterns: v1.0, 1.2.3, r2, ver3, etc.
 fn has_version_number(s: &str) -> bool {
     let lower = s.to_ascii_lowercase();
     // v1, v1.0, v1.2.3, ver1, ver1.0, rev1, r1, r1.0, build123
-    let version_prefixes = ["v", "ver", "rev", "r", "build", "release", "v"];
+    let version_prefixes = ["v", "ver", "rev", "r", "build", "release"];
     for prefix in &version_prefixes {
         if let Some(rest) = lower.strip_prefix(prefix) {
             if !rest.is_empty()
@@ -179,10 +203,14 @@ pub fn score_name(name: &str) -> NameScore {
     let lower = name.to_ascii_lowercase();
     let normalized = normalize_for_compare(name);
 
+    // Short numeric names (<=6 chars) are treated as generic/low quality
+    let is_purely_numeric_short = name.len() <= 6 && name.chars().all(|c| c.is_ascii_digit());
+
     // Check for generic name
-    let is_generic = GENERIC_NAMES
-        .iter()
-        .any(|g| normalized == *g || lower == *g);
+    let is_generic = is_purely_numeric_short
+        || GENERIC_NAMES
+            .iter()
+            .any(|g| normalized == *g || lower == *g);
 
     let mut total: f32 = 0.0;
     let mut semantic_count: usize = 0;
@@ -233,9 +261,100 @@ pub fn score_name(name: &str) -> NameScore {
     }
 }
 
-/// Normalize a string for comparison: decompose (NFD) and strip combining marks, lowercase, strip separators.
+/// Archive format suffixes to strip during normalization.
+const ARCHIVE_SUFFIXES: &[&str] = &[
+    ".tar.gz",
+    ".tar.bz2",
+    ".tar.xz",
+    ".tar.zst",
+    ".tar.lz",
+    ".tar.lzma",
+    ".tar.zstd",
+    ".tar",
+    ".tgz",
+    ".tbz2",
+    ".txz",
+    ".zip",
+    ".7z",
+    ".rar",
+    ".gz",
+    ".bz2",
+    ".xz",
+    ".zst",
+    ".lz",
+    ".lzma",
+    ".cab",
+    ".iso",
+    ".dmg",
+    ".jar",
+    ".war",
+    ".ear",
+];
+
+/// Strip leading/trailing bracket content like [Author], (C102), [DL版].
+fn strip_bracket_noise(s: &str) -> String {
+    let mut result = s;
+    loop {
+        let trimmed = result.trim();
+        if trimmed.is_empty() {
+            break;
+        }
+        let first_char = trimmed.as_bytes()[0];
+        let close_char = match first_char {
+            b'[' => b']',
+            b'(' => b')',
+            b'{' => b'}',
+            _ => break,
+        };
+        if let Some(end_idx) = trimmed.find(close_char as char) {
+            // Only strip if it's a prefix bracket group (starts at beginning)
+            let after = &trimmed[end_idx + 1..];
+            result = after.trim();
+        } else {
+            break;
+        }
+    }
+    result.to_string()
+}
+
+/// Normalize a string for comparison: fullwidth→halfwidth, NFD decomposition,
+/// strip combining marks, lowercase, strip separators, strip archive suffixes,
+/// strip bracket noise.
 pub fn normalize_for_compare(s: &str) -> String {
-    s.nfd()
+    // 1. Fullwidth → halfwidth conversion
+    let halfwidth: String = s
+        .chars()
+        .map(|c| {
+            if c >= '\u{FF01}' && c <= '\u{FF5E}' {
+                // Fullwidth Latin characters: offset by 0xFEE0
+                char::from_u32(c as u32 - 0xFEE0).unwrap_or(c)
+            } else if c == '\u{3000}' {
+                // Fullwidth space → ASCII space
+                ' '
+            } else if c >= '\u{FF10}' && c <= '\u{FF19}' {
+                // Fullwidth digits (redundant with above range but explicit)
+                char::from_u32(c as u32 - 0xFEE0).unwrap_or(c)
+            } else {
+                c
+            }
+        })
+        .collect();
+
+    // 2. Strip archive format suffixes (order: longest first)
+    let mut stripped = halfwidth.to_ascii_lowercase();
+    for suffix in ARCHIVE_SUFFIXES {
+        if let Some(stem) = stripped.strip_suffix(suffix) {
+            stripped = stem.to_string();
+            break;
+        }
+    }
+
+    // 3. Strip bracket noise from leading/trailing positions
+    let no_brackets = strip_bracket_noise(&stripped);
+
+    // 4. NFD decomposition, strip combining marks, strip separators
+    no_brackets
+        .nfd()
         .collect::<String>()
         .chars()
         .filter(|c| !matches!(c, '.' | '_' | '-' | ' '))
@@ -325,7 +444,16 @@ mod tests {
 
     #[test]
     fn generic_names_get_penalty() {
-        for name in &["download", "files", "data", "archive", "新建文件夹", "未命名"] {
+        for name in &[
+            "download",
+            "files",
+            "data",
+            "archive",
+            "新建文件夹",
+            "未命名",
+            "解压后",
+            "压缩包",
+        ] {
             let score = score_name(name);
             assert!(score.is_generic, "{name} should be generic");
             assert!(
@@ -334,6 +462,12 @@ mod tests {
                 score.total
             );
         }
+    }
+
+    #[test]
+    fn new_folder_is_generic() {
+        let score = score_name("new folder");
+        assert!(score.is_generic, "new folder should be generic");
     }
 
     #[test]
@@ -431,5 +565,48 @@ mod tests {
         assert!(has_bracket_info("file {v2}"));
         assert!(!has_bracket_info("file"));
         assert!(!has_bracket_info("file []"));
+    }
+
+    #[test]
+    fn fullwidth_normalization() {
+        assert_eq!(name_similarity("\u{FF21}", "A"), 1.0);
+        assert_eq!(name_similarity("\u{FF11}", "1"), 1.0);
+        assert_eq!(name_similarity("Hello\u{3000}World", "Hello World"), 1.0);
+    }
+
+    #[test]
+    fn archive_suffix_stripping() {
+        assert_eq!(name_similarity("archive.zip", "archive"), 1.0);
+        assert_eq!(name_similarity("data.tar.gz", "data"), 1.0);
+        assert_eq!(name_similarity("backup.7z", "backup"), 1.0);
+        assert_eq!(name_similarity("file.rar", "file"), 1.0);
+        assert_eq!(name_similarity("image.tgz", "image"), 1.0);
+    }
+
+    #[test]
+    fn bracket_noise_stripping() {
+        let sim = name_similarity("[Author] book", "book");
+        assert!(sim > 0.8, "bracket-stripped names should be similar: {sim}");
+        let sim2 = name_similarity("(C102) content", "content");
+        assert!(sim2 > 0.8, "paren-stripped names should be similar: {sim2}");
+    }
+
+    #[test]
+    fn short_numeric_names_are_generic() {
+        assert!(score_name("1").is_generic);
+        assert!(score_name("01").is_generic);
+        assert!(score_name("123456").is_generic);
+        assert!(!score_name("1234567").is_generic);
+        assert!(!score_name("abc123").is_generic);
+    }
+
+    #[test]
+    fn classify_similarity_boundaries() {
+        assert_eq!(classify_similarity(1.0), SimilarityLevel::Equivalent);
+        assert_eq!(classify_similarity(0.85), SimilarityLevel::Equivalent);
+        assert_eq!(classify_similarity(0.84), SimilarityLevel::Partial);
+        assert_eq!(classify_similarity(0.55), SimilarityLevel::Partial);
+        assert_eq!(classify_similarity(0.54), SimilarityLevel::Different);
+        assert_eq!(classify_similarity(0.0), SimilarityLevel::Different);
     }
 }
