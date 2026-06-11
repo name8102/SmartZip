@@ -106,25 +106,23 @@ impl OutputMaterializer {
             single_root_name_policy: request.single_root_name_policy,
         });
 
-        let commit_target =
-            resolve_commit_target(&layout_plan.target, request.commit_policy).map_err(
-                |error| MaterializeFailure {
-                    error,
-                    preserved_temp_dir: None,
-                },
-            )?;
-        if commit_target.exists() {
-            remove_existing_output(&commit_target).map_err(|error| MaterializeFailure {
-                error,
-                preserved_temp_dir: None,
-            })?;
-        }
-
         let committed_temp_path = temp.keep();
         match &layout_plan.kind {
             LayoutPlanKind::CommitWholeTempAsArchiveDir { .. }
-            | LayoutPlanKind::RawArchiveDir { .. }
-            | LayoutPlanKind::Empty => {
+            | LayoutPlanKind::RawArchiveDir { .. } => {
+                let commit_target =
+                    resolve_commit_target(&layout_plan.target, request.commit_policy).map_err(
+                        |error| MaterializeFailure {
+                            error,
+                            preserved_temp_dir: None,
+                        },
+                    )?;
+                if commit_target.exists() {
+                    remove_existing_output(&commit_target).map_err(|error| MaterializeFailure {
+                        error,
+                        preserved_temp_dir: None,
+                    })?;
+                }
                 match std::fs::rename(&committed_temp_path, &commit_target) {
                     Ok(_) => Ok(MaterializeResult {
                         output_dir: commit_target,
@@ -139,13 +137,21 @@ impl OutputMaterializer {
                     }
                 }
             }
+            LayoutPlanKind::Empty => {
+                let _ = std::fs::remove_dir_all(&committed_temp_path);
+                Ok(MaterializeResult {
+                    output_dir: request.output_dir,
+                    layout_plan: Some(layout_plan),
+                })
+            }
             LayoutPlanKind::CommitSingleDirAsInnerName => {
-                std::fs::create_dir_all(&commit_target).map_err(|source| MaterializeFailure {
+                let commit_target = &request.output_dir;
+                std::fs::create_dir_all(commit_target).map_err(|source| MaterializeFailure {
                     error: SmartZipError::io(Some(commit_target.clone()), source),
                     preserved_temp_dir: None,
                 })?;
                 if let Some(dir_path) = find_single_visible_dir(&committed_temp_path) {
-                    recursive_move_contents(&dir_path, &commit_target).map_err(|source| {
+                    recursive_move_contents(&dir_path, commit_target).map_err(|source| {
                         MaterializeFailure {
                             error: SmartZipError::io(Some(commit_target.clone()), source),
                             preserved_temp_dir: None,
@@ -154,12 +160,13 @@ impl OutputMaterializer {
                 }
                 let _ = std::fs::remove_dir_all(&committed_temp_path);
                 Ok(MaterializeResult {
-                    output_dir: commit_target,
+                    output_dir: commit_target.clone(),
                     layout_plan: Some(layout_plan),
                 })
             }
             LayoutPlanKind::CommitSingleFileAsInnerName => {
-                std::fs::create_dir_all(&commit_target).map_err(|source| MaterializeFailure {
+                let commit_target = &request.output_dir;
+                std::fs::create_dir_all(commit_target).map_err(|source| MaterializeFailure {
                     error: SmartZipError::io(Some(commit_target.clone()), source),
                     preserved_temp_dir: None,
                 })?;
@@ -174,7 +181,7 @@ impl OutputMaterializer {
                 }
                 let _ = std::fs::remove_dir_all(&committed_temp_path);
                 Ok(MaterializeResult {
-                    output_dir: commit_target,
+                    output_dir: commit_target.clone(),
                     layout_plan: Some(layout_plan),
                 })
             }
