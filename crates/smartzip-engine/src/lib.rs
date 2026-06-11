@@ -1,6 +1,7 @@
 //! Application-level orchestration for SmartZip workflows.
 
 mod materialize;
+pub mod name_score;
 
 use async_trait::async_trait;
 use futures_util::FutureExt;
