@@ -9,6 +9,8 @@ rust-version.workspace = true
 [dependencies]
 async-trait.workspace = true
 async_zip.workspace = true
+rc-zip.workspace = true
+rc-zip-tokio.workspace = true
 futures-lite.workspace = true
 serde.workspace = true
 smartzip-core.workspace = true

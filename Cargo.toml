@@ -40,6 +40,8 @@ smartzip-engine = { path = "crates/smartzip-engine" }
 smartzip-passwords = { path = "crates/smartzip-passwords" }
 smartzip-platform = { path = "crates/smartzip-platform" }
 smartzip-scanner = { path = "crates/smartzip-scanner" }
+rc-zip = { version = "5.4", features = ["deflate"] }
+rc-zip-tokio = { version = "4.3", features = ["deflate"] }
 thiserror = "2.0"
 futures-util = "0.3"
 futures-lite = "2.6"
