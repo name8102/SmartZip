@@ -1,3 +1,6 @@
+use crate::layout::{
+    LayoutPlan, LayoutPlanKind, LayoutRequest, OutputLayoutPolicy, SingleRootNamePolicy,
+};
 use smartzip_core::{Result, SmartZipError};
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -13,11 +16,15 @@ pub enum CommitPolicy {
 pub struct MaterializeRequest {
     pub output_dir: PathBuf,
     pub commit_policy: CommitPolicy,
+    pub archive_stem: Option<String>,
+    pub layout_policy: OutputLayoutPolicy,
+    pub single_root_name_policy: SingleRootNamePolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MaterializeResult {
     pub output_dir: PathBuf,
+    pub layout_plan: Option<LayoutPlan>,
 }
 
 #[derive(Debug)]
@@ -80,26 +87,93 @@ impl OutputMaterializer {
             });
         }
 
-        let output_dir = resolve_commit_target(&request.output_dir, request.commit_policy)
+        let archive_stem = request.archive_stem.unwrap_or_else(|| {
+            request
+                .output_dir
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("archive")
+                .to_string()
+        });
+
+        let shape = crate::layout::scan_visible_top_level(&temp_path);
+        let layout_plan = crate::layout::plan_layout(&LayoutRequest {
+            shape,
+            archive_path: request.output_dir.clone(),
+            archive_stem,
+            output_root: parent.clone(),
+            layout_policy: request.layout_policy,
+            single_root_name_policy: request.single_root_name_policy,
+        });
+
+        let commit_target = resolve_commit_target(&request.output_dir, request.commit_policy)
             .map_err(|error| MaterializeFailure {
                 error,
                 preserved_temp_dir: None,
             })?;
-        if output_dir.exists() {
-            remove_existing_output(&output_dir).map_err(|error| MaterializeFailure {
+        if commit_target.exists() {
+            remove_existing_output(&commit_target).map_err(|error| MaterializeFailure {
                 error,
                 preserved_temp_dir: None,
             })?;
         }
 
         let committed_temp_path = temp.keep();
-        match std::fs::rename(&committed_temp_path, &output_dir) {
-            Ok(_) => Ok(MaterializeResult { output_dir }),
-            Err(error) => {
-                let _ = std::fs::remove_dir_all(&committed_temp_path);
-                Err(MaterializeFailure {
-                    error: SmartZipError::io(Some(output_dir), error),
+        match &layout_plan.kind {
+            LayoutPlanKind::CommitWholeTempAsArchiveDir { .. }
+            | LayoutPlanKind::RawArchiveDir { .. }
+            | LayoutPlanKind::Empty => {
+                match std::fs::rename(&committed_temp_path, &commit_target) {
+                    Ok(_) => Ok(MaterializeResult {
+                        output_dir: commit_target,
+                        layout_plan: Some(layout_plan),
+                    }),
+                    Err(error) => {
+                        let _ = std::fs::remove_dir_all(&committed_temp_path);
+                        Err(MaterializeFailure {
+                            error: SmartZipError::io(Some(commit_target), error),
+                            preserved_temp_dir: None,
+                        })
+                    }
+                }
+            }
+            LayoutPlanKind::CommitSingleDirAsInnerName => {
+                std::fs::create_dir_all(&commit_target).map_err(|source| MaterializeFailure {
+                    error: SmartZipError::io(Some(commit_target.clone()), source),
                     preserved_temp_dir: None,
+                })?;
+                if let Some(dir_path) = find_single_visible_dir(&committed_temp_path) {
+                    recursive_move_contents(&dir_path, &commit_target).map_err(|source| {
+                        MaterializeFailure {
+                            error: SmartZipError::io(Some(commit_target.clone()), source),
+                            preserved_temp_dir: None,
+                        }
+                    })?;
+                }
+                let _ = std::fs::remove_dir_all(&committed_temp_path);
+                Ok(MaterializeResult {
+                    output_dir: commit_target,
+                    layout_plan: Some(layout_plan),
+                })
+            }
+            LayoutPlanKind::CommitSingleFileAsInnerName => {
+                std::fs::create_dir_all(&commit_target).map_err(|source| MaterializeFailure {
+                    error: SmartZipError::io(Some(commit_target.clone()), source),
+                    preserved_temp_dir: None,
+                })?;
+                if let Some(file_path) = find_single_visible_file(&committed_temp_path) {
+                    let target_file = commit_target.join(file_path.file_name().unwrap());
+                    std::fs::rename(&file_path, &target_file).map_err(|source| {
+                        MaterializeFailure {
+                            error: SmartZipError::io(Some(target_file), source),
+                            preserved_temp_dir: None,
+                        }
+                    })?;
+                }
+                let _ = std::fs::remove_dir_all(&committed_temp_path);
+                Ok(MaterializeResult {
+                    output_dir: commit_target,
+                    layout_plan: Some(layout_plan),
                 })
             }
         }
@@ -157,6 +231,59 @@ fn find_non_colliding_name(parent: &Path, name: &std::ffi::OsStr) -> PathBuf {
     parent.join(format!("{name_str}_{}", std::process::id()))
 }
 
+fn find_single_visible_dir(dir: &Path) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    let dirs: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            let name = e.file_name();
+            let name_str = name.to_string_lossy();
+            !crate::layout::METADATA_ENTRIES.contains(&name_str.as_ref())
+                && e.file_type().map(|ft| ft.is_dir()).unwrap_or(false)
+        })
+        .map(|e| e.path())
+        .collect();
+    if dirs.len() == 1 {
+        Some(dirs.into_iter().next().unwrap())
+    } else {
+        None
+    }
+}
+
+fn find_single_visible_file(dir: &Path) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    let files: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            let name = e.file_name();
+            let name_str = name.to_string_lossy();
+            !crate::layout::METADATA_ENTRIES.contains(&name_str.as_ref())
+                && e.file_type().map(|ft| ft.is_file()).unwrap_or(false)
+        })
+        .map(|e| e.path())
+        .collect();
+    if files.len() == 1 {
+        Some(files.into_iter().next().unwrap())
+    } else {
+        None
+    }
+}
+
+fn recursive_move_contents(from: &Path, to: &Path) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let source = entry.path();
+        let dest = to.join(entry.file_name());
+        if source.is_dir() {
+            std::fs::create_dir_all(&dest)?;
+            recursive_move_contents(&source, &dest)?;
+        } else {
+            std::fs::rename(&source, &dest)?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -171,6 +298,9 @@ mod tests {
                 MaterializeRequest {
                     output_dir: output.clone(),
                     commit_policy: CommitPolicy::FailIfExists,
+                    archive_stem: None,
+                    layout_policy: OutputLayoutPolicy::default(),
+                    single_root_name_policy: SingleRootNamePolicy::default(),
                 },
                 |temp_dir| async move {
                     std::fs::write(temp_dir.join("hello.txt"), b"hello")
@@ -196,6 +326,9 @@ mod tests {
                 MaterializeRequest {
                     output_dir: output.clone(),
                     commit_policy: CommitPolicy::Overwrite,
+                    archive_stem: None,
+                    layout_policy: OutputLayoutPolicy::default(),
+                    single_root_name_policy: SingleRootNamePolicy::default(),
                 },
                 |temp_dir| async move {
                     std::fs::write(temp_dir.join("new.txt"), b"new")
@@ -221,6 +354,9 @@ mod tests {
                 MaterializeRequest {
                     output_dir: output.clone(),
                     commit_policy: CommitPolicy::Overwrite,
+                    archive_stem: None,
+                    layout_policy: OutputLayoutPolicy::default(),
+                    single_root_name_policy: SingleRootNamePolicy::default(),
                 },
                 |_temp_dir| async {
                     Err(SmartZipError::BackendFailed {
@@ -246,6 +382,9 @@ mod tests {
                 MaterializeRequest {
                     output_dir: output.clone(),
                     commit_policy: CommitPolicy::FailIfExists,
+                    archive_stem: None,
+                    layout_policy: OutputLayoutPolicy::default(),
+                    single_root_name_policy: SingleRootNamePolicy::default(),
                 },
                 |temp_dir| async move {
                     std::fs::write(temp_dir.join("partial.txt"), b"partial")
@@ -264,5 +403,36 @@ mod tests {
         assert!(preserved.join("partial.txt").exists());
         assert!(!output.exists());
         std::fs::remove_dir_all(preserved).unwrap();
+    }
+
+    #[tokio::test]
+    async fn materialize_flattens_single_generic_inner_dir() {
+        let root = tempfile::tempdir().unwrap();
+        let output = root.path().join("my-archive");
+
+        let result = OutputMaterializer::default()
+            .materialize(
+                MaterializeRequest {
+                    output_dir: output.clone(),
+                    commit_policy: CommitPolicy::FailIfExists,
+                    archive_stem: Some("my-archive".to_string()),
+                    layout_policy: OutputLayoutPolicy::Smart,
+                    single_root_name_policy: SingleRootNamePolicy::default(),
+                },
+                |temp_dir| async move {
+                    let inner = temp_dir.join("files");
+                    std::fs::create_dir_all(&inner)
+                        .map_err(|source| SmartZipError::io(Some(temp_dir.clone()), source))?;
+                    std::fs::write(inner.join("a.txt"), b"alpha")
+                        .map_err(|source| SmartZipError::io(Some(temp_dir), source))
+                },
+            )
+            .await
+            .unwrap();
+
+        let plan = result.layout_plan.as_ref().unwrap();
+        assert_eq!(plan.kind, LayoutPlanKind::CommitWholeTempAsArchiveDir { name: "my-archive".to_string() });
+        assert!(output.join("files").exists());
+        assert_eq!(std::fs::read(output.join("files").join("a.txt")).unwrap(), b"alpha");
     }
 }

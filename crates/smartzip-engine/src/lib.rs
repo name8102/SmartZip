@@ -481,6 +481,9 @@ impl SmartZipEngine {
                                 MaterializeRequest {
                                     output_dir: output_dir.clone(),
                                     commit_policy: output_plan.commit_policy,
+                                    archive_stem: None,
+                                    layout_policy: crate::layout::OutputLayoutPolicy::default(),
+                                    single_root_name_policy: crate::layout::SingleRootNamePolicy::default(),
                                 },
                                 |temp_output_dir| async move {
                                     backend_call(
@@ -574,6 +577,9 @@ impl SmartZipEngine {
                                             MaterializeRequest {
                                                 output_dir: output_dir.clone(),
                                                 commit_policy: output_plan.commit_policy,
+                                                archive_stem: None,
+                                                layout_policy: crate::layout::OutputLayoutPolicy::default(),
+                                                single_root_name_policy: crate::layout::SingleRootNamePolicy::default(),
                                             },
                                             |temp_output_dir| async move {
                                                 backend_call(
