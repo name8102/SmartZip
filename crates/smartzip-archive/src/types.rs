@@ -108,7 +108,7 @@ impl Default for ExtractionLimits {
             max_entries: 100_000,
             max_single_entry_bytes: 10 * 1024 * 1024 * 1024,
             max_total_output_bytes: 100 * 1024 * 1024 * 1024,
-            max_compression_ratio: 100,
+            max_compression_ratio: 10_000,
         }
     }
 }
