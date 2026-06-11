@@ -83,6 +83,8 @@ pub struct ExtractWorkflowRequest {
     pub encoding_mode: EncodingMode,
     pub scanner: ScannerConfig,
     pub password_candidates: PasswordCandidateRequest,
+    pub layout_policy: crate::layout::OutputLayoutPolicy,
+    pub single_root_name_policy: crate::layout::SingleRootNamePolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -482,8 +484,8 @@ impl SmartZipEngine {
                                     output_dir: output_dir.clone(),
                                     commit_policy: output_plan.commit_policy,
                                     archive_stem: Some(archive_stem(&candidate.path).to_string_lossy().into_owned()),
-                                    layout_policy: crate::layout::OutputLayoutPolicy::default(),
-                                    single_root_name_policy: crate::layout::SingleRootNamePolicy::default(),
+                                    layout_policy: request.layout_policy,
+                                    single_root_name_policy: request.single_root_name_policy,
                                 },
                                 |temp_output_dir| async move {
                                     backend_call(
@@ -578,8 +580,8 @@ impl SmartZipEngine {
                                                 output_dir: output_dir.clone(),
                                                 commit_policy: output_plan.commit_policy,
                                                 archive_stem: Some(archive_stem(&candidate.path).to_string_lossy().into_owned()),
-                                                layout_policy: crate::layout::OutputLayoutPolicy::default(),
-                                                single_root_name_policy: crate::layout::SingleRootNamePolicy::default(),
+                                                layout_policy: request.layout_policy,
+                                                single_root_name_policy: request.single_root_name_policy,
                                             },
                                             |temp_output_dir| async move {
                                                 backend_call(
@@ -1187,7 +1189,7 @@ mod tests {
             .extract_recursive(
                 &backend,
                 &service,
-                ExtractWorkflowRequest {
+                 ExtractWorkflowRequest {
                     inputs: vec![input.clone(), root.join("skip.part2.rar")],
                     output_dir: output.clone(),
                     recursion_limit: 2,
@@ -1198,6 +1200,8 @@ mod tests {
                         limit: 10,
                         ..PasswordCandidateRequest::default()
                     },
+                    layout_policy: crate::layout::OutputLayoutPolicy::default(),
+                    single_root_name_policy: crate::layout::SingleRootNamePolicy::default(),
                 },
                 None,
                 None,
@@ -1264,6 +1268,8 @@ mod tests {
                     encoding_mode: EncodingMode::Auto,
                     scanner: ScannerConfig::default(),
                     password_candidates: PasswordCandidateRequest::default(),
+                    layout_policy: crate::layout::OutputLayoutPolicy::default(),
+                    single_root_name_policy: crate::layout::SingleRootNamePolicy::default(),
                 },
                 None,
                 None,
@@ -1338,6 +1344,8 @@ mod tests {
                 encoding_mode: EncodingMode::Auto,
                 scanner: ScannerConfig::default(),
                 password_candidates: PasswordCandidateRequest::default(),
+                layout_policy: crate::layout::OutputLayoutPolicy::default(),
+                single_root_name_policy: crate::layout::SingleRootNamePolicy::default(),
             },
             None,
             Some(&output_prompter),
@@ -1476,6 +1484,8 @@ mod tests {
                     encoding_mode: EncodingMode::Override("gbk".into()),
                     scanner: ScannerConfig::default(),
                     password_candidates: PasswordCandidateRequest::default(),
+                    layout_policy: crate::layout::OutputLayoutPolicy::default(),
+                    single_root_name_policy: crate::layout::SingleRootNamePolicy::default(),
                 },
                 None,
                 None,
@@ -1594,6 +1604,8 @@ mod tests {
                         include_empty: false,
                         limit: 8,
                     },
+                    layout_policy: crate::layout::OutputLayoutPolicy::default(),
+                    single_root_name_policy: crate::layout::SingleRootNamePolicy::default(),
                 },
                 None,
                 None,
@@ -1727,6 +1739,8 @@ mod tests {
                     encoding_mode: EncodingMode::Auto,
                     scanner: ScannerConfig::default(),
                     password_candidates: PasswordCandidateRequest::default(),
+                    layout_policy: crate::layout::OutputLayoutPolicy::default(),
+                    single_root_name_policy: crate::layout::SingleRootNamePolicy::default(),
                 },
                 None,
                 None,
@@ -1789,6 +1803,8 @@ mod tests {
                     encoding_mode: EncodingMode::Auto,
                     scanner: ScannerConfig::default(),
                     password_candidates: PasswordCandidateRequest::default(),
+                    layout_policy: crate::layout::OutputLayoutPolicy::default(),
+                    single_root_name_policy: crate::layout::SingleRootNamePolicy::default(),
                 },
                 None,
                 None,

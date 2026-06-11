@@ -80,6 +80,18 @@ enum Command {
 
         #[arg(long)]
         json: bool,
+
+        /// Output layout policy: "conservative", "smart", "raw", "flat-single".
+        #[arg(long, default_value = "conservative", value_enum)]
+        layout: LayoutPolicyArg,
+
+        /// Single root name policy: "auto", "archive", "inner", "preserve-both".
+        #[arg(long, default_value = "auto", value_enum)]
+        single_root_name: SingleRootNameArg,
+
+        /// Show planned output without extracting.
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// Placeholder for future compression implementation.
@@ -159,6 +171,44 @@ impl From<ConfidenceArg> for Confidence {
     }
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum LayoutPolicyArg {
+    Conservative,
+    Smart,
+    Raw,
+    FlatSingle,
+}
+
+impl From<LayoutPolicyArg> for smartzip_engine::layout::OutputLayoutPolicy {
+    fn from(value: LayoutPolicyArg) -> Self {
+        match value {
+            LayoutPolicyArg::Conservative => Self::Conservative,
+            LayoutPolicyArg::Smart => Self::Smart,
+            LayoutPolicyArg::Raw => Self::Raw,
+            LayoutPolicyArg::FlatSingle => Self::FlatSingle,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum SingleRootNameArg {
+    Auto,
+    Archive,
+    Inner,
+    PreserveBoth,
+}
+
+impl From<SingleRootNameArg> for smartzip_engine::layout::SingleRootNamePolicy {
+    fn from(value: SingleRootNameArg) -> Self {
+        match value {
+            SingleRootNameArg::Auto => Self::Auto,
+            SingleRootNameArg::Archive => Self::PreferArchiveName,
+            SingleRootNameArg::Inner => Self::PreferInnerName,
+            SingleRootNameArg::PreserveBoth => Self::PreserveBoth,
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     if let Err(error) = run().await {
@@ -188,6 +238,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             deep,
             encoding,
             json: _json,
+            layout,
+            single_root_name,
+            dry_run,
         } => {
             let db = open_db(cli.db)?;
             extract(
@@ -199,6 +252,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 no_empty,
                 deep,
                 &encoding,
+                layout.into(),
+                single_root_name.into(),
+                dry_run,
             )
             .await
         }
@@ -308,9 +364,24 @@ async fn extract(
     no_empty: bool,
     deep: bool,
     encoding: &str,
+    layout_policy: smartzip_engine::layout::OutputLayoutPolicy,
+    single_root_name_policy: smartzip_engine::layout::SingleRootNamePolicy,
+    dry_run: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if paths.is_empty() {
         return Err("no paths provided".into());
+    }
+
+    if dry_run {
+        let output_dir = output.unwrap_or_else(|| default_output_dir(paths.first().unwrap()));
+        for path in &paths {
+            let stem = path.file_stem().map(|s| s.to_string_lossy()).unwrap_or_default();
+            let target = output_dir.join(&*stem);
+            println!("{} -> {}", path.display(), target.display());
+        }
+        println!("layout: {layout_policy:?}, single_root_name: {single_root_name_policy:?}");
+        println!("(dry run — no extraction performed)");
+        return Ok(());
     }
 
     let encoding_mode = if encoding == "auto" {
@@ -342,6 +413,8 @@ async fn extract(
                     include_empty: !no_empty,
                     limit: 128,
                 },
+                layout_policy,
+                single_root_name_policy,
             },
             Some(&StdinPrompter {
                 lock: stdin_lock.clone(),
