@@ -6,6 +6,27 @@ use smartzip_scanner::ScannerConfig;
 use std::path::Path;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LayoutConfig {
+    pub policy: String,
+    pub single_root_name: String,
+    pub ignore_metadata_entries: bool,
+    pub preserve_archive_context_for_root: bool,
+    pub preserve_archive_context_for_nested: bool,
+}
+
+impl Default for LayoutConfig {
+    fn default() -> Self {
+        Self {
+            policy: "conservative".into(),
+            single_root_name: "auto".into(),
+            ignore_metadata_entries: true,
+            preserve_archive_context_for_root: true,
+            preserve_archive_context_for_nested: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SmartZipConfig {
     pub default_format: ArchiveFormat,
     pub default_level: CompressionLevel,
@@ -14,6 +35,7 @@ pub struct SmartZipConfig {
     pub delete_source_to_trash: bool,
     pub log_level: LogLevel,
     pub gui: GuiConfig,
+    pub layout: LayoutConfig,
 }
 
 impl Default for SmartZipConfig {
@@ -26,6 +48,7 @@ impl Default for SmartZipConfig {
             delete_source_to_trash: true,
             log_level: LogLevel::Info,
             gui: GuiConfig::default(),
+            layout: LayoutConfig::default(),
         }
     }
 }
