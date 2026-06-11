@@ -47,16 +47,11 @@ pub enum TaskKind {
 }
 
 /// Encoding policy used for archive entry names.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum EncodingMode {
+    #[default]
     Auto,
     Override(String),
-}
-
-impl Default for EncodingMode {
-    fn default() -> Self {
-        Self::Auto
-    }
 }
 
 /// Archive formats SmartZip recognizes at the domain layer.
@@ -100,17 +95,12 @@ impl ArchiveFormat {
 }
 
 /// User-facing compression level preset.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum CompressionLevel {
     Fast,
+    #[default]
     Balanced,
     Best,
-}
-
-impl Default for CompressionLevel {
-    fn default() -> Self {
-        Self::Balanced
-    }
 }
 
 /// Request to extract one or more archives.
