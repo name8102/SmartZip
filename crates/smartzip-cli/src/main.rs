@@ -11,6 +11,7 @@ use smartzip_passwords::{PasswordCandidateRequest, PasswordService};
 use smartzip_platform::PlatformPaths;
 use smartzip_scanner::{Confidence, ScanMode, ScannerConfig};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 const DEFAULT_RECURSION_LIMIT: u8 = 3;
 
@@ -323,6 +324,7 @@ async fn extract(
     let backend = BackendRouter::locate()?;
     let service = PasswordService::new(PasswordRepository::new(db.connection()));
 
+    let stdin_lock = StdinLock::new();
     let engine = SmartZipEngine::default();
     let result = engine
         .extract_recursive(
@@ -341,8 +343,10 @@ async fn extract(
                     limit: 128,
                 },
             },
-            Some(&StdinPrompter),
-            Some(&StdinOutputPrompter),
+            Some(&StdinPrompter {
+                lock: stdin_lock.clone(),
+            }),
+            Some(&StdinOutputPrompter { lock: stdin_lock }),
         )
         .await?;
 
@@ -549,81 +553,118 @@ fn default_output_dir(first_path: &Path) -> PathBuf {
 
 // ── Interactive password prompt via stdin ────────────────────────────────
 
-struct StdinPrompter;
+/// Serializes access to stdin so only one interactive prompt reads at a time.
+/// Prevents interleaved display when output-collision and password prompts
+/// are both active concurrently (e.g. engine continues processing while an
+/// output-collision prompt is pending, then a password prompt is triggered).
+struct StdinLock(Arc<Mutex<()>>);
+
+impl StdinLock {
+    fn new() -> Self {
+        Self(Arc::new(Mutex::new(())))
+    }
+}
+
+impl Clone for StdinLock {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+}
+
+struct StdinPrompter {
+    lock: StdinLock,
+}
 
 #[async_trait]
 impl InteractivePasswordPrompter for StdinPrompter {
     async fn prompt(&self, archive_path: &Path) -> Option<String> {
+        let lock = self.lock.0.clone();
         let path = archive_path.to_path_buf();
         tokio::task::spawn_blocking(move || {
-            use std::io::{self, IsTerminal, Write};
-
-            if !io::stdin().is_terminal() {
-                return None;
-            }
-
-            eprint!(
-                "\n  No matching password for \"{}\".\n  Enter password (or press Enter to skip): ",
-                path.display()
-            );
-            let _ = io::stderr().flush();
-
-            let mut pw = String::new();
-            io::stdin().read_line(&mut pw).ok()?;
-            let pw = pw.trim().to_string();
-
-            if pw.is_empty() {
-                eprintln!("  (skipped)");
-                None
-            } else {
-                Some(pw)
-            }
+            let _guard = lock.lock().unwrap();
+            prompt_password_stdin(&path)
         })
         .await
         .unwrap_or(None)
     }
 }
 
-struct StdinOutputPrompter;
+struct StdinOutputPrompter {
+    lock: StdinLock,
+}
 
 #[async_trait]
 impl InteractiveOutputPrompter for StdinOutputPrompter {
     async fn prompt(&self, archive_path: PathBuf, output_path: PathBuf) -> OutputCollisionStrategy {
+        let lock = self.lock.0.clone();
         tokio::task::spawn_blocking(move || {
-            use std::io::{self, IsTerminal, Write};
-
-            if !io::stdin().is_terminal() {
-                return OutputCollisionStrategy::Skip;
-            }
-
-            loop {
-                eprint!(
-                    "\n  Output already exists for \"{}\": {}\n  Choose [s]kip, [o]verwrite, [r]ename: ",
-                    archive_path.display(),
-                    output_path.display()
-                );
-                let _ = io::stderr().flush();
-
-                let mut choice = String::new();
-                if io::stdin().read_line(&mut choice).is_err() {
-                    return OutputCollisionStrategy::Skip;
-                }
-
-                match choice.trim().to_ascii_lowercase().as_str() {
-                    "s" | "skip" => {
-                        eprintln!("  (skipped)");
-                        return OutputCollisionStrategy::Skip;
-                    }
-                    "o" | "overwrite" => return OutputCollisionStrategy::Overwrite,
-                    "r" | "rename" => return OutputCollisionStrategy::Rename,
-                    _ => {
-                        eprintln!("  Please enter s, o, or r.");
-                    }
-                }
-            }
+            let _guard = lock.lock().unwrap();
+            prompt_output_collision_stdin(&archive_path, &output_path)
         })
         .await
         .unwrap_or(OutputCollisionStrategy::Skip)
+    }
+}
+
+fn prompt_password_stdin(path: &Path) -> Option<String> {
+    use std::io::{self, IsTerminal, Write};
+
+    if !io::stdin().is_terminal() {
+        return None;
+    }
+
+    eprint!(
+        "\n  No matching password for \"{}\".\n  Enter password (or press Enter to skip): ",
+        path.display()
+    );
+    let _ = io::stderr().flush();
+
+    let mut pw = String::new();
+    io::stdin().read_line(&mut pw).ok()?;
+    let pw = pw.trim().to_string();
+
+    if pw.is_empty() {
+        eprintln!("  (skipped)");
+        None
+    } else {
+        Some(pw)
+    }
+}
+
+fn prompt_output_collision_stdin(
+    archive_path: &Path,
+    output_path: &Path,
+) -> OutputCollisionStrategy {
+    use std::io::{self, IsTerminal, Write};
+
+    if !io::stdin().is_terminal() {
+        return OutputCollisionStrategy::Skip;
+    }
+
+    loop {
+        eprint!(
+            "\n  Output already exists for \"{}\": {}\n  Choose [s]kip, [o]verwrite, [r]ename: ",
+            archive_path.display(),
+            output_path.display()
+        );
+        let _ = io::stderr().flush();
+
+        let mut choice = String::new();
+        if io::stdin().read_line(&mut choice).is_err() {
+            return OutputCollisionStrategy::Skip;
+        }
+
+        match choice.trim().to_ascii_lowercase().as_str() {
+            "s" | "skip" => {
+                eprintln!("  (skipped)");
+                return OutputCollisionStrategy::Skip;
+            }
+            "o" | "overwrite" => return OutputCollisionStrategy::Overwrite,
+            "r" | "rename" => return OutputCollisionStrategy::Rename,
+            _ => {
+                eprintln!("  Please enter s, o, or r.");
+            }
+        }
     }
 }
 
