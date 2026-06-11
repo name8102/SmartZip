@@ -194,6 +194,20 @@ fn empty_result() -> EncodingDetectionResult {
     }
 }
 
+/// Decode raw bytes using the specified encoding name.
+/// Returns `None` if the encoding is unknown or the bytes can't be decoded.
+pub fn decode_name(raw: &[u8], encoding: &str) -> Option<String> {
+    if raw.is_empty() {
+        return Some(String::new());
+    }
+    let enc = Encoding::for_label(encoding.as_bytes())?;
+    let (decoded, had_replacements) = enc.decode_without_bom_handling(raw);
+    if had_replacements {
+        return None;
+    }
+    Some(decoded.into_owned())
+}
+
 fn sample(text: &str) -> String {
     text.chars()
         .take(80)

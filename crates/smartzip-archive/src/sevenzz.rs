@@ -272,7 +272,9 @@ fn parse_entries(stdout: &str) -> Vec<ArchiveEntry> {
                 if !current_is_archive {
                     entries.push(ArchiveEntry {
                         path,
-                        size: current_size,
+                        raw_name: Vec::new(),
+                        compressed_size: None,
+                        uncompressed_size: current_size,
                         is_dir: current_is_dir,
                     });
                 }
@@ -294,7 +296,9 @@ fn parse_entries(stdout: &str) -> Vec<ArchiveEntry> {
         if !current_is_archive {
             entries.push(ArchiveEntry {
                 path,
-                size: current_size,
+                raw_name: Vec::new(),
+                compressed_size: None,
+                uncompressed_size: current_size,
                 is_dir: current_is_dir,
             });
         }
@@ -320,7 +324,7 @@ mod tests {
         let entries = parse_entries(stdout);
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].path, PathBuf::from("file.txt"));
-        assert_eq!(entries[0].size, Some(42));
+        assert_eq!(entries[0].uncompressed_size, Some(42));
         assert!(entries[1].is_dir);
     }
 

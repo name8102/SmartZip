@@ -30,7 +30,12 @@ pub struct ListRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArchiveEntry {
     pub path: PathBuf,
-    pub size: Option<u64>,
+    #[serde(default)]
+    pub raw_name: Vec<u8>,
+    #[serde(default)]
+    pub compressed_size: Option<u64>,
+    #[serde(default)]
+    pub uncompressed_size: Option<u64>,
     pub is_dir: bool,
 }
 
@@ -87,4 +92,23 @@ pub struct BackendCommandOutput {
     pub status: Option<i32>,
     pub stdout: String,
     pub stderr: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExtractionLimits {
+    pub max_entries: usize,
+    pub max_single_entry_bytes: u64,
+    pub max_total_output_bytes: u64,
+    pub max_compression_ratio: u32,
+}
+
+impl Default for ExtractionLimits {
+    fn default() -> Self {
+        Self {
+            max_entries: 100_000,
+            max_single_entry_bytes: 10 * 1024 * 1024 * 1024,
+            max_total_output_bytes: 100 * 1024 * 1024 * 1024,
+            max_compression_ratio: 100,
+        }
+    }
 }

@@ -332,8 +332,7 @@ impl SmartZipEngine {
                     let raw_names: Vec<u8> = listing
                         .entries
                         .iter()
-                        .flat_map(|entry| entry.path.as_os_str().as_encoded_bytes())
-                        .copied()
+                        .flat_map(|entry| entry.raw_name.iter().copied())
                         .collect();
                     if !raw_names.is_empty() {
                         let mut detector = smartzip_encoding::ArchiveEncodingDetector::new();
@@ -435,8 +434,7 @@ impl SmartZipEngine {
                                 let raw_names: Vec<u8> = listing
                                     .entries
                                     .iter()
-                                    .flat_map(|entry| entry.path.as_os_str().as_encoded_bytes())
-                                    .copied()
+                                    .flat_map(|entry| entry.raw_name.iter().copied())
                                     .collect();
                                 if !raw_names.is_empty() {
                                     let mut detector =

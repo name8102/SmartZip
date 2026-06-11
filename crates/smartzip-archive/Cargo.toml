@@ -8,10 +8,9 @@ rust-version.workspace = true
 
 [dependencies]
 async-trait.workspace = true
-async_zip.workspace = true
-futures-lite.workspace = true
 serde.workspace = true
 smartzip-core.workspace = true
+smartzip-encoding.workspace = true
 tokio.workspace = true
 zip.workspace = true
 

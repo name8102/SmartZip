@@ -60,7 +60,9 @@ impl ArchiveBackend for NativeZipBackend {
             let name = String::from_utf8_lossy(name_bytes).into_owned();
             entries.push(ArchiveEntry {
                 path: PathBuf::from(&name),
-                size: Some(entry.compressed_size()),
+                raw_name: name_bytes.to_vec(),
+                compressed_size: Some(entry.compressed_size()),
+                uncompressed_size: Some(entry.size()),
                 is_dir: entry.is_dir(),
             });
         }
@@ -98,44 +100,14 @@ impl ArchiveBackend for NativeZipBackend {
 
     async fn extract(&self, request: ExtractArchiveRequest) -> Result<ExtractArchiveResult> {
         Self::reject_password(&request.archive, &request.password)?;
-        let mut archive = Self::open_archive_read(&request.archive)?;
-        std::fs::create_dir_all(&request.output_dir)
-            .map_err(|source| SmartZipError::io(Some(request.output_dir.clone()), source))?;
-
-        let len = archive.len();
-        for i in 0..len {
-            let mut entry = archive
-                .by_index(i)
-                .map_err(|source| map_zip_error(source, &request.archive))?;
-
-            let output_path = match entry.enclosed_name() {
-                Some(name) => request.output_dir.join(name),
-                None => {
-                    let raw = String::from_utf8_lossy(entry.name_raw()).into_owned();
-                    return Err(SmartZipError::UnsafeArchivePath { entry: raw });
-                }
-            };
-
-            if entry.is_dir() {
-                std::fs::create_dir_all(&output_path)
-                    .map_err(|source| SmartZipError::io(Some(output_path.clone()), source))?;
-                continue;
-            }
-
-            if let Some(parent) = output_path.parent() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|source| SmartZipError::io(Some(parent.to_path_buf()), source))?;
-            }
-
-            let mut outfile = File::create(&output_path)
-                .map_err(|source| SmartZipError::io(Some(output_path.clone()), source))?;
-            std::io::copy(&mut entry, &mut outfile)
-                .map_err(|source| SmartZipError::io(Some(output_path), source))?;
-        }
-
-        Ok(ExtractArchiveResult {
-            output_dir: request.output_dir,
-        })
+        let path = request.archive.clone();
+        tokio::task::spawn_blocking(move || extract_sync(&path, &request))
+            .await
+            .map_err(|e| SmartZipError::BackendFailed {
+                backend: "native-zip".into(),
+                exit_code: None,
+                stderr: format!("task join error: {e}"),
+            })?
     }
 
     async fn compress(&self, request: CompressArchiveRequest) -> Result<CompressArchiveResult> {
@@ -146,39 +118,14 @@ impl ArchiveBackend for NativeZipBackend {
             });
         }
         Self::reject_password(&request.output, &request.password)?;
-
-        let file = File::create(&request.output)
-            .map_err(|source| SmartZipError::io(Some(request.output.clone()), source))?;
-        let mut writer = ZipWriter::new(file);
-        let options = SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Deflated)
-            .compression_level(Some(6));
-
-        for input in &request.inputs {
-            let base = input.parent().unwrap_or_else(|| Path::new("."));
-            for file in collect_files(input)? {
-                let entry_name = file
-                    .strip_prefix(base)
-                    .unwrap_or(file.as_path())
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                writer
-                    .start_file(entry_name, options)
-                    .map_err(|source| map_zip_error(source, &request.output))?;
-                let mut contents = File::open(&file)
-                    .map_err(|source| SmartZipError::io(Some(file.clone()), source))?;
-                std::io::copy(&mut contents, &mut writer)
-                    .map_err(|source| SmartZipError::io(Some(request.output.clone()), source))?;
-            }
-        }
-
-        writer
-            .finish()
-            .map_err(|source| map_zip_error(source, &request.output))?;
-
-        Ok(CompressArchiveResult {
-            output: request.output,
-        })
+        let path = request.output.clone();
+        tokio::task::spawn_blocking(move || compress_sync(&path, &request))
+            .await
+            .map_err(|e| SmartZipError::BackendFailed {
+                backend: "native-zip".into(),
+                exit_code: None,
+                stderr: format!("task join error: {e}"),
+            })?
     }
 
     fn capabilities(&self) -> BackendCapabilities {
@@ -214,6 +161,146 @@ fn collect_files(input: &Path) -> Result<Vec<PathBuf>> {
     }
     files.sort();
     Ok(files)
+}
+
+fn extract_sync(archive_path: &Path, request: &ExtractArchiveRequest) -> Result<ExtractArchiveResult> {
+    let mut archive = NativeZipBackend::open_archive_read(archive_path)?;
+    std::fs::create_dir_all(&request.output_dir)
+        .map_err(|source| SmartZipError::io(Some(request.output_dir.clone()), source))?;
+
+    let limits = ExtractionLimits::default();
+    let mut total_written: u64 = 0;
+    let len = archive.len();
+
+    if len > limits.max_entries {
+        return Err(SmartZipError::BackendFailed {
+            backend: "native-zip".into(),
+            exit_code: None,
+            stderr: format!(
+                "archive has {} entries, limit is {}",
+                len, limits.max_entries
+            ),
+        });
+    }
+
+    for i in 0..len {
+        let mut entry = archive
+            .by_index(i)
+            .map_err(|source| map_zip_error(source, archive_path))?;
+
+        let uncompressed = entry.size();
+        if uncompressed > limits.max_single_entry_bytes {
+            return Err(SmartZipError::BackendFailed {
+                backend: "native-zip".into(),
+                exit_code: None,
+                stderr: format!(
+                    "entry {} uncompressed size {} exceeds limit {}",
+                    i, uncompressed, limits.max_single_entry_bytes
+                ),
+            });
+        }
+
+        let compressed = entry.compressed_size();
+        if compressed > 0 && uncompressed / compressed > limits.max_compression_ratio as u64 {
+            return Err(SmartZipError::BackendFailed {
+                backend: "native-zip".into(),
+                exit_code: None,
+                stderr: format!(
+                    "entry {} compression ratio {}:{} exceeds limit {}:{}",
+                    i, uncompressed, compressed, limits.max_compression_ratio, 1
+                ),
+            });
+        }
+
+        let raw_name = entry.name_raw();
+        let relative_path = match &request.encoding {
+            smartzip_core::EncodingMode::Override(enc) => {
+                let decoded = smartzip_encoding::decode_name(raw_name, enc).ok_or_else(|| {
+                    SmartZipError::UnsafeArchivePath {
+                        entry: String::from_utf8_lossy(raw_name).into_owned(),
+                    }
+                })?;
+                crate::safety::safe_entry_path(decoded.as_bytes()).ok_or_else(|| {
+                    SmartZipError::UnsafeArchivePath { entry: decoded }
+                })?
+            }
+            smartzip_core::EncodingMode::Auto => {
+                crate::safety::safe_entry_path(raw_name).ok_or_else(|| {
+                    SmartZipError::UnsafeArchivePath {
+                        entry: String::from_utf8_lossy(raw_name).into_owned(),
+                    }
+                })?
+            }
+        };
+        let output_path = request.output_dir.join(relative_path);
+
+        if entry.is_dir() {
+            std::fs::create_dir_all(&output_path)
+                .map_err(|source| SmartZipError::io(Some(output_path.clone()), source))?;
+            continue;
+        }
+
+        if let Some(parent) = output_path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|source| SmartZipError::io(Some(parent.to_path_buf()), source))?;
+        }
+
+        let mut outfile = File::create(&output_path)
+            .map_err(|source| SmartZipError::io(Some(output_path.clone()), source))?;
+        let written = std::io::copy(&mut entry, &mut outfile)
+            .map_err(|source| SmartZipError::io(Some(output_path), source))?;
+        total_written += written;
+
+        if total_written > limits.max_total_output_bytes {
+            return Err(SmartZipError::BackendFailed {
+                backend: "native-zip".into(),
+                exit_code: None,
+                stderr: format!(
+                    "total output {} bytes exceeds limit {}",
+                    total_written, limits.max_total_output_bytes
+                ),
+            });
+        }
+    }
+
+    Ok(ExtractArchiveResult {
+        output_dir: request.output_dir.clone(),
+    })
+}
+
+fn compress_sync(output_path: &Path, request: &CompressArchiveRequest) -> Result<CompressArchiveResult> {
+    let file = File::create(output_path)
+        .map_err(|source| SmartZipError::io(Some(output_path.to_path_buf()), source))?;
+    let mut writer = ZipWriter::new(file);
+    let options = SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated)
+        .compression_level(Some(6));
+
+    for input in &request.inputs {
+        let base = input.parent().unwrap_or_else(|| Path::new("."));
+        for file in collect_files(input)? {
+            let entry_name = file
+                .strip_prefix(base)
+                .unwrap_or(file.as_path())
+                .to_string_lossy()
+                .replace('\\', "/");
+            writer
+                .start_file(entry_name, options)
+                .map_err(|source| map_zip_error(source, output_path))?;
+            let mut contents = File::open(&file)
+                .map_err(|source| SmartZipError::io(Some(file.clone()), source))?;
+            std::io::copy(&mut contents, &mut writer)
+                .map_err(|source| SmartZipError::io(Some(output_path.to_path_buf()), source))?;
+        }
+    }
+
+    writer
+        .finish()
+        .map_err(|source| map_zip_error(source, output_path))?;
+
+    Ok(CompressArchiveResult {
+        output: output_path.to_path_buf(),
+    })
 }
 
 fn map_zip_error(source: zip::result::ZipError, path: &Path) -> SmartZipError {

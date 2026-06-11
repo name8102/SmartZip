@@ -156,7 +156,9 @@ impl ArchiveBackend for UnrarBackend {
             .filter(|line| !line.trim().is_empty())
             .map(|line| ArchiveEntry {
                 path: PathBuf::from(line),
-                size: None,
+                raw_name: Vec::new(),
+                compressed_size: None,
+                uncompressed_size: None,
                 is_dir: line.ends_with('/') || line.ends_with('\\'),
             })
             .collect();
