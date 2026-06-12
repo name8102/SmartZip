@@ -12,11 +12,19 @@
 | **ExtractionCandidate** | 待解压候选条目。包含路径、深度、来源类型、检测格式、内嵌偏移等。 |
 | **CandidateSource** | 候选来源枚举：`RootInput`（用户直接输入）、`ExtractedFile`（解压产物中找到的）、`EmbeddedFinding`（扫描器在二进制偏移处发现的）。 |
 | **Recursive extraction** | BFS 队列驱动的递归解压。队列中每个候选经过同一管线：格式检测 → 编码检测 → 密码尝试 → 解压 → 输出扫描 → 嵌套候选入队。 |
-| **Collapse single output** | 解压产出唯一条目时的优化：将该条目提到父目录，去掉中间层空目录。 |
+| **Collapse single output** | 解压产出唯一条目时的优化：将该条目提到父目录，去掉中间层空目录。现在由 `LayoutPlanKind` 的各种 `Commit*` 变体实现，包括内容上移（`CommitSingleDirContentsAsArchiveName`）和直接重命名（`CommitSingleDirAsInnerName`/`CommitSingleFileAsInnerName`）。 |
 | **ArchiveNode** | 下一阶段动态节点模型。记录父节点、来源、深度、状态、指纹和成功密码。节点在父归档解压后增量产生，不要求预先构造完整 DAG。 |
 | **VolumeSet** | 分卷归档集合。识别首卷、成员、缺卷和重复卷，仅将首卷交给后端。 |
 | **ExtractionLimits** | 不可信归档的资源预算：递归深度、内层候选数、文件数、磁盘安全余量和内嵌 finding 数量。 |
-| **OutputMaterializer** | 事务式输出策略：规划目标路径、同盘临时目录解压、校验、保守整理、碰撞处理、提交或回滚。失败时默认清理临时目录；开发模式可保留临时目录用于诊断。 |
+| **OutputMaterializer** | 事务式输出策略：规划目标路径、同盘临时目录解压、校验、智能整理、碰撞处理、提交或回滚。失败时默认清理临时目录；开发模式可保留临时目录用于诊断。碰撞处理在布局规划之后执行，通过 `CollisionResolver` 回调解交互。 |
+| **LayoutPlan** | 智能整理规划结果。包含 `source`（待移动项）、`kind`（整理策略）、`target`（最终目标路径）、`reason`（决策原因）。由 `plan_layout()` 在解压到临时目录后生成。 |
+| **PlanSource** | 待移动项来源：`WholeTempDir`（整个临时目录）、`SingleDir`（单目录）、`SingleDirContents`（单目录内容）、`SingleFile`（单文件）。 |
+| **LayoutPlanKind** | 整理策略枚举：`CommitWholeTempAsArchiveDir`（归档名容器）、`CommitSingleDirContentsAsArchiveName`（泛名目录内容上移到归档名）、`CommitSingleDirAsInnerName`（内层目录名）、`CommitSingleFileAsArchiveName`（文件用归档名）、`CommitSingleFileAsInnerName`（文件用内层名）、`PreserveBothSingleDir`（保留双层目录）、`PreserveBothSingleFile`（保留双层文件）、`RawArchiveDir`（原样输出）、`Empty`（空解压）。 |
+| **OutputLayoutPolicy** | 输出布局策略：`Conservative`（默认，保留归档名上下文）、`Smart`（更激进折叠）、`Raw`（原样输出）、`FlatSingle`（单项目直接放到输出根）。 |
+| **SingleRootNamePolicy** | 单根项命名策略：`Auto`（启发式）、`PreferArchiveName`（强制用归档名）、`PreferInnerName`（强制用内层名）、`PreserveBoth`（保留两层）、`AskWhenAmbiguous`（低置信度时询问）。 |
+| **NameScore** | 名称质量评分。基于语义 token 数量、版本号、括号信息、泛名惩罚、hash 惩罚计算总分。用于决定归档名和内层名哪个更有信息量。 |
+| **CollisionResolver** | 异步回调，在布局规划后、提交前检测目标路径冲突。接收 `(archive_path, target_path, layout_plan)`，返回 `CollisionAction`（Skip/Overwrite/Rename）。 |
+| **MaterializeFailureKind** | 材质化失败类型：`ExtractFailed`（后端解压失败）、`CommitFailed`（提交失败）、`CollisionSkipped`（用户选择跳过碰撞）。 |
 
 ## Event Model
 
@@ -55,3 +63,13 @@
 ### ADR-004: Two-phase incremental implementation
 **Decision**: 不整体迁移，不提前拆分新的 graph/scheduler/events crate。先修复现有行为错误和安全预算，再实现 Native ZIP、密码 worker pool、动态 ArchiveNode，最后接入事件流和 GUI。
 **Rationale**: 每步可独立测试和回滚，并优先解决复杂网络归档的真实风险。
+
+### ADR-005: Smart output layout with plan-execute separation
+**Decision**: 智能整理分为规划（`layout.rs`）和执行（`materialize.rs`）两阶段。规划器扫描临时目录、评分名称、生成 `LayoutPlan`；执行器只按计划移动文件。碰撞处理在规划之后、提交之前执行。
+**Rationale**: 规划和执行分离让 CLI dry-run、GUI 预览、碰撞回调成为自然扩展点。`PlanSource` + `LayoutPlanKind` 的显式模型消除了"规划器说一种路径、提交器走另一种路径"的漂移风险。
+**Trade-off**: `MaterializeRequest` 需要携带 `archive_path`、`layout_policy`、`single_root_name_policy` 等字段，调用方代码略多。
+
+### ADR-006: Collision handling after layout planning
+**Decision**: 碰撞检测从"解压前检查候选输出路径"改为"布局规划后检查实际目标路径"。`CollisionResolver` 回调在 `materialize()` 内部、`plan_layout()` 之后调用。
+**Rationale**: 旧流程拿预布局路径判断碰撞，会产生两类错误：(1) 目标存在但最终路径不同→误报；(2) 最终路径冲突但预检查未命中→漏报。新流程保证碰撞检测针对真实目标。
+**Trade-off**: `materialize()` 现在是 async 并可能等待用户输入，engine 主循环在碰撞期间阻塞。并发解压多个归档时，碰撞提示会串行化。

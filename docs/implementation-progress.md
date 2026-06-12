@@ -378,11 +378,11 @@ packaging/         ❌ 未开始  AppImage, bundled 7zz
 | 密码候选排序 | ✅ |
 | 逐候选按检测格式路由解压 | ✅ |
 | 成功/失败记录 | ✅ |
-| 智能输出结构 | ✅ |
+| 智能输出结构 | ✅ (plan-execute separation, collision after layout) |
 | 扫描输出目录 | ✅ |
 | 嵌套压缩包入队 | ✅ |
-| 后处理规则（删除/重命名） | ❌ |
-| 临时目录安全提取 | ❌ |
+| 后处理规则（删除/重命名） | 🟡 collision handling 已实现，backup-swap 待做 |
+| 临时目录安全提取 | ✅ (temp dir + collision after layout) |
 | Zip Slip 路径检查 | 🟡 ZIP 原生后端已做安全路径检查 |
 | offset 级内嵌提取 | ❌ (检测已实现) |
 
@@ -391,7 +391,7 @@ packaging/         ❌ 未开始  AppImage, bundled 7zz
 | 命令 | 状态 |
 |------|------|
 | `detect` | ✅ |
-| `extract` | ✅ (缺 --scan-embedded) |
+| `extract` | ✅ (含 --layout, --single-root-name, --dry-run) |
 | `compress` | ❌ (stub) |
 | `open` | ❌ |
 | `password list` | ✅ |
@@ -476,7 +476,7 @@ packaging/         ❌ 未开始  AppImage, bundled 7zz
 | 密码候选排序 | ✅ |
 | 逐候选按检测格式路由解压 | ✅ |
 | 成功/失败记录 | ✅ |
-| 智能输出结构 | ✅ |
+| 智能输出结构 | ✅ (plan-execute separation, collision after layout) |
 | 扫描输出目录 | ✅ |
 | 嵌套压缩包入队 | ✅ |
 | 后处理规则(删除/重命名) | ❌ |
@@ -617,3 +617,78 @@ The file is a disguised RAR payload. Before this stage, the embedded RAR was mat
 - `async_zip` does not support encrypted ZIP; encrypted ZIP operations intentionally fall back to 7zz through the router.
 - RAR compression is not supported by `UnrarBackend`; RAR extraction/list/test are supported.
 - A later run exposed a separate recursion issue: some application `.pak` or test fixture `.zip` files inside extracted payloads can be detected as archives and then fail during deep recursive extraction. That is separate from the RAR routing bug and should be handled by extraction limits, format confidence, or skip rules.
+
+## 2026-06-12 — Stage 14: smart output layout (plan-execute separation)
+
+### Scope
+
+- Implement smart output layout planning that decides the optimal output directory structure after extraction.
+- Replace naive "always use archive stem" with heuristic scoring, similarity detection, and policy-based decisions.
+- Move collision detection from pre-extraction to post-layout-planning.
+
+### Changed
+
+- `crates/smartzip-engine/src/name_score.rs` (new)
+  - Name quality scoring: `score_name()`, `normalize_for_compare()`, `name_similarity()`, `classify_similarity()`.
+  - Generic names list, semantic token detection, version/bracket/hash scoring.
+  - Fullwidth normalization, archive suffix stripping, bracket noise stripping.
+  - 21 tests covering scoring, similarity, and classification.
+- `crates/smartzip-engine/src/layout.rs` (new)
+  - `TopLevelShape` scanning with metadata entry filtering.
+  - `PlanSource` enum: `WholeTempDir`, `SingleDir`, `SingleDirContents`, `SingleFile`.
+  - `LayoutPlanKind` enum: 9 variants covering all layout strategies.
+  - `plan_layout()` decision function with policy priority (explicit policies before heuristics).
+  - `OutputLayoutPolicy`: Conservative, Smart, Raw, FlatSingle.
+  - `SingleRootNamePolicy`: Auto, PreferArchiveName, PreferInnerName, PreserveBoth, AskWhenAmbiguous.
+  - 23 tests covering scanning, planning, and policy decisions.
+- `crates/smartzip-engine/src/materialize.rs` (modified)
+  - `MaterializeRequest` gains `archive_path`, `archive_stem`, `layout_policy`, `single_root_name_policy`.
+  - `MaterializeResult` gains `layout_plan`.
+  - `materialize()` calls `plan_layout()` after extraction, uses `layout_plan.target` for commit.
+  - All layout kinds unified through `resolve_commit_target()` for Rename/Overwrite support.
+  - `CommitSingleFileAsInnerName` renames file directly to target (not create directory).
+  - `CollisionResolver` callback type: receives `(archive_path, target_path, layout_plan)`.
+  - `MaterializeFailureKind`: ExtractFailed, CommitFailed, CollisionSkipped.
+  - Collision Skip is terminal state (breaks password loop, no retry).
+- `crates/smartzip-engine/src/lib.rs` (modified)
+  - `terminal_skip` flag prevents interactive fallback after CollisionSkipped.
+  - No Failed event emitted for CollisionSkipped.
+  - `make_collision_resolver()` passes real archive_path to prompter.
+  - Removed dead `OutputPlan` struct and `output_overrides` HashMap.
+  - Nested scan uses `actual_output_dir` from materializer result.
+- `crates/smartzip-config/src/lib.rs` (modified)
+  - Added `LayoutConfig` struct with policy, single_root_name, metadata ignore, context preservation fields.
+- `crates/smartzip-cli/src/main.rs` (modified)
+  - Added `--layout`, `--single-root-name`, `--dry-run` flags to extract command.
+  - ValueEnum parsing for layout policies.
+- `crates/smartzip-engine/Cargo.toml` (modified)
+  - Added `unicode-normalization` dependency.
+
+### Validation
+
+- `cargo fmt`
+- `cargo test --workspace`
+
+Result: 176 tests pass across workspace (114 engine unit + 62 integration + others).
+
+### Design decisions
+
+See CONTEXT.md ADR-005 (plan-execute separation) and ADR-006 (collision after layout).
+
+### Known limitations
+
+- Overwrite is not backup-swap (pre-existing safety concern).
+- Collision handling is sequential (single archive at a time during user prompts).
+- Similarity context_delta not yet implemented (bracket metadata may be lost).
+- LCS similarity uses byte-level, not char-level (CJK edge cases).
+
+### CLI usage
+
+```bash
+smartzip extract a.zip --layout conservative
+smartzip extract a.zip --layout smart
+smartzip extract a.zip --layout raw
+smartzip extract a.zip --single-root-name archive
+smartzip extract a.zip --single-root-name inner
+smartzip extract a.zip --dry-run
+```
