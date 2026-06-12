@@ -41,6 +41,33 @@ pub enum SmartZipError {
         stderr: String,
     },
 
+    #[error("ambiguous embedded archives at {path:?}: {count} findings")]
+    EmbeddedArchiveAmbiguous {
+        path: PathBuf,
+        count: usize,
+    },
+
+    #[error("embedded archive at {path:?} offset {offset} not extractable: {detail}")]
+    EmbeddedArchiveDetectedButNotExtractable {
+        path: PathBuf,
+        offset: u64,
+        detail: String,
+    },
+
+    #[error("failed to carve embedded archive at {path:?} offset {offset}: {detail}")]
+    EmbeddedArchiveCarveFailed {
+        path: PathBuf,
+        offset: u64,
+        detail: String,
+    },
+
+    #[error("large file scan requires confirmation: {path:?} ({file_size} bytes, threshold {threshold})")]
+    LargeEmbeddedScanRequiresConfirmation {
+        path: PathBuf,
+        file_size: u64,
+        threshold: u64,
+    },
+
     #[error("operation cancelled")]
     Cancelled,
 }
