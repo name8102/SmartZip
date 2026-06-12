@@ -3,7 +3,9 @@ use crate::layout::{
 };
 use smartzip_core::{Result, SmartZipError};
 use std::future::Future;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommitPolicy {
@@ -11,6 +13,26 @@ pub enum CommitPolicy {
     Overwrite,
     Rename,
 }
+
+/// Strategy for handling output path collisions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CollisionAction {
+    Skip,
+    Overwrite,
+    Rename,
+}
+
+/// Async callback that resolves a collision at `target_path`.
+/// Returns the action to take. Called after layout planning, before commit.
+pub type CollisionResolver<'a> = Box<
+    dyn Fn(
+            PathBuf,
+            LayoutPlan,
+        ) -> Pin<Box<dyn Future<Output = CollisionAction> + Send + 'a>>
+        + Send
+        + Sync
+        + 'a,
+>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MaterializeRequest {
@@ -45,10 +67,11 @@ impl OutputMaterializer {
         }
     }
 
-    pub async fn materialize<F, Fut>(
+    pub async fn materialize<'r, 'a, F, Fut>(
         &self,
         request: MaterializeRequest,
         extract_into: F,
+        collision_resolver: Option<&'r CollisionResolver<'a>>,
     ) -> std::result::Result<MaterializeResult, MaterializeFailure>
     where
         F: FnOnce(PathBuf) -> Fut,
@@ -101,12 +124,67 @@ impl OutputMaterializer {
             single_root_name_policy: request.single_root_name_policy,
         });
 
+        // Empty extraction: nothing to commit, no collision possible.
+        if matches!(layout_plan.kind, LayoutPlanKind::Empty) {
+            let _ = std::fs::remove_dir_all(temp.path());
+            return Ok(MaterializeResult {
+                output_dir: request.output_dir,
+                layout_plan: Some(layout_plan),
+            });
+        }
+
+        let mut commit_policy = request.commit_policy;
+        if layout_plan.target.exists() && commit_policy == CommitPolicy::FailIfExists {
+            if let Some(resolver) = collision_resolver {
+                let action = resolver(layout_plan.target.clone(), layout_plan.clone()).await;
+                match action {
+                    CollisionAction::Skip => {
+                        let _ = std::fs::remove_dir_all(temp.path());
+                        return Err(MaterializeFailure {
+                            error: SmartZipError::io(
+                                Some(layout_plan.target.clone()),
+                                std::io::Error::new(
+                                    ErrorKind::AlreadyExists,
+                                    format!(
+                                        "output path already exists: {}",
+                                        layout_plan.target.display()
+                                    ),
+                                ),
+                            ),
+                            preserved_temp_dir: None,
+                        });
+                    }
+                    CollisionAction::Overwrite => {
+                        commit_policy = CommitPolicy::Overwrite;
+                    }
+                    CollisionAction::Rename => {
+                        commit_policy = CommitPolicy::Rename;
+                    }
+                }
+            } else {
+                let _ = std::fs::remove_dir_all(temp.path());
+                return Err(MaterializeFailure {
+                    error: SmartZipError::io(
+                        Some(layout_plan.target.clone()),
+                        std::io::Error::new(
+                            ErrorKind::AlreadyExists,
+                            format!(
+                                "output path already exists: {}",
+                                layout_plan.target.display()
+                            ),
+                        ),
+                    ),
+                    preserved_temp_dir: None,
+                });
+            }
+        }
+
         let committed_temp_path = temp.keep();
         match &layout_plan.kind {
             LayoutPlanKind::CommitWholeTempAsArchiveDir { .. }
             | LayoutPlanKind::RawArchiveDir { .. } => {
                 let commit_target =
-                    resolve_commit_target(&layout_plan.target, request.commit_policy).map_err(
+                    resolve_commit_target(&layout_plan.target, commit_policy).map_err(
                         |error| MaterializeFailure {
                             error,
                             preserved_temp_dir: None,
@@ -137,7 +215,7 @@ impl OutputMaterializer {
                     unreachable!()
                 };
                 let commit_target =
-                    resolve_commit_target(&layout_plan.target, request.commit_policy).map_err(
+                    resolve_commit_target(&layout_plan.target, commit_policy).map_err(
                         |error| MaterializeFailure {
                             error,
                             preserved_temp_dir: None,
@@ -191,7 +269,7 @@ impl OutputMaterializer {
                     unreachable!()
                 };
                 let commit_target =
-                    resolve_commit_target(&layout_plan.target, request.commit_policy).map_err(
+                    resolve_commit_target(&layout_plan.target, commit_policy).map_err(
                         |error| MaterializeFailure {
                             error,
                             preserved_temp_dir: None,
@@ -240,7 +318,7 @@ impl OutputMaterializer {
                     unreachable!()
                 };
                 let commit_target =
-                    resolve_commit_target(&layout_plan.target, request.commit_policy).map_err(
+                    resolve_commit_target(&layout_plan.target, commit_policy).map_err(
                         |error| MaterializeFailure {
                             error,
                             preserved_temp_dir: None,
@@ -272,7 +350,7 @@ impl OutputMaterializer {
                     unreachable!()
                 };
                 let commit_target =
-                    resolve_commit_target(&layout_plan.target, request.commit_policy).map_err(
+                    resolve_commit_target(&layout_plan.target, commit_policy).map_err(
                         |error| MaterializeFailure {
                             error,
                             preserved_temp_dir: None,
@@ -398,6 +476,7 @@ mod tests {
                     std::fs::write(temp_dir.join("hello.txt"), b"hello")
                         .map_err(|source| SmartZipError::io(Some(temp_dir), source))
                 },
+                None,
             )
             .await
             .unwrap();
@@ -435,6 +514,7 @@ mod tests {
                     std::fs::write(temp_dir.join("also.txt"), b"also")
                         .map_err(|source| SmartZipError::io(Some(temp_dir), source))
                 },
+                None,
             )
             .await
             .unwrap();
@@ -469,6 +549,7 @@ mod tests {
                         stderr: "failed".into(),
                     })
                 },
+                None,
             )
             .await;
 
@@ -499,6 +580,7 @@ mod tests {
                         stderr: "failed".into(),
                     })
                 },
+                None,
             )
             .await
             .unwrap_err();
@@ -530,6 +612,7 @@ mod tests {
                     std::fs::write(inner.join("a.txt"), b"alpha")
                         .map_err(|source| SmartZipError::io(Some(temp_dir), source))
                 },
+                None,
             )
             .await
             .unwrap();
@@ -565,6 +648,7 @@ mod tests {
                     std::fs::write(inner.join("file.txt"), b"hello")
                         .map_err(|source| SmartZipError::io(Some(temp_dir), source))
                 },
+                None,
             )
             .await
             .unwrap();
@@ -598,6 +682,7 @@ mod tests {
                     std::fs::write(temp_dir.join("doc.pdf"), b"pdf-content")
                         .map_err(|source| SmartZipError::io(Some(temp_dir), source))
                 },
+                None,
             )
             .await
             .unwrap();
@@ -634,6 +719,7 @@ mod tests {
                     std::fs::write(inner.join("file.txt"), b"content")
                         .map_err(|e| SmartZipError::io(Some(inner), e))
                 },
+                None,
             )
             .await
             .unwrap();

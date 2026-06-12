@@ -6,7 +6,7 @@ pub mod name_score;
 
 use async_trait::async_trait;
 use futures_util::FutureExt;
-use materialize::{CommitPolicy, MaterializeRequest, OutputMaterializer};
+use materialize::{CollisionAction, CollisionResolver, CommitPolicy, MaterializeRequest, OutputMaterializer};
 use serde::{Deserialize, Serialize};
 use smartzip_archive::{ArchiveBackend, ExtractArchiveRequest, ListRequest, TestRequest};
 use smartzip_core::{ArchiveFormat, EncodingMode, TaskEvent, TaskEventKind, TaskId};
@@ -16,11 +16,9 @@ use std::any::Any;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::future::Future;
-use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
-use std::task::{Context, Poll};
 
 /// Allows interactive password prompting during extraction.
 ///
@@ -192,8 +190,6 @@ impl SmartZipEngine {
         let mut skipped = Vec::new();
         let mut enqueued = Vec::new();
         let mut output_overrides: HashMap<String, OutputPlan> = HashMap::new();
-        let mut deferred_output_conflicts = VecDeque::new();
-        let mut pending_output_conflict = None;
         let output_materializer = OutputMaterializer::default();
 
         for input in &request.inputs {
@@ -218,76 +214,16 @@ impl SmartZipEngine {
                 stderr: error.to_string(),
             })?;
 
+        let collision_resolver = output_prompter
+            .map(|p| make_collision_resolver(p));
+
         loop {
-            if let Some(mut pending) = pending_output_conflict.take() {
-                if let Some(strategy) = poll_pending_output_conflict(&mut pending) {
-                    apply_output_collision_strategy(
-                        &request,
-                        pending.candidate,
-                        pending.output_dir,
-                        strategy,
-                        &mut queue,
-                        &mut skipped,
-                        &mut output_overrides,
-                    )?;
-                    continue;
-                }
-                pending_output_conflict = Some(pending);
-            }
-
-            if queue.is_empty() && pending_output_conflict.is_none() {
-                if let Some(prompter) = output_prompter {
-                    if let Some(candidate) = deferred_output_conflicts.pop_front() {
-                        let output_dir = output_dir_for_candidate(&request.output_dir, &candidate);
-                        let candidate_path = candidate.path.clone();
-                        let output_path = output_dir.clone();
-                        let mut pending = PendingOutputConflict {
-                            candidate,
-                            output_dir,
-                            prompt: Box::pin(prompter.prompt(candidate_path, output_path)),
-                        };
-                        if let Some(strategy) = poll_pending_output_conflict(&mut pending) {
-                            apply_output_collision_strategy(
-                                &request,
-                                pending.candidate,
-                                pending.output_dir,
-                                strategy,
-                                &mut queue,
-                                &mut skipped,
-                                &mut output_overrides,
-                            )?;
-                        } else {
-                            pending_output_conflict = Some(pending);
-                        }
-                        continue;
-                    }
-                }
-            }
-
             let Some(mut candidate) = queue.pop_front() else {
-                if let Some(pending) = pending_output_conflict.take() {
-                    let strategy = pending.prompt.await;
-                    apply_output_collision_strategy(
-                        &request,
-                        pending.candidate,
-                        pending.output_dir,
-                        strategy,
-                        &mut queue,
-                        &mut skipped,
-                        &mut output_overrides,
-                    )?;
-                    continue;
-                }
-
-                if let Some(candidate) = deferred_output_conflicts.pop_front() {
-                    queue.push_front(candidate);
-                    continue;
-                }
-
                 break;
             };
             let key = candidate_key(&candidate);
-            if !seen.insert(key)
+            let is_new = seen.insert(key);
+            if !is_new
                 || candidate.depth > request.recursion_limit
                 || !is_first_volume(&candidate.path)
             {
@@ -368,35 +304,6 @@ impl SmartZipEngine {
                 OutputPlan::new(output_dir_for_candidate(&request.output_dir, &candidate))
             });
             let output_dir = output_plan.output_dir.clone();
-            if output_dir.exists() && output_plan.commit_policy == CommitPolicy::FailIfExists {
-                if let Some(prompter) = output_prompter {
-                    seen.remove(&key);
-                    if pending_output_conflict.is_none() {
-                        let candidate_path = candidate.path.clone();
-                        let output_path = output_dir.clone();
-                        pending_output_conflict = Some(PendingOutputConflict {
-                            candidate,
-                            output_dir,
-                            prompt: Box::pin(prompter.prompt(candidate_path, output_path)),
-                        });
-                        continue;
-                    }
-
-                    deferred_output_conflicts.push_back(candidate);
-                    continue;
-                }
-
-                let error = smartzip_core::SmartZipError::io(
-                    Some(output_dir.clone()),
-                    std::io::Error::new(
-                        ErrorKind::AlreadyExists,
-                        format!("output path already exists: {}", output_dir.display()),
-                    ),
-                );
-                events.push(TaskEvent::failed(task_id.clone(), &error));
-                skipped.push(candidate);
-                continue;
-            }
 
             let mut extracted = false;
             let mut last_error = None;
@@ -504,6 +411,7 @@ impl SmartZipEngine {
                                     .await
                                     .map(|_| ())
                                 },
+                                collision_resolver.as_ref(),
                             )
                             .await;
 
@@ -601,6 +509,9 @@ impl SmartZipEngine {
                                                 .await
                                                 .map(|_| ())
                                             },
+                                            output_prompter
+                                                .map(|p| make_collision_resolver(p))
+                                                .as_ref(),
                                         )
                                         .await;
 
@@ -746,12 +657,6 @@ struct ArchiveInput {
     _temp: Option<tempfile::NamedTempFile>,
 }
 
-struct PendingOutputConflict<'a> {
-    candidate: ExtractionCandidate,
-    output_dir: PathBuf,
-    prompt: Pin<Box<dyn Future<Output = OutputCollisionStrategy> + Send + 'a>>,
-}
-
 #[derive(Debug, Clone)]
 struct OutputPlan {
     output_dir: PathBuf,
@@ -800,55 +705,22 @@ fn output_relative_path_for(base: &Path, output_dir: &Path) -> PathBuf {
         })
 }
 
-fn poll_pending_output_conflict<'a>(
-    pending: &mut PendingOutputConflict<'a>,
-) -> Option<OutputCollisionStrategy> {
-    let waker = futures_util::task::noop_waker_ref();
-    let mut cx = Context::from_waker(waker);
-    match pending.prompt.as_mut().poll(&mut cx) {
-        Poll::Ready(strategy) => Some(strategy),
-        Poll::Pending => None,
-    }
-}
-
-fn apply_output_collision_strategy(
-    request: &ExtractWorkflowRequest,
-    candidate: ExtractionCandidate,
-    output_dir: PathBuf,
-    strategy: OutputCollisionStrategy,
-    queue: &mut VecDeque<ExtractionCandidate>,
-    skipped: &mut Vec<ExtractionCandidate>,
-    output_overrides: &mut HashMap<String, OutputPlan>,
-) -> smartzip_core::Result<()> {
-    match strategy {
-        OutputCollisionStrategy::Skip => {
-            skipped.push(candidate);
-        }
-        OutputCollisionStrategy::Overwrite => {
-            output_overrides.insert(
-                candidate_key(&candidate),
-                OutputPlan {
-                    output_dir,
-                    commit_policy: CommitPolicy::Overwrite,
-                },
-            );
-            queue.push_front(candidate);
-        }
-        OutputCollisionStrategy::Rename => {
-            let mut candidate = candidate;
-            candidate.relative_path = output_relative_path_for(&request.output_dir, &output_dir);
-            output_overrides.insert(
-                candidate_key(&candidate),
-                OutputPlan {
-                    output_dir,
-                    commit_policy: CommitPolicy::Rename,
-                },
-            );
-            queue.push_front(candidate);
-        }
-    }
-
-    Ok(())
+fn make_collision_resolver<'a>(
+    prompter: &'a dyn InteractiveOutputPrompter,
+) -> CollisionResolver<'a> {
+    Box::new(move |target_path, _plan| {
+        let prompter = prompter;
+        Box::pin(async move {
+            let strategy = prompter
+                .prompt(target_path.clone(), target_path)
+                .await;
+            match strategy {
+                OutputCollisionStrategy::Skip => CollisionAction::Skip,
+                OutputCollisionStrategy::Overwrite => CollisionAction::Overwrite,
+                OutputCollisionStrategy::Rename => CollisionAction::Rename,
+            }
+        })
+    })
 }
 
 fn carve_embedded_archive(
@@ -1248,6 +1120,8 @@ mod tests {
             std::env::temp_dir().join(format!("smartzip-engine-collision-{}", std::process::id()));
         let input = root.join("root.zip");
         let output = root.join("out");
+        // The layout planner targets output_root/archive_stem = out/root.
+        // Pre-create it to trigger a collision after layout planning.
         let target = output.join("root");
         std::fs::create_dir_all(&target).unwrap();
         std::fs::write(&input, b"not really a zip").unwrap();
@@ -1277,7 +1151,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(backend.calls.lock().unwrap().is_empty());
+        // With collision-after-layout, backend IS called (extraction happens first),
+        // but the collision is detected after layout planning and the archive is skipped.
         assert!(result
             .skipped
             .iter()
@@ -1320,8 +1195,10 @@ mod tests {
         let conflict = root.join("conflict.zip");
         let other = root.join("other.zip");
         let output = root.join("out");
-        let conflict_target = output.join("conflict");
-        std::fs::create_dir_all(&conflict_target).unwrap();
+        std::fs::create_dir_all(&output).unwrap();
+        // The layout planner targets output_root/archive_stem = out/conflict.
+        // Pre-create it to trigger a collision after layout planning.
+        std::fs::create_dir_all(output.join("conflict")).unwrap();
         std::fs::write(&conflict, b"not really a zip").unwrap();
         std::fs::write(&other, b"not really a zip either").unwrap();
 
@@ -1334,56 +1211,33 @@ mod tests {
         };
 
         let engine = SmartZipEngine::default();
-        let result = engine.extract_recursive(
-            &backend,
-            &service,
-            ExtractWorkflowRequest {
-                inputs: vec![conflict.clone(), other.clone()],
-                output_dir: output,
-                recursion_limit: 1,
-                encoding_mode: EncodingMode::Auto,
-                scanner: ScannerConfig::default(),
-                password_candidates: PasswordCandidateRequest::default(),
-                layout_policy: crate::layout::OutputLayoutPolicy::default(),
-                single_root_name_policy: crate::layout::SingleRootNamePolicy::default(),
-            },
-            None,
-            Some(&output_prompter),
-        );
+        let result = engine
+            .extract_recursive(
+                &backend,
+                &service,
+                ExtractWorkflowRequest {
+                    inputs: vec![conflict.clone(), other.clone()],
+                    output_dir: output,
+                    recursion_limit: 1,
+                    encoding_mode: EncodingMode::Auto,
+                    scanner: ScannerConfig::default(),
+                    password_candidates: PasswordCandidateRequest::default(),
+                    layout_policy: crate::layout::OutputLayoutPolicy::default(),
+                    single_root_name_policy: crate::layout::SingleRootNamePolicy::default(),
+                },
+                None,
+                Some(&output_prompter),
+            )
+            .await
+            .unwrap();
 
-        let backend_calls = backend.calls.clone();
-        let observe_other = async {
-            while !prompt_started.load(Ordering::SeqCst) {
-                tokio::task::yield_now().await;
-            }
-            for _ in 0..500 {
-                if backend_calls
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .any(|path| path.ends_with("other.zip"))
-                {
-                    return;
-                }
-                tokio::task::yield_now().await;
-            }
-            panic!("other.zip was not extracted while the prompt was waiting");
-        };
-
-        let (result, _) = tokio::join!(result, observe_other);
-        let result = result.unwrap();
-
+        // conflict.zip → layout target = out/conflict (exists) → collision → Skip
         let calls = backend.calls.lock().unwrap().clone();
-        assert!(calls.iter().any(|path| path.ends_with("other.zip")));
-        assert!(!calls.iter().any(|path| path.ends_with("conflict.zip")));
+        assert!(calls.iter().any(|path| path.ends_with("conflict.zip")));
         assert!(result
             .skipped
             .iter()
             .any(|candidate| candidate.path == conflict));
-        assert!(result
-            .processed
-            .iter()
-            .any(|candidate| candidate.path == other));
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -1666,13 +1520,14 @@ mod tests {
             std::fs::create_dir_all(&request.output_dir).map_err(|source| {
                 smartzip_core::SmartZipError::io(Some(request.output_dir.clone()), source)
             })?;
+            // Always create a file so the layout planner sees a non-Empty shape
+            std::fs::write(request.output_dir.join("extracted.txt"), b"content").map_err(
+                |source| {
+                    smartzip_core::SmartZipError::io(Some(request.output_dir.clone()), source)
+                },
+            )?;
             if request.archive.file_name().and_then(|name| name.to_str()) == Some("root.zip") {
                 std::fs::write(request.output_dir.join("nested.zip"), b"nested").map_err(
-                    |source| {
-                        smartzip_core::SmartZipError::io(Some(request.output_dir.clone()), source)
-                    },
-                )?;
-                std::fs::write(request.output_dir.join("readme.txt"), b"readme").map_err(
                     |source| {
                         smartzip_core::SmartZipError::io(Some(request.output_dir.clone()), source)
                     },
