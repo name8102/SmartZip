@@ -6,8 +6,8 @@ pub mod progress;
 pub mod task;
 
 pub use embedded::{
-    DetectionAction, DetectionDecision, DetectionKind, EmbeddedScanMode, EmbeddedScanPolicy,
-    FindingSummary,
+    BusinessContainerKind, DetectionAction, DetectionDecision, DetectionKind, EmbeddedScanMode,
+    EmbeddedScanPolicy, FindingSummary,
 };
 pub use error::{Result, SmartZipError};
 pub use progress::{
