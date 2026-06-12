@@ -77,7 +77,7 @@ pub struct SmartZipEngine {
     scanner: EmbeddedScanner,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExtractWorkflowRequest {
     pub inputs: Vec<PathBuf>,
     pub output_dir: PathBuf,
@@ -87,6 +87,9 @@ pub struct ExtractWorkflowRequest {
     pub password_candidates: PasswordCandidateRequest,
     pub layout_policy: crate::layout::OutputLayoutPolicy,
     pub single_root_name_policy: crate::layout::SingleRootNamePolicy,
+    pub embedded_scan_mode: smartzip_core::EmbeddedScanMode,
+    pub dominant_min_ratio: f32,
+    pub confirm_large_scan: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1231,6 +1234,9 @@ mod tests {
                     },
                     layout_policy: crate::layout::OutputLayoutPolicy::default(),
                     single_root_name_policy: crate::layout::SingleRootNamePolicy::default(),
+                    embedded_scan_mode: smartzip_core::EmbeddedScanMode::default(),
+                    dominant_min_ratio: 0.70,
+                    confirm_large_scan: false,
                 },
                 None,
                 None,
@@ -1301,6 +1307,9 @@ mod tests {
                     password_candidates: PasswordCandidateRequest::default(),
                     layout_policy: crate::layout::OutputLayoutPolicy::default(),
                     single_root_name_policy: crate::layout::SingleRootNamePolicy::default(),
+                    embedded_scan_mode: smartzip_core::EmbeddedScanMode::default(),
+                    dominant_min_ratio: 0.70,
+                    confirm_large_scan: false,
                 },
                 None,
                 None,
@@ -1381,6 +1390,9 @@ mod tests {
                     password_candidates: PasswordCandidateRequest::default(),
                     layout_policy: crate::layout::OutputLayoutPolicy::default(),
                     single_root_name_policy: crate::layout::SingleRootNamePolicy::default(),
+                    embedded_scan_mode: smartzip_core::EmbeddedScanMode::default(),
+                    dominant_min_ratio: 0.70,
+                    confirm_large_scan: false,
                 },
                 None,
                 Some(&output_prompter),
@@ -1497,6 +1509,9 @@ mod tests {
                     password_candidates: PasswordCandidateRequest::default(),
                     layout_policy: crate::layout::OutputLayoutPolicy::default(),
                     single_root_name_policy: crate::layout::SingleRootNamePolicy::default(),
+                    embedded_scan_mode: smartzip_core::EmbeddedScanMode::default(),
+                    dominant_min_ratio: 0.70,
+                    confirm_large_scan: false,
                 },
                 None,
                 None,
@@ -1617,6 +1632,9 @@ mod tests {
                     },
                     layout_policy: crate::layout::OutputLayoutPolicy::default(),
                     single_root_name_policy: crate::layout::SingleRootNamePolicy::default(),
+                    embedded_scan_mode: smartzip_core::EmbeddedScanMode::default(),
+                    dominant_min_ratio: 0.70,
+                    confirm_large_scan: false,
                 },
                 None,
                 None,
@@ -1753,6 +1771,9 @@ mod tests {
                     password_candidates: PasswordCandidateRequest::default(),
                     layout_policy: crate::layout::OutputLayoutPolicy::default(),
                     single_root_name_policy: crate::layout::SingleRootNamePolicy::default(),
+                    embedded_scan_mode: smartzip_core::EmbeddedScanMode::default(),
+                    dominant_min_ratio: 0.70,
+                    confirm_large_scan: false,
                 },
                 None,
                 None,
@@ -1818,6 +1839,9 @@ mod tests {
                     password_candidates: PasswordCandidateRequest::default(),
                     layout_policy: crate::layout::OutputLayoutPolicy::default(),
                     single_root_name_policy: crate::layout::SingleRootNamePolicy::default(),
+                    embedded_scan_mode: smartzip_core::EmbeddedScanMode::default(),
+                    dominant_min_ratio: 0.70,
+                    confirm_large_scan: false,
                 },
                 None,
                 None,

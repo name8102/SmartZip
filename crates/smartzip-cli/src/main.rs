@@ -28,6 +28,29 @@ struct Cli {
     command: Command,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum EmbeddedModeArg {
+    Auto,
+    Ask,
+    Largest,
+    Aggressive,
+    All,
+    Ignore,
+}
+
+impl From<EmbeddedModeArg> for smartzip_core::EmbeddedScanMode {
+    fn from(value: EmbeddedModeArg) -> Self {
+        match value {
+            EmbeddedModeArg::Auto => Self::Auto,
+            EmbeddedModeArg::Ask => Self::Ask,
+            EmbeddedModeArg::Largest => Self::Largest,
+            EmbeddedModeArg::Aggressive => Self::Aggressive,
+            EmbeddedModeArg::All => Self::All,
+            EmbeddedModeArg::Ignore => Self::Ignore,
+        }
+    }
+}
+
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Detect embedded archives or disguised archive data.
@@ -93,6 +116,18 @@ enum Command {
         /// Show planned output without extracting.
         #[arg(long)]
         dry_run: bool,
+
+        /// Embedded scan mode: "auto", "ask", "largest", "aggressive", "all", "ignore".
+        #[arg(long, default_value = "auto")]
+        embedded: EmbeddedModeArg,
+
+        /// Minimum ratio for a finding to be considered dominant (0.0-1.0).
+        #[arg(long, default_value_t = 0.70)]
+        dominant_min_ratio: f32,
+
+        /// Auto-confirm large file scans (>10GB).
+        #[arg(long)]
+        confirm_large_scan: bool,
     },
 
     /// Placeholder for future compression implementation.
@@ -242,6 +277,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             layout,
             single_root_name,
             dry_run,
+            embedded,
+            dominant_min_ratio,
+            confirm_large_scan,
         } => {
             let db = open_db(cli.db)?;
             extract(
@@ -256,6 +294,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 layout.into(),
                 single_root_name.into(),
                 dry_run,
+                embedded,
+                dominant_min_ratio,
+                confirm_large_scan,
             )
             .await
         }
@@ -328,13 +369,34 @@ fn detect(
         ..scanner_config(deep, max_scan_bytes)
     };
     let engine = SmartZipEngine::with_scanner_config(config.clone());
+    let detect_path = path.clone();
     let result = engine.detect(DetectRequest {
         path,
         scanner: config,
     })?;
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&result.findings)?);
+        let file_size = std::fs::metadata(&detect_path).map(|m| m.len()).unwrap_or(0);
+        let policy = smartzip_core::EmbeddedScanPolicy::default();
+        let ext_is_archive = smartzip_engine::format_from_extension(&detect_path).is_some();
+        let decision = smartzip_engine::embedded::select_embedded_action(
+            file_size,
+            &result.findings,
+            &policy,
+            ext_is_archive,
+        );
+
+        let output = serde_json::json!({
+            "path": detect_path,
+            "file_size": file_size,
+            "classification": format!("{:?}", decision.kind).to_lowercase(),
+            "action": format!("{:?}", decision.action).to_lowercase(),
+            "archive_ratio": decision.archive_ratio,
+            "selected_index": decision.selected_index,
+            "reason": decision.reason,
+            "findings": result.findings,
+        });
+        println!("{}", serde_json::to_string_pretty(&output)?);
     } else if result.findings.is_empty() {
         println!("No embedded archives found.");
     } else {
@@ -368,6 +430,9 @@ async fn extract(
     layout_policy: smartzip_engine::layout::OutputLayoutPolicy,
     single_root_name_policy: smartzip_engine::layout::SingleRootNamePolicy,
     dry_run: bool,
+    embedded: EmbeddedModeArg,
+    dominant_min_ratio: f32,
+    confirm_large_scan: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if paths.is_empty() {
         return Err("no paths provided".into());
@@ -415,6 +480,9 @@ async fn extract(
                 },
                 layout_policy,
                 single_root_name_policy,
+                embedded_scan_mode: embedded.into(),
+                dominant_min_ratio,
+                confirm_large_scan,
             },
             Some(&StdinPrompter {
                 lock: stdin_lock.clone(),
