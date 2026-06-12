@@ -669,10 +669,19 @@ fn materialize_archive_input(
     candidate: &ExtractionCandidate,
 ) -> smartzip_core::Result<ArchiveInput> {
     if let Some(offset) = candidate.embedded_offset.filter(|offset| *offset > 0) {
-        let temp = carve_embedded_archive(&candidate.path, offset, candidate.embedded_size)
-            .map_err(|source| {
-                smartzip_core::SmartZipError::io(Some(candidate.path.clone()), source)
-            })?;
+        let temp = carve_embedded_archive(
+            &candidate.path,
+            offset,
+            candidate.embedded_size,
+            candidate.detected_format.as_ref(),
+        )
+        .map_err(|source| {
+            smartzip_core::SmartZipError::EmbeddedArchiveCarveFailed {
+                path: candidate.path.clone(),
+                offset,
+                detail: source.to_string(),
+            }
+        })?;
         let path = temp.path().to_path_buf();
         Ok(ArchiveInput {
             path,
@@ -720,20 +729,57 @@ fn carve_embedded_archive(
     source: &Path,
     offset: u64,
     size: Option<u64>,
+    format: Option<&ArchiveFormat>,
 ) -> std::io::Result<tempfile::NamedTempFile> {
+    let file_len = std::fs::metadata(source)?.len();
+
+    if offset >= file_len {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("carve offset {} exceeds file size {}", offset, file_len),
+        ));
+    }
+
+    let effective_end = match size {
+        Some(s) => {
+            if s == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "carve size cannot be zero",
+                ));
+            }
+            offset.saturating_add(s).min(file_len)
+        }
+        None => {
+            if format == Some(&ArchiveFormat::Zip) {
+                if let Ok(Some(zip_end)) =
+                    crate::embedded_zip::detect_zip_end(source, offset)
+                {
+                    zip_end
+                } else {
+                    file_len
+                }
+            } else {
+                file_len
+            }
+        }
+    };
+
+    if effective_end <= offset {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "carve range is empty",
+        ));
+    }
+
     let mut input = File::open(source)?;
     input.seek(SeekFrom::Start(offset))?;
 
     let mut output = tempfile::NamedTempFile::new()?;
-    match size {
-        Some(size) => {
-            std::io::copy(&mut input.take(size), &mut output)?;
-        }
-        None => {
-            std::io::copy(&mut input, &mut output)?;
-        }
-    }
+    let bytes_to_copy = effective_end - offset;
+    std::io::copy(&mut input.take(bytes_to_copy), &mut output)?;
     output.flush()?;
+
     Ok(output)
 }
 
