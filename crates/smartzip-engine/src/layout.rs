@@ -185,14 +185,14 @@ pub fn plan_layout(req: &LayoutRequest) -> LayoutPlan {
             TopLevelShape::SingleDir(item) => LayoutPlan {
                 source: PlanSource::SingleDir(item.path.clone()),
                 kind: LayoutPlanKind::CommitSingleDirAsInnerName,
-                target: req.output_root.clone(),
+                target: req.output_root.join(&item.name),
                 reason: LayoutDecisionReason::SingleDirGoodName,
                 warnings: vec![],
             },
             TopLevelShape::SingleFile(item) => LayoutPlan {
                 source: PlanSource::SingleFile(item.path.clone()),
                 kind: LayoutPlanKind::CommitSingleFileAsInnerName,
-                target: req.output_root.clone(),
+                target: req.output_root.join(&item.name),
                 reason: LayoutDecisionReason::SingleFileGoodName,
                 warnings: vec![],
             },
@@ -248,10 +248,8 @@ fn decide_single_dir(req: &LayoutRequest, item: &TopLevelItemSummary) -> LayoutP
     match req.single_root_name_policy {
         SingleRootNamePolicy::PreferArchiveName => {
             return LayoutPlan {
-                source: PlanSource::WholeTempDir,
-                kind: LayoutPlanKind::CommitWholeTempAsArchiveDir {
-                    name: req.archive_stem.clone(),
-                },
+                source: PlanSource::SingleDirContents(item.path.clone()),
+                kind: LayoutPlanKind::CommitSingleDirContentsAsArchiveName,
                 target: req.output_root.join(&req.archive_stem),
                 reason: LayoutDecisionReason::DefaultConservative,
                 warnings: vec![],
@@ -261,7 +259,7 @@ fn decide_single_dir(req: &LayoutRequest, item: &TopLevelItemSummary) -> LayoutP
             return LayoutPlan {
                 source: PlanSource::SingleDir(item.path.clone()),
                 kind: LayoutPlanKind::CommitSingleDirAsInnerName,
-                target: req.output_root.clone(),
+                target: req.output_root.join(&item.name),
                 reason: LayoutDecisionReason::SingleDirGoodName,
                 warnings: vec![],
             };
@@ -289,7 +287,7 @@ fn decide_single_dir(req: &LayoutRequest, item: &TopLevelItemSummary) -> LayoutP
         return LayoutPlan {
             source: PlanSource::SingleDir(item.path.clone()),
             kind: LayoutPlanKind::CommitSingleDirAsInnerName,
-            target: req.output_root.clone(),
+            target: req.output_root.join(&item.name),
             reason: LayoutDecisionReason::SingleDirSimilarToArchive,
             warnings: vec![],
         };
@@ -299,7 +297,7 @@ fn decide_single_dir(req: &LayoutRequest, item: &TopLevelItemSummary) -> LayoutP
         return LayoutPlan {
             source: PlanSource::SingleDir(item.path.clone()),
             kind: LayoutPlanKind::CommitSingleDirAsInnerName,
-            target: req.output_root.clone(),
+            target: req.output_root.join(&item.name),
             reason: LayoutDecisionReason::SingleDirGoodName,
             warnings: vec![],
         };
@@ -319,7 +317,7 @@ fn decide_single_dir(req: &LayoutRequest, item: &TopLevelItemSummary) -> LayoutP
         return LayoutPlan {
             source: PlanSource::SingleDir(item.path.clone()),
             kind: LayoutPlanKind::CommitSingleDirAsInnerName,
-            target: req.output_root.clone(),
+            target: req.output_root.join(&item.name),
             reason: LayoutDecisionReason::SingleDirGoodName,
             warnings: vec![],
         };
@@ -371,7 +369,7 @@ fn decide_single_file(req: &LayoutRequest, item: &TopLevelItemSummary) -> Layout
             return LayoutPlan {
                 source: PlanSource::SingleFile(item.path.clone()),
                 kind: LayoutPlanKind::CommitSingleFileAsInnerName,
-                target: req.output_root.clone(),
+                target: req.output_root.join(&item.name),
                 reason: LayoutDecisionReason::SingleFileGoodName,
                 warnings: vec![],
             };
@@ -401,7 +399,7 @@ fn decide_single_file(req: &LayoutRequest, item: &TopLevelItemSummary) -> Layout
         return LayoutPlan {
             source: PlanSource::SingleFile(item.path.clone()),
             kind: LayoutPlanKind::CommitSingleFileAsInnerName,
-            target: req.output_root.clone(),
+            target: req.output_root.join(&item.name),
             reason: LayoutDecisionReason::SingleFileSimilarToArchive,
             warnings: vec![],
         };
@@ -411,7 +409,7 @@ fn decide_single_file(req: &LayoutRequest, item: &TopLevelItemSummary) -> Layout
         return LayoutPlan {
             source: PlanSource::SingleFile(item.path.clone()),
             kind: LayoutPlanKind::CommitSingleFileAsInnerName,
-            target: req.output_root.clone(),
+            target: req.output_root.join(&item.name),
             reason: LayoutDecisionReason::SingleFileGoodName,
             warnings: vec![],
         };
@@ -436,7 +434,7 @@ fn decide_single_file(req: &LayoutRequest, item: &TopLevelItemSummary) -> Layout
         return LayoutPlan {
             source: PlanSource::SingleFile(item.path.clone()),
             kind: LayoutPlanKind::CommitSingleFileAsInnerName,
-            target: req.output_root.clone(),
+            target: req.output_root.join(&item.name),
             reason: LayoutDecisionReason::SingleFileArchiveExtension,
             warnings: vec![],
         };
@@ -446,7 +444,7 @@ fn decide_single_file(req: &LayoutRequest, item: &TopLevelItemSummary) -> Layout
         return LayoutPlan {
             source: PlanSource::SingleFile(item.path.clone()),
             kind: LayoutPlanKind::CommitSingleFileAsInnerName,
-            target: req.output_root.clone(),
+            target: req.output_root.join(&item.name),
             reason: LayoutDecisionReason::SingleFileGoodName,
             warnings: vec![],
         };
@@ -685,13 +683,12 @@ mod tests {
             SingleRootNamePolicy::PreferArchiveName,
         );
         let plan = plan_layout(&req);
-        assert_eq!(plan.source, PlanSource::WholeTempDir);
+        assert_eq!(plan.kind, LayoutPlanKind::CommitSingleDirContentsAsArchiveName);
         assert_eq!(
-            plan.kind,
-            LayoutPlanKind::CommitWholeTempAsArchiveDir {
-                name: "my-archive".to_string()
-            }
+            plan.source,
+            PlanSource::SingleDirContents(PathBuf::from("MyProject"))
         );
+        assert_eq!(plan.target, req.output_root.join("my-archive"));
         assert_eq!(plan.reason, LayoutDecisionReason::DefaultConservative);
     }
 
@@ -710,7 +707,7 @@ mod tests {
             PlanSource::SingleDir(PathBuf::from("MyProject"))
         );
         assert_eq!(plan.kind, LayoutPlanKind::CommitSingleDirAsInnerName);
-        assert_eq!(plan.target, req.output_root);
+        assert_eq!(plan.target, req.output_root.join("MyProject"));
         assert_eq!(plan.reason, LayoutDecisionReason::SingleDirGoodName);
     }
 
@@ -860,7 +857,7 @@ mod tests {
         );
         let plan = plan_layout(&req);
         assert_eq!(plan.kind, LayoutPlanKind::CommitSingleFileAsInnerName);
-        assert_eq!(plan.target, req.output_root);
+        assert_eq!(plan.target, req.output_root.join("document.pdf"));
         assert_eq!(plan.reason, LayoutDecisionReason::SingleFileGoodName);
     }
 
@@ -918,7 +915,7 @@ mod tests {
         let plan = plan_layout(&req);
         assert_eq!(plan.kind, LayoutPlanKind::CommitSingleDirAsInnerName);
         assert_eq!(plan.source, PlanSource::SingleDir(PathBuf::from("MyProject")));
-        assert_eq!(plan.target, req.output_root);
+        assert_eq!(plan.target, req.output_root.join("MyProject"));
     }
 
     #[test]
@@ -933,7 +930,7 @@ mod tests {
         let plan = plan_layout(&req);
         assert_eq!(plan.kind, LayoutPlanKind::CommitSingleFileAsInnerName);
         assert_eq!(plan.source, PlanSource::SingleFile(PathBuf::from("document.pdf")));
-        assert_eq!(plan.target, req.output_root);
+        assert_eq!(plan.target, req.output_root.join("document.pdf"));
     }
 
     #[test]
@@ -963,13 +960,12 @@ mod tests {
             SingleRootNamePolicy::PreferArchiveName,
         );
         let plan = plan_layout(&req);
+        assert_eq!(plan.kind, LayoutPlanKind::CommitSingleDirContentsAsArchiveName);
         assert_eq!(
-            plan.kind,
-            LayoutPlanKind::CommitWholeTempAsArchiveDir {
-                name: "downloads".to_string()
-            }
+            plan.source,
+            PlanSource::SingleDirContents(PathBuf::from("The Great Gatsby - F. Scott Fitzgerald"))
         );
-        assert_eq!(plan.source, PlanSource::WholeTempDir);
+        assert_eq!(plan.target, req.output_root.join("downloads"));
     }
 
     #[test]
@@ -984,7 +980,7 @@ mod tests {
         let plan = plan_layout(&req);
         assert_eq!(plan.kind, LayoutPlanKind::CommitSingleDirAsInnerName);
         assert_eq!(plan.source, PlanSource::SingleDir(PathBuf::from("downloads")));
-        assert_eq!(plan.target, req.output_root);
+        assert_eq!(plan.target, req.output_root.join("downloads"));
     }
 
     #[test]
@@ -1012,7 +1008,7 @@ mod tests {
         );
         let plan = plan_layout(&req);
         assert_eq!(plan.kind, LayoutPlanKind::CommitSingleFileAsInnerName);
-        assert_eq!(plan.target, req.output_root);
+        assert_eq!(plan.target, req.output_root.join("downloads.pdf"));
     }
 
     #[test]
@@ -1025,6 +1021,52 @@ mod tests {
         );
         let plan = plan_layout(&req);
         assert!(plan.warnings.is_empty());
+    }
+
+    #[test]
+    fn layout_flat_single_dir_targets_output_root_inner_dir() {
+        let item = make_item("ProjectName", true, &PathBuf::new());
+        let req = make_request(
+            TopLevelShape::SingleDir(item),
+            "archive",
+            OutputLayoutPolicy::FlatSingle,
+            SingleRootNamePolicy::Auto,
+        );
+        let plan = plan_layout(&req);
+        assert_eq!(plan.kind, LayoutPlanKind::CommitSingleDirAsInnerName);
+        assert_eq!(plan.target, req.output_root.join("ProjectName"));
+    }
+
+    #[test]
+    fn layout_flat_single_file_targets_output_root_file() {
+        let item = make_item("doc.pdf", false, &PathBuf::new());
+        let req = make_request(
+            TopLevelShape::SingleFile(item),
+            "archive",
+            OutputLayoutPolicy::FlatSingle,
+            SingleRootNamePolicy::Auto,
+        );
+        let plan = plan_layout(&req);
+        assert_eq!(plan.kind, LayoutPlanKind::CommitSingleFileAsInnerName);
+        assert_eq!(plan.target, req.output_root.join("doc.pdf"));
+    }
+
+    #[test]
+    fn layout_prefer_archive_name_single_dir_flattens_contents() {
+        let item = make_item("images", true, &PathBuf::new());
+        let req = make_request(
+            TopLevelShape::SingleDir(item),
+            "archive",
+            OutputLayoutPolicy::Smart,
+            SingleRootNamePolicy::PreferArchiveName,
+        );
+        let plan = plan_layout(&req);
+        assert_eq!(plan.kind, LayoutPlanKind::CommitSingleDirContentsAsArchiveName);
+        assert_eq!(plan.target, req.output_root.join("archive"));
+        assert_eq!(
+            plan.source,
+            PlanSource::SingleDirContents(PathBuf::from("images"))
+        );
     }
 
     // ── pick_best_duplicate_name tests ────────────────────────────────────

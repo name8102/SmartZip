@@ -169,12 +169,12 @@ impl OutputMaterializer {
                 let PlanSource::SingleDir(dir_path) = &layout_plan.source else {
                     unreachable!()
                 };
-                let commit_target = &request.output_dir;
-                std::fs::create_dir_all(commit_target).map_err(|source| MaterializeFailure {
+                let commit_target = request.output_dir.join(dir_path.file_name().unwrap());
+                std::fs::create_dir_all(&commit_target).map_err(|source| MaterializeFailure {
                     error: SmartZipError::io(Some(commit_target.clone()), source),
                     preserved_temp_dir: None,
                 })?;
-                recursive_move_contents(dir_path, commit_target).map_err(|source| {
+                recursive_move_contents(dir_path, &commit_target).map_err(|source| {
                     MaterializeFailure {
                         error: SmartZipError::io(Some(commit_target.clone()), source),
                         preserved_temp_dir: None,
@@ -182,7 +182,7 @@ impl OutputMaterializer {
                 })?;
                 let _ = std::fs::remove_dir_all(&committed_temp_path);
                 Ok(MaterializeResult {
-                    output_dir: commit_target.clone(),
+                    output_dir: commit_target,
                     layout_plan: Some(layout_plan),
                 })
             }
@@ -541,6 +541,72 @@ mod tests {
         assert_eq!(
             std::fs::read(result.output_dir.join("a.txt")).unwrap(),
             b"alpha"
+        );
+    }
+
+    #[tokio::test]
+    async fn materialize_single_dir_as_inner_name_outputs_inner_dir_not_archive_dir() {
+        let root = tempfile::tempdir().unwrap();
+        let output = root.path().join("output");
+
+        let result = OutputMaterializer::default()
+            .materialize(
+                MaterializeRequest {
+                    output_dir: output.clone(),
+                    commit_policy: CommitPolicy::FailIfExists,
+                    archive_stem: Some("archive".to_string()),
+                    layout_policy: OutputLayoutPolicy::Smart,
+                    single_root_name_policy: SingleRootNamePolicy::PreferInnerName,
+                },
+                |temp_dir| async move {
+                    let inner = temp_dir.join("single_dir");
+                    std::fs::create_dir_all(&inner)
+                        .map_err(|source| SmartZipError::io(Some(temp_dir.clone()), source))?;
+                    std::fs::write(inner.join("file.txt"), b"hello")
+                        .map_err(|source| SmartZipError::io(Some(temp_dir), source))
+                },
+            )
+            .await
+            .unwrap();
+
+        let plan = result.layout_plan.as_ref().unwrap();
+        assert_eq!(plan.kind, LayoutPlanKind::CommitSingleDirAsInnerName);
+        assert!(output.join("single_dir").exists());
+        assert!(output.join("single_dir/file.txt").exists());
+        assert_eq!(
+            std::fs::read(output.join("single_dir/file.txt")).unwrap(),
+            b"hello"
+        );
+    }
+
+    #[tokio::test]
+    async fn materialize_single_file_as_inner_name_outputs_file_at_root() {
+        let root = tempfile::tempdir().unwrap();
+        let output = root.path().join("output");
+
+        let result = OutputMaterializer::default()
+            .materialize(
+                MaterializeRequest {
+                    output_dir: output.clone(),
+                    commit_policy: CommitPolicy::FailIfExists,
+                    archive_stem: Some("archive".to_string()),
+                    layout_policy: OutputLayoutPolicy::Smart,
+                    single_root_name_policy: SingleRootNamePolicy::PreferInnerName,
+                },
+                |temp_dir| async move {
+                    std::fs::write(temp_dir.join("doc.pdf"), b"pdf-content")
+                        .map_err(|source| SmartZipError::io(Some(temp_dir), source))
+                },
+            )
+            .await
+            .unwrap();
+
+        let plan = result.layout_plan.as_ref().unwrap();
+        assert_eq!(plan.kind, LayoutPlanKind::CommitSingleFileAsInnerName);
+        assert!(output.join("doc.pdf").exists());
+        assert_eq!(
+            std::fs::read(output.join("doc.pdf")).unwrap(),
+            b"pdf-content"
         );
     }
 }
