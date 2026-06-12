@@ -1,5 +1,6 @@
 //! Application-level orchestration for SmartZip workflows.
 
+pub mod detect;
 mod materialize;
 pub mod layout;
 pub mod name_score;
