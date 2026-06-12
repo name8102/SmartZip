@@ -1,5 +1,6 @@
 //! Application-level orchestration for SmartZip workflows.
 
+pub mod container;
 pub mod detect;
 pub mod embedded;
 pub mod embedded_zip;
