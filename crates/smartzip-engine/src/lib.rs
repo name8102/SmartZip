@@ -894,6 +894,16 @@ fn panic_message(panic: Box<dyn Any + Send>) -> String {
     }
 }
 
+fn is_business_container(path: &Path) -> bool {
+    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+        return false;
+    };
+    matches!(
+        ext.to_ascii_lowercase().as_str(),
+        "docx" | "xlsx" | "pptx" | "epub" | "apk" | "jar" | "cbz" | "cbr"
+    )
+}
+
 fn discover_nested_candidates(
     scanner: &EmbeddedScanner,
     root: &Path,
@@ -906,6 +916,9 @@ fn discover_nested_candidates(
     if root.is_file() {
         let header_result = crate::detect::probe_file_header(root);
         if let Some((fmt, offset)) = header_result {
+            if is_business_container(root) {
+                return candidates;
+            }
             candidates.push(ExtractionCandidate {
                 path: root.to_path_buf(),
                 relative_path: prefix.join(archive_stem(root)),
@@ -919,6 +932,9 @@ fn discover_nested_candidates(
         }
 
         if let Some(format) = format_from_extension(root) {
+            if is_business_container(root) {
+                return candidates;
+            }
             candidates.push(ExtractionCandidate {
                 path: root.to_path_buf(),
                 relative_path: prefix.join(archive_stem(root)),
@@ -958,6 +974,9 @@ fn discover_nested_candidates(
 
         let header_result = crate::detect::probe_file_header(&path);
         if let Some((fmt, offset)) = header_result {
+            if is_business_container(&path) {
+                continue;
+            }
             candidates.push(ExtractionCandidate {
                 path: path.clone(),
                 relative_path,
@@ -971,6 +990,9 @@ fn discover_nested_candidates(
         }
 
         if detected_format.is_some() {
+            if is_business_container(&path) {
+                continue;
+            }
             candidates.push(ExtractionCandidate {
                 path: path.clone(),
                 relative_path,
