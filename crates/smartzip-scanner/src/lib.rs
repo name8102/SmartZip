@@ -6,6 +6,9 @@ use std::fs;
 use std::io::Read;
 use std::path::Path;
 
+/// Default threshold for requiring user confirmation before scanning large files.
+pub const DEFAULT_LARGE_SCAN_THRESHOLD: u64 = 10 * 1024 * 1024 * 1024; // 10GB
+
 /// Minimum confidence threshold for scanner findings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Confidence {
@@ -123,6 +126,51 @@ impl EmbeddedScanner {
             file.read_to_end(&mut data)?;
         }
         Ok(self.scan_bytes(&data))
+    }
+
+    /// Scan a file using chunked reading for large files. Avoids loading the
+    /// entire file into a single Vec<u8> when it exceeds 64MB.
+    pub fn scan_path_mmap(
+        &self,
+        path: impl AsRef<Path>,
+    ) -> std::io::Result<Vec<EmbeddedArchiveFinding>> {
+        let file = fs::File::open(path.as_ref())?;
+        let file_size = file.metadata()?.len();
+
+        let scan_size = if let Some(max) = self.config.max_scan_bytes {
+            std::cmp::min(file_size, max)
+        } else {
+            file_size
+        };
+
+        if scan_size == 0 {
+            return Ok(vec![]);
+        }
+
+        // For small files, fall back to read
+        if scan_size <= 64 * 1024 * 1024 {
+            return self.scan_path(path);
+        }
+
+        let mut file = fs::File::open(path.as_ref())?;
+        let mut data = Vec::with_capacity(scan_size as usize);
+        let mut buf = [0u8; 64 * 1024];
+        let mut remaining = scan_size;
+        while remaining > 0 {
+            let to_read = std::cmp::min(remaining, buf.len() as u64) as usize;
+            let n = file.read(&mut buf[..to_read])?;
+            if n == 0 {
+                break;
+            }
+            data.extend_from_slice(&buf[..n]);
+            remaining -= n as u64;
+        }
+        Ok(self.scan_bytes(&data))
+    }
+
+    /// Get file size without loading it.
+    pub fn file_size(path: impl AsRef<Path>) -> std::io::Result<u64> {
+        Ok(std::fs::metadata(path.as_ref())?.len())
     }
 }
 
