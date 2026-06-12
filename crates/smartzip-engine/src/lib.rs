@@ -2,6 +2,7 @@
 
 pub mod detect;
 pub mod embedded;
+pub mod embedded_zip;
 mod materialize;
 pub mod layout;
 pub mod name_score;
