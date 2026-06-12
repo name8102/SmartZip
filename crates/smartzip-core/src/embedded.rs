@@ -51,7 +51,7 @@ pub struct FindingSummary {
     pub ratio: Option<f64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EmbeddedScanPolicy {
     pub mode: EmbeddedScanMode,
     pub dominant_min_ratio: f32,

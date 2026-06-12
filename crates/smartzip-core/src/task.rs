@@ -104,12 +104,12 @@ pub enum CompressionLevel {
 }
 
 /// Request to extract one or more archives.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExtractRequest {
     pub inputs: Vec<PathBuf>,
     pub output_dir: Option<PathBuf>,
     pub encoding: EncodingMode,
-    pub scan_embedded: bool,
+    pub embedded_scan_policy: crate::embedded::EmbeddedScanPolicy,
     pub delete_source_on_success: bool,
     pub recursion_limit: u8,
 }
