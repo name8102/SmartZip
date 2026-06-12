@@ -233,14 +233,91 @@ impl SmartZipEngine {
                 continue;
             }
 
-            // B1: magic-number (scanner) detection first, extension fallback
+            // Header-based detection first, then scanner confirmation
+            let header_result = crate::detect::probe_file_header(&candidate.path);
+            let _has_non_archive_header = {
+                let mut file = match std::fs::File::open(&candidate.path) {
+                    Ok(f) => f,
+                    Err(_) => return Err(smartzip_core::SmartZipError::BackendFailed {
+                        backend: "detect".into(),
+                        exit_code: None,
+                        stderr: format!("cannot open {}", candidate.path.display()),
+                    }),
+                };
+                let mut buf = [0u8; 8192];
+                let n = file.read(&mut buf).unwrap_or(0);
+                crate::detect::detect_non_archive_header(&buf[..n])
+            };
+
             let findings = scanner.scan_path(&candidate.path).unwrap_or_default();
-            if let Some(finding) = findings.first() {
-                candidate.detected_format = Some(finding.format.clone());
-                candidate.embedded_offset = Some(finding.offset);
-                candidate.embedded_size = finding.size;
+
+            // Use dominant selector for embedded findings
+            if !findings.is_empty() {
+                let ext_is_archive =
+                    crate::format_from_extension(&candidate.path).is_some();
+                let file_size =
+                    std::fs::metadata(&candidate.path).map(|m| m.len()).unwrap_or(0);
+                let decision = crate::embedded::select_embedded_action(
+                    file_size,
+                    &findings,
+                    &smartzip_core::EmbeddedScanPolicy::default(),
+                    ext_is_archive,
+                );
+
+                match decision.action {
+                    smartzip_core::DetectionAction::ExtractDirect => {
+                        if let Some(idx) = decision.selected_index {
+                            let f = &findings[idx];
+                            candidate.detected_format = Some(f.format.clone());
+                            candidate.embedded_offset = Some(f.offset);
+                            candidate.embedded_size = f.size;
+                        }
+                    }
+                    smartzip_core::DetectionAction::CarveAndExtract => {
+                        if let Some(idx) = decision.selected_index {
+                            let f = &findings[idx];
+                            candidate.detected_format = Some(f.format.clone());
+                            candidate.embedded_offset = Some(f.offset);
+                            candidate.embedded_size = f.size;
+                            events.push(TaskEvent {
+                                task_id: task_id.clone(),
+                                kind: TaskEventKind::EmbeddedArchiveSelected {
+                                    offset: f.offset,
+                                    size: f.size,
+                                    format: f.format.clone(),
+                                    reason: decision.reason.clone(),
+                                },
+                            });
+                        }
+                    }
+                    smartzip_core::DetectionAction::AskUser => {
+                        if let Some(idx) = decision.selected_index {
+                            let f = &findings[idx];
+                            candidate.detected_format = Some(f.format.clone());
+                            candidate.embedded_offset = Some(f.offset);
+                            candidate.embedded_size = f.size;
+                        }
+                    }
+                    _ => {
+                        // Skip or report — don't extract
+                        if candidate.detected_format.is_none() {
+                            candidate.detected_format =
+                                crate::format_from_extension(&candidate.path);
+                        }
+                    }
+                }
             } else if candidate.detected_format.is_none() {
-                candidate.detected_format = format_from_extension(&candidate.path);
+                // Fallback to extension
+                candidate.detected_format = crate::format_from_extension(&candidate.path);
+                // Also try header detection
+                if candidate.detected_format.is_none() {
+                    if let Some((fmt, offset)) = header_result {
+                        candidate.detected_format = Some(fmt);
+                        if offset > 0 {
+                            candidate.embedded_offset = Some(offset);
+                        }
+                    }
+                }
             }
 
             if candidate.detected_format.is_none() {
@@ -826,6 +903,20 @@ fn discover_nested_candidates(
 
     // Handle single-file roots directly when a candidate resolves to one file.
     if root.is_file() {
+        let header_result = crate::detect::probe_file_header(root);
+        if let Some((fmt, offset)) = header_result {
+            candidates.push(ExtractionCandidate {
+                path: root.to_path_buf(),
+                relative_path: prefix.join(archive_stem(root)),
+                depth,
+                source: CandidateSource::ExtractedFile,
+                detected_format: Some(fmt),
+                embedded_offset: if offset > 0 { Some(offset) } else { None },
+                embedded_size: None,
+            });
+            return candidates;
+        }
+
         if let Some(format) = format_from_extension(root) {
             candidates.push(ExtractionCandidate {
                 path: root.to_path_buf(),
@@ -837,17 +928,6 @@ fn discover_nested_candidates(
                 embedded_size: None,
             });
             return candidates;
-        }
-        for finding in scanner.scan_path(root).unwrap_or_default() {
-            candidates.push(ExtractionCandidate {
-                path: root.to_path_buf(),
-                relative_path: prefix.join(archive_stem(root)),
-                depth,
-                source: CandidateSource::EmbeddedFinding,
-                detected_format: Some(finding.format),
-                embedded_offset: Some(finding.offset),
-                embedded_size: finding.size,
-            });
         }
         return candidates;
     }
@@ -874,6 +954,21 @@ fn discover_nested_candidates(
         let mut relative_path = prefix.to_path_buf();
         relative_path.push(path.strip_prefix(root).unwrap_or(path.as_path()));
         relative_path.set_file_name(archive_stem(&path));
+
+        let header_result = crate::detect::probe_file_header(&path);
+        if let Some((fmt, offset)) = header_result {
+            candidates.push(ExtractionCandidate {
+                path: path.clone(),
+                relative_path,
+                depth,
+                source: CandidateSource::ExtractedFile,
+                detected_format: Some(fmt),
+                embedded_offset: if offset > 0 { Some(offset) } else { None },
+                embedded_size: None,
+            });
+            continue;
+        }
+
         if detected_format.is_some() {
             candidates.push(ExtractionCandidate {
                 path: path.clone(),
