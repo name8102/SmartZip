@@ -169,7 +169,7 @@ impl OutputMaterializer {
                 let PlanSource::SingleDir(dir_path) = &layout_plan.source else {
                     unreachable!()
                 };
-                let commit_target = request.output_dir.join(dir_path.file_name().unwrap());
+                let commit_target = layout_plan.target.clone();
                 std::fs::create_dir_all(&commit_target).map_err(|source| MaterializeFailure {
                     error: SmartZipError::io(Some(commit_target.clone()), source),
                     preserved_temp_dir: None,
@@ -219,8 +219,8 @@ impl OutputMaterializer {
                 let PlanSource::SingleFile(file_path) = &layout_plan.source else {
                     unreachable!()
                 };
-                let commit_target = &request.output_dir;
-                std::fs::create_dir_all(commit_target).map_err(|source| MaterializeFailure {
+                let commit_target = layout_plan.target.clone();
+                std::fs::create_dir_all(&commit_target).map_err(|source| MaterializeFailure {
                     error: SmartZipError::io(Some(commit_target.clone()), source),
                     preserved_temp_dir: None,
                 })?;
@@ -231,7 +231,7 @@ impl OutputMaterializer {
                 })?;
                 let _ = std::fs::remove_dir_all(&committed_temp_path);
                 Ok(MaterializeResult {
-                    output_dir: commit_target.clone(),
+                    output_dir: commit_target,
                     layout_plan: Some(layout_plan),
                 })
             }
@@ -571,10 +571,11 @@ mod tests {
 
         let plan = result.layout_plan.as_ref().unwrap();
         assert_eq!(plan.kind, LayoutPlanKind::CommitSingleDirAsInnerName);
-        assert!(output.join("single_dir").exists());
-        assert!(output.join("single_dir/file.txt").exists());
+        assert_eq!(result.output_dir, plan.target);
+        assert!(plan.target.exists());
+        assert!(plan.target.join("file.txt").exists());
         assert_eq!(
-            std::fs::read(output.join("single_dir/file.txt")).unwrap(),
+            std::fs::read(plan.target.join("file.txt")).unwrap(),
             b"hello"
         );
     }
@@ -603,10 +604,43 @@ mod tests {
 
         let plan = result.layout_plan.as_ref().unwrap();
         assert_eq!(plan.kind, LayoutPlanKind::CommitSingleFileAsInnerName);
-        assert!(output.join("doc.pdf").exists());
+        assert_eq!(result.output_dir, plan.target);
+        assert!(plan.target.join("doc.pdf").exists());
         assert_eq!(
-            std::fs::read(output.join("doc.pdf")).unwrap(),
+            std::fs::read(plan.target.join("doc.pdf")).unwrap(),
             b"pdf-content"
         );
+    }
+
+    #[tokio::test]
+    async fn materialize_single_dir_collapse_outputs_to_layout_target() {
+        let root = tempfile::tempdir().unwrap();
+        let output = root.path().join("output");
+        std::fs::create_dir_all(&output).unwrap();
+
+        let _result = OutputMaterializer::default()
+            .materialize(
+                MaterializeRequest {
+                    output_dir: output.join("download"), // archive_stem path
+                    commit_policy: CommitPolicy::FailIfExists,
+                    archive_stem: Some("download".to_string()),
+                    layout_policy: OutputLayoutPolicy::Conservative,
+                    single_root_name_policy: SingleRootNamePolicy::PreferInnerName,
+                },
+                |temp_dir| async move {
+                    let inner = temp_dir.join("ProjectName");
+                    std::fs::create_dir_all(&inner)
+                        .map_err(|e| SmartZipError::io(Some(temp_dir), e))?;
+                    std::fs::write(inner.join("file.txt"), b"content")
+                        .map_err(|e| SmartZipError::io(Some(inner), e))
+                },
+            )
+            .await
+            .unwrap();
+
+        // Should be output/ProjectName/file.txt, NOT output/download/ProjectName/file.txt
+        assert!(output.join("ProjectName").exists());
+        assert!(output.join("ProjectName").join("file.txt").exists());
+        assert!(!output.join("download").join("ProjectName").exists());
     }
 }
