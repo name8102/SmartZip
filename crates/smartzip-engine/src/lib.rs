@@ -13,7 +13,7 @@ use smartzip_core::{ArchiveFormat, EncodingMode, TaskEvent, TaskEventKind, TaskI
 use smartzip_passwords::{PasswordCandidate, PasswordCandidateRequest, PasswordService};
 use smartzip_scanner::{EmbeddedArchiveFinding, EmbeddedScanner, ScannerConfig};
 use std::any::Any;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque};
 use std::fs::File;
 use std::future::Future;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -189,7 +189,6 @@ impl SmartZipEngine {
         let mut processed = Vec::new();
         let mut skipped = Vec::new();
         let mut enqueued = Vec::new();
-        let mut output_overrides: HashMap<String, OutputPlan> = HashMap::new();
         let output_materializer = OutputMaterializer::default();
 
         for input in &request.inputs {
@@ -299,10 +298,8 @@ impl SmartZipEngine {
                 }
             }
 
-            let key = candidate_key(&candidate);
-            let output_plan = output_overrides.remove(&key).unwrap_or_else(|| {
-                OutputPlan::new(output_dir_for_candidate(&request.output_dir, &candidate))
-            });
+            let _key = candidate_key(&candidate);
+            let output_plan = OutputPlan::new(output_dir_for_candidate(&request.output_dir, &candidate));
             let output_dir = output_plan.output_dir.clone();
 
             let mut extracted = false;
@@ -428,6 +425,12 @@ impl SmartZipEngine {
                                 break;
                             }
                             Err(failure) => {
+                                if failure.kind == materialize::MaterializeFailureKind::CollisionSkipped {
+                                    // Collision was detected and user chose Skip —
+                                    // terminal state, don't try more passwords.
+                                    last_error = Some(failure.error);
+                                    break;
+                                }
                                 if let Some(temp_dir) = &failure.preserved_temp_dir {
                                     eprintln!(
                                         "preserved failed extraction temp dir: {}",

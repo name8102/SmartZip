@@ -53,6 +53,14 @@ pub struct MaterializeResult {
 pub struct MaterializeFailure {
     pub error: SmartZipError,
     pub preserved_temp_dir: Option<PathBuf>,
+    pub kind: MaterializeFailureKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaterializeFailureKind {
+    ExtractFailed,
+    CommitFailed,
+    CollisionSkipped,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,6 +93,7 @@ impl OutputMaterializer {
         std::fs::create_dir_all(&parent).map_err(|source| MaterializeFailure {
             error: SmartZipError::io(Some(parent.clone()), source),
             preserved_temp_dir: None,
+            kind: MaterializeFailureKind::CommitFailed,
         })?;
 
         let temp = tempfile::Builder::new()
@@ -93,6 +102,7 @@ impl OutputMaterializer {
             .map_err(|source| MaterializeFailure {
                 error: SmartZipError::io(Some(parent.clone()), source),
                 preserved_temp_dir: None,
+                kind: MaterializeFailureKind::CommitFailed,
             })?;
         let temp_path = temp.path().to_path_buf();
 
@@ -102,11 +112,13 @@ impl OutputMaterializer {
                 return Err(MaterializeFailure {
                     error,
                     preserved_temp_dir: Some(preserved),
+                    kind: MaterializeFailureKind::ExtractFailed,
                 });
             }
             return Err(MaterializeFailure {
                 error,
                 preserved_temp_dir: None,
+                kind: MaterializeFailureKind::CommitFailed,
             });
         }
 
@@ -152,6 +164,7 @@ impl OutputMaterializer {
                                 ),
                             ),
                             preserved_temp_dir: None,
+                            kind: MaterializeFailureKind::CollisionSkipped,
                         });
                     }
                     CollisionAction::Overwrite => {
@@ -175,6 +188,7 @@ impl OutputMaterializer {
                         ),
                     ),
                     preserved_temp_dir: None,
+                    kind: MaterializeFailureKind::CommitFailed,
                 });
             }
         }
@@ -188,12 +202,14 @@ impl OutputMaterializer {
                         |error| MaterializeFailure {
                             error,
                             preserved_temp_dir: None,
+                            kind: MaterializeFailureKind::CommitFailed,
                         },
                     )?;
                 if commit_target.exists() {
                     remove_existing_output(&commit_target).map_err(|error| MaterializeFailure {
                         error,
                         preserved_temp_dir: None,
+                        kind: MaterializeFailureKind::CommitFailed,
                     })?;
                 }
                 match std::fs::rename(&committed_temp_path, &commit_target) {
@@ -206,6 +222,7 @@ impl OutputMaterializer {
                         Err(MaterializeFailure {
                             error: SmartZipError::io(Some(commit_target), error),
                             preserved_temp_dir: None,
+                            kind: MaterializeFailureKind::CommitFailed,
                         })
                     }
                 }
@@ -219,22 +236,26 @@ impl OutputMaterializer {
                         |error| MaterializeFailure {
                             error,
                             preserved_temp_dir: None,
+                            kind: MaterializeFailureKind::CommitFailed,
                         },
                     )?;
                 if commit_target.exists() {
                     remove_existing_output(&commit_target).map_err(|error| MaterializeFailure {
                         error,
                         preserved_temp_dir: None,
+                        kind: MaterializeFailureKind::CommitFailed,
                     })?;
                 }
                 std::fs::create_dir_all(&commit_target).map_err(|source| MaterializeFailure {
                     error: SmartZipError::io(Some(commit_target.clone()), source),
                     preserved_temp_dir: None,
+                    kind: MaterializeFailureKind::CommitFailed,
                 })?;
                 recursive_move_contents(dir_path, &commit_target).map_err(|source| {
                     MaterializeFailure {
                         error: SmartZipError::io(Some(commit_target.clone()), source),
                         preserved_temp_dir: None,
+                    kind: MaterializeFailureKind::CommitFailed,
                     }
                 })?;
                 let _ = std::fs::remove_dir_all(&committed_temp_path);
@@ -247,15 +268,31 @@ impl OutputMaterializer {
                 let PlanSource::SingleDir(dir_path) = &layout_plan.source else {
                     unreachable!()
                 };
-                let commit_target = layout_plan.target.clone();
+                let commit_target =
+                    resolve_commit_target(&layout_plan.target, commit_policy).map_err(
+                        |error| MaterializeFailure {
+                            error,
+                            preserved_temp_dir: None,
+                            kind: MaterializeFailureKind::CommitFailed,
+                        },
+                    )?;
+                if commit_target.exists() {
+                    remove_existing_output(&commit_target).map_err(|error| MaterializeFailure {
+                        error,
+                        preserved_temp_dir: None,
+                        kind: MaterializeFailureKind::CommitFailed,
+                    })?;
+                }
                 std::fs::create_dir_all(&commit_target).map_err(|source| MaterializeFailure {
                     error: SmartZipError::io(Some(commit_target.clone()), source),
                     preserved_temp_dir: None,
+                    kind: MaterializeFailureKind::CommitFailed,
                 })?;
                 recursive_move_contents(dir_path, &commit_target).map_err(|source| {
                     MaterializeFailure {
                         error: SmartZipError::io(Some(commit_target.clone()), source),
                         preserved_temp_dir: None,
+                        kind: MaterializeFailureKind::CommitFailed,
                     }
                 })?;
                 let _ = std::fs::remove_dir_all(&committed_temp_path);
@@ -273,18 +310,21 @@ impl OutputMaterializer {
                         |error| MaterializeFailure {
                             error,
                             preserved_temp_dir: None,
+                            kind: MaterializeFailureKind::CommitFailed,
                         },
                     )?;
                 if commit_target.exists() {
                     remove_existing_output(&commit_target).map_err(|error| MaterializeFailure {
                         error,
                         preserved_temp_dir: None,
+                        kind: MaterializeFailureKind::CommitFailed,
                     })?;
                 }
                 std::fs::rename(file_path, &commit_target).map_err(|source| {
                     MaterializeFailure {
                         error: SmartZipError::io(Some(commit_target.clone()), source),
                         preserved_temp_dir: None,
+                    kind: MaterializeFailureKind::CommitFailed,
                     }
                 })?;
                 let _ = std::fs::remove_dir_all(&committed_temp_path);
@@ -297,15 +337,35 @@ impl OutputMaterializer {
                 let PlanSource::SingleFile(file_path) = &layout_plan.source else {
                     unreachable!()
                 };
-                let commit_target = layout_plan.target.clone();
-                std::fs::create_dir_all(&commit_target).map_err(|source| MaterializeFailure {
-                    error: SmartZipError::io(Some(commit_target.clone()), source),
-                    preserved_temp_dir: None,
-                })?;
-                let target_file = commit_target.join(file_path.file_name().unwrap());
-                std::fs::rename(file_path, &target_file).map_err(|source| MaterializeFailure {
-                    error: SmartZipError::io(Some(target_file), source),
-                    preserved_temp_dir: None,
+                let commit_target =
+                    resolve_commit_target(&layout_plan.target, commit_policy).map_err(
+                        |error| MaterializeFailure {
+                            error,
+                            preserved_temp_dir: None,
+                            kind: MaterializeFailureKind::CommitFailed,
+                        },
+                    )?;
+                if commit_target.exists() {
+                    remove_existing_output(&commit_target).map_err(|error| MaterializeFailure {
+                        error,
+                        preserved_temp_dir: None,
+                        kind: MaterializeFailureKind::CommitFailed,
+                    })?;
+                }
+                // Ensure parent directory exists for the target file
+                if let Some(parent) = commit_target.parent() {
+                    std::fs::create_dir_all(parent).map_err(|source| MaterializeFailure {
+                        error: SmartZipError::io(Some(parent.to_path_buf()), source),
+                        preserved_temp_dir: None,
+                        kind: MaterializeFailureKind::CommitFailed,
+                    })?;
+                }
+                std::fs::rename(file_path, &commit_target).map_err(|source| {
+                    MaterializeFailure {
+                        error: SmartZipError::io(Some(commit_target.clone()), source),
+                        preserved_temp_dir: None,
+                        kind: MaterializeFailureKind::CommitFailed,
+                    }
                 })?;
                 let _ = std::fs::remove_dir_all(&committed_temp_path);
                 Ok(MaterializeResult {
@@ -322,22 +382,26 @@ impl OutputMaterializer {
                         |error| MaterializeFailure {
                             error,
                             preserved_temp_dir: None,
+                            kind: MaterializeFailureKind::CommitFailed,
                         },
                     )?;
                 if commit_target.exists() {
                     remove_existing_output(&commit_target).map_err(|error| MaterializeFailure {
                         error,
                         preserved_temp_dir: None,
+                        kind: MaterializeFailureKind::CommitFailed,
                     })?;
                 }
                 std::fs::create_dir_all(&commit_target).map_err(|source| MaterializeFailure {
                     error: SmartZipError::io(Some(commit_target.clone()), source),
                     preserved_temp_dir: None,
+                    kind: MaterializeFailureKind::CommitFailed,
                 })?;
                 let inner_target = commit_target.join(dir_path.file_name().unwrap());
                 std::fs::rename(dir_path, &inner_target).map_err(|source| MaterializeFailure {
                     error: SmartZipError::io(Some(inner_target), source),
                     preserved_temp_dir: None,
+                    kind: MaterializeFailureKind::CommitFailed,
                 })?;
                 let _ = std::fs::remove_dir_all(&committed_temp_path);
                 Ok(MaterializeResult {
@@ -354,22 +418,26 @@ impl OutputMaterializer {
                         |error| MaterializeFailure {
                             error,
                             preserved_temp_dir: None,
+                            kind: MaterializeFailureKind::CommitFailed,
                         },
                     )?;
                 if commit_target.exists() {
                     remove_existing_output(&commit_target).map_err(|error| MaterializeFailure {
                         error,
                         preserved_temp_dir: None,
+                        kind: MaterializeFailureKind::CommitFailed,
                     })?;
                 }
                 std::fs::create_dir_all(&commit_target).map_err(|source| MaterializeFailure {
                     error: SmartZipError::io(Some(commit_target.clone()), source),
                     preserved_temp_dir: None,
+                    kind: MaterializeFailureKind::CommitFailed,
                 })?;
                 let inner_target = commit_target.join(file_path.file_name().unwrap());
                 std::fs::rename(file_path, &inner_target).map_err(|source| MaterializeFailure {
                     error: SmartZipError::io(Some(inner_target), source),
                     preserved_temp_dir: None,
+                    kind: MaterializeFailureKind::CommitFailed,
                 })?;
                 let _ = std::fs::remove_dir_all(&committed_temp_path);
                 Ok(MaterializeResult {
@@ -690,9 +758,10 @@ mod tests {
         let plan = result.layout_plan.as_ref().unwrap();
         assert_eq!(plan.kind, LayoutPlanKind::CommitSingleFileAsInnerName);
         assert_eq!(result.output_dir, plan.target);
-        assert!(plan.target.join("doc.pdf").exists());
+        assert!(plan.target.exists());
+        assert!(plan.target.is_file());
         assert_eq!(
-            std::fs::read(plan.target.join("doc.pdf")).unwrap(),
+            std::fs::read(&plan.target).unwrap(),
             b"pdf-content"
         );
     }
