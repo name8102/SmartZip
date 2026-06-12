@@ -56,6 +56,31 @@ pub enum TaskEventKind {
         confidence: f32,
         description: String,
     },
+    EmbeddedArchiveSelected {
+        offset: u64,
+        size: Option<u64>,
+        format: ArchiveFormat,
+        reason: String,
+    },
+    EmbeddedArchiveCarved {
+        source: PathBuf,
+        temp_path: PathBuf,
+        offset: u64,
+        size: Option<u64>,
+    },
+    EmbeddedArchiveSelectionRequired {
+        path: PathBuf,
+        findings_count: usize,
+    },
+    LargeEmbeddedScanConfirmationRequired {
+        path: PathBuf,
+        file_size: u64,
+        threshold: u64,
+    },
+    BusinessContainerSkipped {
+        path: PathBuf,
+        kind: String,
+    },
     OutputCreated {
         path: PathBuf,
     },
