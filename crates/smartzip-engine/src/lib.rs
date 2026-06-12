@@ -299,10 +299,10 @@ impl SmartZipEngine {
             }
 
             let _key = candidate_key(&candidate);
-            let output_plan = OutputPlan::new(output_dir_for_candidate(&request.output_dir, &candidate));
-            let output_dir = output_plan.output_dir.clone();
+            let output_dir = output_dir_for_candidate(&request.output_dir, &candidate);
 
             let mut extracted = false;
+            let mut terminal_skip = false;
             let mut last_error = None;
             let mut actual_output_dir = output_dir.clone();
             for password in &password_candidates {
@@ -387,7 +387,8 @@ impl SmartZipEngine {
                             .materialize(
                                 MaterializeRequest {
                                     output_dir: output_dir.clone(),
-                                    commit_policy: output_plan.commit_policy,
+                                    archive_path: candidate.path.clone(),
+                                    commit_policy: CommitPolicy::FailIfExists,
                                     archive_stem: Some(archive_stem(&candidate.path).to_string_lossy().into_owned()),
                                     layout_policy: request.layout_policy,
                                     single_root_name_policy: request.single_root_name_policy,
@@ -426,9 +427,7 @@ impl SmartZipEngine {
                             }
                             Err(failure) => {
                                 if failure.kind == materialize::MaterializeFailureKind::CollisionSkipped {
-                                    // Collision was detected and user chose Skip —
-                                    // terminal state, don't try more passwords.
-                                    last_error = Some(failure.error);
+                                    terminal_skip = true;
                                     break;
                                 }
                                 if let Some(temp_dir) = &failure.preserved_temp_dir {
@@ -457,7 +456,7 @@ impl SmartZipEngine {
                 }
             }
 
-            if !extracted {
+            if !extracted && !terminal_skip {
                 // Interactive fallback: prompt the user for a password. Use test->extract
                 // and reuse the materialized archive path (carved temp when embedded).
                 if let Some(prompter) = password_prompter {
@@ -491,7 +490,8 @@ impl SmartZipEngine {
                                         .materialize(
                                             MaterializeRequest {
                                                 output_dir: output_dir.clone(),
-                                                commit_policy: output_plan.commit_policy,
+                                                archive_path: candidate.path.clone(),
+                                                commit_policy: CommitPolicy::FailIfExists,
                                                 archive_stem: Some(archive_stem(&candidate.path).to_string_lossy().into_owned()),
                                                 layout_policy: request.layout_policy,
                                                 single_root_name_policy: request.single_root_name_policy,
@@ -569,10 +569,12 @@ impl SmartZipEngine {
                 }
             }
 
-            if !extracted {
+            if !extracted && !terminal_skip {
                 if let Some(error) = last_error {
                     events.push(TaskEvent::failed(task_id.clone(), &error));
                 }
+            }
+            if terminal_skip || !extracted {
                 skipped.push(candidate);
                 continue;
             }
@@ -660,21 +662,6 @@ struct ArchiveInput {
     _temp: Option<tempfile::NamedTempFile>,
 }
 
-#[derive(Debug, Clone)]
-struct OutputPlan {
-    output_dir: PathBuf,
-    commit_policy: CommitPolicy,
-}
-
-impl OutputPlan {
-    fn new(output_dir: PathBuf) -> Self {
-        Self {
-            output_dir,
-            commit_policy: CommitPolicy::FailIfExists,
-        }
-    }
-}
-
 fn materialize_archive_input(
     candidate: &ExtractionCandidate,
 ) -> smartzip_core::Result<ArchiveInput> {
@@ -711,11 +698,11 @@ fn output_relative_path_for(base: &Path, output_dir: &Path) -> PathBuf {
 fn make_collision_resolver<'a>(
     prompter: &'a dyn InteractiveOutputPrompter,
 ) -> CollisionResolver<'a> {
-    Box::new(move |target_path, _plan| {
+    Box::new(move |archive_path, target_path, _plan| {
         let prompter = prompter;
         Box::pin(async move {
             let strategy = prompter
-                .prompt(target_path.clone(), target_path)
+                .prompt(archive_path, target_path)
                 .await;
             match strategy {
                 OutputCollisionStrategy::Skip => CollisionAction::Skip,

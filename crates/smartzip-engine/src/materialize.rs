@@ -27,6 +27,7 @@ pub enum CollisionAction {
 pub type CollisionResolver<'a> = Box<
     dyn Fn(
             PathBuf,
+            PathBuf,
             LayoutPlan,
         ) -> Pin<Box<dyn Future<Output = CollisionAction> + Send + 'a>>
         + Send
@@ -37,6 +38,7 @@ pub type CollisionResolver<'a> = Box<
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MaterializeRequest {
     pub output_dir: PathBuf,
+    pub archive_path: PathBuf,
     pub commit_policy: CommitPolicy,
     pub archive_stem: Option<String>,
     pub layout_policy: OutputLayoutPolicy,
@@ -118,7 +120,7 @@ impl OutputMaterializer {
             return Err(MaterializeFailure {
                 error,
                 preserved_temp_dir: None,
-                kind: MaterializeFailureKind::CommitFailed,
+                kind: MaterializeFailureKind::ExtractFailed,
             });
         }
 
@@ -148,7 +150,7 @@ impl OutputMaterializer {
         let mut commit_policy = request.commit_policy;
         if layout_plan.target.exists() && commit_policy == CommitPolicy::FailIfExists {
             if let Some(resolver) = collision_resolver {
-                let action = resolver(layout_plan.target.clone(), layout_plan.clone()).await;
+                let action = resolver(request.archive_path.clone(), layout_plan.target.clone(), layout_plan.clone()).await;
                 match action {
                     CollisionAction::Skip => {
                         let _ = std::fs::remove_dir_all(temp.path());
@@ -535,6 +537,7 @@ mod tests {
             .materialize(
                 MaterializeRequest {
                     output_dir: output.clone(),
+                    archive_path: output.clone(),
                     commit_policy: CommitPolicy::FailIfExists,
                     archive_stem: None,
                     layout_policy: OutputLayoutPolicy::default(),
@@ -571,6 +574,7 @@ mod tests {
             .materialize(
                 MaterializeRequest {
                     output_dir: output.clone(),
+                    archive_path: output.clone(),
                     commit_policy: CommitPolicy::Overwrite,
                     archive_stem: None,
                     layout_policy: OutputLayoutPolicy::default(),
@@ -605,6 +609,7 @@ mod tests {
             .materialize(
                 MaterializeRequest {
                     output_dir: output.clone(),
+                    archive_path: output.clone(),
                     commit_policy: CommitPolicy::Overwrite,
                     archive_stem: None,
                     layout_policy: OutputLayoutPolicy::default(),
@@ -634,6 +639,7 @@ mod tests {
             .materialize(
                 MaterializeRequest {
                     output_dir: output.clone(),
+                    archive_path: output.clone(),
                     commit_policy: CommitPolicy::FailIfExists,
                     archive_stem: None,
                     layout_policy: OutputLayoutPolicy::default(),
@@ -668,6 +674,7 @@ mod tests {
             .materialize(
                 MaterializeRequest {
                     output_dir: output.clone(),
+                    archive_path: output.clone(),
                     commit_policy: CommitPolicy::FailIfExists,
                     archive_stem: Some("my-archive".to_string()),
                     layout_policy: OutputLayoutPolicy::Smart,
@@ -704,6 +711,7 @@ mod tests {
             .materialize(
                 MaterializeRequest {
                     output_dir: output.clone(),
+                    archive_path: output.clone(),
                     commit_policy: CommitPolicy::FailIfExists,
                     archive_stem: Some("archive".to_string()),
                     layout_policy: OutputLayoutPolicy::Smart,
@@ -741,6 +749,7 @@ mod tests {
             .materialize(
                 MaterializeRequest {
                     output_dir: output.clone(),
+                    archive_path: output.clone(),
                     commit_policy: CommitPolicy::FailIfExists,
                     archive_stem: Some("archive".to_string()),
                     layout_policy: OutputLayoutPolicy::Smart,
@@ -775,7 +784,8 @@ mod tests {
         let _result = OutputMaterializer::default()
             .materialize(
                 MaterializeRequest {
-                    output_dir: output.join("download"), // archive_stem path
+                    output_dir: output.join("download"),
+                    archive_path: output.clone(),
                     commit_policy: CommitPolicy::FailIfExists,
                     archive_stem: Some("download".to_string()),
                     layout_policy: OutputLayoutPolicy::Conservative,
