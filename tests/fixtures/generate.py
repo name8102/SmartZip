@@ -261,6 +261,56 @@ def gen_nested_mixed_formats():
 
 
 # ═══════════════════════════════════════════════════════════════════
+#  1b. 嵌套归档路径冲突测试夹具 (tar.gz 与 archive_stem 等价名称)
+# ═══════════════════════════════════════════════════════════════════
+
+def _create_tar_gz_with_leaf(name: str, leaf_filename: str, leaf_content: str):
+    """
+    Create a .tar.gz where the inner tar name equals archive_stem
+    (e.g. name='real_tar' → real_tar.tar.gz → real_tar.tar → leaf).
+    This triggers CommitSingleFileAsInnerName path collision.
+    """
+    tar_path = WORK_DIR / f"{name}.tar"
+    leaf_path = WORK_DIR / leaf_filename
+    leaf_path.write_text(leaf_content)
+    with tarfile.open(tar_path, "w") as tf:
+        tf.add(leaf_path, arcname=leaf_filename)
+    tgz_path = FIXTURES_DIR / f"{name}.tar.gz"
+    with gzip.open(tgz_path, "wb") as gf:
+        gf.write(tar_path.read_bytes())
+    print(f"    -> {tgz_path}  ({tgz_path.stat().st_size} B)")
+
+
+def gen_nested_path_collision_fixtures():
+    print("\n[1b] 嵌套归档路径冲突夹具")
+
+    # real_tar.tar.gz — archive_stem='real_tar', inner tar='real_tar.tar'
+    # → Equivalent name_similarity → CommitSingleFileAsInnerName → path collision
+    _create_tar_gz_with_leaf("real_tar", "leaf_rt.txt", "leaf content from real_tar\n")
+
+    # matching.tar.gz — same equivalence trigger, different name
+    _create_tar_gz_with_leaf("matching", "leaf_m.txt", "leaf from matching\n")
+
+    # zip_containing_real_tar_gz.zip — outer zip with single-entry tar.gz
+    inner_tgz = FIXTURES_DIR / "real_tar.tar.gz"
+    zip_path = FIXTURES_DIR / "zip_containing_real_tar_gz.zip"
+    with pyzipper.AESZipFile(zip_path, 'w', compression=pyzipper.ZIP_DEFLATED, encryption=None) as zf:
+        zf.writestr("real_tar.tar.gz", inner_tgz.read_bytes())
+    print(f"    -> {zip_path}  ({zip_path.stat().st_size} B)")
+
+    # zip_inner_zip.zip — outer zip contains a single inner archive named
+    # like the outer archive stem, forcing CommitSingleFileAsInnerName for
+    # an archive file before nested extraction continues.
+    inner_zip_path = WORK_DIR / "zip_inner_zip_payload.zip"
+    with pyzipper.AESZipFile(inner_zip_path, 'w', compression=pyzipper.ZIP_DEFLATED, encryption=None) as zf:
+        zf.writestr("zip_inner_leaf.txt", "leaf from inner zip\n")
+    zip_inner_zip_path = FIXTURES_DIR / "zip_inner_zip.zip"
+    with pyzipper.AESZipFile(zip_inner_zip_path, 'w', compression=pyzipper.ZIP_DEFLATED, encryption=None) as zf:
+        zf.writestr("zip_inner_zip.zip", inner_zip_path.read_bytes())
+    print(f"    -> {zip_inner_zip_path}  ({zip_inner_zip_path.stat().st_size} B)")
+
+
+# ═══════════════════════════════════════════════════════════════════
 #  2. Unicode 密码加密压缩包
 # ═══════════════════════════════════════════════════════════════════
 
@@ -509,6 +559,7 @@ def main():
         gen_nested_7z_in_zip()
         gen_nested_multi_level()
         gen_nested_mixed_formats()
+        gen_nested_path_collision_fixtures()
 
         print("\n[2/5] Unicode 密码加密压缩包")
         gen_unicode_passwords()

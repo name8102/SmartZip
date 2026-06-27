@@ -323,6 +323,273 @@ fn test_scanner_does_not_panic_on_archive_fixtures(#[case] fixture_name: &str) {
     );
 }
 
+// ── Nested archive path collision (TDD: red before P0-2 fix) ──────────────
+
+/// TDD regression: `.tar.gz -> .tar -> leaf` path collision.
+///
+/// Current failure (P0-1): when `CommitSingleFileAsInnerName` commits the
+/// extracted `.tar` as a single file, `candidate.relative_path` is updated to
+/// the file path.  The nested tar candidate then uses that file path as a
+/// directory prefix → `create_dir_all` fails with `File exists`.
+///
+/// Remove `#[ignore]` after P0-2 nested output path model is fixed.
+#[ignore = "TDD: blocked by P0-2 nested output path model fix"]
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn test_TDD_tar_gz_name_equivalent_to_inner_tar_collision() {
+    // `real_tar.tar.gz`: gzip → `real_tar.tar` → `leaf_rt.txt`
+    // archive_stem("real_tar.tar.gz") = "real_tar"
+    // inner file name = "real_tar.tar" → Equivalent similarity
+    // → CommitSingleFileAsInnerName → file path used as dir prefix → collision
+    let archive = fixture_path("real_tar.tar.gz");
+    assert!(archive.exists(), "fixture missing: real_tar.tar.gz");
+
+    let backend = backend();
+    let db = SmartZipDb::in_memory().unwrap();
+    let service = PasswordService::new(PasswordRepository::new(db.connection()));
+    let engine = SmartZipEngine::default();
+    let output = TempDir::new().unwrap();
+
+    let result = engine
+        .extract_recursive(
+            &backend,
+            &service,
+            ExtractWorkflowRequest {
+                inputs: vec![archive.clone()],
+                output_dir: output.path().to_path_buf(),
+                recursion_limit: 2,
+                encoding_mode: EncodingMode::Auto,
+                scanner: ScannerConfig::default(),
+                password_candidates: PasswordCandidateRequest::default(),
+                layout_policy: Default::default(),
+                single_root_name_policy: Default::default(),
+                embedded_scan_mode: smartzip_core::EmbeddedScanMode::default(),
+                dominant_min_ratio: 0.70,
+                confirm_large_scan: false,
+            },
+            None,
+            None,
+        )
+        .await;
+
+    // Target behavior (post-fix): extraction succeeds, leaf is found
+    assert!(
+        result.is_ok(),
+        "tar.gz -> tar -> leaf extraction failed (expected after P0-2 fix): {:?}",
+        result
+    );
+    let workflow = result.unwrap();
+
+    // Both gzip and tar levels should be processed
+    assert!(
+        workflow.processed.len() >= 2,
+        "expected >=2 processed (gzip + tar), got {:?}",
+        workflow
+            .processed
+            .iter()
+            .map(|c| c.path.display().to_string())
+            .collect::<Vec<_>>()
+    );
+
+    assert!(
+        find_file(output.path(), "leaf_rt.txt").is_some(),
+        "expected leaf_rt.txt in {:?}",
+        output.path()
+    );
+}
+
+/// TDD regression: `zip -> tar.gz -> tar -> leaf` three-level path collision.
+///
+/// The outermost zip extraction discovers `real_tar.tar.gz` as a nested
+/// archive.  The gzip→tar step hits the same `CommitSingleFileAsInnerName`
+/// path collision described above.
+///
+/// Remove `#[ignore]` after P0-2 nested output path model is fixed.
+#[ignore = "TDD: blocked by P0-2 nested output path model fix"]
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn test_TDD_zip_containing_tar_gz_three_level_collision() {
+    let archive = fixture_path("zip_containing_real_tar_gz.zip");
+    assert!(archive.exists(), "fixture missing");
+
+    let backend = backend();
+    let db = SmartZipDb::in_memory().unwrap();
+    let service = PasswordService::new(PasswordRepository::new(db.connection()));
+    let engine = SmartZipEngine::default();
+    let output = TempDir::new().unwrap();
+
+    let result = engine
+        .extract_recursive(
+            &backend,
+            &service,
+            ExtractWorkflowRequest {
+                inputs: vec![archive.clone()],
+                output_dir: output.path().to_path_buf(),
+                recursion_limit: 3,
+                encoding_mode: EncodingMode::Auto,
+                scanner: ScannerConfig::default(),
+                password_candidates: PasswordCandidateRequest::default(),
+                layout_policy: Default::default(),
+                single_root_name_policy: Default::default(),
+                embedded_scan_mode: smartzip_core::EmbeddedScanMode::default(),
+                dominant_min_ratio: 0.70,
+                confirm_large_scan: false,
+            },
+            None,
+            None,
+        )
+        .await;
+
+    // Target behavior (post-fix): leaf found at the end of zip→gzip→tar chain
+    assert!(
+        result.is_ok(),
+        "zip -> tar.gz -> tar extraction failed (expected after P0-2 fix): {:?}",
+        result
+    );
+    let workflow = result.unwrap();
+
+    assert!(
+        workflow.processed.len() >= 2,
+        "expected >=2 processed, got {:?}",
+        workflow.processed.len()
+    );
+
+    assert!(
+        find_file(output.path(), "leaf_rt.txt").is_some(),
+        "expected leaf_rt.txt from nested tar.gz chain in {:?}",
+        output.path()
+    );
+}
+
+/// TDD regression: `zip -> inner.zip -> leaf` path collision.
+///
+/// `zip_inner_zip.zip` extracts a single file named `zip_inner_zip.zip`, which
+/// is equivalent to the outer archive stem. That forces
+/// `CommitSingleFileAsInnerName` for an archive file; the nested inner-zip
+/// candidate must not treat that file path as a directory prefix.
+///
+/// Remove `#[ignore]` after P0-2 nested output path model is fixed.
+#[ignore = "TDD: blocked by P0-2 nested output path model fix"]
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn test_TDD_zip_inner_zip_single_file_path_collision() {
+    let archive = fixture_path("zip_inner_zip.zip");
+    assert!(archive.exists(), "fixture missing: zip_inner_zip.zip");
+
+    let backend = backend();
+    let db = SmartZipDb::in_memory().unwrap();
+    let service = PasswordService::new(PasswordRepository::new(db.connection()));
+    let engine = SmartZipEngine::default();
+    let output = TempDir::new().unwrap();
+
+    let result = engine
+        .extract_recursive(
+            &backend,
+            &service,
+            ExtractWorkflowRequest {
+                inputs: vec![archive.clone()],
+                output_dir: output.path().to_path_buf(),
+                recursion_limit: 2,
+                encoding_mode: EncodingMode::Auto,
+                scanner: ScannerConfig::default(),
+                password_candidates: PasswordCandidateRequest::default(),
+                layout_policy: Default::default(),
+                single_root_name_policy: Default::default(),
+                embedded_scan_mode: smartzip_core::EmbeddedScanMode::default(),
+                dominant_min_ratio: 0.70,
+                confirm_large_scan: false,
+            },
+            None,
+            None,
+        )
+        .await;
+
+    assert!(
+        result.is_ok(),
+        "zip -> inner.zip extraction failed (expected after P0-2 fix): {:?}",
+        result
+    );
+    let workflow = result.unwrap();
+
+    assert!(
+        workflow.processed.len() >= 2,
+        "expected outer + inner zip processed, got {:?}",
+        workflow
+            .processed
+            .iter()
+            .map(|c| c.path.display().to_string())
+            .collect::<Vec<_>>()
+    );
+
+    assert!(
+        find_file(output.path(), "zip_inner_leaf.txt").is_some(),
+        "expected zip_inner_leaf.txt in {:?}",
+        output.path()
+    );
+}
+
+/// TDD regression: alternate naming variant of the `.tar.gz` path collision.
+///
+/// `matching.tar.gz` → `matching.tar` → `leaf_m.txt`
+/// Same root cause as `real_tar.tar.gz` — different name confirms the
+/// trigger is the Equivalent similarity, not a specific name string.
+///
+/// Remove `#[ignore]` after P0-2 nested output path model is fixed.
+#[ignore = "TDD: blocked by P0-2 nested output path model fix"]
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn test_TDD_tar_gz_name_equivalent_variant_collision() {
+    let archive = fixture_path("matching.tar.gz");
+    assert!(archive.exists(), "fixture missing: matching.tar.gz");
+
+    let backend = backend();
+    let db = SmartZipDb::in_memory().unwrap();
+    let service = PasswordService::new(PasswordRepository::new(db.connection()));
+    let engine = SmartZipEngine::default();
+    let output = TempDir::new().unwrap();
+
+    let result = engine
+        .extract_recursive(
+            &backend,
+            &service,
+            ExtractWorkflowRequest {
+                inputs: vec![archive.clone()],
+                output_dir: output.path().to_path_buf(),
+                recursion_limit: 2,
+                encoding_mode: EncodingMode::Auto,
+                scanner: ScannerConfig::default(),
+                password_candidates: PasswordCandidateRequest::default(),
+                layout_policy: Default::default(),
+                single_root_name_policy: Default::default(),
+                embedded_scan_mode: smartzip_core::EmbeddedScanMode::default(),
+                dominant_min_ratio: 0.70,
+                confirm_large_scan: false,
+            },
+            None,
+            None,
+        )
+        .await;
+
+    assert!(
+        result.is_ok(),
+        "matching.tar.gz extraction failed (expected after P0-2 fix): {:?}",
+        result
+    );
+    let workflow = result.unwrap();
+
+    assert!(
+        workflow.processed.len() >= 2,
+        "expected >=2 processed, got {:?}",
+        workflow.processed.len()
+    );
+
+    assert!(
+        find_file(output.path(), "leaf_m.txt").is_some(),
+        "expected leaf_m.txt in {:?}",
+        output.path()
+    );
+}
+
 // ── Engine: full extract_recursive ────────────────────────────────────────
 
 #[tokio::test]
@@ -812,6 +1079,10 @@ fn test_encoding_detection_from_fixture(
 #[case("nested_7z_in_zip.zip")]
 #[case("nested_multi_level.zip")]
 #[case("nested_mixed_formats.zip")]
+#[case("real_tar.tar.gz")]
+#[case("matching.tar.gz")]
+#[case("zip_containing_real_tar_gz.zip")]
+#[case("zip_inner_zip.zip")]
 fn test_fixture_exists(#[case] name: &str) {
     let path = fixture_path(name);
     assert!(
