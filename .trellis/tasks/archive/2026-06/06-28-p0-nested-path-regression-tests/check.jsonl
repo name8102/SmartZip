@@ -1,0 +1,4 @@
+{"_example": "Fill with {\"file\": \"<path>\", \"reason\": \"<why>\"}. Put spec/research files only — no code paths. Run `python3 .trellis/scripts/get_context.py --mode packages` to list available specs. Delete this line once real entries are added."}
+{"file": ".trellis/spec/smartzip-engine/backend/index.md", "reason": "Engine extraction behavior and quality guidelines"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "Cross-layer extraction flow checks"}
+{"file": ".trellis/tasks/06-28-smartzip-fix-roadmap/research/handoff-summary.md", "reason": "Handoff facts and constraints for this repair roadmap"}
