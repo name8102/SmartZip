@@ -122,7 +122,10 @@ pub fn select_embedded_action(
                     DetectionAction::ReportOnly
                 }
             }
-            _ => DetectionAction::AskUser,
+            EmbeddedScanMode::Largest | EmbeddedScanMode::Aggressive | EmbeddedScanMode::All => {
+                DetectionAction::CarveAndExtract
+            }
+            EmbeddedScanMode::Ignore => DetectionAction::SkipByDefault,
         };
 
         return DetectionDecision {

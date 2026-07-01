@@ -15,7 +15,8 @@ use materialize::{
 };
 use serde::{Deserialize, Serialize};
 use smartzip_archive::{
-    ArchiveBackend, ExtractArchiveRequest, ExtractionProgressCallback, ListRequest, TestRequest,
+    ArchiveBackend, ArchiveListing, ExtractArchiveRequest, ExtractionProgressCallback, ListRequest,
+    NativeZipBackend, TestRequest,
 };
 use smartzip_core::{ArchiveFormat, EncodingMode, TaskEvent, TaskEventKind, TaskId};
 use smartzip_passwords::{PasswordCandidate, PasswordCandidateRequest, PasswordService};
@@ -62,6 +63,45 @@ pub trait InteractiveOutputPrompter: Send + Sync {
     /// async runtime can continue extracting unrelated archives while the
     /// user decides.
     async fn prompt(&self, archive_path: PathBuf, output_path: PathBuf) -> OutputCollisionStrategy;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EmbeddedSelectionChoice {
+    Extract,
+    Skip,
+    ExtractAll,
+}
+
+#[async_trait]
+pub trait InteractiveEmbeddedPrompter: Send + Sync {
+    async fn prompt(
+        &self,
+        archive_path: &Path,
+        decision: &smartzip_core::DetectionDecision,
+    ) -> EmbeddedSelectionChoice;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EncodingConfirmationChoice {
+    AcceptDetected,
+    Override(String),
+    SkipArchive,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EncodingConfirmationContext {
+    pub detected: smartzip_core::EncodingDetectionResult,
+    pub preview_names: Vec<String>,
+    pub suspicious_reasons: Vec<String>,
+}
+
+#[async_trait]
+pub trait InteractiveEncodingPrompter: Send + Sync {
+    async fn prompt(
+        &self,
+        archive_path: &Path,
+        context: &EncodingConfirmationContext,
+    ) -> EncodingConfirmationChoice;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -236,12 +276,36 @@ impl SmartZipEngine {
         password_prompter: Option<&dyn InteractivePasswordPrompter>,
         output_prompter: Option<&dyn InteractiveOutputPrompter>,
     ) -> smartzip_core::Result<ExtractWorkflowResult> {
-        self.extract_recursive_with_listener(
+        self.extract_recursive_interactive(
             backend,
             passwords,
             request,
             password_prompter,
             output_prompter,
+            None,
+            None,
+        )
+        .await
+    }
+
+    pub async fn extract_recursive_interactive<B: ArchiveBackend>(
+        &self,
+        backend: &B,
+        passwords: &PasswordService<'_>,
+        request: ExtractWorkflowRequest,
+        password_prompter: Option<&dyn InteractivePasswordPrompter>,
+        output_prompter: Option<&dyn InteractiveOutputPrompter>,
+        embedded_prompter: Option<&dyn InteractiveEmbeddedPrompter>,
+        encoding_prompter: Option<&dyn InteractiveEncodingPrompter>,
+    ) -> smartzip_core::Result<ExtractWorkflowResult> {
+        self.extract_recursive_with_listener_interactive(
+            backend,
+            passwords,
+            request,
+            password_prompter,
+            output_prompter,
+            embedded_prompter,
+            encoding_prompter,
             None,
         )
         .await
@@ -254,6 +318,30 @@ impl SmartZipEngine {
         request: ExtractWorkflowRequest,
         password_prompter: Option<&dyn InteractivePasswordPrompter>,
         output_prompter: Option<&dyn InteractiveOutputPrompter>,
+        listener: Option<TaskEventListener>,
+    ) -> smartzip_core::Result<ExtractWorkflowResult> {
+        self.extract_recursive_with_listener_interactive(
+            backend,
+            passwords,
+            request,
+            password_prompter,
+            output_prompter,
+            None,
+            None,
+            listener,
+        )
+        .await
+    }
+
+    pub async fn extract_recursive_with_listener_interactive<B: ArchiveBackend>(
+        &self,
+        backend: &B,
+        passwords: &PasswordService<'_>,
+        request: ExtractWorkflowRequest,
+        password_prompter: Option<&dyn InteractivePasswordPrompter>,
+        output_prompter: Option<&dyn InteractiveOutputPrompter>,
+        embedded_prompter: Option<&dyn InteractiveEmbeddedPrompter>,
+        encoding_prompter: Option<&dyn InteractiveEncodingPrompter>,
         listener: Option<TaskEventListener>,
     ) -> smartzip_core::Result<ExtractWorkflowResult> {
         let task_id = TaskId::new();
@@ -274,11 +362,20 @@ impl SmartZipEngine {
         let output_materializer = OutputMaterializer::default();
         let root_input_total = request.inputs.len();
         let mut root_input_started = 0usize;
+        let embedded_policy = embedded_policy_from_request(&request);
+        let nested_embedded_enabled = matches!(
+            embedded_policy.mode,
+            smartzip_core::EmbeddedScanMode::Aggressive | smartzip_core::EmbeddedScanMode::All
+        );
+        let mut embedded_extract_all = false;
 
         for input in &request.inputs {
             let relative_path = archive_output_name(input);
+            // Header-first: leave detected_format empty here. The main loop
+            // resolves format from file header, embedded findings, and finally
+            // the extension as a hint.
             queue.push_back(ExtractionCandidate {
-                detected_format: format_from_extension(input),
+                detected_format: None,
                 path: input.clone(),
                 relative_path,
                 depth: 0,
@@ -331,7 +428,18 @@ impl SmartZipEngine {
                 crate::detect::detect_non_archive_header(&buf[..n])
             };
 
-            let findings = scanner.scan_path(&candidate.path).unwrap_or_default();
+            let findings = if should_scan_candidate_for_embedded(
+                &candidate,
+                &embedded_policy,
+                nested_embedded_enabled,
+                request.confirm_large_scan,
+                &events,
+                &task_id,
+            ) {
+                scanner.scan_path(&candidate.path).unwrap_or_default()
+            } else {
+                Vec::new()
+            };
 
             // Use dominant selector for embedded findings
             if !findings.is_empty() {
@@ -342,7 +450,7 @@ impl SmartZipEngine {
                 let decision = crate::embedded::select_embedded_action(
                     file_size,
                     &findings,
-                    &smartzip_core::EmbeddedScanPolicy::default(),
+                    &embedded_policy,
                     ext_is_archive,
                 );
 
@@ -373,38 +481,111 @@ impl SmartZipEngine {
                         }
                     }
                     smartzip_core::DetectionAction::AskUser => {
-                        if let Some(idx) = decision.selected_index {
-                            let f = &findings[idx];
-                            candidate.detected_format = Some(f.format.clone());
-                            candidate.embedded_offset = Some(f.offset);
-                            candidate.embedded_size = f.size;
+                        events.push(TaskEvent {
+                            task_id: task_id.clone(),
+                            kind: TaskEventKind::EmbeddedArchiveSelectionRequired {
+                                path: candidate.path.clone(),
+                                findings_count: findings.len(),
+                            },
+                        });
+                        let selection = if embedded_extract_all {
+                            Some(EmbeddedSelectionChoice::Extract)
+                        } else if let Some(prompter) = embedded_prompter {
+                            Some(prompter.prompt(&candidate.path, &decision).await)
+                        } else {
+                            None
+                        };
+
+                        match selection {
+                            Some(choice) => match choice {
+                                EmbeddedSelectionChoice::Extract => {
+                                    if let Some(idx) = decision.selected_index {
+                                        let f = &findings[idx];
+                                        candidate.detected_format = Some(f.format.clone());
+                                        candidate.embedded_offset = Some(f.offset);
+                                        candidate.embedded_size = f.size;
+                                        events.push(TaskEvent {
+                                            task_id: task_id.clone(),
+                                            kind: TaskEventKind::EmbeddedArchiveSelected {
+                                                offset: f.offset,
+                                                size: f.size,
+                                                format: f.format.clone(),
+                                                reason: decision.reason.clone(),
+                                            },
+                                        });
+                                    }
+                                }
+                                EmbeddedSelectionChoice::ExtractAll => {
+                                    embedded_extract_all = true;
+                                    if let Some(idx) = decision.selected_index {
+                                        let f = &findings[idx];
+                                        candidate.detected_format = Some(f.format.clone());
+                                        candidate.embedded_offset = Some(f.offset);
+                                        candidate.embedded_size = f.size;
+                                        events.push(TaskEvent {
+                                            task_id: task_id.clone(),
+                                            kind: TaskEventKind::EmbeddedArchiveSelected {
+                                                offset: f.offset,
+                                                size: f.size,
+                                                format: f.format.clone(),
+                                                reason: decision.reason.clone(),
+                                            },
+                                        });
+                                    }
+                                }
+                                EmbeddedSelectionChoice::Skip => {
+                                    skipped.push(candidate);
+                                    continue;
+                                }
+                            },
+                            None => {
+                                skipped.push(candidate);
+                                continue;
+                            }
                         }
                     }
                     _ => {
-                        // Skip or report — don't extract
-                        if candidate.detected_format.is_none() {
-                            candidate.detected_format =
-                                crate::format_from_extension(&candidate.path);
-                        }
+                        skipped.push(candidate);
+                        continue;
                     }
                 }
             } else if candidate.detected_format.is_none() {
-                // Fallback to extension
-                candidate.detected_format = crate::format_from_extension(&candidate.path);
-                // Also try header detection
-                if candidate.detected_format.is_none() {
-                    if let Some((fmt, offset)) = header_result {
-                        candidate.detected_format = Some(fmt);
-                        if offset > 0 {
-                            candidate.embedded_offset = Some(offset);
-                        }
+                // Header-first, extension as hint/fallback
+                if let Some((fmt, offset)) = header_result {
+                    candidate.detected_format = Some(fmt);
+                    if offset > 0 {
+                        candidate.embedded_offset = Some(offset);
                     }
+                } else {
+                    candidate.detected_format = crate::format_from_extension(&candidate.path);
                 }
             }
 
             if candidate.detected_format.is_none() {
                 skipped.push(candidate);
                 continue;
+            }
+
+            // Business container filter for root inputs: nested candidates are
+            // filtered in discover_nested_candidates, but root inputs (a .docx
+            // dropped straight in, or a plain .zip whose contents match docx
+            // structure) reach the main loop directly.
+            if candidate.detected_format == Some(ArchiveFormat::Zip) {
+                if let Some(kind) =
+                    ext_business_container_kind(&candidate.path).or_else(|| {
+                        crate::container::classify_zip_path(&candidate.path)
+                    })
+                {
+                    events.push(TaskEvent {
+                        task_id: task_id.clone(),
+                        kind: TaskEventKind::BusinessContainerSkipped {
+                            path: candidate.path.clone(),
+                            kind: format!("{kind:?}"),
+                        },
+                    });
+                    skipped.push(candidate);
+                    continue;
+                }
             }
 
             let archive_input = materialize_archive_input(&candidate)?;
@@ -445,45 +626,23 @@ impl SmartZipEngine {
                 ))),
             });
 
-            let mut encoding_result = None;
-            if request.encoding_mode == EncodingMode::Auto {
-                if let Ok(listing) = backend
-                    .list(ListRequest {
-                        archive: archive_path.clone(),
-                        format: candidate.detected_format.clone(),
-                        password: Some(String::new()),
-                        encoding: EncodingMode::Auto,
-                    })
-                    .await
-                {
-                    let raw_names: Vec<u8> = listing
-                        .entries
-                        .iter()
-                        .flat_map(|entry| entry.raw_name.iter().copied())
-                        .collect();
-                    if !raw_names.is_empty() {
-                        let mut detector = smartzip_encoding::ArchiveEncodingDetector::new();
-                        let result = detector.detect(&raw_names);
-                        events.push(TaskEvent {
-                            task_id: task_id.clone(),
-                            kind: TaskEventKind::EncodingDetected(
-                                smartzip_core::EncodingDetectionResult {
-                                    selected: EncodingMode::Override(result.selected.clone()),
-                                    confidence: result.confidence,
-                                    candidates: result
-                                        .candidates
-                                        .iter()
-                                        .map(|c| smartzip_core::EncodingCandidate {
-                                            name: c.name.clone(),
-                                            confidence: c.confidence,
-                                        })
-                                        .collect(),
-                                },
-                            ),
-                        });
-                        encoding_result = Some(result);
+            let mut zip_encoding_assessment = None;
+            if request.encoding_mode == EncodingMode::Auto
+                && candidate.detected_format == Some(ArchiveFormat::Zip)
+            {
+                let native_zip = NativeZipBackend::new();
+                if let Ok(probe) = native_zip.probe(&archive_path).await {
+                    if probe.encrypted == Some(false) {
+                        zip_encoding_assessment =
+                            assess_zip_encoding(&native_zip, &archive_path, None).await;
                     }
                 }
+            }
+            if let Some(assessment) = &zip_encoding_assessment {
+                events.push(TaskEvent {
+                    task_id: task_id.clone(),
+                    kind: TaskEventKind::EncodingDetected(assessment.context.detected.clone()),
+                });
             }
 
             let _key = candidate_key(&candidate);
@@ -539,59 +698,34 @@ impl SmartZipEngine {
                                 ),
                             });
 
-                            if encoding_result.is_none()
+                            if zip_encoding_assessment.is_none()
                                 && request.encoding_mode == EncodingMode::Auto
+                                && candidate.detected_format == Some(ArchiveFormat::Zip)
                             {
-                                if let Ok(listing) = backend_call(
-                                    "archive-backend",
-                                    "list",
+                                let native_zip = NativeZipBackend::new();
+                                zip_encoding_assessment = assess_zip_encoding(
+                                    &native_zip,
                                     &archive_path,
-                                    backend.list(ListRequest {
-                                        archive: archive_path.clone(),
-                                        format: candidate.detected_format.clone(),
-                                        password: pw_value.clone(),
-                                        encoding: EncodingMode::Auto,
-                                    }),
+                                    pw_value.clone(),
                                 )
-                                .await
-                                {
-                                    let raw_names: Vec<u8> = listing
-                                        .entries
-                                        .iter()
-                                        .flat_map(|entry| entry.raw_name.iter().copied())
-                                        .collect();
-                                    if !raw_names.is_empty() {
-                                        let mut detector =
-                                            smartzip_encoding::ArchiveEncodingDetector::new();
-                                        let result = detector.detect(&raw_names);
-                                        events.push(TaskEvent {
-                                            task_id: task_id.clone(),
-                                            kind: TaskEventKind::EncodingDetected(
-                                                smartzip_core::EncodingDetectionResult {
-                                                    selected: EncodingMode::Override(
-                                                        result.selected.clone(),
-                                                    ),
-                                                    confidence: result.confidence,
-                                                    candidates: result
-                                                        .candidates
-                                                        .iter()
-                                                        .map(|c| smartzip_core::EncodingCandidate {
-                                                            name: c.name.clone(),
-                                                            confidence: c.confidence,
-                                                        })
-                                                        .collect(),
-                                                },
-                                            ),
-                                        });
-                                        encoding_result = Some(result);
-                                    }
+                                .await;
+                                if let Some(assessment) = &zip_encoding_assessment {
+                                    events.push(TaskEvent {
+                                        task_id: task_id.clone(),
+                                        kind: TaskEventKind::EncodingDetected(
+                                            assessment.context.detected.clone(),
+                                        ),
+                                    });
                                 }
                             }
 
-                            let encoding_to_use = encoding_result
-                                .as_ref()
-                                .map(|r| EncodingMode::Override(r.selected.clone()))
-                                .unwrap_or_else(|| request.encoding_mode.clone());
+                            let encoding_to_use = resolve_encoding_mode(
+                                &archive_path,
+                                request.encoding_mode.clone(),
+                                zip_encoding_assessment.as_ref(),
+                                encoding_prompter,
+                            )
+                            .await?;
                             let extract_archive_path = archive_path.clone();
                             let extract_format = candidate.detected_format.clone();
                             let extract_password = pw_value.clone();
@@ -844,10 +978,33 @@ impl SmartZipEngine {
                                                 ),
                                             ),
                                         });
-                                        let encoding_to_use = encoding_result
-                                            .as_ref()
-                                            .map(|r| EncodingMode::Override(r.selected.clone()))
-                                            .unwrap_or_else(|| request.encoding_mode.clone());
+                                        if zip_encoding_assessment.is_none()
+                                            && request.encoding_mode == EncodingMode::Auto
+                                            && candidate.detected_format == Some(ArchiveFormat::Zip)
+                                        {
+                                            let native_zip = NativeZipBackend::new();
+                                            zip_encoding_assessment = assess_zip_encoding(
+                                                &native_zip,
+                                                &archive_path,
+                                                Some(pw.clone()),
+                                            )
+                                            .await;
+                                            if let Some(assessment) = &zip_encoding_assessment {
+                                                events.push(TaskEvent {
+                                                    task_id: task_id.clone(),
+                                                    kind: TaskEventKind::EncodingDetected(
+                                                        assessment.context.detected.clone(),
+                                                    ),
+                                                });
+                                            }
+                                        }
+                                        let encoding_to_use = resolve_encoding_mode(
+                                            &archive_path,
+                                            request.encoding_mode.clone(),
+                                            zip_encoding_assessment.as_ref(),
+                                            encoding_prompter,
+                                        )
+                                        .await?;
                                         let extract_archive_path = archive_path.clone();
                                         let extract_format = candidate.detected_format.clone();
                                         let extract_password = pw.clone();
@@ -979,7 +1136,13 @@ impl SmartZipEngine {
                                 let extract_archive_path = archive_path.clone();
                                 let extract_format = candidate.detected_format.clone();
                                 let extract_password = pw.clone();
-                                let extract_encoding = request.encoding_mode.clone();
+                                let extract_encoding = resolve_encoding_mode(
+                                    &archive_path,
+                                    request.encoding_mode.clone(),
+                                    zip_encoding_assessment.as_ref(),
+                                    encoding_prompter,
+                                )
+                                .await?;
                                 let extraction_progress = extraction_progress_callback(
                                     events.clone(),
                                     task_id.clone(),
@@ -1121,6 +1284,8 @@ impl SmartZipEngine {
                 &actual_output_dir,
                 candidate.depth + 1,
                 &output_relative_path,
+                &embedded_policy,
+                nested_embedded_enabled,
             );
             for nested in nested_candidates {
                 enqueued.push(nested.clone());
@@ -1431,13 +1596,263 @@ fn panic_message(panic: Box<dyn Any + Send>) -> String {
 }
 
 fn is_business_container(path: &Path) -> bool {
-    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+    ext_business_container_kind(path).is_some()
+}
+
+fn ext_business_container_kind(path: &Path) -> Option<smartzip_core::BusinessContainerKind> {
+    let ext = path.extension().and_then(|e| e.to_str())?;
+    match ext.to_ascii_lowercase().as_str() {
+        "docx" => Some(smartzip_core::BusinessContainerKind::OfficeDocx),
+        "xlsx" => Some(smartzip_core::BusinessContainerKind::OfficeXlsx),
+        "pptx" => Some(smartzip_core::BusinessContainerKind::OfficePptx),
+        "epub" => Some(smartzip_core::BusinessContainerKind::Epub),
+        "apk" => Some(smartzip_core::BusinessContainerKind::Apk),
+        "jar" => Some(smartzip_core::BusinessContainerKind::Jar),
+        "cbz" => Some(smartzip_core::BusinessContainerKind::Cbz),
+        "cbr" => Some(smartzip_core::BusinessContainerKind::Cbr),
+        _ => None,
+    }
+}
+
+fn embedded_policy_from_request(
+    request: &ExtractWorkflowRequest,
+) -> smartzip_core::EmbeddedScanPolicy {
+    smartzip_core::EmbeddedScanPolicy {
+        mode: request.embedded_scan_mode,
+        dominant_min_ratio: request.dominant_min_ratio,
+        ..smartzip_core::EmbeddedScanPolicy::default()
+    }
+}
+
+fn should_scan_candidate_for_embedded(
+    candidate: &ExtractionCandidate,
+    policy: &smartzip_core::EmbeddedScanPolicy,
+    nested_embedded_enabled: bool,
+    confirm_large_scan: bool,
+    events: &EventSink,
+    task_id: &TaskId,
+) -> bool {
+    if matches!(policy.mode, smartzip_core::EmbeddedScanMode::Ignore) {
         return false;
+    }
+
+    if candidate.source != CandidateSource::RootInput && !nested_embedded_enabled {
+        return false;
+    }
+
+    let file_size = std::fs::metadata(&candidate.path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    if candidate.source == CandidateSource::RootInput
+        && !confirm_large_scan
+        && crate::format_from_extension(&candidate.path).is_none()
+        && file_size > policy.root_full_scan_confirm_threshold
+    {
+        events.push(TaskEvent {
+            task_id: task_id.clone(),
+            kind: TaskEventKind::LargeEmbeddedScanConfirmationRequired {
+                path: candidate.path.clone(),
+                file_size,
+                threshold: policy.root_full_scan_confirm_threshold,
+            },
+        });
+        return false;
+    }
+
+    if candidate.source != CandidateSource::RootInput
+        && policy
+            .inner_scan_max_bytes
+            .is_some_and(|max_bytes| file_size > max_bytes)
+    {
+        return false;
+    }
+
+    true
+}
+
+async fn resolve_encoding_mode(
+    archive_path: &Path,
+    requested: EncodingMode,
+    assessment: Option<&ZipEncodingAssessment>,
+    prompter: Option<&dyn InteractiveEncodingPrompter>,
+) -> smartzip_core::Result<EncodingMode> {
+    if requested != EncodingMode::Auto {
+        return Ok(requested);
+    }
+
+    let Some(assessment) = assessment else {
+        return Ok(EncodingMode::Auto);
     };
-    matches!(
-        ext.to_ascii_lowercase().as_str(),
-        "docx" | "xlsx" | "pptx" | "epub" | "apk" | "jar" | "cbz" | "cbr"
-    )
+
+    if assessment.should_confirm {
+        if let Some(prompter) = prompter {
+            match prompter.prompt(archive_path, &assessment.context).await {
+                EncodingConfirmationChoice::AcceptDetected => {}
+                EncodingConfirmationChoice::Override(encoding) => {
+                    return Ok(EncodingMode::Override(encoding));
+                }
+                EncodingConfirmationChoice::SkipArchive => {
+                    return Err(smartzip_core::SmartZipError::BackendFailed {
+                        backend: "encoding-confirmation".into(),
+                        exit_code: None,
+                        stderr: format!("encoding confirmation skipped {}", archive_path.display()),
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(EncodingMode::Override(
+        assessment.detected_raw.selected.clone(),
+    ))
+}
+
+#[derive(Debug, Clone)]
+struct ZipEncodingAssessment {
+    detected_raw: smartzip_encoding::EncodingDetectionResult,
+    context: EncodingConfirmationContext,
+    should_confirm: bool,
+}
+
+async fn assess_zip_encoding(
+    native_zip: &NativeZipBackend,
+    archive_path: &Path,
+    password: Option<String>,
+) -> Option<ZipEncodingAssessment> {
+    let listing = native_zip
+        .list(ListRequest {
+            archive: archive_path.to_path_buf(),
+            format: Some(ArchiveFormat::Zip),
+            password,
+            encoding: EncodingMode::Auto,
+        })
+        .await
+        .ok()?;
+
+    build_zip_encoding_assessment(listing)
+}
+
+fn build_zip_encoding_assessment(listing: ArchiveListing) -> Option<ZipEncodingAssessment> {
+    let raw_entries: Vec<&[u8]> = listing
+        .entries
+        .iter()
+        .map(|entry| entry.raw_name.as_slice())
+        .filter(|raw| !raw.is_empty())
+        .collect();
+    if raw_entries.is_empty() {
+        return None;
+    }
+
+    let ascii_only = raw_entries.iter().all(|raw| raw.is_ascii());
+    let raw_names: Vec<u8> = raw_entries
+        .iter()
+        .enumerate()
+        .flat_map(|(idx, raw)| {
+            let mut merged = Vec::new();
+            if idx > 0 {
+                merged.push(b'/');
+            }
+            merged.extend_from_slice(raw);
+            merged
+        })
+        .collect();
+
+    let mut detector = smartzip_encoding::ArchiveEncodingDetector::new();
+    let detected_raw = detector.detect(&raw_names);
+    let detected = to_core_encoding_detection(&detected_raw);
+    let preview_names = raw_entries
+        .iter()
+        .take(6)
+        .map(|raw| decode_preview_name(raw, &detected_raw.selected))
+        .collect::<Vec<_>>();
+    let suspicious_reasons =
+        suspicious_encoding_reasons(&detected_raw, &preview_names, ascii_only, &raw_entries);
+    Some(ZipEncodingAssessment {
+        detected_raw,
+        context: EncodingConfirmationContext {
+            detected,
+            preview_names,
+            suspicious_reasons: suspicious_reasons.clone(),
+        },
+        should_confirm: !suspicious_reasons.is_empty(),
+    })
+}
+
+fn to_core_encoding_detection(
+    result: &smartzip_encoding::EncodingDetectionResult,
+) -> smartzip_core::EncodingDetectionResult {
+    smartzip_core::EncodingDetectionResult {
+        selected: EncodingMode::Override(result.selected.clone()),
+        confidence: result.confidence,
+        candidates: result
+            .candidates
+            .iter()
+            .map(|candidate| smartzip_core::EncodingCandidate {
+                name: candidate.name.clone(),
+                confidence: candidate.confidence,
+            })
+            .collect(),
+    }
+}
+
+fn decode_preview_name(raw_name: &[u8], encoding: &str) -> String {
+    smartzip_encoding::decode_name(raw_name, encoding)
+        .unwrap_or_else(|| String::from_utf8_lossy(raw_name).into_owned())
+}
+
+fn suspicious_encoding_reasons(
+    detected: &smartzip_encoding::EncodingDetectionResult,
+    preview_names: &[String],
+    ascii_only: bool,
+    raw_entries: &[&[u8]],
+) -> Vec<String> {
+    let mut reasons = Vec::new();
+    if ascii_only {
+        return reasons;
+    }
+
+    if raw_entries
+        .iter()
+        .all(|raw| std::str::from_utf8(raw).is_ok())
+        && detected.selected.eq_ignore_ascii_case("utf-8")
+    {
+        return reasons;
+    }
+
+    let second_confidence = detected
+        .candidates
+        .get(1)
+        .map(|candidate| candidate.confidence)
+        .unwrap_or(0.0);
+    if detected.confidence < 0.90 {
+        reasons.push(format!(
+            "low confidence {:.0}%",
+            detected.confidence * 100.0
+        ));
+    }
+    if (detected.confidence - second_confidence).abs() < 0.15 {
+        reasons.push("top encoding candidates are close".into());
+    }
+    if preview_names.iter().any(|name| looks_like_mojibake(name)) {
+        reasons.push("previewed names look garbled".into());
+    }
+
+    reasons
+}
+
+fn looks_like_mojibake(value: &str) -> bool {
+    if value.contains('\u{FFFD}') {
+        return true;
+    }
+    let suspicious_markers = ['Ã', 'Â', 'Ð', 'Ñ', 'æ', 'ç', 'ø', '¢', '¤', '¥'];
+    let suspicious_count = value
+        .chars()
+        .filter(|ch| suspicious_markers.contains(ch))
+        .count();
+    suspicious_count >= 2
+        || value
+            .chars()
+            .any(|ch| ch.is_control() && ch != '\n' && ch != '\t')
 }
 
 fn discover_nested_candidates(
@@ -1445,6 +1860,8 @@ fn discover_nested_candidates(
     root: &Path,
     depth: u8,
     prefix: &Path,
+    policy: &smartzip_core::EmbeddedScanPolicy,
+    nested_embedded_enabled: bool,
 ) -> Vec<ExtractionCandidate> {
     let mut candidates = Vec::new();
 
@@ -1452,7 +1869,7 @@ fn discover_nested_candidates(
     if root.is_file() {
         let header_result = crate::detect::probe_file_header(root);
         if let Some((fmt, offset)) = header_result {
-            if is_business_container(root) {
+            if is_business_container(root) || crate::container::classify_zip_path(root).is_some() {
                 return candidates;
             }
             candidates.push(ExtractionCandidate {
@@ -1468,7 +1885,7 @@ fn discover_nested_candidates(
         }
 
         if let Some(format) = format_from_extension(root) {
-            if is_business_container(root) {
+            if is_business_container(root) || crate::container::classify_zip_path(root).is_some() {
                 return candidates;
             }
             candidates.push(ExtractionCandidate {
@@ -1499,6 +1916,8 @@ fn discover_nested_candidates(
                 &path,
                 depth,
                 &next_prefix,
+                policy,
+                nested_embedded_enabled,
             ));
             continue;
         }
@@ -1510,7 +1929,8 @@ fn discover_nested_candidates(
 
         let header_result = crate::detect::probe_file_header(&path);
         if let Some((fmt, offset)) = header_result {
-            if is_business_container(&path) {
+            if is_business_container(&path) || crate::container::classify_zip_path(&path).is_some()
+            {
                 continue;
             }
             candidates.push(ExtractionCandidate {
@@ -1526,7 +1946,8 @@ fn discover_nested_candidates(
         }
 
         if detected_format.is_some() {
-            if is_business_container(&path) {
+            if is_business_container(&path) || crate::container::classify_zip_path(&path).is_some()
+            {
                 continue;
             }
             candidates.push(ExtractionCandidate {
@@ -1541,16 +1962,55 @@ fn discover_nested_candidates(
             continue;
         }
 
-        for finding in scanner.scan_path(&path).unwrap_or_default() {
-            candidates.push(ExtractionCandidate {
-                path: path.clone(),
-                relative_path: relative_path.clone(),
-                depth,
-                source: CandidateSource::EmbeddedFinding,
-                detected_format: Some(finding.format),
-                embedded_offset: Some(finding.offset),
-                embedded_size: finding.size,
-            });
+        if !nested_embedded_enabled {
+            continue;
+        }
+        let file_size = std::fs::metadata(&path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        if policy
+            .inner_scan_max_bytes
+            .is_some_and(|max_bytes| file_size > max_bytes)
+        {
+            continue;
+        }
+        let findings = scanner.scan_path(&path).unwrap_or_default();
+        if findings.is_empty() {
+            continue;
+        }
+        if matches!(policy.mode, smartzip_core::EmbeddedScanMode::All) {
+            for finding in findings {
+                candidates.push(ExtractionCandidate {
+                    path: path.clone(),
+                    relative_path: relative_path.clone(),
+                    depth,
+                    source: CandidateSource::EmbeddedFinding,
+                    detected_format: Some(finding.format),
+                    embedded_offset: Some(finding.offset),
+                    embedded_size: finding.size,
+                });
+            }
+            continue;
+        }
+
+        let decision = crate::embedded::select_embedded_action(file_size, &findings, policy, false);
+        if let Some(idx) = decision.selected_index {
+            let finding = &findings[idx];
+            if matches!(
+                decision.action,
+                smartzip_core::DetectionAction::ExtractDirect
+                    | smartzip_core::DetectionAction::CarveAndExtract
+            ) {
+                candidates.push(ExtractionCandidate {
+                    path: path.clone(),
+                    relative_path: relative_path.clone(),
+                    depth,
+                    source: CandidateSource::EmbeddedFinding,
+                    detected_format: Some(finding.format.clone()),
+                    embedded_offset: Some(finding.offset),
+                    embedded_size: finding.size,
+                });
+            }
         }
     }
 
@@ -1625,9 +2085,9 @@ mod tests {
     use async_trait::async_trait;
     use rstest::*;
     use smartzip_archive::{
-        ArchiveBackend, ArchiveListing, ArchiveProbe, BackendCapabilities, CompressArchiveRequest,
-        CompressArchiveResult, ExtractArchiveRequest, ExtractArchiveResult, ListRequest,
-        SevenZipBackend, TestRequest, TestResult,
+        ArchiveBackend, ArchiveListing, ArchiveProbe, BackendCapabilities, BackendRouter,
+        CompressArchiveRequest, CompressArchiveResult, ExtractArchiveRequest, ExtractArchiveResult,
+        ListRequest, SevenZipBackend, TestRequest, TestResult,
     };
     use smartzip_db::{password::PasswordRepository, SmartZipDb};
     use smartzip_passwords::{PasswordCandidateRequest, PasswordService};
@@ -1641,6 +2101,17 @@ mod tests {
     fn engine_with_test_recycler() -> SmartZipEngine {
         let recycler: ArchiveRecycleHandler = Arc::new(std::fs::remove_file);
         SmartZipEngine::default().with_archive_recycler(recycler)
+    }
+
+    fn fixture_path(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("tests")
+            .join("fixtures")
+            .join(name)
     }
 
     #[test]
@@ -1667,6 +2138,68 @@ mod tests {
             result.events.last().unwrap().kind,
             TaskEventKind::Completed
         ));
+    }
+
+    #[test]
+    fn zip_encoding_assessment_skips_confirmation_for_ascii_names() {
+        let assessment = build_zip_encoding_assessment(ArchiveListing {
+            format: Some(ArchiveFormat::Zip),
+            entries: vec![smartzip_archive::ArchiveEntry {
+                path: PathBuf::from("docs/readme.txt"),
+                raw_name: b"docs/readme.txt".to_vec(),
+                compressed_size: None,
+                uncompressed_size: None,
+                is_dir: false,
+            }],
+        })
+        .unwrap();
+
+        assert!(!assessment.should_confirm);
+        assert!(assessment.context.suspicious_reasons.is_empty());
+    }
+
+    #[tokio::test]
+    async fn embedded_ask_without_prompter_skips_archive() {
+        let archive = fixture_path("video_7z_pass.mp4");
+        let backend = BackendRouter::locate().unwrap();
+        let db = SmartZipDb::in_memory().unwrap();
+        let service = PasswordService::new(PasswordRepository::new(db.connection()));
+        let output = tempfile::tempdir().unwrap();
+
+        let result = SmartZipEngine::default()
+            .extract_recursive(
+                &backend,
+                &service,
+                ExtractWorkflowRequest {
+                    inputs: vec![archive],
+                    output_dir: output.path().to_path_buf(),
+                    recursion_limit: 1,
+                    encoding_mode: EncodingMode::Auto,
+                    scanner: ScannerConfig::default(),
+                    password_candidates: PasswordCandidateRequest {
+                        manual: Vec::new(),
+                        clipboard: None,
+                        include_empty: false,
+                        limit: 8,
+                    },
+                    layout_policy: Default::default(),
+                    single_root_name_policy: Default::default(),
+                    embedded_scan_mode: smartzip_core::EmbeddedScanMode::Ask,
+                    dominant_min_ratio: 0.70,
+                    confirm_large_scan: false,
+                },
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.processed.is_empty());
+        assert_eq!(result.skipped.len(), 1);
+        assert!(result.events.iter().any(|event| matches!(
+            event.kind,
+            TaskEventKind::EmbeddedArchiveSelectionRequired { .. }
+        )));
     }
 
     #[test]

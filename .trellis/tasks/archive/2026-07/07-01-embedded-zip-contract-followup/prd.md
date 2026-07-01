@@ -49,7 +49,9 @@
 
 ## Acceptance Criteria
 
-- [ ] 已将 later-added embedded / ZIP / CLI 契约需求从 `06-27-fix-plan` 拆分为独立 task。
-- [ ] 新 task 明确区分 embedded、detection/router、ZIP encoding、CLI contract 四类工作。
-- [ ] 文档明确 `fix-plan` 已完成，而这些内容属于后续新增范围。
-- [ ] 每类工作至少包含一种可执行验证方式。
+- [x] 已将 later-added embedded / ZIP / CLI 契约需求从 `06-27-fix-plan` 拆分为独立 task。
+- [x] 新 task 明确区分 embedded、detection/router、ZIP encoding、CLI contract 四类工作。
+- [x] 文档明确 `fix-plan` 已完成，而这些内容属于后续新增范围。
+- [x] 每类工作至少包含一种可执行验证方式。
+- [x] 缺口补全：root candidate 采用 header-first 检测；extension 仅作 hint/fallback。
+- [x] 缺口补全：root candidate 通过扩展名 + `classify_zip_path` 双通道判定 business container，并发送 `BusinessContainerSkipped` 事件跳过。

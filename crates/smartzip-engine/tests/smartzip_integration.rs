@@ -15,8 +15,9 @@ use smartzip_core::{ArchiveFormat, EncodingMode};
 use smartzip_db::{password::PasswordRepository, SmartZipDb};
 use smartzip_encoding::ArchiveEncodingDetector;
 use smartzip_engine::{
-    format_from_extension, is_first_volume, ArchiveRecycleHandler, ExtractWorkflowRequest,
-    InteractivePasswordPrompter, SmartZipEngine,
+    format_from_extension, is_first_volume, ArchiveRecycleHandler, EmbeddedSelectionChoice,
+    ExtractWorkflowRequest, InteractiveEmbeddedPrompter, InteractivePasswordPrompter,
+    SmartZipEngine,
 };
 use smartzip_passwords::{PasswordCandidateRequest, PasswordService};
 use smartzip_scanner::{EmbeddedScanner, ScannerConfig};
@@ -927,6 +928,19 @@ impl InteractivePasswordPrompter for StaticPasswordPrompter {
     }
 }
 
+struct ExtractEmbeddedPrompter;
+
+#[async_trait]
+impl InteractiveEmbeddedPrompter for ExtractEmbeddedPrompter {
+    async fn prompt(
+        &self,
+        _archive_path: &Path,
+        _decision: &smartzip_core::DetectionDecision,
+    ) -> EmbeddedSelectionChoice {
+        EmbeddedSelectionChoice::Extract
+    }
+}
+
 #[tokio::test]
 async fn test_engine_interactive_password_reuses_carved_embedded_archive_path() {
     let archive = fixture_path("video_7z_pass.mp4");
@@ -940,9 +954,10 @@ async fn test_engine_interactive_password_reuses_carved_embedded_archive_path() 
     let prompter = StaticPasswordPrompter {
         password: "video-pass".into(),
     };
+    let embedded_prompter = ExtractEmbeddedPrompter;
 
     let result = engine
-        .extract_recursive(
+        .extract_recursive_interactive(
             &backend,
             &service,
             ExtractWorkflowRequest {
@@ -964,6 +979,8 @@ async fn test_engine_interactive_password_reuses_carved_embedded_archive_path() 
                 confirm_large_scan: false,
             },
             Some(&prompter),
+            None,
+            Some(&embedded_prompter),
             None,
         )
         .await

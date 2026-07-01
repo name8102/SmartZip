@@ -2,6 +2,8 @@ use crate::backend::{ArchiveBackend, ExtractionProgressCallback};
 use crate::types::*;
 use async_trait::async_trait;
 use smartzip_core::{ArchiveFormat, Result, SmartZipError};
+use std::fs::File;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -195,26 +197,66 @@ impl SevenZipBackend {
     }
 }
 
+fn cheap_probe_format(path: &Path) -> Option<ArchiveFormat> {
+    let mut file = File::open(path).ok()?;
+    let mut buf = [0u8; 512];
+    let n = file.read(&mut buf).ok()?;
+    let bytes = &buf[..n];
+
+    if bytes.starts_with(b"PK\x03\x04") || bytes.starts_with(b"PK\x05\x06") {
+        return Some(ArchiveFormat::Zip);
+    }
+    if bytes.starts_with(b"Rar!\x1a\x07\x00") || bytes.starts_with(b"Rar!\x1a\x07\x01\x00") {
+        return Some(ArchiveFormat::Rar);
+    }
+    if bytes.starts_with(b"\x37\x7a\xbc\xaf\x27\x1c") {
+        return Some(ArchiveFormat::SevenZip);
+    }
+    if bytes.starts_with(b"\x1f\x8b") {
+        return Some(ArchiveFormat::Gzip);
+    }
+    if bytes.starts_with(b"BZh") || bytes.starts_with(b"BZ") {
+        return Some(ArchiveFormat::Bzip2);
+    }
+    if bytes.starts_with(b"\xfd\x37\x7a\x58\x5a\x00") {
+        return Some(ArchiveFormat::Xz);
+    }
+    if bytes.len() >= 263 && &bytes[257..263] == b"ustar\0" {
+        return Some(ArchiveFormat::Tar);
+    }
+
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("7z") => Some(ArchiveFormat::SevenZip),
+        Some("rar") => Some(ArchiveFormat::Rar),
+        Some("tar") => Some(ArchiveFormat::Tar),
+        Some("gz") | Some("tgz") => Some(ArchiveFormat::Gzip),
+        Some("bz2") | Some("tbz2") => Some(ArchiveFormat::Bzip2),
+        Some("xz") | Some("txz") => Some(ArchiveFormat::Xz),
+        Some("cab") => Some(ArchiveFormat::Cab),
+        Some("iso") => Some(ArchiveFormat::Iso),
+        Some("dmg") => Some(ArchiveFormat::Dmg),
+        Some("zst") | Some("zstd") => Some(ArchiveFormat::Zstd),
+        Some("lz4") => Some(ArchiveFormat::Lz4),
+        Some("lzma") => Some(ArchiveFormat::Lzma),
+        Some("zip") => Some(ArchiveFormat::Zip),
+        _ => None,
+    }
+}
+
 #[async_trait]
 impl ArchiveBackend for SevenZipBackend {
     async fn probe(&self, path: &Path) -> Result<ArchiveProbe> {
-        let request = TestRequest {
-            archive: path.to_path_buf(),
-            format: None,
-            password: Some(String::new()),
-            encoding: smartzip_core::EncodingMode::Auto,
-        };
-        let result = self.test(request).await;
-        let (supported, encrypted) = match result {
-            Ok(result) => (result.ok, result.encrypted),
-            Err(SmartZipError::WrongPassword { .. }) => (true, Some(true)),
-            Err(_) => (false, None),
-        };
+        let format = cheap_probe_format(path);
         Ok(ArchiveProbe {
             path: path.to_path_buf(),
-            format: None,
-            encrypted,
-            supported,
+            format: format.clone(),
+            encrypted: None,
+            supported: format.is_some(),
         })
     }
 
@@ -539,7 +581,8 @@ mod tests {
         let probe = backend.probe(&archive).await.unwrap();
 
         assert!(probe.supported);
-        assert_eq!(probe.encrypted, Some(true));
+        assert_eq!(probe.format, Some(ArchiveFormat::SevenZip));
+        assert_eq!(probe.encrypted, None);
         let _ = std::fs::remove_dir_all(root);
     }
 

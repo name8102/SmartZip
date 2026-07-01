@@ -5,8 +5,9 @@ use smartzip_core::EncodingMode;
 use smartzip_db::{password::PasswordRepository, SmartZipDb};
 use smartzip_engine::name_score;
 use smartzip_engine::{
-    DetectRequest, ExtractWorkflowRequest, InteractiveOutputPrompter, InteractivePasswordPrompter,
-    OutputCollisionStrategy, SmartZipEngine,
+    DetectRequest, EmbeddedSelectionChoice, EncodingConfirmationChoice, ExtractWorkflowRequest,
+    InteractiveEmbeddedPrompter, InteractiveEncodingPrompter, InteractiveOutputPrompter,
+    InteractivePasswordPrompter, OutputCollisionStrategy, SmartZipEngine,
 };
 use smartzip_passwords::{PasswordCandidateRequest, PasswordService};
 use smartzip_platform::PlatformPaths;
@@ -489,7 +490,7 @@ async fn extract(
     let event_listener = (!json)
         .then(|| std::sync::Arc::new(render_extract_event) as smartzip_engine::TaskEventListener);
     let result = engine
-        .extract_recursive_with_listener(
+        .extract_recursive_with_listener_interactive(
             &backend,
             &service,
             ExtractWorkflowRequest {
@@ -513,7 +514,13 @@ async fn extract(
             Some(&StdinPrompter {
                 lock: stdin_lock.clone(),
             }),
-            Some(&StdinOutputPrompter { lock: stdin_lock }),
+            Some(&StdinOutputPrompter {
+                lock: stdin_lock.clone(),
+            }),
+            Some(&StdinEmbeddedPrompter {
+                lock: stdin_lock.clone(),
+            }),
+            Some(&StdinEncodingPrompter { lock: stdin_lock }),
             event_listener,
         )
         .await?;
@@ -556,6 +563,31 @@ fn render_extract_event(event: &smartzip_core::TaskEvent) {
                 "  encoding: {encoding} (confidence: {:.0}%)",
                 detection.confidence * 100.0
             );
+        }
+        smartzip_core::TaskEventKind::EmbeddedArchiveSelectionRequired {
+            path,
+            findings_count,
+        } => {
+            println!(
+                "  embedded selection required: {} ({} finding(s))",
+                path.display(),
+                findings_count
+            );
+        }
+        smartzip_core::TaskEventKind::LargeEmbeddedScanConfirmationRequired {
+            path,
+            file_size,
+            threshold,
+        } => {
+            eprintln!(
+                "  large embedded scan skipped without confirmation: {} ({} bytes > {} bytes)",
+                path.display(),
+                file_size,
+                threshold
+            );
+        }
+        smartzip_core::TaskEventKind::BusinessContainerSkipped { path, kind } => {
+            println!("  skipped business container {kind}: {}", path.display());
         }
         smartzip_core::TaskEventKind::OutputCreated { path } => {
             println!("  -> {}", path.display());
@@ -891,6 +923,52 @@ impl InteractiveOutputPrompter for StdinOutputPrompter {
     }
 }
 
+struct StdinEmbeddedPrompter {
+    lock: StdinLock,
+}
+
+#[async_trait]
+impl InteractiveEmbeddedPrompter for StdinEmbeddedPrompter {
+    async fn prompt(
+        &self,
+        archive_path: &Path,
+        decision: &smartzip_core::DetectionDecision,
+    ) -> EmbeddedSelectionChoice {
+        let lock = self.lock.0.clone();
+        let path = archive_path.to_path_buf();
+        let decision = decision.clone();
+        tokio::task::spawn_blocking(move || {
+            let _guard = lock.lock().unwrap();
+            prompt_embedded_stdin(&path, &decision)
+        })
+        .await
+        .unwrap_or(EmbeddedSelectionChoice::Skip)
+    }
+}
+
+struct StdinEncodingPrompter {
+    lock: StdinLock,
+}
+
+#[async_trait]
+impl InteractiveEncodingPrompter for StdinEncodingPrompter {
+    async fn prompt(
+        &self,
+        archive_path: &Path,
+        context: &smartzip_engine::EncodingConfirmationContext,
+    ) -> EncodingConfirmationChoice {
+        let lock = self.lock.0.clone();
+        let path = archive_path.to_path_buf();
+        let context = context.clone();
+        tokio::task::spawn_blocking(move || {
+            let _guard = lock.lock().unwrap();
+            prompt_encoding_stdin(&path, &context)
+        })
+        .await
+        .unwrap_or(EncodingConfirmationChoice::AcceptDetected)
+    }
+}
+
 fn prompt_password_stdin(path: &Path) -> Option<String> {
     use std::io::{self, IsTerminal, Write};
 
@@ -949,6 +1027,96 @@ fn prompt_output_collision_stdin(
             _ => {
                 eprintln!("  Please enter s, o, or r.");
             }
+        }
+    }
+}
+
+fn prompt_embedded_stdin(
+    path: &Path,
+    decision: &smartzip_core::DetectionDecision,
+) -> EmbeddedSelectionChoice {
+    use std::io::{self, IsTerminal, Write};
+
+    if !io::stdin().is_terminal() {
+        return EmbeddedSelectionChoice::Skip;
+    }
+
+    loop {
+        eprintln!("\n  Embedded archive decision required: {}", path.display());
+        eprintln!(
+            "  {} finding(s), reason: {}",
+            decision.findings_summary.len(),
+            decision.reason
+        );
+        eprint!("  Choose [e]xtract, [s]kip, [a]lways extract remaining ask findings: ");
+        let _ = io::stderr().flush();
+
+        let mut choice = String::new();
+        if io::stdin().read_line(&mut choice).is_err() {
+            return EmbeddedSelectionChoice::Skip;
+        }
+
+        match choice.trim().to_ascii_lowercase().as_str() {
+            "e" | "extract" => return EmbeddedSelectionChoice::Extract,
+            "s" | "skip" => return EmbeddedSelectionChoice::Skip,
+            "a" | "always" => return EmbeddedSelectionChoice::ExtractAll,
+            _ => eprintln!("  Please enter e, s, or a."),
+        }
+    }
+}
+
+fn prompt_encoding_stdin(
+    path: &Path,
+    context: &smartzip_engine::EncodingConfirmationContext,
+) -> EncodingConfirmationChoice {
+    use std::io::{self, IsTerminal, Write};
+
+    if !io::stdin().is_terminal() {
+        return EncodingConfirmationChoice::AcceptDetected;
+    }
+
+    let detected = match &context.detected.selected {
+        smartzip_core::EncodingMode::Auto => "auto".to_string(),
+        smartzip_core::EncodingMode::Override(value) => value.clone(),
+    };
+
+    loop {
+        eprintln!(
+            "\n  ZIP filename encoding looks suspicious: {}",
+            path.display()
+        );
+        eprintln!("  detected: {detected}");
+        if !context.suspicious_reasons.is_empty() {
+            eprintln!("  reasons: {}", context.suspicious_reasons.join(", "));
+        }
+        for preview in &context.preview_names {
+            eprintln!("  preview: {preview}");
+        }
+        eprint!("  Choose [Enter] accept, [m]anual encoding, [s]kip archive: ");
+        let _ = io::stderr().flush();
+
+        let mut choice = String::new();
+        if io::stdin().read_line(&mut choice).is_err() {
+            return EncodingConfirmationChoice::AcceptDetected;
+        }
+        match choice.trim() {
+            "" => return EncodingConfirmationChoice::AcceptDetected,
+            value if value.eq_ignore_ascii_case("s") || value.eq_ignore_ascii_case("skip") => {
+                return EncodingConfirmationChoice::SkipArchive;
+            }
+            value if value.eq_ignore_ascii_case("m") || value.eq_ignore_ascii_case("manual") => {
+                eprint!("  Enter encoding name: ");
+                let _ = io::stderr().flush();
+                let mut encoding = String::new();
+                if io::stdin().read_line(&mut encoding).is_err() {
+                    return EncodingConfirmationChoice::AcceptDetected;
+                }
+                let encoding = encoding.trim();
+                if !encoding.is_empty() {
+                    return EncodingConfirmationChoice::Override(encoding.to_string());
+                }
+            }
+            other => return EncodingConfirmationChoice::Override(other.to_string()),
         }
     }
 }

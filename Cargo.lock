@@ -5636,6 +5636,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "unicode-normalization",
+ "zip",
 ]
 
 [[package]]

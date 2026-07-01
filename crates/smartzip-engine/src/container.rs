@@ -1,4 +1,7 @@
 use smartzip_core::BusinessContainerKind;
+use std::fs::File;
+use std::path::Path;
+use zip::ZipArchive;
 
 /// Check if a ZIP listing indicates a business container.
 ///
@@ -55,6 +58,28 @@ pub fn classify_zip_listing(
     }
 
     None
+}
+
+pub fn classify_zip_path(path: &Path) -> Option<BusinessContainerKind> {
+    let file = File::open(path).ok()?;
+    let mut archive = ZipArchive::new(file).ok()?;
+    let mut entry_paths = Vec::new();
+    let mut has_archive_entries = false;
+
+    for index in 0..archive.len() {
+        let entry = archive.by_index(index).ok()?;
+        let name = entry.name().to_string();
+        let lower = name.to_ascii_lowercase();
+        has_archive_entries |= matches!(
+            Path::new(&lower)
+                .extension()
+                .and_then(|extension| extension.to_str()),
+            Some("zip" | "7z" | "rar" | "tar" | "gz" | "bz2" | "xz")
+        );
+        entry_paths.push(name);
+    }
+
+    classify_zip_listing(&entry_paths, has_archive_entries)
 }
 
 #[cfg(test)]
