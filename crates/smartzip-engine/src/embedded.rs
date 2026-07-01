@@ -16,7 +16,9 @@ pub fn compute_ratio(file_size: u64, finding: &EmbeddedArchiveFinding) -> Option
     if file_size == 0 {
         return None;
     }
-    let effective = finding.size.unwrap_or(file_size.saturating_sub(finding.offset));
+    let effective = finding
+        .size
+        .unwrap_or(file_size.saturating_sub(finding.offset));
     if effective == 0 {
         return None;
     }
@@ -148,10 +150,7 @@ pub fn select_embedded_action(
     }
 }
 
-fn find_dominant(
-    findings: &[EmbeddedArchiveFinding],
-    file_size: u64,
-) -> Option<(usize, f64)> {
+fn find_dominant(findings: &[EmbeddedArchiveFinding], file_size: u64) -> Option<(usize, f64)> {
     findings
         .iter()
         .enumerate()
@@ -283,10 +282,7 @@ mod tests {
         let f = finding(10, None, ArchiveFormat::Rar);
         let d = select_embedded_action(100, &[f], &default_policy(), false);
         let ratio = d.archive_ratio.unwrap();
-        assert!(
-            (ratio - 0.90).abs() < 0.01,
-            "expected ~0.90, got {ratio}"
-        );
+        assert!((ratio - 0.90).abs() < 0.01, "expected ~0.90, got {ratio}");
         assert_eq!(d.kind, DetectionKind::PrependedCarrier);
     }
 

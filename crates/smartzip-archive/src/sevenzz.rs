@@ -1,9 +1,10 @@
-use crate::backend::ArchiveBackend;
+use crate::backend::{ArchiveBackend, ExtractionProgressCallback};
 use crate::types::*;
 use async_trait::async_trait;
 use smartzip_core::{ArchiveFormat, Result, SmartZipError};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 
 #[derive(Debug, Clone)]
@@ -82,6 +83,62 @@ impl SevenZipBackend {
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         })
+    }
+
+    async fn run_with_progress(
+        &self,
+        args: &[String],
+        progress: Option<ExtractionProgressCallback>,
+    ) -> Result<BackendCommandOutput> {
+        let mut child = Command::new(&self.executable)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|source| SmartZipError::io(Some(self.executable.clone()), source))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| SmartZipError::BackendFailed {
+                backend: "7zz".into(),
+                exit_code: None,
+                stderr: "failed to capture 7z stdout".into(),
+            })?;
+        let mut stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| SmartZipError::BackendFailed {
+                backend: "7zz".into(),
+                exit_code: None,
+                stderr: "failed to capture 7z stderr".into(),
+            })?;
+
+        let stdout_future = read_progress_stream(stdout, progress);
+        let stderr_future = async {
+            let mut bytes = Vec::new();
+            stderr.read_to_end(&mut bytes).await?;
+            Ok::<_, std::io::Error>(bytes)
+        };
+        let wait_future = child.wait();
+        let (stdout, stderr, status) = tokio::try_join!(stdout_future, stderr_future, wait_future)
+            .map_err(|source| SmartZipError::io(Some(self.executable.clone()), source))?;
+
+        Ok(BackendCommandOutput {
+            status: status.code(),
+            stdout: String::from_utf8_lossy(&stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&stderr).into_owned(),
+        })
+    }
+
+    fn output_indicates_failure(output: &BackendCommandOutput) -> bool {
+        let combined = format!("{}\n{}", output.stdout, output.stderr);
+        let lower = combined.to_ascii_lowercase();
+        lower.contains("error:")
+            || lower.contains("errors:")
+            || lower.contains("headers error")
+            || lower.contains("unexpected end of archive")
+            || lower.contains("can not open the file as archive")
     }
 
     fn encoding_arg(encoding: &smartzip_core::EncodingMode) -> Option<String> {
@@ -171,7 +228,7 @@ impl ArchiveBackend for SevenZipBackend {
         }
         args.push(request.archive.to_string_lossy().into_owned());
         let output = self.run(&args).await?;
-        if output.status != Some(0) {
+        if output.status != Some(0) || Self::output_indicates_failure(&output) {
             return Err(self.map_failure(&output, &request.archive));
         }
         Ok(ArchiveListing {
@@ -190,7 +247,7 @@ impl ArchiveBackend for SevenZipBackend {
         }
         args.push(request.archive.to_string_lossy().into_owned());
         let output = self.run(&args).await?;
-        if output.status != Some(0) {
+        if output.status != Some(0) || Self::output_indicates_failure(&output) {
             return Err(self.map_failure(&output, &request.archive));
         }
         Ok(TestResult {
@@ -200,7 +257,18 @@ impl ArchiveBackend for SevenZipBackend {
     }
 
     async fn extract(&self, request: ExtractArchiveRequest) -> Result<ExtractArchiveResult> {
+        self.extract_with_progress(request, None).await
+    }
+
+    async fn extract_with_progress(
+        &self,
+        request: ExtractArchiveRequest,
+        progress: Option<ExtractionProgressCallback>,
+    ) -> Result<ExtractArchiveResult> {
         let mut args: Vec<String> = vec!["x".into(), "-y".into()];
+        if progress.is_some() {
+            args.push("-bsp1".into());
+        }
         if let Some(pw) = Self::password_arg(&request.password) {
             args.push(pw);
         }
@@ -209,9 +277,13 @@ impl ArchiveBackend for SevenZipBackend {
         }
         args.push(format!("-o{}", request.output_dir.display()));
         args.push(request.archive.to_string_lossy().into_owned());
-        let output = self.run(&args).await?;
-        if output.status != Some(0) {
+        let completion_callback = progress.clone();
+        let output = self.run_with_progress(&args, progress).await?;
+        if output.status != Some(0) || Self::output_indicates_failure(&output) {
             return Err(self.map_failure(&output, &request.archive));
+        }
+        if let Some(callback) = completion_callback {
+            callback(100.0);
         }
         Ok(ExtractArchiveResult {
             output_dir: request.output_dir,
@@ -257,6 +329,74 @@ impl ArchiveBackend for SevenZipBackend {
             supports_test: true,
         }
     }
+
+    fn should_test_before_extract(&self, _archive: &Path, _format: Option<&ArchiveFormat>) -> bool {
+        false
+    }
+}
+
+async fn read_progress_stream(
+    mut reader: impl AsyncRead + Unpin,
+    progress: Option<ExtractionProgressCallback>,
+) -> std::io::Result<Vec<u8>> {
+    let mut output = Vec::new();
+    let mut pending = Vec::new();
+    let mut buffer = [0u8; 4096];
+    let mut last_percent = None;
+
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        output.extend_from_slice(&buffer[..read]);
+        pending.extend_from_slice(&buffer[..read]);
+
+        let mut start = 0;
+        for index in 0..pending.len() {
+            if matches!(pending[index], b'\r' | b'\n') {
+                report_progress(&pending[start..index], &progress, &mut last_percent);
+                start = index + 1;
+            }
+        }
+        if start > 0 {
+            pending.drain(..start);
+        }
+    }
+    report_progress(&pending, &progress, &mut last_percent);
+    Ok(output)
+}
+
+fn report_progress(
+    line: &[u8],
+    callback: &Option<ExtractionProgressCallback>,
+    last_percent: &mut Option<u8>,
+) {
+    let Some(percent) = parse_progress_percent(line) else {
+        return;
+    };
+    if last_percent.replace(percent) != Some(percent) {
+        if let Some(callback) = callback {
+            callback(f32::from(percent));
+        }
+    }
+}
+
+fn parse_progress_percent(line: &[u8]) -> Option<u8> {
+    let percent_index = line.iter().position(|byte| *byte == b'%')?;
+    let digits_end = line[..percent_index]
+        .iter()
+        .rposition(|byte| byte.is_ascii_digit())?
+        + 1;
+    let digits_start = line[..digits_end]
+        .iter()
+        .rposition(|byte| !byte.is_ascii_digit())
+        .map_or(0, |index| index + 1);
+    let value = std::str::from_utf8(&line[digits_start..digits_end])
+        .ok()?
+        .parse::<u8>()
+        .ok()?;
+    (value <= 100).then_some(value)
 }
 
 fn parse_entries(stdout: &str) -> Vec<ArchiveEntry> {
@@ -354,6 +494,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn detects_fatal_markers_even_when_exit_code_is_missing() {
+        let output = BackendCommandOutput {
+            status: Some(0),
+            stdout: "ERRORS:\nHeaders Error\n".into(),
+            stderr: String::new(),
+        };
+        assert!(SevenZipBackend::output_indicates_failure(&output));
+    }
+
+    #[test]
+    fn parses_7z_progress_lines() {
+        assert_eq!(parse_progress_percent(b"  0%"), Some(0));
+        assert_eq!(
+            parse_progress_percent(b" 42% 12 - nested/path/file.txt"),
+            Some(42)
+        );
+        assert_eq!(parse_progress_percent(b"100% Everything is Ok"), Some(100));
+        assert_eq!(parse_progress_percent(b"Size = 42"), None);
+        assert_eq!(parse_progress_percent(b"101% invalid"), None);
+    }
+
     #[tokio::test]
     async fn probe_handles_encrypted_archives_without_prompting() {
         let root = std::env::temp_dir().join(format!("smartzip-probe-{}", std::process::id()));
@@ -379,5 +541,52 @@ mod tests {
         assert!(probe.supported);
         assert_eq!(probe.encrypted, Some(true));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn extract_reports_progress_and_writes_output() {
+        use std::sync::{Arc, Mutex};
+
+        let root = tempfile::tempdir().unwrap();
+        let archive = root.path().join("progress.7z");
+        let input = root.path().join("hello.txt");
+        let output = root.path().join("output");
+        std::fs::write(&input, b"hello progress").unwrap();
+
+        let status = std::process::Command::new("7z")
+            .arg("a")
+            .arg(&archive)
+            .arg(&input)
+            .status()
+            .unwrap();
+        assert!(status.success(), "7z must be available in PATH");
+
+        let percentages = Arc::new(Mutex::new(Vec::new()));
+        let callback_values = Arc::clone(&percentages);
+        let callback: ExtractionProgressCallback = Arc::new(move |percent| {
+            callback_values.lock().unwrap().push(percent);
+        });
+        let backend =
+            SevenZipBackend::locate(&SevenZipLocator::default()).expect("7z/7zz must be available");
+
+        backend
+            .extract_with_progress(
+                ExtractArchiveRequest {
+                    archive,
+                    format: Some(ArchiveFormat::SevenZip),
+                    output_dir: output.clone(),
+                    password: None,
+                    encoding: smartzip_core::EncodingMode::Auto,
+                },
+                Some(callback),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(percentages.lock().unwrap().last(), Some(&100.0));
+        assert_eq!(
+            std::fs::read(output.join("hello.txt")).unwrap(),
+            b"hello progress"
+        );
     }
 }

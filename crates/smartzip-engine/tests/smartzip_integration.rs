@@ -8,19 +8,20 @@
 use async_trait::async_trait;
 use rstest::*;
 use smartzip_archive::{
-    ArchiveBackend, ExtractArchiveRequest, ListRequest, SevenZipBackend, SevenZipLocator,
-    TestRequest,
+    ArchiveBackend, BackendRouter, ExtractArchiveRequest, ListRequest, SevenZipBackend,
+    SevenZipLocator, TestRequest,
 };
 use smartzip_core::{ArchiveFormat, EncodingMode};
 use smartzip_db::{password::PasswordRepository, SmartZipDb};
 use smartzip_encoding::ArchiveEncodingDetector;
 use smartzip_engine::{
-    format_from_extension, is_first_volume, ExtractWorkflowRequest, InteractivePasswordPrompter,
-    SmartZipEngine,
+    format_from_extension, is_first_volume, ArchiveRecycleHandler, ExtractWorkflowRequest,
+    InteractivePasswordPrompter, SmartZipEngine,
 };
 use smartzip_passwords::{PasswordCandidateRequest, PasswordService};
 use smartzip_scanner::{EmbeddedScanner, ScannerConfig};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
 
 // ── Helpers ───────────────────────────────────────────────────────────────
@@ -44,6 +45,55 @@ fn fixture_path(name: &str) -> PathBuf {
 fn backend() -> SevenZipBackend {
     SevenZipBackend::locate(&SevenZipLocator::default())
         .expect("7z/7zz must be available in PATH to run integration tests")
+}
+
+fn engine_with_test_recycler() -> (SmartZipEngine, Arc<Mutex<Vec<PathBuf>>>) {
+    let recycled = Arc::new(Mutex::new(Vec::new()));
+    let recycled_for_handler = Arc::clone(&recycled);
+    let handler: ArchiveRecycleHandler = Arc::new(move |path| {
+        std::fs::remove_file(&path)?;
+        recycled_for_handler.lock().unwrap().push(path.clone());
+        Ok(())
+    });
+    (
+        SmartZipEngine::default().with_archive_recycler(handler),
+        recycled,
+    )
+}
+
+fn router() -> BackendRouter {
+    BackendRouter::locate().expect("backend router should initialize")
+}
+
+fn create_split_encrypted_zip(root: &Path, password: &str) -> PathBuf {
+    let input = root.join("big.bin");
+    let first_volume = root.join("split.zip");
+    let mut state = 0x1234_5678_9ABC_DEF0_u64;
+    let payload: Vec<u8> = (0..200_000)
+        .map(|_| {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (state >> 24) as u8
+        })
+        .collect();
+    std::fs::write(&input, payload).unwrap();
+
+    let status = std::process::Command::new("zip")
+        .arg("-s")
+        .arg("64k")
+        .arg("-P")
+        .arg(password)
+        .arg("split.zip")
+        .arg("big.bin")
+        .current_dir(root)
+        .status()
+        .expect("zip must be available in PATH");
+    assert!(status.success(), "zip should create split encrypted zip");
+    assert!(
+        root.join("split.z01").exists(),
+        "first split sidecar should exist"
+    );
+    assert!(first_volume.exists(), "split zip entrypoint should exist");
+    first_volume
 }
 
 // ── Basic extraction (no password) ────────────────────────────────────────
@@ -332,8 +382,7 @@ fn test_scanner_does_not_panic_on_archive_fixtures(#[case] fixture_name: &str) {
 /// the file path.  The nested tar candidate then uses that file path as a
 /// directory prefix → `create_dir_all` fails with `File exists`.
 ///
-/// Remove `#[ignore]` after P0-2 nested output path model is fixed.
-#[ignore = "TDD: blocked by P0-2 nested output path model fix"]
+/// Regression fixed by P0-2 nested output-root separation.
 #[tokio::test]
 #[allow(non_snake_case)]
 async fn test_TDD_tar_gz_name_equivalent_to_inner_tar_collision() {
@@ -347,7 +396,7 @@ async fn test_TDD_tar_gz_name_equivalent_to_inner_tar_collision() {
     let backend = backend();
     let db = SmartZipDb::in_memory().unwrap();
     let service = PasswordService::new(PasswordRepository::new(db.connection()));
-    let engine = SmartZipEngine::default();
+    let (engine, recycled) = engine_with_test_recycler();
     let output = TempDir::new().unwrap();
 
     let result = engine
@@ -396,6 +445,16 @@ async fn test_TDD_tar_gz_name_equivalent_to_inner_tar_collision() {
         "expected leaf_rt.txt in {:?}",
         output.path()
     );
+    assert!(
+        recycled
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|path| path.file_name().and_then(|name| name.to_str()) == Some("real_tar.tar")),
+        "processed inner tar should be recycled; processed={:?}, recycled={:?}",
+        workflow.processed,
+        recycled.lock().unwrap()
+    );
 }
 
 /// TDD regression: `zip -> tar.gz -> tar -> leaf` three-level path collision.
@@ -404,8 +463,7 @@ async fn test_TDD_tar_gz_name_equivalent_to_inner_tar_collision() {
 /// archive.  The gzip→tar step hits the same `CommitSingleFileAsInnerName`
 /// path collision described above.
 ///
-/// Remove `#[ignore]` after P0-2 nested output path model is fixed.
-#[ignore = "TDD: blocked by P0-2 nested output path model fix"]
+/// Regression fixed by P0-2 nested output-root separation.
 #[tokio::test]
 #[allow(non_snake_case)]
 async fn test_TDD_zip_containing_tar_gz_three_level_collision() {
@@ -415,7 +473,7 @@ async fn test_TDD_zip_containing_tar_gz_three_level_collision() {
     let backend = backend();
     let db = SmartZipDb::in_memory().unwrap();
     let service = PasswordService::new(PasswordRepository::new(db.connection()));
-    let engine = SmartZipEngine::default();
+    let (engine, recycled) = engine_with_test_recycler();
     let output = TempDir::new().unwrap();
 
     let result = engine
@@ -459,6 +517,15 @@ async fn test_TDD_zip_containing_tar_gz_three_level_collision() {
         "expected leaf_rt.txt from nested tar.gz chain in {:?}",
         output.path()
     );
+    let recycled_names = recycled
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|path| path.file_name().and_then(|name| name.to_str()))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    assert!(recycled_names.iter().any(|name| name == "real_tar.tar.gz"));
+    assert!(recycled_names.iter().any(|name| name == "real_tar.tar"));
 }
 
 /// TDD regression: `zip -> inner.zip -> leaf` path collision.
@@ -468,8 +535,7 @@ async fn test_TDD_zip_containing_tar_gz_three_level_collision() {
 /// `CommitSingleFileAsInnerName` for an archive file; the nested inner-zip
 /// candidate must not treat that file path as a directory prefix.
 ///
-/// Remove `#[ignore]` after P0-2 nested output path model is fixed.
-#[ignore = "TDD: blocked by P0-2 nested output path model fix"]
+/// Regression fixed by P0-2 nested output-root separation.
 #[tokio::test]
 #[allow(non_snake_case)]
 async fn test_TDD_zip_inner_zip_single_file_path_collision() {
@@ -479,7 +545,7 @@ async fn test_TDD_zip_inner_zip_single_file_path_collision() {
     let backend = backend();
     let db = SmartZipDb::in_memory().unwrap();
     let service = PasswordService::new(PasswordRepository::new(db.connection()));
-    let engine = SmartZipEngine::default();
+    let (engine, recycled) = engine_with_test_recycler();
     let output = TempDir::new().unwrap();
 
     let result = engine
@@ -526,6 +592,12 @@ async fn test_TDD_zip_inner_zip_single_file_path_collision() {
         "expected zip_inner_leaf.txt in {:?}",
         output.path()
     );
+    assert!(
+        recycled.lock().unwrap().iter().any(|path| {
+            path.file_name().and_then(|name| name.to_str()) == Some("zip_inner_zip.zip")
+        }),
+        "processed inner zip should be recycled"
+    );
 }
 
 /// TDD regression: alternate naming variant of the `.tar.gz` path collision.
@@ -534,8 +606,7 @@ async fn test_TDD_zip_inner_zip_single_file_path_collision() {
 /// Same root cause as `real_tar.tar.gz` — different name confirms the
 /// trigger is the Equivalent similarity, not a specific name string.
 ///
-/// Remove `#[ignore]` after P0-2 nested output path model is fixed.
-#[ignore = "TDD: blocked by P0-2 nested output path model fix"]
+/// Regression fixed by P0-2 nested output-root separation.
 #[tokio::test]
 #[allow(non_snake_case)]
 async fn test_TDD_tar_gz_name_equivalent_variant_collision() {
@@ -545,7 +616,7 @@ async fn test_TDD_tar_gz_name_equivalent_variant_collision() {
     let backend = backend();
     let db = SmartZipDb::in_memory().unwrap();
     let service = PasswordService::new(PasswordRepository::new(db.connection()));
-    let engine = SmartZipEngine::default();
+    let (engine, recycled) = engine_with_test_recycler();
     let output = TempDir::new().unwrap();
 
     let result = engine
@@ -588,6 +659,65 @@ async fn test_TDD_tar_gz_name_equivalent_variant_collision() {
         "expected leaf_m.txt in {:?}",
         output.path()
     );
+    assert!(
+        recycled
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|path| path.file_name().and_then(|name| name.to_str()) == Some("matching.tar")),
+        "processed inner tar should be recycled"
+    );
+}
+
+#[tokio::test]
+async fn test_nested_archive_recycle_failure_warns_and_preserves_success() {
+    let archive = fixture_path("real_tar.tar.gz");
+    let backend = backend();
+    let db = SmartZipDb::in_memory().unwrap();
+    let service = PasswordService::new(PasswordRepository::new(db.connection()));
+    let recycler: ArchiveRecycleHandler = Arc::new(|_| {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "test recycler rejected path",
+        ))
+    });
+    let engine = SmartZipEngine::default().with_archive_recycler(recycler);
+    let output = TempDir::new().unwrap();
+
+    let result = engine
+        .extract_recursive(
+            &backend,
+            &service,
+            ExtractWorkflowRequest {
+                inputs: vec![archive],
+                output_dir: output.path().to_path_buf(),
+                recursion_limit: 2,
+                encoding_mode: EncodingMode::Auto,
+                scanner: ScannerConfig::default(),
+                password_candidates: PasswordCandidateRequest::default(),
+                layout_policy: Default::default(),
+                single_root_name_policy: Default::default(),
+                embedded_scan_mode: smartzip_core::EmbeddedScanMode::default(),
+                dominant_min_ratio: 0.70,
+                confirm_large_scan: false,
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result.processed.len(), 2);
+    assert!(find_file(output.path(), "leaf_rt.txt").is_some());
+    assert!(
+        find_file(output.path(), "real_tar.tar").is_some(),
+        "failed recycle must preserve the inner archive"
+    );
+    assert!(result.events.iter().any(|event| matches!(
+        event.kind,
+        smartzip_core::TaskEventKind::Warning { ref message }
+            if message.contains("failed to move processed nested archive")
+    )));
 }
 
 // ── Engine: full extract_recursive ────────────────────────────────────────
@@ -851,6 +981,118 @@ async fn test_engine_interactive_password_reuses_carved_embedded_archive_path() 
 }
 
 #[tokio::test]
+async fn test_router_extracts_split_encrypted_zip_with_manual_password() {
+    let root = TempDir::new().unwrap();
+    let archive = create_split_encrypted_zip(root.path(), "secret");
+
+    let backend = router();
+    let db = SmartZipDb::in_memory().unwrap();
+    let service = PasswordService::new(PasswordRepository::new(db.connection()));
+    let engine = SmartZipEngine::default();
+    let output = TempDir::new().unwrap();
+
+    let result = engine
+        .extract_recursive(
+            &backend,
+            &service,
+            ExtractWorkflowRequest {
+                inputs: vec![archive],
+                output_dir: output.path().to_path_buf(),
+                recursion_limit: 0,
+                encoding_mode: EncodingMode::Auto,
+                scanner: ScannerConfig::default(),
+                password_candidates: PasswordCandidateRequest {
+                    manual: vec!["secret".into()],
+                    clipboard: None,
+                    include_empty: false,
+                    limit: 8,
+                },
+                layout_policy: smartzip_engine::layout::OutputLayoutPolicy::default(),
+                single_root_name_policy: smartzip_engine::layout::SingleRootNamePolicy::default(),
+                embedded_scan_mode: smartzip_core::EmbeddedScanMode::default(),
+                dominant_min_ratio: 0.70,
+                confirm_large_scan: false,
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        result.processed.len(),
+        1,
+        "split zip should extract successfully"
+    );
+    assert!(result.skipped.is_empty(), "split zip should not be skipped");
+    assert!(
+        find_file(output.path(), "big.bin").is_some(),
+        "split zip payload should be extracted"
+    );
+}
+
+#[tokio::test]
+async fn test_router_prompts_for_split_encrypted_zip_password_when_missing() {
+    let root = TempDir::new().unwrap();
+    let archive = create_split_encrypted_zip(root.path(), "secret");
+
+    let backend = router();
+    let db = SmartZipDb::in_memory().unwrap();
+    let service = PasswordService::new(PasswordRepository::new(db.connection()));
+    let engine = SmartZipEngine::default();
+    let output = TempDir::new().unwrap();
+    let prompter = StaticPasswordPrompter {
+        password: "secret".into(),
+    };
+
+    let result = engine
+        .extract_recursive(
+            &backend,
+            &service,
+            ExtractWorkflowRequest {
+                inputs: vec![archive],
+                output_dir: output.path().to_path_buf(),
+                recursion_limit: 0,
+                encoding_mode: EncodingMode::Auto,
+                scanner: ScannerConfig::default(),
+                password_candidates: PasswordCandidateRequest {
+                    manual: Vec::new(),
+                    clipboard: None,
+                    include_empty: true,
+                    limit: 8,
+                },
+                layout_policy: smartzip_engine::layout::OutputLayoutPolicy::default(),
+                single_root_name_policy: smartzip_engine::layout::SingleRootNamePolicy::default(),
+                embedded_scan_mode: smartzip_core::EmbeddedScanMode::default(),
+                dominant_min_ratio: 0.70,
+                confirm_large_scan: false,
+            },
+            Some(&prompter),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        result.processed.len(),
+        1,
+        "prompted split zip should extract"
+    );
+    assert!(
+        result
+            .events
+            .iter()
+            .all(|event| !matches!(event.kind, smartzip_core::TaskEventKind::Failed { .. })),
+        "prompted split zip should not end in failure: {:?}",
+        result.events
+    );
+    assert!(
+        find_file(output.path(), "big.bin").is_some(),
+        "prompted split zip payload should be extracted"
+    );
+}
+
+#[tokio::test]
 async fn test_engine_respects_recursion_limit() {
     let archive = fixture_path("nested_multi_level.zip");
     assert!(archive.exists(), "fixture missing: nested_multi_level.zip");
@@ -858,7 +1100,7 @@ async fn test_engine_respects_recursion_limit() {
     let backend = backend();
     let db = SmartZipDb::in_memory().unwrap();
     let service = PasswordService::new(PasswordRepository::new(db.connection()));
-    let engine = SmartZipEngine::default();
+    let (engine, _) = engine_with_test_recycler();
     let output = TempDir::new().unwrap();
 
     let result = engine
@@ -910,6 +1152,121 @@ async fn test_engine_respects_recursion_limit() {
 }
 
 #[tokio::test]
+async fn test_engine_extracts_nested_multi_level_without_path_collision() {
+    let archive = fixture_path("nested_multi_level.zip");
+    assert!(archive.exists(), "fixture missing: nested_multi_level.zip");
+
+    let backend = backend();
+    let db = SmartZipDb::in_memory().unwrap();
+    let service = PasswordService::new(PasswordRepository::new(db.connection()));
+    let (engine, recycled) = engine_with_test_recycler();
+    let output = TempDir::new().unwrap();
+
+    let result = engine
+        .extract_recursive(
+            &backend,
+            &service,
+            ExtractWorkflowRequest {
+                inputs: vec![archive.clone()],
+                output_dir: output.path().to_path_buf(),
+                recursion_limit: 3,
+                encoding_mode: EncodingMode::Auto,
+                scanner: ScannerConfig::default(),
+                password_candidates: PasswordCandidateRequest::default(),
+                layout_policy: smartzip_engine::layout::OutputLayoutPolicy::default(),
+                single_root_name_policy: smartzip_engine::layout::SingleRootNamePolicy::default(),
+                embedded_scan_mode: smartzip_core::EmbeddedScanMode::default(),
+                dominant_min_ratio: 0.70,
+                confirm_large_scan: false,
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        result.processed.len(),
+        3,
+        "outer + L2 + L3 should all extract"
+    );
+    assert!(
+        result.skipped.is_empty(),
+        "no candidate should be skipped: {:?}",
+        result.skipped
+    );
+    assert!(
+        result
+            .events
+            .iter()
+            .all(|event| !matches!(event.kind, smartzip_core::TaskEventKind::Failed { .. })),
+        "unexpected failure events: {:?}",
+        result.events
+    );
+    assert!(
+        find_file(output.path(), "deep.txt").is_some(),
+        "expected deepest file to be extracted"
+    );
+    assert_eq!(
+        recycled.lock().unwrap().len(),
+        2,
+        "L2.zip and L3.zip should both be recycled after deeper discovery"
+    );
+}
+
+#[tokio::test]
+async fn test_engine_reports_wrong_password_as_failure() {
+    let archive = fixture_path("pass_cn.zip");
+    assert!(archive.exists(), "fixture missing: pass_cn.zip");
+
+    let backend = backend();
+    let db = SmartZipDb::in_memory().unwrap();
+    let service = PasswordService::new(PasswordRepository::new(db.connection()));
+    let engine = SmartZipEngine::default();
+    let output = TempDir::new().unwrap();
+
+    let result = engine
+        .extract_recursive(
+            &backend,
+            &service,
+            ExtractWorkflowRequest {
+                inputs: vec![archive.clone()],
+                output_dir: output.path().to_path_buf(),
+                recursion_limit: 1,
+                encoding_mode: EncodingMode::Auto,
+                scanner: ScannerConfig::default(),
+                password_candidates: PasswordCandidateRequest {
+                    manual: vec!["wrong-password".into()],
+                    clipboard: None,
+                    include_empty: false,
+                    limit: 8,
+                },
+                layout_policy: smartzip_engine::layout::OutputLayoutPolicy::default(),
+                single_root_name_policy: smartzip_engine::layout::SingleRootNamePolicy::default(),
+                embedded_scan_mode: smartzip_core::EmbeddedScanMode::default(),
+                dominant_min_ratio: 0.70,
+                confirm_large_scan: false,
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert!(result.processed.is_empty());
+    assert_eq!(result.skipped.len(), 1);
+    assert!(
+        result.events.iter().any(|event| matches!(
+            event.kind,
+            smartzip_core::TaskEventKind::Failed { ref error }
+            if error.contains("wrong password")
+        )),
+        "wrong password should surface as a failure event: {:?}",
+        result.events
+    );
+}
+
+#[tokio::test]
 async fn test_engine_preserves_nested_archive_paths() {
     let archive = fixture_path("nested_zip_in_zip.zip");
     assert!(archive.exists(), "fixture missing: nested_zip_in_zip.zip");
@@ -917,7 +1274,7 @@ async fn test_engine_preserves_nested_archive_paths() {
     let backend = backend();
     let db = SmartZipDb::in_memory().unwrap();
     let service = PasswordService::new(PasswordRepository::new(db.connection()));
-    let engine = SmartZipEngine::default();
+    let (engine, _) = engine_with_test_recycler();
     let output = TempDir::new().unwrap();
 
     let result = engine

@@ -29,9 +29,7 @@ pub fn classify_zip_listing(
         return Some(BusinessContainerKind::Epub);
     }
 
-    if has("AndroidManifest.xml")
-        && (has("classes.dex") || has("resources.arsc"))
-    {
+    if has("AndroidManifest.xml") && (has("classes.dex") || has("resources.arsc")) {
         return Some(BusinessContainerKind::Apk);
     }
 

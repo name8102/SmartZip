@@ -3,7 +3,7 @@ use crate::types::*;
 use async_trait::async_trait;
 use smartzip_core::{ArchiveFormat, Result, SmartZipError};
 use std::fs::File;
-use std::io::Read;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use zip::write::SimpleFileOptions;
 use zip::{ZipArchive, ZipWriter};
@@ -24,12 +24,7 @@ impl NativeZipBackend {
 
     /// Check if any entry in the archive is encrypted.
     fn has_encrypted_entries(archive: &mut ZipArchive<File>) -> bool {
-        (0..archive.len()).any(|i| {
-            archive
-                .by_index_raw(i)
-                .ok()
-                .is_some_and(|e| e.encrypted())
-        })
+        (0..archive.len()).any(|i| archive.by_index_raw(i).ok().is_some_and(|e| e.encrypted()))
     }
 
     /// Open an entry by index, using password if provided.
@@ -65,6 +60,22 @@ impl NativeZipBackend {
             .by_index(index)
             .map_err(|source| map_zip_error(source, archive_path))
     }
+
+    fn decode_entry_name(
+        raw_name: &[u8],
+        encoding: &smartzip_core::EncodingMode,
+    ) -> Result<String> {
+        match encoding {
+            smartzip_core::EncodingMode::Override(enc) => {
+                smartzip_encoding::decode_name(raw_name, enc).ok_or_else(|| {
+                    SmartZipError::UnsafeArchivePath {
+                        entry: String::from_utf8_lossy(raw_name).into_owned(),
+                    }
+                })
+            }
+            smartzip_core::EncodingMode::Auto => Ok(String::from_utf8_lossy(raw_name).into_owned()),
+        }
+    }
 }
 
 #[async_trait]
@@ -88,7 +99,7 @@ impl ArchiveBackend for NativeZipBackend {
                 .by_index_raw(i)
                 .map_err(|source| map_zip_error(source, &request.archive))?;
             let name_bytes = entry.name_raw();
-            let name = String::from_utf8_lossy(name_bytes).into_owned();
+            let name = Self::decode_entry_name(name_bytes, &request.encoding)?;
             entries.push(ArchiveEntry {
                 path: PathBuf::from(&name),
                 raw_name: name_bytes.to_vec(),
@@ -111,12 +122,7 @@ impl ArchiveBackend for NativeZipBackend {
         let mut buf = vec![0u8; 8192];
 
         for i in 0..len {
-            let mut entry = Self::open_entry(
-                &mut archive,
-                i,
-                &request.password,
-                &request.archive,
-            )?;
+            let mut entry = Self::open_entry(&mut archive, i, &request.password, &request.archive)?;
             loop {
                 let n = entry
                     .read(&mut buf)
@@ -222,12 +228,7 @@ fn extract_sync(
     }
 
     for i in 0..len {
-        let mut entry = NativeZipBackend::open_entry(
-            &mut archive,
-            i,
-            password,
-            archive_path,
-        )?;
+        let mut entry = NativeZipBackend::open_entry(&mut archive, i, password, archive_path)?;
 
         let uncompressed = entry.size();
         if uncompressed > limits.max_single_entry_bytes {
@@ -259,46 +260,33 @@ fn extract_sync(
                 exit_code: None,
                 stderr: format!(
                     "projected total output {} bytes would exceed limit {}",
-                    total_written + uncompressed, limits.max_total_output_bytes
+                    total_written + uncompressed,
+                    limits.max_total_output_bytes
                 ),
             });
         }
 
         let raw_name = entry.name_raw();
         let relative_path = match &request.encoding {
-            smartzip_core::EncodingMode::Override(enc) => {
-                let decoded = smartzip_encoding::decode_name(raw_name, enc).ok_or_else(|| {
-                    SmartZipError::UnsafeArchivePath {
-                        entry: String::from_utf8_lossy(raw_name).into_owned(),
-                    }
-                })?;
-                crate::safety::safe_entry_path(decoded.as_bytes()).ok_or(SmartZipError::UnsafeArchivePath { entry: decoded })?
+            smartzip_core::EncodingMode::Override(_) => {
+                let decoded = NativeZipBackend::decode_entry_name(raw_name, &request.encoding)?;
+                crate::safety::safe_entry_path(decoded.as_bytes())
+                    .ok_or(SmartZipError::UnsafeArchivePath { entry: decoded })?
             }
-            smartzip_core::EncodingMode::Auto => {
-                crate::safety::safe_entry_path(raw_name).ok_or_else(|| {
-                    SmartZipError::UnsafeArchivePath {
-                        entry: String::from_utf8_lossy(raw_name).into_owned(),
-                    }
-                })?
-            }
+            smartzip_core::EncodingMode::Auto => crate::safety::safe_entry_path(raw_name)
+                .ok_or_else(|| SmartZipError::UnsafeArchivePath {
+                    entry: String::from_utf8_lossy(raw_name).into_owned(),
+                })?,
         };
-        let output_path = request.output_dir.join(relative_path);
-
         if entry.is_dir() {
-            std::fs::create_dir_all(&output_path)
-                .map_err(|source| SmartZipError::io(Some(output_path.clone()), source))?;
+            create_output_dir(&request.output_dir, &relative_path)?;
             continue;
         }
 
-        if let Some(parent) = output_path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|source| SmartZipError::io(Some(parent.to_path_buf()), source))?;
-        }
-
-        let mut outfile = File::create(&output_path)
-            .map_err(|source| SmartZipError::io(Some(output_path.clone()), source))?;
+        let (mut outfile, actual_output_path) =
+            create_output_file(&request.output_dir, &relative_path)?;
         let written = std::io::copy(&mut entry, &mut outfile)
-            .map_err(|source| SmartZipError::io(Some(output_path), source))?;
+            .map_err(|source| SmartZipError::io(Some(actual_output_path), source))?;
         total_written += written;
 
         if total_written > limits.max_total_output_bytes {
@@ -316,6 +304,43 @@ fn extract_sync(
     Ok(ExtractArchiveResult {
         output_dir: request.output_dir.clone(),
     })
+}
+
+fn create_output_dir(output_root: &Path, relative_path: &Path) -> Result<PathBuf> {
+    let output_path = output_root.join(relative_path);
+    match std::fs::create_dir_all(&output_path) {
+        Ok(()) => Ok(output_path),
+        Err(source) if source.kind() == io::ErrorKind::InvalidFilename => {
+            let fallback =
+                output_root.join(crate::safety::shorten_overlong_components(relative_path));
+            std::fs::create_dir_all(&fallback)
+                .map_err(|source| SmartZipError::io(Some(fallback.clone()), source))?;
+            Ok(fallback)
+        }
+        Err(source) => Err(SmartZipError::io(Some(output_path), source)),
+    }
+}
+
+fn create_output_file(output_root: &Path, relative_path: &Path) -> Result<(File, PathBuf)> {
+    let output_path = output_root.join(relative_path);
+    match create_file_and_parents(&output_path) {
+        Ok(file) => Ok((file, output_path)),
+        Err(source) if source.kind() == io::ErrorKind::InvalidFilename => {
+            let fallback =
+                output_root.join(crate::safety::shorten_overlong_components(relative_path));
+            let file = create_file_and_parents(&fallback)
+                .map_err(|source| SmartZipError::io(Some(fallback.clone()), source))?;
+            Ok((file, fallback))
+        }
+        Err(source) => Err(SmartZipError::io(Some(output_path), source)),
+    }
+}
+
+fn create_file_and_parents(path: &Path) -> io::Result<File> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    File::create(path)
 }
 
 fn compress_sync(
@@ -391,8 +416,8 @@ mod tests {
         let mut buf = std::io::Cursor::new(Vec::new());
         {
             let mut writer = ZipWriter::new(&mut buf);
-            let options = SimpleFileOptions::default()
-                .compression_method(zip::CompressionMethod::Stored);
+            let options =
+                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
             writer.start_file("test.txt", options).unwrap();
             writer.write_all(b"hello").unwrap();
             writer.finish().unwrap();
@@ -478,8 +503,8 @@ mod tests {
         let mut buf = std::io::Cursor::new(Vec::new());
         {
             let mut writer = ZipWriter::new(&mut buf);
-            let options = SimpleFileOptions::default()
-                .compression_method(zip::CompressionMethod::Stored);
+            let options =
+                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
             writer.start_file("good.txt", options).unwrap();
             writer.write_all(b"good content").unwrap();
             // This entry attempts path traversal
@@ -495,8 +520,8 @@ mod tests {
         let mut buf = std::io::Cursor::new(Vec::new());
         {
             let mut writer = ZipWriter::new(&mut buf);
-            let options = SimpleFileOptions::default()
-                .compression_method(zip::CompressionMethod::Stored);
+            let options =
+                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
             writer.start_file("/tmp/evil.txt", options).unwrap();
             writer.write_all(b"evil").unwrap();
             writer.finish().unwrap();
@@ -509,8 +534,8 @@ mod tests {
         let mut buf = std::io::Cursor::new(Vec::new());
         {
             let mut writer = ZipWriter::new(&mut buf);
-            let options = SimpleFileOptions::default()
-                .compression_method(zip::CompressionMethod::Stored);
+            let options =
+                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
             writer
                 .start_file("C:\\Windows\\system32\\evil.txt", options)
                 .unwrap();
@@ -525,8 +550,8 @@ mod tests {
         let mut buf = std::io::Cursor::new(Vec::new());
         {
             let mut writer = ZipWriter::new(&mut buf);
-            let options = SimpleFileOptions::default()
-                .compression_method(zip::CompressionMethod::Stored);
+            let options =
+                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
             writer
                 .start_file("foo\\..\\..\\etc\\passwd", options)
                 .unwrap();
@@ -554,8 +579,8 @@ mod tests {
         let mut buf = std::io::Cursor::new(Vec::new());
         {
             let mut writer = ZipWriter::new(&mut buf);
-            let options = SimpleFileOptions::default()
-                .compression_method(zip::CompressionMethod::Stored);
+            let options =
+                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
             for i in 0..1000 {
                 let name = format!("file_{:04}.txt", i);
                 writer.start_file(&name, options).unwrap();
@@ -614,16 +639,16 @@ mod tests {
         let local_offset = f.stream_position().unwrap();
         f.write_all(b"PK\x03\x04").unwrap();
         f.write_all(&20u16.to_le_bytes()).unwrap(); // version needed
-        f.write_all(&0u16.to_le_bytes()).unwrap();   // flags
-        f.write_all(&0u16.to_le_bytes()).unwrap();   // method (stored)
-        f.write_all(&0u16.to_le_bytes()).unwrap();   // mod time
-        f.write_all(&0u16.to_le_bytes()).unwrap();   // mod date
+        f.write_all(&0u16.to_le_bytes()).unwrap(); // flags
+        f.write_all(&0u16.to_le_bytes()).unwrap(); // method (stored)
+        f.write_all(&0u16.to_le_bytes()).unwrap(); // mod time
+        f.write_all(&0u16.to_le_bytes()).unwrap(); // mod date
         let crc = crc32fast::hash(content);
         f.write_all(&crc.to_le_bytes()).unwrap();
         f.write_all(&(content.len() as u32).to_le_bytes()).unwrap(); // compressed = 1
         f.write_all(&(content.len() as u32).to_le_bytes()).unwrap(); // uncompressed = 1
-        f.write_all(&(fname.len() as u16).to_le_bytes()).unwrap();  // name len
-        f.write_all(&0u16.to_le_bytes()).unwrap();   // extra len
+        f.write_all(&(fname.len() as u16).to_le_bytes()).unwrap(); // name len
+        f.write_all(&0u16.to_le_bytes()).unwrap(); // extra len
         f.write_all(fname).unwrap();
         f.write_all(content).unwrap();
 
@@ -632,19 +657,19 @@ mod tests {
         f.write_all(b"PK\x01\x02").unwrap();
         f.write_all(&20u16.to_le_bytes()).unwrap(); // version made by
         f.write_all(&20u16.to_le_bytes()).unwrap(); // version needed
-        f.write_all(&0u16.to_le_bytes()).unwrap();  // flags
-        f.write_all(&0u16.to_le_bytes()).unwrap();  // method
-        f.write_all(&0u16.to_le_bytes()).unwrap();  // mod time
-        f.write_all(&0u16.to_le_bytes()).unwrap();  // mod date
+        f.write_all(&0u16.to_le_bytes()).unwrap(); // flags
+        f.write_all(&0u16.to_le_bytes()).unwrap(); // method
+        f.write_all(&0u16.to_le_bytes()).unwrap(); // mod time
+        f.write_all(&0u16.to_le_bytes()).unwrap(); // mod date
         f.write_all(&crc.to_le_bytes()).unwrap();
         f.write_all(&(content.len() as u32).to_le_bytes()).unwrap(); // compressed = 1
-        f.write_all(&declared_uncompressed.to_le_bytes()).unwrap();   // uncompressed = inflated
-        f.write_all(&(fname.len() as u16).to_le_bytes()).unwrap();   // name len
-        f.write_all(&0u16.to_le_bytes()).unwrap();  // extra len
-        f.write_all(&0u16.to_le_bytes()).unwrap();  // comment len
-        f.write_all(&0u16.to_le_bytes()).unwrap();  // disk start
-        f.write_all(&0u16.to_le_bytes()).unwrap();  // internal attrs
-        f.write_all(&0u32.to_le_bytes()).unwrap();  // external attrs
+        f.write_all(&declared_uncompressed.to_le_bytes()).unwrap(); // uncompressed = inflated
+        f.write_all(&(fname.len() as u16).to_le_bytes()).unwrap(); // name len
+        f.write_all(&0u16.to_le_bytes()).unwrap(); // extra len
+        f.write_all(&0u16.to_le_bytes()).unwrap(); // comment len
+        f.write_all(&0u16.to_le_bytes()).unwrap(); // disk start
+        f.write_all(&0u16.to_le_bytes()).unwrap(); // internal attrs
+        f.write_all(&0u32.to_le_bytes()).unwrap(); // external attrs
         f.write_all(&(local_offset as u32).to_le_bytes()).unwrap(); // local header offset
         f.write_all(fname).unwrap();
 
@@ -653,8 +678,8 @@ mod tests {
         f.write_all(b"PK\x05\x06").unwrap();
         f.write_all(&0u16.to_le_bytes()).unwrap();
         f.write_all(&0u16.to_le_bytes()).unwrap();
-        f.write_all(&1u16.to_le_bytes()).unwrap();  // CD entries this disk
-        f.write_all(&1u16.to_le_bytes()).unwrap();  // CD entries total
+        f.write_all(&1u16.to_le_bytes()).unwrap(); // CD entries this disk
+        f.write_all(&1u16.to_le_bytes()).unwrap(); // CD entries total
         f.write_all(&cd_size.to_le_bytes()).unwrap();
         f.write_all(&(cd_offset as u32).to_le_bytes()).unwrap();
         f.write_all(&0u16.to_le_bytes()).unwrap();
@@ -723,7 +748,10 @@ mod tests {
                 encoding: EncodingMode::Auto,
             })
             .await;
-        assert!(matches!(result, Err(SmartZipError::PasswordRequired { .. })));
+        assert!(matches!(
+            result,
+            Err(SmartZipError::PasswordRequired { .. })
+        ));
     }
 
     #[tokio::test]
@@ -878,6 +906,46 @@ mod tests {
     // ── Tests: path safety ───────────────────────────────────────────
 
     #[tokio::test]
+    async fn native_zip_extract_retries_with_stable_name_after_filename_too_long() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("long-name.zip");
+        let long_name = format!("{}.txt", "a".repeat(300));
+        let file = File::create(&archive).unwrap();
+        let mut writer = ZipWriter::new(file);
+        writer
+            .start_file(&long_name, SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(b"long filename content").unwrap();
+        writer.finish().unwrap();
+
+        let backend = NativeZipBackend::new();
+        let output_dir = temp.path().join("output");
+        backend
+            .extract(ExtractArchiveRequest {
+                archive,
+                format: Some(ArchiveFormat::Zip),
+                output_dir: output_dir.clone(),
+                password: None,
+                encoding: EncodingMode::Auto,
+            })
+            .await
+            .unwrap();
+
+        let extracted: Vec<_> = std::fs::read_dir(&output_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(extracted.len(), 1);
+        assert_eq!(
+            std::fs::read(&extracted[0]).unwrap(),
+            b"long filename content"
+        );
+        let extracted_name = extracted[0].file_name().unwrap().to_string_lossy();
+        assert!(extracted_name.len() < long_name.len());
+        assert!(extracted_name.ends_with(".txt"));
+    }
+
+    #[tokio::test]
     async fn native_zip_extract_rejects_zip_slip() {
         let temp = tempfile::tempdir().unwrap();
         let archive = temp.path().join("zipslip.zip");
@@ -1024,6 +1092,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_zip_list_override_encoding_gbk_decodes_display_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("gbk.zip");
+        let gbk_name = b"\xb2\xe2\xca\xd4\xce\xc4\xbc\xfe.txt";
+        create_raw_zip_with_encoding(&archive, &[(gbk_name, b"hello")]);
+
+        let backend = NativeZipBackend::new();
+        let listing = backend
+            .list(ListRequest {
+                archive,
+                format: Some(ArchiveFormat::Zip),
+                password: None,
+                encoding: EncodingMode::Override("gb18030".into()),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(listing.entries.len(), 1);
+        assert_eq!(
+            listing.entries[0].path,
+            PathBuf::from(smartzip_encoding::decode_name(gbk_name, "gb18030").unwrap())
+        );
+    }
+
+    #[tokio::test]
+    async fn native_zip_list_override_encoding_shift_jis_decodes_display_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("sjis.zip");
+        let sjis_name = b"\x83\x65\x83\x58\x83\x67.txt";
+        create_raw_zip_with_encoding(&archive, &[(sjis_name, b"hello")]);
+
+        let backend = NativeZipBackend::new();
+        let listing = backend
+            .list(ListRequest {
+                archive,
+                format: Some(ArchiveFormat::Zip),
+                password: None,
+                encoding: EncodingMode::Override("shift_jis".into()),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(listing.entries.len(), 1);
+        assert_eq!(
+            listing.entries[0].path,
+            PathBuf::from(smartzip_encoding::decode_name(sjis_name, "shift_jis").unwrap())
+        );
+    }
+
+    #[tokio::test]
     async fn native_zip_extract_override_encoding_gbk() {
         let temp = tempfile::tempdir().unwrap();
         let archive = temp.path().join("gbk.zip");
@@ -1155,7 +1273,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            std::fs::read_to_string(output_dir.join("small.txt")).unwrap().len(),
+            std::fs::read_to_string(output_dir.join("small.txt"))
+                .unwrap()
+                .len(),
             10000
         );
     }
@@ -1180,7 +1300,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            std::fs::read_to_string(output_dir.join("large.txt")).unwrap().len(),
+            std::fs::read_to_string(output_dir.join("large.txt"))
+                .unwrap()
+                .len(),
             1024 * 1024
         );
     }

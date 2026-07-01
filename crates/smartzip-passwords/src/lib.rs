@@ -65,6 +65,7 @@ impl<'a> PasswordService<'a> {
         request: PasswordCandidateRequest,
     ) -> smartzip_db::Result<Vec<PasswordCandidate>> {
         let mut candidates = Vec::new();
+        let mut has_explicit_candidates = false;
 
         if request.include_empty {
             push_unique(
@@ -83,6 +84,7 @@ impl<'a> PasswordService<'a> {
             .map(normalize_password)
             .filter(|v| !v.is_empty())
         {
+            has_explicit_candidates = true;
             push_unique(
                 &mut candidates,
                 PasswordCandidate {
@@ -98,6 +100,7 @@ impl<'a> PasswordService<'a> {
             .map(normalize_password)
             .filter(|v| !v.is_empty())
         {
+            has_explicit_candidates = true;
             push_unique(
                 &mut candidates,
                 PasswordCandidate {
@@ -106,6 +109,10 @@ impl<'a> PasswordService<'a> {
                     source: PasswordSource::Clipboard,
                 },
             );
+        }
+
+        if has_explicit_candidates {
+            return Ok(candidates);
         }
 
         for record in self.repo.ranked_candidates(request.limit)? {
@@ -210,5 +217,25 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(id > 0);
+    }
+
+    #[test]
+    fn manual_passwords_disable_database_fallback() {
+        let db = SmartZipDb::in_memory().unwrap();
+        let service = PasswordService::new(PasswordRepository::new(db.connection()));
+        service.add_password("数据库密码", "manual", false).unwrap();
+
+        let candidates = service
+            .ranked_candidates(PasswordCandidateRequest {
+                manual: vec!["手动密码".into()],
+                clipboard: None,
+                include_empty: true,
+                limit: 10,
+            })
+            .unwrap();
+
+        assert!(candidates.iter().any(|c| c.value.is_empty()));
+        assert!(candidates.iter().any(|c| c.value == "手动密码"));
+        assert!(!candidates.iter().any(|c| c.value == "数据库密码"));
     }
 }

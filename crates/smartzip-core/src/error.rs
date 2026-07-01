@@ -42,10 +42,7 @@ pub enum SmartZipError {
     },
 
     #[error("ambiguous embedded archives at {path:?}: {count} findings")]
-    EmbeddedArchiveAmbiguous {
-        path: PathBuf,
-        count: usize,
-    },
+    EmbeddedArchiveAmbiguous { path: PathBuf, count: usize },
 
     #[error("embedded archive at {path:?} offset {offset} not extractable: {detail}")]
     EmbeddedArchiveDetectedButNotExtractable {

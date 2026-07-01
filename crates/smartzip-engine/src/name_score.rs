@@ -436,10 +436,7 @@ pub fn archive_display_stem(path: &Path) -> String {
 }
 
 fn is_hash_like(name: &str) -> bool {
-    let stem = name
-        .rsplit_once('.')
-        .map(|(s, _)| s)
-        .unwrap_or(name);
+    let stem = name.rsplit_once('.').map(|(s, _)| s).unwrap_or(name);
     // A name is hash-like if it's 8+ hex chars with no other structure
     if stem.len() >= 8 && stem.chars().all(|c| c.is_ascii_hexdigit()) {
         return true;
@@ -509,7 +506,11 @@ mod tests {
     #[test]
     fn hash_like_names_get_penalized() {
         let score = score_name("a1b2c3d4e5f6");
-        assert!(score.total <= 1.5, "hash-like name should be low: {}", score.total);
+        assert!(
+            score.total <= 1.5,
+            "hash-like name should be low: {}",
+            score.total
+        );
     }
 
     #[test]

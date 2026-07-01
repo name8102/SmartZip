@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use clap::{Parser, Subcommand, ValueEnum};
-use smartzip_archive::BackendRouter;
+use smartzip_archive::{ArchiveBackend, BackendRouter, NativeZipBackend};
 use smartzip_core::EncodingMode;
 use smartzip_db::{password::PasswordRepository, SmartZipDb};
 use smartzip_engine::name_score;
@@ -20,7 +20,7 @@ const DEFAULT_RECURSION_LIMIT: u8 = 3;
 #[command(name = "smartzip")]
 #[command(about = "SmartZip cross-platform archive helper")]
 struct Cli {
-    /// Path to database file. Defaults to in-memory if not set.
+    /// Path to database file. Defaults to the platform data directory if not set.
     #[arg(long)]
     db: Option<PathBuf>,
 
@@ -128,6 +128,18 @@ enum Command {
         /// Auto-confirm large file scans (>10GB).
         #[arg(long)]
         confirm_large_scan: bool,
+    },
+
+    /// Preview archive entry names under several encodings.
+    EncodingPreview {
+        path: PathBuf,
+
+        /// Password to use when the archive requires one.
+        #[arg(short = 'p', long)]
+        password: Option<String>,
+
+        #[arg(long)]
+        json: bool,
     },
 
     /// Placeholder for future compression implementation.
@@ -273,7 +285,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             no_empty,
             deep,
             encoding,
-            json: _json,
+            json,
             layout,
             single_root_name,
             dry_run,
@@ -291,6 +303,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 no_empty,
                 deep,
                 &encoding,
+                json,
                 layout.into(),
                 single_root_name.into(),
                 dry_run,
@@ -300,6 +313,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             )
             .await
         }
+        Command::EncodingPreview {
+            path,
+            password,
+            json,
+        } => preview_encodings(path, password, json).await,
         Command::Compress { paths } => {
             println!(
                 "compress is not implemented yet; received {} path(s)",
@@ -376,7 +394,9 @@ fn detect(
     })?;
 
     if json {
-        let file_size = std::fs::metadata(&detect_path).map(|m| m.len()).unwrap_or(0);
+        let file_size = std::fs::metadata(&detect_path)
+            .map(|m| m.len())
+            .unwrap_or(0);
         let policy = smartzip_core::EmbeddedScanPolicy::default();
         let ext_is_archive = smartzip_engine::format_from_extension(&detect_path).is_some();
         let decision = smartzip_engine::embedded::select_embedded_action(
@@ -427,6 +447,7 @@ async fn extract(
     no_empty: bool,
     deep: bool,
     encoding: &str,
+    json: bool,
     layout_policy: smartzip_engine::layout::OutputLayoutPolicy,
     single_root_name_policy: smartzip_engine::layout::SingleRootNamePolicy,
     dry_run: bool,
@@ -445,7 +466,10 @@ async fn extract(
         println!("Archive stem: {archive_stem}");
         println!("Layout policy: {layout_policy:?}");
         println!("Note: --dry-run shows initial candidate path. Final layout depends on extracted content.");
-        println!("Planned output: {}", output_dir.join(&archive_stem).display());
+        println!(
+            "Planned output: {}",
+            output_dir.join(&archive_stem).display()
+        );
         return Ok(());
     }
 
@@ -462,8 +486,10 @@ async fn extract(
 
     let stdin_lock = StdinLock::new();
     let engine = SmartZipEngine::default();
+    let event_listener = (!json)
+        .then(|| std::sync::Arc::new(render_extract_event) as smartzip_engine::TaskEventListener);
     let result = engine
-        .extract_recursive(
+        .extract_recursive_with_listener(
             &backend,
             &service,
             ExtractWorkflowRequest {
@@ -488,68 +514,180 @@ async fn extract(
                 lock: stdin_lock.clone(),
             }),
             Some(&StdinOutputPrompter { lock: stdin_lock }),
+            event_listener,
         )
         .await?;
 
-    // Print per-archive progress from events.
-    for event in &result.events {
-        match &event.kind {
-            smartzip_core::TaskEventKind::Progress(progress) => {
-                println!("  {}", progress.message);
+    let exit_code = extraction_exit_code(result.processed.len(), result.skipped.len());
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&build_extract_json_output(&result, exit_code))?
+        );
+    } else {
+        let processed_count = result.processed.len();
+        let skipped_count = result.skipped.len();
+        if processed_count > 0 {
+            println!("processed {} archive(s)", processed_count);
+        }
+        if skipped_count > 0 {
+            println!("skipped {} candidate(s)", skipped_count);
+            for skipped in &result.skipped {
+                println!("  - {} (depth {})", skipped.path.display(), skipped.depth);
             }
-            smartzip_core::TaskEventKind::EncodingDetected(detection) => {
-                let encoding = match &detection.selected {
-                    smartzip_core::EncodingMode::Auto => "auto",
-                    smartzip_core::EncodingMode::Override(s) => s.as_str(),
-                };
-                println!(
-                    "  encoding: {encoding} (confidence: {:.0}%)",
-                    detection.confidence * 100.0
-                );
-            }
-            smartzip_core::TaskEventKind::OutputCreated { path } => {
-                println!("  -> {}", path.display());
-            }
-            _ => {}
         }
     }
 
-    // Summary.
-    let processed_count = result.processed.len();
-    let skipped_count = result.skipped.len();
-    if processed_count > 0 {
-        println!("processed {} archive(s)", processed_count);
+    std::process::exit(exit_code);
+}
+
+fn render_extract_event(event: &smartzip_core::TaskEvent) {
+    match &event.kind {
+        smartzip_core::TaskEventKind::Progress(progress) => match progress.percent {
+            Some(percent) => println!("  {percent:>3.0}%  {}", progress.message),
+            None => println!("  {}", progress.message),
+        },
+        smartzip_core::TaskEventKind::EncodingDetected(detection) => {
+            let encoding = match &detection.selected {
+                smartzip_core::EncodingMode::Auto => "auto",
+                smartzip_core::EncodingMode::Override(s) => s.as_str(),
+            };
+            println!(
+                "  encoding: {encoding} (confidence: {:.0}%)",
+                detection.confidence * 100.0
+            );
+        }
+        smartzip_core::TaskEventKind::OutputCreated { path } => {
+            println!("  -> {}", path.display());
+        }
+        smartzip_core::TaskEventKind::Failed { error } => eprintln!("  FAILED: {error}"),
+        smartzip_core::TaskEventKind::Warning { message } => {
+            eprintln!("  warning: {message}")
+        }
+        _ => {}
     }
-    if skipped_count > 0 {
-        println!("skipped {} candidate(s)", skipped_count);
-        for skipped in &result.skipped {
-            println!("  - {} (depth {})", skipped.path.display(), skipped.depth);
+}
+
+#[derive(Debug)]
+struct EncodingPreviewEntry {
+    encoding: String,
+    ok: bool,
+    names: Vec<String>,
+    error: Option<String>,
+}
+
+async fn preview_encodings(
+    path: PathBuf,
+    password: Option<String>,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let backend = BackendRouter::locate()?;
+    let native_zip = NativeZipBackend::new();
+    let candidates = encoding_preview_candidates();
+    let mut previews = Vec::new();
+
+    for encoding in candidates {
+        let mode = match *encoding {
+            "auto" => EncodingMode::Auto,
+            other => EncodingMode::Override(other.to_string()),
+        };
+        let request = smartzip_archive::ListRequest {
+            archive: path.clone(),
+            format: smartzip_engine::format_from_extension(&path),
+            password: password.clone(),
+            encoding: mode,
+        };
+        let listing = if smartzip_engine::format_from_extension(&path)
+            == Some(smartzip_core::ArchiveFormat::Zip)
+        {
+            native_zip.list(request).await
+        } else {
+            backend.list(request).await
+        };
+        match listing {
+            Ok(listing) => previews.push(EncodingPreviewEntry {
+                encoding: encoding.to_string(),
+                ok: true,
+                names: listing
+                    .entries
+                    .into_iter()
+                    .map(|entry| entry.path.display().to_string())
+                    .collect(),
+                error: None,
+            }),
+            Err(error) => previews.push(EncodingPreviewEntry {
+                encoding: encoding.to_string(),
+                ok: false,
+                names: Vec::new(),
+                error: Some(error.to_string()),
+            }),
         }
     }
 
-    // Warnings and failures.
-    for event in result.events.iter().filter(|event| {
-        matches!(
-            event.kind,
-            smartzip_core::TaskEventKind::Failed { .. }
-                | smartzip_core::TaskEventKind::Warning { .. }
-        )
-    }) {
-        match &event.kind {
-            smartzip_core::TaskEventKind::Failed { error } => {
-                eprintln!("  FAILED: {error}")
+    if json {
+        let output: Vec<serde_json::Value> = previews
+            .into_iter()
+            .map(|preview| {
+                serde_json::json!({
+                    "encoding": preview.encoding,
+                    "ok": preview.ok,
+                    "names": preview.names,
+                    "error": preview.error,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        for preview in previews {
+            println!("[{}]", preview.encoding);
+            if preview.ok {
+                if preview.names.is_empty() {
+                    println!("  (no entries)");
+                } else {
+                    for name in preview.names.iter().take(20) {
+                        println!("  {name}");
+                    }
+                    if preview.names.len() > 20 {
+                        println!("  ... {} more", preview.names.len() - 20);
+                    }
+                }
+            } else if let Some(error) = preview.error {
+                println!("  ERROR: {error}");
             }
-            smartzip_core::TaskEventKind::Warning { message } => {
-                eprintln!("  warning: {message}")
-            }
-            _ => unreachable!(),
         }
     }
 
-    std::process::exit(extraction_exit_code(
-        result.processed.len(),
-        result.skipped.len(),
-    ));
+    Ok(())
+}
+
+fn encoding_preview_candidates() -> &'static [&'static str] {
+    &[
+        "auto",
+        "UTF-8",
+        "GB18030",
+        "GBK",
+        "Big5",
+        "Shift_JIS",
+        "EUC-JP",
+        "EUC-KR",
+    ]
+}
+
+fn build_extract_json_output(
+    result: &smartzip_engine::ExtractWorkflowResult,
+    exit_code: i32,
+) -> serde_json::Value {
+    serde_json::json!({
+        "task_id": result.task_id,
+        "processed_count": result.processed.len(),
+        "skipped_count": result.skipped.len(),
+        "enqueued_count": result.enqueued.len(),
+        "processed": result.processed,
+        "skipped": result.skipped,
+        "enqueued": result.enqueued,
+        "events": result.events,
+        "exit_code": exit_code,
+    })
 }
 
 fn extraction_exit_code(processed_count: usize, skipped_count: usize) -> i32 {
@@ -626,7 +764,13 @@ fn password(db: &SmartZipDb, cmd: PasswordCmd) -> Result<(), Box<dyn std::error:
         PasswordCmd::Export { path } => {
             let repo = PasswordRepository::new(db.connection());
             let passwords = repo.ranked_candidates(usize::MAX)?;
-            let out_path = path.unwrap_or_else(|| PathBuf::from("smartzip-passwords.txt"));
+            let out_path = if let Some(path) = path {
+                path
+            } else {
+                let paths = PlatformPaths::new();
+                paths.ensure_dirs()?;
+                paths.password_export_path()
+            };
             let lines: Vec<String> = passwords.iter().map(|p| p.value.clone()).collect();
             std::fs::write(&out_path, lines.join("\n") + "\n")?;
             println!(
@@ -811,7 +955,10 @@ fn prompt_output_collision_stdin(
 
 #[cfg(test)]
 mod tests {
-    use super::extraction_exit_code;
+    use super::{build_extract_json_output, encoding_preview_candidates, extraction_exit_code};
+    use serde_json::json;
+    use smartzip_core::TaskId;
+    use smartzip_engine::ExtractWorkflowResult;
 
     #[test]
     fn exit_code_is_success_when_all_candidates_process() {
@@ -827,5 +974,29 @@ mod tests {
     fn exit_code_is_failure_when_nothing_processes() {
         assert_eq!(extraction_exit_code(0, 3), 1);
         assert_eq!(extraction_exit_code(0, 0), 1);
+    }
+
+    #[test]
+    fn extract_json_output_includes_exit_code_and_counts() {
+        let result = ExtractWorkflowResult {
+            task_id: TaskId::new(),
+            processed: Vec::new(),
+            skipped: Vec::new(),
+            enqueued: Vec::new(),
+            events: Vec::new(),
+        };
+
+        let output = build_extract_json_output(&result, 1);
+        assert_eq!(output["processed_count"], json!(0));
+        assert_eq!(output["skipped_count"], json!(0));
+        assert_eq!(output["exit_code"], json!(1));
+    }
+
+    #[test]
+    fn encoding_preview_candidates_cover_expected_defaults() {
+        assert_eq!(encoding_preview_candidates()[0], "auto");
+        assert!(encoding_preview_candidates().contains(&"UTF-8"));
+        assert!(encoding_preview_candidates().contains(&"GB18030"));
+        assert!(encoding_preview_candidates().contains(&"Shift_JIS"));
     }
 }

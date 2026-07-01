@@ -98,7 +98,10 @@ mod tests {
         let policy = EmbeddedScanPolicy::default();
         assert_eq!(policy.mode, EmbeddedScanMode::Auto);
         assert!((policy.dominant_min_ratio - 0.70).abs() < f32::EPSILON);
-        assert_eq!(policy.root_full_scan_confirm_threshold, 10 * 1024 * 1024 * 1024);
+        assert_eq!(
+            policy.root_full_scan_confirm_threshold,
+            10 * 1024 * 1024 * 1024
+        );
         assert_eq!(policy.max_findings_per_file, 8);
         assert_eq!(policy.inner_scan_max_bytes, Some(4 * 1024 * 1024 * 1024));
     }
@@ -177,7 +180,10 @@ mod tests {
         let roundtrip: EmbeddedScanPolicy = serde_json::from_str(&json).unwrap();
         assert_eq!(roundtrip.mode, EmbeddedScanMode::Auto);
         assert!((roundtrip.dominant_min_ratio - 0.70).abs() < f32::EPSILON);
-        assert_eq!(roundtrip.root_full_scan_confirm_threshold, 10 * 1024 * 1024 * 1024);
+        assert_eq!(
+            roundtrip.root_full_scan_confirm_threshold,
+            10 * 1024 * 1024 * 1024
+        );
         assert_eq!(roundtrip.max_findings_per_file, 8);
         assert_eq!(roundtrip.inner_scan_max_bytes, Some(4 * 1024 * 1024 * 1024));
     }

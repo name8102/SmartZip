@@ -1,6 +1,4 @@
-use crate::name_score::{
-    classify_similarity, name_similarity, score_name, SimilarityLevel,
-};
+use crate::name_score::{classify_similarity, name_similarity, score_name, SimilarityLevel};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -47,7 +45,10 @@ pub enum TopLevelShape {
     Empty,
     SingleFile(TopLevelItemSummary),
     SingleDir(TopLevelItemSummary),
-    Multiple { items: Vec<TopLevelItemSummary>, count: usize },
+    Multiple {
+        items: Vec<TopLevelItemSummary>,
+        count: usize,
+    },
 }
 
 /// Summary of a single item found during top-level scan.
@@ -601,7 +602,10 @@ mod tests {
             make_item("b.txt", false, &PathBuf::new()),
         ];
         let req = make_request(
-            TopLevelShape::Multiple { items: items.clone(), count: items.len() },
+            TopLevelShape::Multiple {
+                items: items.clone(),
+                count: items.len(),
+            },
             "my-archive",
             OutputLayoutPolicy::Smart,
             SingleRootNamePolicy::PreferArchiveName,
@@ -624,7 +628,10 @@ mod tests {
             make_item("b.txt", false, &PathBuf::new()),
         ];
         let req = make_request(
-            TopLevelShape::Multiple { items: items.clone(), count: items.len() },
+            TopLevelShape::Multiple {
+                items: items.clone(),
+                count: items.len(),
+            },
             "archive",
             OutputLayoutPolicy::Raw,
             SingleRootNamePolicy::PreferArchiveName,
@@ -668,7 +675,10 @@ mod tests {
             plan.source,
             PlanSource::SingleDirContents(PathBuf::from("files"))
         );
-        assert_eq!(plan.kind, LayoutPlanKind::CommitSingleDirContentsAsArchiveName);
+        assert_eq!(
+            plan.kind,
+            LayoutPlanKind::CommitSingleDirContentsAsArchiveName
+        );
         assert_eq!(plan.target, req.output_root.join("my-project-v2.0"));
         assert_eq!(plan.reason, LayoutDecisionReason::SingleDirGenericName);
     }
@@ -683,7 +693,10 @@ mod tests {
             SingleRootNamePolicy::PreferArchiveName,
         );
         let plan = plan_layout(&req);
-        assert_eq!(plan.kind, LayoutPlanKind::CommitSingleDirContentsAsArchiveName);
+        assert_eq!(
+            plan.kind,
+            LayoutPlanKind::CommitSingleDirContentsAsArchiveName
+        );
         assert_eq!(
             plan.source,
             PlanSource::SingleDirContents(PathBuf::from("MyProject"))
@@ -824,7 +837,15 @@ mod tests {
         );
         let plan = plan_layout(&req);
         assert_eq!(plan.kind, LayoutPlanKind::CommitSingleFileAsInnerName);
-        assert_eq!(plan.reason, LayoutDecisionReason::SingleFileArchiveExtension);
+        assert_eq!(
+            plan.target,
+            req.output_root
+                .join("The Great Gatsby - F. Scott Fitzgerald.zip")
+        );
+        assert_eq!(
+            plan.reason,
+            LayoutDecisionReason::SingleFileArchiveExtension
+        );
     }
 
     #[test]
@@ -914,7 +935,10 @@ mod tests {
         );
         let plan = plan_layout(&req);
         assert_eq!(plan.kind, LayoutPlanKind::CommitSingleDirAsInnerName);
-        assert_eq!(plan.source, PlanSource::SingleDir(PathBuf::from("MyProject")));
+        assert_eq!(
+            plan.source,
+            PlanSource::SingleDir(PathBuf::from("MyProject"))
+        );
         assert_eq!(plan.target, req.output_root.join("MyProject"));
     }
 
@@ -929,7 +953,10 @@ mod tests {
         );
         let plan = plan_layout(&req);
         assert_eq!(plan.kind, LayoutPlanKind::CommitSingleFileAsInnerName);
-        assert_eq!(plan.source, PlanSource::SingleFile(PathBuf::from("document.pdf")));
+        assert_eq!(
+            plan.source,
+            PlanSource::SingleFile(PathBuf::from("document.pdf"))
+        );
         assert_eq!(plan.target, req.output_root.join("document.pdf"));
     }
 
@@ -940,19 +967,31 @@ mod tests {
             make_item("b.txt", false, &PathBuf::new()),
         ];
         let req = make_request(
-            TopLevelShape::Multiple { items: items.clone(), count: items.len() },
+            TopLevelShape::Multiple {
+                items: items.clone(),
+                count: items.len(),
+            },
             "archive",
             OutputLayoutPolicy::FlatSingle,
             SingleRootNamePolicy::Auto,
         );
         let plan = plan_layout(&req);
-        assert_eq!(plan.kind, LayoutPlanKind::CommitWholeTempAsArchiveDir { name: "archive".to_string() });
+        assert_eq!(
+            plan.kind,
+            LayoutPlanKind::CommitWholeTempAsArchiveDir {
+                name: "archive".to_string()
+            }
+        );
         assert_eq!(plan.reason, LayoutDecisionReason::MultipleTopLevelItems);
     }
 
     #[test]
     fn plan_prefer_archive_name_always_wraps_single_dir() {
-        let item = make_item("The Great Gatsby - F. Scott Fitzgerald", true, &PathBuf::new());
+        let item = make_item(
+            "The Great Gatsby - F. Scott Fitzgerald",
+            true,
+            &PathBuf::new(),
+        );
         let req = make_request(
             TopLevelShape::SingleDir(item),
             "downloads",
@@ -960,7 +999,10 @@ mod tests {
             SingleRootNamePolicy::PreferArchiveName,
         );
         let plan = plan_layout(&req);
-        assert_eq!(plan.kind, LayoutPlanKind::CommitSingleDirContentsAsArchiveName);
+        assert_eq!(
+            plan.kind,
+            LayoutPlanKind::CommitSingleDirContentsAsArchiveName
+        );
         assert_eq!(
             plan.source,
             PlanSource::SingleDirContents(PathBuf::from("The Great Gatsby - F. Scott Fitzgerald"))
@@ -979,7 +1021,10 @@ mod tests {
         );
         let plan = plan_layout(&req);
         assert_eq!(plan.kind, LayoutPlanKind::CommitSingleDirAsInnerName);
-        assert_eq!(plan.source, PlanSource::SingleDir(PathBuf::from("downloads")));
+        assert_eq!(
+            plan.source,
+            PlanSource::SingleDir(PathBuf::from("downloads"))
+        );
         assert_eq!(plan.target, req.output_root.join("downloads"));
     }
 
@@ -1061,7 +1106,10 @@ mod tests {
             SingleRootNamePolicy::PreferArchiveName,
         );
         let plan = plan_layout(&req);
-        assert_eq!(plan.kind, LayoutPlanKind::CommitSingleDirContentsAsArchiveName);
+        assert_eq!(
+            plan.kind,
+            LayoutPlanKind::CommitSingleDirContentsAsArchiveName
+        );
         assert_eq!(plan.target, req.output_root.join("archive"));
         assert_eq!(
             plan.source,

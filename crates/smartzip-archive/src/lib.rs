@@ -8,7 +8,7 @@ pub mod sevenzz;
 pub mod types;
 pub mod unrar;
 
-pub use backend::ArchiveBackend;
+pub use backend::{ArchiveBackend, ExtractionProgressCallback};
 pub use native_zip::NativeZipBackend;
 pub use router::BackendRouter;
 pub use sevenzz::{SevenZipBackend, SevenZipLocator};

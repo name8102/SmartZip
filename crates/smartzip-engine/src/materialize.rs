@@ -124,9 +124,9 @@ impl OutputMaterializer {
             });
         }
 
-        let archive_stem = request.archive_stem.unwrap_or_else(|| {
-            crate::name_score::archive_display_stem(&request.output_dir)
-        });
+        let archive_stem = request
+            .archive_stem
+            .unwrap_or_else(|| crate::name_score::archive_display_stem(&request.output_dir));
 
         let shape = crate::layout::scan_visible_top_level(&temp_path);
         let layout_plan = crate::layout::plan_layout(&LayoutRequest {
@@ -150,7 +150,12 @@ impl OutputMaterializer {
         let mut commit_policy = request.commit_policy;
         if layout_plan.target.exists() && commit_policy == CommitPolicy::FailIfExists {
             if let Some(resolver) = collision_resolver {
-                let action = resolver(request.archive_path.clone(), layout_plan.target.clone(), layout_plan.clone()).await;
+                let action = resolver(
+                    request.archive_path.clone(),
+                    layout_plan.target.clone(),
+                    layout_plan.clone(),
+                )
+                .await;
                 match action {
                     CollisionAction::Skip => {
                         let _ = std::fs::remove_dir_all(temp.path());
@@ -199,14 +204,12 @@ impl OutputMaterializer {
         match &layout_plan.kind {
             LayoutPlanKind::CommitWholeTempAsArchiveDir { .. }
             | LayoutPlanKind::RawArchiveDir { .. } => {
-                let commit_target =
-                    resolve_commit_target(&layout_plan.target, commit_policy).map_err(
-                        |error| MaterializeFailure {
-                            error,
-                            preserved_temp_dir: None,
-                            kind: MaterializeFailureKind::CommitFailed,
-                        },
-                    )?;
+                let commit_target = resolve_commit_target(&layout_plan.target, commit_policy)
+                    .map_err(|error| MaterializeFailure {
+                        error,
+                        preserved_temp_dir: None,
+                        kind: MaterializeFailureKind::CommitFailed,
+                    })?;
                 if commit_target.exists() {
                     remove_existing_output(&commit_target).map_err(|error| MaterializeFailure {
                         error,
@@ -233,14 +236,12 @@ impl OutputMaterializer {
                 let PlanSource::SingleDirContents(dir_path) = &layout_plan.source else {
                     unreachable!()
                 };
-                let commit_target =
-                    resolve_commit_target(&layout_plan.target, commit_policy).map_err(
-                        |error| MaterializeFailure {
-                            error,
-                            preserved_temp_dir: None,
-                            kind: MaterializeFailureKind::CommitFailed,
-                        },
-                    )?;
+                let commit_target = resolve_commit_target(&layout_plan.target, commit_policy)
+                    .map_err(|error| MaterializeFailure {
+                        error,
+                        preserved_temp_dir: None,
+                        kind: MaterializeFailureKind::CommitFailed,
+                    })?;
                 if commit_target.exists() {
                     remove_existing_output(&commit_target).map_err(|error| MaterializeFailure {
                         error,
@@ -257,7 +258,7 @@ impl OutputMaterializer {
                     MaterializeFailure {
                         error: SmartZipError::io(Some(commit_target.clone()), source),
                         preserved_temp_dir: None,
-                    kind: MaterializeFailureKind::CommitFailed,
+                        kind: MaterializeFailureKind::CommitFailed,
                     }
                 })?;
                 let _ = std::fs::remove_dir_all(&committed_temp_path);
@@ -270,14 +271,12 @@ impl OutputMaterializer {
                 let PlanSource::SingleDir(dir_path) = &layout_plan.source else {
                     unreachable!()
                 };
-                let commit_target =
-                    resolve_commit_target(&layout_plan.target, commit_policy).map_err(
-                        |error| MaterializeFailure {
-                            error,
-                            preserved_temp_dir: None,
-                            kind: MaterializeFailureKind::CommitFailed,
-                        },
-                    )?;
+                let commit_target = resolve_commit_target(&layout_plan.target, commit_policy)
+                    .map_err(|error| MaterializeFailure {
+                        error,
+                        preserved_temp_dir: None,
+                        kind: MaterializeFailureKind::CommitFailed,
+                    })?;
                 if commit_target.exists() {
                     remove_existing_output(&commit_target).map_err(|error| MaterializeFailure {
                         error,
@@ -307,14 +306,12 @@ impl OutputMaterializer {
                 let PlanSource::SingleFile(file_path) = &layout_plan.source else {
                     unreachable!()
                 };
-                let commit_target =
-                    resolve_commit_target(&layout_plan.target, commit_policy).map_err(
-                        |error| MaterializeFailure {
-                            error,
-                            preserved_temp_dir: None,
-                            kind: MaterializeFailureKind::CommitFailed,
-                        },
-                    )?;
+                let commit_target = resolve_commit_target(&layout_plan.target, commit_policy)
+                    .map_err(|error| MaterializeFailure {
+                        error,
+                        preserved_temp_dir: None,
+                        kind: MaterializeFailureKind::CommitFailed,
+                    })?;
                 if commit_target.exists() {
                     remove_existing_output(&commit_target).map_err(|error| MaterializeFailure {
                         error,
@@ -326,7 +323,7 @@ impl OutputMaterializer {
                     MaterializeFailure {
                         error: SmartZipError::io(Some(commit_target.clone()), source),
                         preserved_temp_dir: None,
-                    kind: MaterializeFailureKind::CommitFailed,
+                        kind: MaterializeFailureKind::CommitFailed,
                     }
                 })?;
                 let _ = std::fs::remove_dir_all(&committed_temp_path);
@@ -339,14 +336,12 @@ impl OutputMaterializer {
                 let PlanSource::SingleFile(file_path) = &layout_plan.source else {
                     unreachable!()
                 };
-                let commit_target =
-                    resolve_commit_target(&layout_plan.target, commit_policy).map_err(
-                        |error| MaterializeFailure {
-                            error,
-                            preserved_temp_dir: None,
-                            kind: MaterializeFailureKind::CommitFailed,
-                        },
-                    )?;
+                let commit_target = resolve_commit_target(&layout_plan.target, commit_policy)
+                    .map_err(|error| MaterializeFailure {
+                        error,
+                        preserved_temp_dir: None,
+                        kind: MaterializeFailureKind::CommitFailed,
+                    })?;
                 if commit_target.exists() {
                     remove_existing_output(&commit_target).map_err(|error| MaterializeFailure {
                         error,
@@ -379,14 +374,12 @@ impl OutputMaterializer {
                 let PlanSource::SingleDir(dir_path) = &layout_plan.source else {
                     unreachable!()
                 };
-                let commit_target =
-                    resolve_commit_target(&layout_plan.target, commit_policy).map_err(
-                        |error| MaterializeFailure {
-                            error,
-                            preserved_temp_dir: None,
-                            kind: MaterializeFailureKind::CommitFailed,
-                        },
-                    )?;
+                let commit_target = resolve_commit_target(&layout_plan.target, commit_policy)
+                    .map_err(|error| MaterializeFailure {
+                        error,
+                        preserved_temp_dir: None,
+                        kind: MaterializeFailureKind::CommitFailed,
+                    })?;
                 if commit_target.exists() {
                     remove_existing_output(&commit_target).map_err(|error| MaterializeFailure {
                         error,
@@ -415,14 +408,12 @@ impl OutputMaterializer {
                 let PlanSource::SingleFile(file_path) = &layout_plan.source else {
                     unreachable!()
                 };
-                let commit_target =
-                    resolve_commit_target(&layout_plan.target, commit_policy).map_err(
-                        |error| MaterializeFailure {
-                            error,
-                            preserved_temp_dir: None,
-                            kind: MaterializeFailureKind::CommitFailed,
-                        },
-                    )?;
+                let commit_target = resolve_commit_target(&layout_plan.target, commit_policy)
+                    .map_err(|error| MaterializeFailure {
+                        error,
+                        preserved_temp_dir: None,
+                        kind: MaterializeFailureKind::CommitFailed,
+                    })?;
                 if commit_target.exists() {
                     remove_existing_output(&commit_target).map_err(|error| MaterializeFailure {
                         error,
@@ -592,7 +583,12 @@ mod tests {
             .unwrap();
 
         let plan = result.layout_plan.as_ref().unwrap();
-        assert_eq!(plan.kind, LayoutPlanKind::CommitWholeTempAsArchiveDir { name: "archive-d0".to_string() });
+        assert_eq!(
+            plan.kind,
+            LayoutPlanKind::CommitWholeTempAsArchiveDir {
+                name: "archive-d0".to_string()
+            }
+        );
         assert!(!output.join("old.txt").exists());
         assert_eq!(std::fs::read(output.join("new.txt")).unwrap(), b"new");
         assert_eq!(std::fs::read(output.join("also.txt")).unwrap(), b"also");
@@ -693,7 +689,10 @@ mod tests {
             .unwrap();
 
         let plan = result.layout_plan.as_ref().unwrap();
-        assert_eq!(plan.kind, LayoutPlanKind::CommitSingleDirContentsAsArchiveName);
+        assert_eq!(
+            plan.kind,
+            LayoutPlanKind::CommitSingleDirContentsAsArchiveName
+        );
         assert_eq!(result.output_dir, plan.target);
         assert!(result.output_dir.join("a.txt").exists());
         assert_eq!(
@@ -769,10 +768,7 @@ mod tests {
         assert_eq!(result.output_dir, plan.target);
         assert!(plan.target.exists());
         assert!(plan.target.is_file());
-        assert_eq!(
-            std::fs::read(&plan.target).unwrap(),
-            b"pdf-content"
-        );
+        assert_eq!(std::fs::read(&plan.target).unwrap(), b"pdf-content");
     }
 
     #[tokio::test]

@@ -1,7 +1,15 @@
 //! Platform-level paths and utilities (Linux, macOS, Windows).
 
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+/// Move a file or directory to the operating system's recycle bin/trash.
+///
+/// This intentionally does not fall back to permanent deletion. Callers can
+/// treat an error as a non-fatal cleanup failure while preserving the source.
+pub fn move_to_trash(path: impl AsRef<Path>) -> std::io::Result<()> {
+    trash::delete(path.as_ref()).map_err(std::io::Error::other)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlatformPaths {

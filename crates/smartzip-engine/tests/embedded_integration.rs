@@ -7,7 +7,9 @@
 
 use smartzip_core::{ArchiveFormat, BusinessContainerKind, DetectionKind, EmbeddedScanPolicy};
 use smartzip_engine::container::classify_zip_listing;
-use smartzip_engine::detect::{classify_by_header, detect_archive_header, detect_non_archive_header};
+use smartzip_engine::detect::{
+    classify_by_header, detect_archive_header, detect_non_archive_header,
+};
 use smartzip_engine::embedded::{compute_ratio, select_embedded_action};
 use smartzip_scanner::{Confidence, EmbeddedScanner, ScannerConfig};
 use std::path::PathBuf;
@@ -210,7 +212,10 @@ fn classify_fake_docx_not_business_container() {
     // Entry paths are plain text, not docx structure
     let entry_paths = vec!["readme.txt".to_string(), "notes.txt".to_string()];
     let kind = classify_zip_listing(&entry_paths, false);
-    assert_eq!(kind, None, "plain zip should not be classified as business container");
+    assert_eq!(
+        kind, None,
+        "plain zip should not be classified as business container"
+    );
 }
 
 // ── nested_cbz_should_skip ─────────────────────────────────────────────────
@@ -259,7 +264,10 @@ fn multi_payload_selects_largest() {
     let decision = select_embedded_action(file_size, &findings, &policy, false);
 
     // Should select the dominant one
-    assert!(decision.selected_index.is_some(), "should select a dominant finding");
+    assert!(
+        decision.selected_index.is_some(),
+        "should select a dominant finding"
+    );
     let ratio = decision.archive_ratio.unwrap();
     assert!(
         ratio >= 0.70,
