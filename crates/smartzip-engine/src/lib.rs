@@ -4,6 +4,7 @@ pub mod container;
 pub mod detect;
 pub mod embedded;
 pub mod embedded_zip;
+pub mod history;
 pub mod layout;
 mod materialize;
 pub mod name_score;
@@ -307,6 +308,7 @@ impl SmartZipEngine {
             embedded_prompter,
             encoding_prompter,
             None,
+            None,
         )
         .await
     }
@@ -329,6 +331,7 @@ impl SmartZipEngine {
             None,
             None,
             listener,
+            None,
         )
         .await
     }
@@ -343,6 +346,7 @@ impl SmartZipEngine {
         embedded_prompter: Option<&dyn InteractiveEmbeddedPrompter>,
         encoding_prompter: Option<&dyn InteractiveEncodingPrompter>,
         listener: Option<TaskEventListener>,
+        history: Option<&dyn crate::history::TaskHistoryRecorder>,
     ) -> smartzip_core::Result<ExtractWorkflowResult> {
         let task_id = TaskId::new();
         let scanner = if request.scanner == *self.scanner.config() {
@@ -396,6 +400,19 @@ impl SmartZipEngine {
 
         let collision_resolver = output_prompter.map(|p| make_collision_resolver(p));
 
+        // History: register the task up-front and accumulate metrics as the
+        // loop runs. All history writes are best-effort — a repo error becomes
+        // a Warning event through the recorder and never aborts extraction.
+        if let Some(recorder) = history {
+            let summary = summarize_inputs(&request.inputs);
+            recorder.start_extract(&task_id, &summary, Some(&request.output_dir));
+        }
+        let mut hist_password_attempts: i64 = 0;
+        let mut hist_encoding_selected: Option<String> = None;
+        let mut hist_embedded_found: i64 = 0;
+        let mut hist_last_output: Option<PathBuf> = None;
+        let mut hist_saw_failure = false;
+
         loop {
             let Some(mut candidate) = queue.pop_front() else {
                 break;
@@ -440,6 +457,13 @@ impl SmartZipEngine {
             } else {
                 Vec::new()
             };
+
+            if !findings.is_empty() {
+                if let Some(recorder) = history {
+                    recorder.record_embedded_findings(&task_id, &candidate.path, &findings);
+                }
+                hist_embedded_found += findings.len() as i64;
+            }
 
             // Use dominant selector for embedded findings
             if !findings.is_empty() {
@@ -643,6 +667,18 @@ impl SmartZipEngine {
                     task_id: task_id.clone(),
                     kind: TaskEventKind::EncodingDetected(assessment.context.detected.clone()),
                 });
+                if let Some(recorder) = history {
+                    recorder.record_encoding_detection(
+                        &task_id,
+                        &candidate.path,
+                        candidate.detected_format.as_ref().map(|f| f.as_str()),
+                        &assessment.context.detected,
+                        Some(&assessment.context),
+                        false,
+                    );
+                    hist_encoding_selected =
+                        Some(encoding_mode_label(&assessment.context.detected.selected));
+                }
             }
 
             let _key = candidate_key(&candidate);
@@ -659,6 +695,7 @@ impl SmartZipEngine {
             for password in &password_candidates {
                 let pw_value = password_value(password);
                 let attempt_index = password_attempt_index(password, &password_candidates);
+                hist_password_attempts += 1;
                 events.push(TaskEvent {
                     task_id: task_id.clone(),
                     kind: TaskEventKind::Progress(smartzip_core::TaskProgress::indeterminate(
@@ -686,7 +723,7 @@ impl SmartZipEngine {
                     .await
                     {
                         Ok(result) if result.ok => {
-                            let _ = passwords.record_success(password);
+                            let matched_password_id = passwords.record_success(password).ok().flatten();
                             events.push(TaskEvent {
                                 task_id: task_id.clone(),
                                 kind: TaskEventKind::Progress(
@@ -697,6 +734,13 @@ impl SmartZipEngine {
                                     )),
                                 ),
                             });
+                            if let Some(recorder) = history {
+                                record_password_match_success(
+                                    recorder,
+                                    matched_password_id,
+                                    &candidate,
+                                );
+                            }
 
                             if zip_encoding_assessment.is_none()
                                 && request.encoding_mode == EncodingMode::Auto
@@ -716,6 +760,21 @@ impl SmartZipEngine {
                                             assessment.context.detected.clone(),
                                         ),
                                     });
+                                    if let Some(recorder) = history {
+                                        recorder.record_encoding_detection(
+                                            &task_id,
+                                            &candidate.path,
+                                            candidate
+                                                .detected_format
+                                                .as_ref()
+                                                .map(|f| f.as_str()),
+                                            &assessment.context.detected,
+                                            Some(&assessment.context),
+                                            false,
+                                        );
+                                    }
+                                    hist_encoding_selected =
+                                        Some(encoding_mode_label(&assessment.context.detected.selected));
                                 }
                             }
 
@@ -892,7 +951,8 @@ impl SmartZipEngine {
 
                     match extract_result {
                         Ok(result) => {
-                            let _ = passwords.record_success(password);
+                            let matched_password_id =
+                                passwords.record_success(password).ok().flatten();
                             events.push(TaskEvent {
                                 task_id: task_id.clone(),
                                 kind: TaskEventKind::Progress(
@@ -903,6 +963,13 @@ impl SmartZipEngine {
                                     )),
                                 ),
                             });
+                            if let Some(recorder) = history {
+                                record_password_match_success(
+                                    recorder,
+                                    matched_password_id,
+                                    &candidate,
+                                );
+                            }
                             if result.output_dir != output_dir {
                                 candidate.relative_path = output_relative_path_for(
                                     &request.output_dir,
@@ -1262,7 +1329,12 @@ impl SmartZipEngine {
                         path: candidate.path.clone(),
                     })
                 }) {
-                    events.push(TaskEvent::failed(task_id.clone(), &error));
+                    hist_saw_failure = true;
+                    let event = TaskEvent::failed(task_id.clone(), &error);
+                    if let Some(recorder) = history {
+                        recorder.record_event(&task_id, &event);
+                    }
+                    events.push(event);
                 }
             }
             if terminal_skip || !extracted {
@@ -1270,12 +1342,17 @@ impl SmartZipEngine {
                 continue;
             }
 
-            events.push(TaskEvent {
+            let output_event = TaskEvent {
                 task_id: task_id.clone(),
                 kind: TaskEventKind::OutputCreated {
                     path: actual_output_dir.clone(),
                 },
-            });
+            };
+            if let Some(recorder) = history {
+                recorder.record_event(&task_id, &output_event);
+            }
+            events.push(output_event);
+            hist_last_output = Some(actual_output_dir.clone());
 
             processed.push(candidate.clone());
             let output_relative_path = candidate_output_relative_path(&candidate);
@@ -1315,12 +1392,43 @@ impl SmartZipEngine {
             kind: TaskEventKind::Completed,
         });
 
+        let snapshot = events.snapshot();
+
+        // History: replay the full event timeline into task_events, then close
+        // out the task row with aggregated metrics. Detection-table rows and
+        // password_matches were written inline above where path context was
+        // available; this final pass only handles task_events + finish.
+        if let Some(recorder) = history {
+            for event in &snapshot {
+                recorder.record_event(&task_id, event);
+            }
+            let status = if processed.is_empty() {
+                crate::history::TaskCompletionStatus::Failed
+            } else if hist_saw_failure {
+                crate::history::TaskCompletionStatus::Partial
+            } else {
+                crate::history::TaskCompletionStatus::Completed
+            };
+            recorder.finish(
+                &task_id,
+                crate::history::TaskOutcome {
+                    status,
+                    error_code: None,
+                    error_message: None,
+                    password_attempts: hist_password_attempts,
+                    encoding_selected: hist_encoding_selected.as_deref(),
+                    embedded_found: hist_embedded_found,
+                    output_path: hist_last_output.as_deref(),
+                },
+            );
+        }
+
         Ok(ExtractWorkflowResult {
             task_id,
             processed,
             skipped,
             enqueued,
-            events: events.snapshot(),
+            events: snapshot,
         })
     }
 }
@@ -1357,6 +1465,51 @@ fn confidence_score(confidence: smartzip_scanner::Confidence) -> f32 {
 
 fn password_value(candidate: &PasswordCandidate) -> Option<String> {
     Some(candidate.value.clone())
+}
+
+/// Summarize root inputs for the `tasks.input_summary` column. Joins the file
+/// names with commas and appends "…and N more" once the list grows long so the
+/// column stays compact for many-input batch runs.
+fn summarize_inputs(inputs: &[PathBuf]) -> String {
+    const MAX_SHOWN: usize = 5;
+    let names: Vec<String> = inputs
+        .iter()
+        .map(|p| {
+            p.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| p.to_string_lossy().into_owned())
+        })
+        .collect();
+    if names.len() <= MAX_SHOWN {
+        return names.join(", ");
+    }
+    let shown = names[..MAX_SHOWN].join(", ");
+    format!("{shown}, …and {} more", names.len() - MAX_SHOWN)
+}
+
+/// Human-readable label for an [`EncodingMode`], used for the
+/// `tasks.encoding_selected` column.
+fn encoding_mode_label(mode: &EncodingMode) -> String {
+    match mode {
+        EncodingMode::Auto => "auto".to_string(),
+        EncodingMode::Override(name) => name.clone(),
+    }
+}
+
+/// Backfill a `password_matches` success row for the archive that a password
+/// just unlocked. No-op when the password had no database id (empty password
+/// or a not-yet-persisted manual candidate).
+fn record_password_match_success(
+    recorder: &dyn crate::history::TaskHistoryRecorder,
+    password_id: Option<i64>,
+    candidate: &ExtractionCandidate,
+) {
+    let Some(id) = password_id else {
+        return;
+    };
+    let format = candidate.detected_format.as_ref().map(|f| f.as_str());
+    let pattern = crate::history::normalize_filename_pattern(&candidate.path);
+    recorder.record_password_match(Some(id), format, pattern.as_deref(), true);
 }
 
 fn password_source_label(candidate: &PasswordCandidate) -> &'static str {

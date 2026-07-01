@@ -1,7 +1,13 @@
 //! SQLite persistence layer for SmartZip.
 
+pub mod embedded_archive_detection;
+pub mod encoding_detection;
 pub mod password;
+pub mod path_hash;
 pub mod schema;
+pub mod task;
+pub mod task_event;
+pub mod timestamp;
 
 use rusqlite::Connection;
 use std::path::Path;
@@ -12,6 +18,8 @@ pub type Result<T> = std::result::Result<T, DbError>;
 pub enum DbError {
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
 }
 
 pub struct SmartZipDb {

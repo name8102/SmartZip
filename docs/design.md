@@ -656,7 +656,7 @@ pub enum MainTab {
 
 ## 4. 数据库设计
 
-> 当前实现状态（2026-07-01）：本节是目标 schema。代码里目前仅实现 `schema_migrations`、`passwords`、`password_matches` 三张表；`tasks`、`task_events`、`encoding_detections`、`embedded_archive_detections` 仍未落库。
+> 当前实现状态（2026-07-02）：本节的六张表全部已落库——`schema_migrations`、`passwords`、`password_matches`、`tasks`、`task_events`、`encoding_detections`、`embedded_archive_detections`。迁移改为版本化顺序步骤（`smartzip-db/src/schema.rs`，`LATEST_VERSION = 2`），v1 建密码相关表，v2 建任务/事件/检测历史表，旧库自动升级。解压/检测工作流通过 `smartzip-engine` 的 `TaskHistoryRecorder`（默认实现 `DbTaskHistoryRecorder`）写入任务行、事件时间线、编码与内嵌检测记录，并回填 `password_matches`；写入为 best-effort，失败降级为 `Warning` 事件、不影响解压。CLI 通过 `smartzip history list` / `smartzip history show <task-id>` 读取，`--no-history` 可关闭记录。本节其余尚未实现的方向（如 `password_sets`、命名密码表）见 `docs/implementation-plan.md` Phase 3。
 
 ### 4.1 `passwords`
 

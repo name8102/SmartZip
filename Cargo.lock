@@ -5604,6 +5604,8 @@ version = "0.1.0"
 dependencies = [
  "rusqlite",
  "serde",
+ "serde_json",
+ "sha2 0.10.9",
  "thiserror 2.0.18",
 ]
 
@@ -5625,7 +5627,9 @@ dependencies = [
  "async-trait",
  "futures-util",
  "rstest",
+ "rusqlite",
  "serde",
+ "serde_json",
  "smartzip-archive",
  "smartzip-core",
  "smartzip-db",

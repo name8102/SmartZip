@@ -8,7 +8,9 @@ rust-version.workspace = true
 
 [dependencies]
 serde.workspace = true
+serde_json.workspace = true
 async-trait.workspace = true
+rusqlite.workspace = true
 smartzip-archive.workspace = true
 smartzip-core.workspace = true
 smartzip-db.workspace = true

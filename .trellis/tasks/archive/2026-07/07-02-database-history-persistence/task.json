@@ -1,0 +1,33 @@
+{
+  "id": "database-history-persistence",
+  "name": "database-history-persistence",
+  "title": "Database History Persistence",
+  "description": "把 docs/design.md 第 4 章列出的 tasks / task_events / encoding_detections / embedded_archive_detections 四张表落库，并让 engine 在解压和检测流程中通过注入的 recorder 写入历史。",
+  "status": "completed",
+  "dev_type": null,
+  "scope": null,
+  "package": "smartzip-db",
+  "priority": "P1",
+  "creator": "charl",
+  "assignee": "charl",
+  "createdAt": "2026-07-02",
+  "completedAt": "2026-07-02",
+  "branch": null,
+  "base_branch": "main",
+  "worktree_path": null,
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [],
+  "children": [],
+  "parent": null,
+  "relatedFiles": [
+    "crates/smartzip-db/src/schema.rs",
+    "crates/smartzip-db/src/lib.rs",
+    "crates/smartzip-engine/src/lib.rs",
+    "crates/smartzip-cli/src/main.rs",
+    "docs/design.md",
+    "docs/implementation-progress.md"
+  ],
+  "notes": "承接 06-27-core-rework-planning 与 07-01-embedded-zip-contract-followup 之后的数据库对齐工作。password_sets / password_set_memberships 属于 Phase P3，不在本任务范围。",
+  "meta": {}
+}

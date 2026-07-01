@@ -30,6 +30,7 @@ gpui = { version = "0.2", features = ["macos-blade"] }
 rusqlite = { version = "0.33", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+sha2 = "0.10"
 smartzip-archive = { path = "crates/smartzip-archive" }
 smartzip-config = { path = "crates/smartzip-config" }
 smartzip-core = { path = "crates/smartzip-core" }

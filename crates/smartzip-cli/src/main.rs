@@ -129,6 +129,11 @@ enum Command {
         /// Auto-confirm large file scans (>10GB).
         #[arg(long)]
         confirm_large_scan: bool,
+
+        /// Do not record this extraction in the task history tables.
+        /// Password statistics are still updated.
+        #[arg(long)]
+        no_history: bool,
     },
 
     /// Preview archive entry names under several encodings.
@@ -149,6 +154,10 @@ enum Command {
     /// Manage password database.
     #[command(subcommand)]
     Password(PasswordCmd),
+
+    /// Inspect recorded task history.
+    #[command(subcommand)]
+    History(HistoryCmd),
 }
 
 #[derive(Debug, Subcommand)]
@@ -200,6 +209,25 @@ enum PasswordCmd {
         /// Also apply cleanup, not just preview.
         #[arg(long)]
         apply: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum HistoryCmd {
+    /// List recent tasks, newest first.
+    List {
+        #[arg(long)]
+        json: bool,
+        /// Show at most this many tasks.
+        #[arg(long, default_value = "20")]
+        limit: usize,
+    },
+
+    /// Show a single task with its full event timeline.
+    Show {
+        task_id: String,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -293,6 +321,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             embedded,
             dominant_min_ratio,
             confirm_large_scan,
+            no_history,
         } => {
             let db = open_db(cli.db)?;
             extract(
@@ -311,6 +340,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 embedded,
                 dominant_min_ratio,
                 confirm_large_scan,
+                no_history,
             )
             .await
         }
@@ -329,6 +359,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Command::Password(cmd) => {
             let db = open_db(cli.db)?;
             password(&db, cmd)
+        }
+        Command::History(cmd) => {
+            let db = open_db(cli.db)?;
+            history(&db, cmd)
         }
     }
 }
@@ -455,6 +489,7 @@ async fn extract(
     embedded: EmbeddedModeArg,
     dominant_min_ratio: f32,
     confirm_large_scan: bool,
+    no_history: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if paths.is_empty() {
         return Err("no paths provided".into());
@@ -489,6 +524,17 @@ async fn extract(
     let engine = SmartZipEngine::default();
     let event_listener = (!json)
         .then(|| std::sync::Arc::new(render_extract_event) as smartzip_engine::TaskEventListener);
+
+    // History recorder shares the same connection as the password service.
+    // Both borrow `&Connection` immutably, which SQLite allows. Suppressed
+    // with `--no-history`; password success/failure writes happen regardless.
+    let recorder = (!no_history).then(|| {
+        smartzip_engine::history::DbTaskHistoryRecorder::new(db.connection())
+    });
+    let recorder_ref = recorder
+        .as_ref()
+        .map(|r| r as &dyn smartzip_engine::history::TaskHistoryRecorder);
+
     let result = engine
         .extract_recursive_with_listener_interactive(
             &backend,
@@ -522,6 +568,7 @@ async fn extract(
             }),
             Some(&StdinEncodingPrompter { lock: stdin_lock }),
             event_listener,
+            recorder_ref,
         )
         .await?;
 
@@ -542,6 +589,9 @@ async fn extract(
             for skipped in &result.skipped {
                 println!("  - {} (depth {})", skipped.path.display(), skipped.depth);
             }
+        }
+        if recorder_ref.is_some() {
+            println!("task-id: {}", result.task_id);
         }
     }
 
@@ -854,6 +904,79 @@ fn password(db: &SmartZipDb, cmd: PasswordCmd) -> Result<(), Box<dyn std::error:
                     "cleanup preview: {} would be disabled. Use --apply to execute.",
                     to_disable.len()
                 );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn history(db: &SmartZipDb, cmd: HistoryCmd) -> Result<(), Box<dyn std::error::Error>> {
+    use smartzip_db::task::TaskRepository;
+    use smartzip_db::task_event::TaskEventRepository;
+
+    match cmd {
+        HistoryCmd::List { limit, json } => {
+            let tasks = TaskRepository::new(db.connection()).recent(limit)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&tasks)?);
+            } else if tasks.is_empty() {
+                println!("No task history recorded.");
+            } else {
+                for t in &tasks {
+                    println!(
+                        "{}  {:<8} {:<9} {}  {}",
+                        t.id,
+                        t.kind,
+                        t.status,
+                        t.started_at,
+                        t.input_summary,
+                    );
+                }
+            }
+        }
+        HistoryCmd::Show { task_id, json } => {
+            let task = TaskRepository::new(db.connection()).find_by_id(&task_id)?;
+            let Some(task) = task else {
+                return Err(format!("no task with id {task_id}").into());
+            };
+            let events = TaskEventRepository::new(db.connection()).list_by_task(&task_id)?;
+            if json {
+                let output = serde_json::json!({
+                    "task": task,
+                    "events": events,
+                });
+                println!("{}", serde_json::to_string_pretty(&output)?);
+            } else {
+                println!("Task {}", task.id);
+                println!("  kind:      {}", task.kind);
+                println!("  status:    {}", task.status);
+                println!("  input:     {}", task.input_summary);
+                if let Some(output) = &task.output_path {
+                    println!("  output:    {output}");
+                }
+                println!("  started:   {}", task.started_at);
+                if let Some(finished) = &task.finished_at {
+                    println!("  finished:  {finished}");
+                }
+                println!("  passwords: {} attempt(s)", task.password_attempts);
+                if let Some(encoding) = &task.encoding_selected {
+                    println!("  encoding:  {encoding}");
+                }
+                println!("  embedded:  {} finding(s)", task.embedded_found);
+                if let Some(code) = &task.error_code {
+                    println!("  error:     {code}");
+                }
+                if let Some(message) = &task.error_message {
+                    println!("  detail:    {message}");
+                }
+                println!("  events:");
+                for event in &events {
+                    println!(
+                        "    {}  [{}] {}: {}",
+                        event.created_at, event.level, event.event_type, event.message,
+                    );
+                }
             }
         }
     }
