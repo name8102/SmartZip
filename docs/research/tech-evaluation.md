@@ -1,5 +1,7 @@
 # SmartZip 跨平台技术栈评估
 
+> 状态：历史研究文档  
+> 说明：本文记录早期技术选型判断，其中的“下一步建议”不等同于当前实施顺序；当前实现状态请看 `docs/implementation-progress.md`，设计基线请看 `docs/design.md`。  
 > 阶段：技术选型初评  
 > 当前倾向：Rust Core + Rust CLI + GPUI GUI  
 > 背景假设：Zed 在 Linux 上兼容性表现良好；系统集成需求优先级不高
@@ -149,7 +151,7 @@ GPUI 生态较小的主要风险之一是系统级能力和插件生态不如 Ta
 ```text
 ArchiveBackend
 ├── SevenZipBackend
-└── LibArchiveBackend / ZipBackend
+└── LibArchiveBackend / NativeZipBackend
 ```
 
 MVP 可以先实现 `SevenZipBackend`，后续加入库级后端。
@@ -158,7 +160,7 @@ MVP 可以先实现 `SevenZipBackend`，后续加入库级后端。
 
 建议使用 SQLite。
 
-主要表：
+主要表（历史设想，后续已收敛为不同的正式 schema 设计）：
 
 - `passwords`
 - `password_stats`

@@ -1,5 +1,7 @@
 # binwalk crate 评估
 
+> 状态：研究结论，部分已落地  
+> 说明：`smartzip-scanner` 已吸收本文的基础方向；更细的实现状态请以源码和 `docs/implementation-progress.md` 为准。  
 > 目标：评估 `binwalk` 是否适合作为 SmartZip `smartzip-scanner` 的内嵌压缩包检测实现  
 > 版本：`binwalk = 3.1.0`  
 > 来源：crates.io、docs.rs、本地 Cargo 源码

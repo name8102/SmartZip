@@ -12,6 +12,12 @@ SmartZip 是一个用 Rust 重写的跨平台压缩包辅助工具，目标是�
 - **编码处理**：支持自动识别与手动指定文件名编码
 - **工作区**：CLI、GUI、核心库、扫描、密码、平台适配等模块分层组织
 
+## 当前修复方向
+
+- ZIP 解压主路径正在调整为优先调用 `7z` / `7zz`，不再把现有原生 ZIP 后端视为复杂 ZIP 的默认实现。
+- ZIP 全自动编码检测已确认暂时不可靠，当前修复方向是先保留手动 `--encoding`，并补一个“多编码文件名预览”辅助命令。
+- 近期优先级仍是：恢复解压成功率、修正密码/分卷行为、消除误报成功与静默失败。
+
 ## 快速开始
 
 查看帮助：
@@ -66,13 +72,28 @@ cargo build
 cargo test
 ```
 
+复杂度/覆盖风险扫描：
+
+```bash
+scripts/crap-scan.sh
+```
+
+说明：
+
+- 默认只针对 `smartzip-engine` 和 `smartzip-cli` 收集覆盖率并运行 `cargo-crap`
+- 使用临时 XDG 目录，避免平台路径测试把扫描流程直接打断
+- `scripts/crap-scan.sh --quick` 可跳过覆盖率采集，只看复杂度热点
+- 当前建议把它作为调查/重构前的辅助检查，不作为全 workspace CI 阻塞门禁
+
 ## 文档
 
 - `docs/requirements.md`
 - `docs/design.md`
 - `docs/implementation-plan.md`
 - `docs/implementation-progress.md`
-- `docs/tech-evaluation.md`
+- `docs/agents/`
+- `docs/compose/plans/`
+- `docs/research/`
 - `CONTEXT.md`
 
 ## 许可证

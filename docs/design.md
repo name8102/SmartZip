@@ -112,6 +112,8 @@ SQLite 保存成功密码、导入密码、命名密码表、关联关系和统�
 
 ### 0.5 后端分工
 
+> 当前实现状态（2026-07-01）：本节描述目标后端分工。代码里 ZIP 的 `list/test/extract` 主路径仍优先走 `SevenZipCliBackend`；`NativeZipBackend` 已存在，但目前主要承担有限特例能力、路径安全校验、ZIP 压缩和后备路径。`NativeSevenZipBackend` 尚未实现。
+
 ```text
 NativeZipBackend
 ├── ZIP ZipCrypto / AES
@@ -139,7 +141,7 @@ SevenZipCliBackend
 └── 保留为疑难格式和库级后端能力缺口的兜底
 ```
 
-后端路由以格式和能力为先，而不是固定单一后端：ZIP 优先 `NativeZipBackend`；RAR 优先 `UnrarBackend`，失败或不可用时回退 `SevenZipCliBackend`；7z 优先评估 `NativeSevenZipBackend`，未覆盖的 7z AES、分卷或复杂格式回退 `SevenZipCliBackend`。路由层需要记录实际使用的 backend、失败原因和 fallback 链路，便于诊断“部分文件失败”这类问题。
+后端路由以格式和能力为先，而不是固定单一后端：目标状态下 ZIP 优先 `NativeZipBackend`；RAR 优先 `UnrarBackend`，失败或不可用时回退 `SevenZipCliBackend`；7z 优先评估 `NativeSevenZipBackend`，未覆盖的 7z AES、分卷或复杂格式回退 `SevenZipCliBackend`。当前实现为了成功率，ZIP 仍默认优先走 `SevenZipCliBackend`。路由层需要记录实际使用的 backend、失败原因和 fallback 链路，便于诊断“部分文件失败”这类问题。
 
 `ArchiveBackend::list()` 需要演进为可表达原始文件名字节的模型，例如 `RawArchiveEntry`。`PathBuf` 只能作为完成编码决策后的输出路径，不能作为归档元数据的唯一表示。
 
@@ -270,7 +272,6 @@ pub struct ExtractRequest {
     pub output_dir: Option<PathBuf>,
     pub encoding: EncodingMode,
     pub scan_embedded: bool,
-    pub delete_source_on_success: bool,
     pub recursion_limit: u8,
 }
 
@@ -320,6 +321,8 @@ pub trait ArchiveBackend: Send + Sync {
 
 MVP 后端：
 
+> 当前实现状态（2026-07-01）：`BackendRouter`、`UnrarBackend`、`SevenZipCliBackend`、`NativeZipBackend` 已存在；但 ZIP 在 router 中默认是 `SevenZipCliBackend` 优先、`NativeZipBackend` 后备。`NativeSevenZipBackend` 和 `LibArchiveBackend` 仍未实现。
+
 ```text
 BackendRouter
 ├── 按格式和 capabilities 选择后端
@@ -327,10 +330,10 @@ BackendRouter
 └── 对 engine 暴露统一 ArchiveBackend 行为
 
 NativeZipBackend
-├── zip crate
-├── ZIP ZipCrypto / AES
-├── 原始文件名字节和编码恢复
-└── 路径安全检查
+├── 目标：zip crate / async_zip 等 Rust 原生能力
+├── 目标：ZIP ZipCrypto / AES
+├── 目标：原始文件名字节和编码恢复
+└── 当前：少量 ZIP 特例能力、路径安全检查、压缩与后备路径
 
 UnrarBackend
 ├── unrar crate 或 unrar CLI
@@ -593,7 +596,7 @@ smartzip config path
 smartzip db path
 ```
 
-退出码：
+退出码（目标设计；当前 CLI 实现仅稳定使用 0=成功、1=全部失败/通用错误、2=部分成功）：
 
 | code | 含义 |
 | --- | --- |
@@ -652,6 +655,8 @@ pub enum MainTab {
 ```
 
 ## 4. 数据库设计
+
+> 当前实现状态（2026-07-01）：本节是目标 schema。代码里目前仅实现 `schema_migrations`、`passwords`、`password_matches` 三张表；`tasks`、`task_events`、`encoding_detections`、`embedded_archive_detections` 仍未落库。
 
 ### 4.1 `passwords`
 

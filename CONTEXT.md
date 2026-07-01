@@ -7,7 +7,7 @@
 | Term | Definition |
 |------|------------|
 | **ArchiveBackend** | 压缩后端抽象 trait。定义 `probe` / `list` / `test` / `extract` / `compress`。所有后端实现（Rust 原生 lib 或 7zz CLI）统一实现此 trait。 |
-| **NativeBackend** | 原生后端门面。第一阶段优先实现 `NativeZipBackend`，负责 ZIP ZipCrypto / AES、原始文件名字节、路径安全和高速密码验证。复杂格式通过独立 fallback 路由交给 `SevenZipBackend`。 |
+| **NativeBackend** | 原生后端门面。长期目标是让 `NativeZipBackend` 承担 ZIP 编码恢复、路径安全和高性能密码验证；当前实现中 ZIP 的主提取路径仍优先走 `SevenZipBackend`，`NativeZipBackend` 主要保留为少量特例能力、测试能力和后备路径。 |
 | **SmartZipEngine** | 解压/检测/压缩工作流编排器。自身不持有后端、密码服务等依赖——由调用方（CLI/GUI）注入。 |
 | **ExtractionCandidate** | 待解压候选条目。包含路径、深度、来源类型、检测格式、内嵌偏移等。 |
 | **CandidateSource** | 候选来源枚举：`RootInput`（用户直接输入）、`ExtractedFile`（解压产物中找到的）、`EmbeddedFinding`（扫描器在二进制偏移处发现的）。 |
@@ -31,7 +31,7 @@
 | Term | Definition |
 |------|------------|
 | **TaskEvent** | 工作流中产生的事件：Started / Progress / PasswordTried / EncodingDetected / EmbeddedArchiveFound / OutputCreated / Warning / Failed / Completed。 |
-| **Event channel** | 计划使用有界 `tokio::sync::mpsc`。engine 在解压过程中实时推送事件，CLI/GUI 异步消费显示进度，并支持取消和等待用户决策。与最终汇总结果并存。 |
+| **Event channel** | 目标设计是有界 `tokio::sync::mpsc` 实时事件流；当前实现仍以 `ExtractWorkflowResult` 中汇总的 `Vec<TaskEvent>` 为主，并支持可选 listener 回调。 |
 | **ExtractWorkflowResult** | `extract_recursive` 的返回值。包含 processed/skipped/enqueued 列表 + 完整事件集合。供调用方做最终统计和断言。 |
 
 ## Password Model
@@ -51,12 +51,12 @@
 **Trade-off**: 调用方代码略多；engine 可测试性不变（注入 mock 即可）。
 
 ### ADR-002: Real-time event streaming via mpsc
-**Decision**: 下一阶段为 engine 增加有界 `mpsc` 事件流，事件即产即推。同时保留最终汇总结果。
+**Decision**: 目标是在后续阶段为 engine 增加有界 `mpsc` 事件流，事件即产即推。同时保留最终汇总结果。当前尚未实现该通道，仍以事件汇总 + listener 为主。
 **Rationale**: 消除 CLI 的"卡死感"——用户实时看到进度。返回值保留供测试断言和最终统计。
 **Trade-off**: 有界通道需要定义背压策略，不能让高频进度事件拖慢解压。
 
 ### ADR-003: Mixed backend — Rust libs + format-specific fallback
-**Decision**: 第一阶段实现 `NativeZipBackend`；RAR 增加 `UnrarBackend`，优先评估 `unrar` crate，必要时使用 `unrar` CLI；7z 增加 `NativeSevenZipBackend` 评估，先看 `sevenz-rust2`，备选 `zesven`；复杂格式和库级能力缺口继续通过 `SevenZipCliBackend` fallback。路由对 engine 透明。
+**Decision**: 保留混合后端方向：RAR 增加 `UnrarBackend`，优先评估 `unrar` crate，必要时使用 `unrar` CLI；7z 继续评估 `NativeSevenZipBackend`，先看 `sevenz-rust2`，备选 `zesven`；复杂格式和库级能力缺口继续通过 `SevenZipCliBackend` fallback。ZIP 的长期目标仍是增强 `NativeZipBackend`，但当前实现里 ZIP 默认仍优先路由到 `SevenZipBackend`，`NativeZipBackend` 只承担有限特例能力和后备路径。路由对 engine 透明。
 **Rationale**: ZIP 是编码恢复、路径安全和高性能密码表遍历的关键格式；RAR 在 7zz 解压中已出现部分失败，需要格式专用后端提高成功率和诊断质量；7zz 仍覆盖 Rust 生态未支持的复杂格式。
 **Trade-off**: 多后端增加测试矩阵，同一功能在不同后端上的能力必须明确标记，并记录实际后端、失败原因和 fallback 链路。
 
