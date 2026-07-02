@@ -433,11 +433,17 @@ fn open_db(path: Option<PathBuf>) -> Result<SmartZipDb, Box<dyn std::error::Erro
 }
 
 fn scanner_config(deep: bool, max_scan_bytes: Option<u64>) -> ScannerConfig {
-    ScannerConfig {
+    let mut config = ScannerConfig {
         mode: if deep { ScanMode::Deep } else { ScanMode::Fast },
-        max_scan_bytes: max_scan_bytes.and_then(|value| (value != 0).then_some(value)),
         ..ScannerConfig::default()
-    }
+    };
+    config.max_scan_bytes = match max_scan_bytes {
+        Some(0) => None,
+        Some(value) => Some(value),
+        None if deep => None,
+        None => config.max_scan_bytes,
+    };
+    config
 }
 
 fn detect(

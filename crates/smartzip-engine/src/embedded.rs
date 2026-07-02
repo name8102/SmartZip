@@ -115,13 +115,7 @@ pub fn select_embedded_action(
 
         let action = match policy.mode {
             EmbeddedScanMode::Ask => DetectionAction::AskUser,
-            EmbeddedScanMode::Auto => {
-                if findings.len() == 1 {
-                    DetectionAction::AskUser
-                } else {
-                    DetectionAction::ReportOnly
-                }
-            }
+            EmbeddedScanMode::Auto => DetectionAction::AskUser,
             EmbeddedScanMode::Largest | EmbeddedScanMode::Aggressive | EmbeddedScanMode::All => {
                 DetectionAction::CarveAndExtract
             }
@@ -225,11 +219,7 @@ mod tests {
         let total = 15 * 1024 * 1024;
         let d = select_embedded_action(total, &[f], &default_policy(), false);
         assert_eq!(d.kind, DetectionKind::EmbeddedPayload);
-        assert!(
-            d.action == DetectionAction::AskUser || d.action == DetectionAction::ReportOnly,
-            "unexpected action: {:?}",
-            d.action
-        );
+        assert_eq!(d.action, DetectionAction::AskUser);
     }
 
     #[test]
@@ -253,11 +243,7 @@ mod tests {
         let f2 = finding(40 * 1024, Some(40 * 1024), ArchiveFormat::Rar);
         let d = select_embedded_action(100 * 1024, &[f1, f2], &default_policy(), false);
         assert_eq!(d.kind, DetectionKind::EmbeddedPayload);
-        assert!(
-            d.action == DetectionAction::AskUser || d.action == DetectionAction::ReportOnly,
-            "unexpected action: {:?}",
-            d.action
-        );
+        assert_eq!(d.action, DetectionAction::AskUser);
     }
 
     #[test]

@@ -21,7 +21,9 @@ use smartzip_archive::{
 };
 use smartzip_core::{ArchiveFormat, EncodingMode, TaskEvent, TaskEventKind, TaskId};
 use smartzip_passwords::{PasswordCandidate, PasswordCandidateRequest, PasswordService};
-use smartzip_scanner::{EmbeddedArchiveFinding, EmbeddedScanner, ScannerConfig};
+use smartzip_scanner::{
+    Confidence, EmbeddedArchiveFinding, EmbeddedScanner, ScanMode, ScannerConfig,
+};
 use std::any::Any;
 use std::collections::{HashSet, VecDeque};
 use std::fs::File;
@@ -122,6 +124,7 @@ pub struct DetectResult {
 pub struct SmartZipEngine {
     scanner: EmbeddedScanner,
     archive_recycler: ArchiveRecycleHandler,
+    min_embedded_size_bytes: u64,
 }
 
 pub type ArchiveRecycleHandler = Arc<dyn Fn(PathBuf) -> std::io::Result<()> + Send + Sync>;
@@ -210,6 +213,7 @@ impl SmartZipEngine {
         Self {
             scanner,
             archive_recycler: Arc::new(smartzip_platform::move_to_trash),
+            min_embedded_size_bytes: smartzip_core::DEFAULT_MIN_EMBEDDED_FINDING_SIZE,
         }
     }
 
@@ -226,14 +230,20 @@ impl SmartZipEngine {
         Self::new(EmbeddedScanner::new(config))
     }
 
+    pub fn with_min_embedded_size_bytes(mut self, min_embedded_size_bytes: u64) -> Self {
+        self.min_embedded_size_bytes = min_embedded_size_bytes;
+        self
+    }
+
     pub fn detect(&self, request: DetectRequest) -> std::io::Result<DetectResult> {
         let task_id = TaskId::new();
         let mut events = vec![TaskEvent::started(task_id.clone())];
 
-        let scanner = if request.scanner == *self.scanner.config() {
+        let effective_config = default_root_scanner_config(&request.scanner);
+        let scanner = if effective_config == *self.scanner.config() {
             None
         } else {
-            Some(EmbeddedScanner::new(request.scanner.clone()))
+            Some(EmbeddedScanner::new(effective_config))
         };
         let scanner = scanner.as_ref().unwrap_or(&self.scanner);
 
@@ -352,12 +362,13 @@ impl SmartZipEngine {
         history: Option<&dyn crate::history::TaskHistoryRecorder>,
     ) -> smartzip_core::Result<ExtractWorkflowResult> {
         let task_id = TaskId::new();
-        let scanner = if request.scanner == *self.scanner.config() {
+        let nested_scanner = if request.scanner == *self.scanner.config() {
             None
         } else {
             Some(EmbeddedScanner::new(request.scanner.clone()))
         };
-        let scanner = scanner.as_ref().unwrap_or(&self.scanner);
+        let nested_scanner = nested_scanner.as_ref().unwrap_or(&self.scanner);
+        let root_scanner = EmbeddedScanner::new(full_root_scanner_config(&request.scanner));
 
         let events = EventSink::new(listener);
         events.push(TaskEvent::started(task_id.clone()));
@@ -369,10 +380,11 @@ impl SmartZipEngine {
         let output_materializer = OutputMaterializer::default();
         let root_input_total = request.inputs.len();
         let mut root_input_started = 0usize;
-        let embedded_policy = embedded_policy_from_request(&request);
-        let nested_embedded_enabled = matches!(
+        let mut embedded_policy = embedded_policy_from_request(&request);
+        embedded_policy.min_finding_size_bytes = self.min_embedded_size_bytes;
+        let nested_embedded_enabled = !matches!(
             embedded_policy.mode,
-            smartzip_core::EmbeddedScanMode::Aggressive | smartzip_core::EmbeddedScanMode::All
+            smartzip_core::EmbeddedScanMode::Ignore
         );
         let mut embedded_extract_all = false;
 
@@ -467,7 +479,73 @@ impl SmartZipEngine {
                 crate::detect::detect_non_archive_header(&buf[..n])
             };
 
-            let findings = if should_scan_candidate_for_embedded(
+            // Root scans enqueue every embedded payload as its own candidate.
+            // Confirm those candidates one at a time without rescanning the
+            // carrier file.
+            if candidate.source == CandidateSource::EmbeddedFinding
+                && matches!(
+                    embedded_policy.mode,
+                    smartzip_core::EmbeddedScanMode::Auto | smartzip_core::EmbeddedScanMode::Ask
+                )
+                && !embedded_extract_all
+            {
+                let finding = EmbeddedArchiveFinding {
+                    offset: candidate.embedded_offset.unwrap_or(0),
+                    size: candidate.embedded_size,
+                    format: candidate
+                        .detected_format
+                        .clone()
+                        .unwrap_or_else(|| ArchiveFormat::Unknown("embedded".into())),
+                    confidence: Confidence::High,
+                    description: "queued embedded archive finding".into(),
+                };
+                let file_size = std::fs::metadata(&candidate.path)
+                    .map(|metadata| metadata.len())
+                    .unwrap_or(0);
+                let decision = crate::embedded::select_embedded_action(
+                    file_size,
+                    std::slice::from_ref(&finding),
+                    &embedded_policy,
+                    false,
+                );
+                events.push(TaskEvent {
+                    task_id: task_id.clone(),
+                    kind: TaskEventKind::EmbeddedArchiveSelectionRequired {
+                        path: candidate.path.clone(),
+                        findings_count: 1,
+                    },
+                });
+                let selection = if let Some(prompter) = embedded_prompter {
+                    Some(prompter.prompt(&candidate.path, &decision).await)
+                } else {
+                    None
+                };
+                match selection {
+                    Some(EmbeddedSelectionChoice::Extract) => {}
+                    Some(EmbeddedSelectionChoice::ExtractAll) => embedded_extract_all = true,
+                    Some(EmbeddedSelectionChoice::Skip) | None => {
+                        record_skip(history, &task_id, &candidate, "not_found");
+                        skipped.push(candidate);
+                        continue;
+                    }
+                }
+                events.push(TaskEvent {
+                    task_id: task_id.clone(),
+                    kind: TaskEventKind::EmbeddedArchiveSelected {
+                        offset: finding.offset,
+                        size: finding.size,
+                        format: finding.format,
+                        reason: "user confirmed queued embedded finding".into(),
+                    },
+                });
+            }
+
+            let scan_with = if candidate.source == CandidateSource::RootInput {
+                &root_scanner
+            } else {
+                nested_scanner
+            };
+            let findings: Vec<_> = if should_scan_candidate_for_embedded(
                 &candidate,
                 &embedded_policy,
                 nested_embedded_enabled,
@@ -475,10 +553,49 @@ impl SmartZipEngine {
                 &events,
                 &task_id,
             ) {
-                scanner.scan_path(&candidate.path).unwrap_or_default()
+                scan_with
+                    .scan_path(&candidate.path)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|finding| finding_meets_min_size(finding, &embedded_policy))
+                    .collect()
             } else {
                 Vec::new()
             };
+
+            let root_findings = if matches!(
+                embedded_policy.mode,
+                smartzip_core::EmbeddedScanMode::Auto
+                    | smartzip_core::EmbeddedScanMode::Ask
+                    | smartzip_core::EmbeddedScanMode::Aggressive
+                    | smartzip_core::EmbeddedScanMode::All
+            ) {
+                root_embedded_candidates(&candidate, &findings)
+            } else {
+                Vec::new()
+            };
+            if !root_findings.is_empty() {
+                for embedded_candidate in root_findings {
+                    if let (Some(offset), Some(format)) = (
+                        embedded_candidate.embedded_offset,
+                        embedded_candidate.detected_format.clone(),
+                    ) {
+                        events.push(TaskEvent {
+                            task_id: task_id.clone(),
+                            kind: TaskEventKind::EmbeddedArchiveFound {
+                                offset,
+                                size: embedded_candidate.embedded_size,
+                                format,
+                                confidence: confidence_score(Confidence::High),
+                                description: "embedded archive queued from root scan".into(),
+                            },
+                        });
+                    }
+                    enqueued.push(embedded_candidate.clone());
+                    queue.push_back(embedded_candidate);
+                }
+                continue;
+            }
 
             // Use dominant selector for embedded findings
             if !findings.is_empty() {
@@ -1598,7 +1715,7 @@ impl SmartZipEngine {
             processed.push(candidate.clone());
             let output_relative_path = candidate_output_relative_path(&candidate);
             let nested_candidates = discover_nested_candidates(
-                scanner,
+                nested_scanner,
                 &actual_output_dir,
                 candidate.depth + 1,
                 &output_relative_path,
@@ -1836,9 +1953,50 @@ fn candidate_key(candidate: &ExtractionCandidate) -> String {
     )
 }
 
+fn root_embedded_candidates(
+    root: &ExtractionCandidate,
+    findings: &[EmbeddedArchiveFinding],
+) -> Vec<ExtractionCandidate> {
+    if root.source != CandidateSource::RootInput
+        || root.embedded_offset.is_some()
+        || findings.iter().any(|finding| finding.offset == 0)
+    {
+        return Vec::new();
+    }
+
+    findings
+        .iter()
+        .enumerate()
+        .map(|(index, finding)| {
+            let mut relative_path = root.relative_path.clone();
+            let base_name = relative_path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy();
+            relative_path.set_file_name(format!(
+                "{base_name}-embedded-{}-{:X}",
+                index + 1,
+                finding.offset
+            ));
+            ExtractionCandidate {
+                path: root.path.clone(),
+                relative_path,
+                depth: root.depth,
+                source: CandidateSource::EmbeddedFinding,
+                detected_format: Some(finding.format.clone()),
+                embedded_offset: Some(finding.offset),
+                embedded_size: finding.size,
+            }
+        })
+        .collect()
+}
+
 fn output_dir_for_candidate(base: &Path, candidate: &ExtractionCandidate) -> PathBuf {
     match candidate.source {
         CandidateSource::RootInput => base.join(candidate_output_relative_path(candidate)),
+        CandidateSource::EmbeddedFinding if candidate.depth == 0 => {
+            base.join(candidate_output_relative_path(candidate))
+        }
         CandidateSource::ExtractedFile | CandidateSource::EmbeddedFinding => candidate
             .path
             .parent()
@@ -2047,7 +2205,6 @@ fn ext_business_container_kind(path: &Path) -> Option<smartzip_core::BusinessCon
         "epub" => Some(smartzip_core::BusinessContainerKind::Epub),
         "apk" => Some(smartzip_core::BusinessContainerKind::Apk),
         "jar" => Some(smartzip_core::BusinessContainerKind::Jar),
-        "cbz" => Some(smartzip_core::BusinessContainerKind::Cbz),
         "cbr" => Some(smartzip_core::BusinessContainerKind::Cbr),
         _ => None,
     }
@@ -2063,6 +2220,32 @@ fn embedded_policy_from_request(
     }
 }
 
+fn full_root_scanner_config(requested: &ScannerConfig) -> ScannerConfig {
+    ScannerConfig {
+        mode: ScanMode::Deep,
+        max_scan_bytes: None,
+        ..requested.clone()
+    }
+}
+
+fn default_root_scanner_config(requested: &ScannerConfig) -> ScannerConfig {
+    if requested == &ScannerConfig::default() || requested.max_scan_bytes.is_none() {
+        full_root_scanner_config(requested)
+    } else {
+        requested.clone()
+    }
+}
+
+fn finding_meets_min_size(
+    finding: &EmbeddedArchiveFinding,
+    policy: &smartzip_core::EmbeddedScanPolicy,
+) -> bool {
+    finding.offset == 0
+        || finding
+            .size
+            .is_none_or(|size| size >= policy.min_finding_size_bytes)
+}
+
 fn should_scan_candidate_for_embedded(
     candidate: &ExtractionCandidate,
     policy: &smartzip_core::EmbeddedScanPolicy,
@@ -2072,6 +2255,10 @@ fn should_scan_candidate_for_embedded(
     task_id: &TaskId,
 ) -> bool {
     if matches!(policy.mode, smartzip_core::EmbeddedScanMode::Ignore) {
+        return false;
+    }
+
+    if candidate.source == CandidateSource::EmbeddedFinding && candidate.embedded_offset.is_some() {
         return false;
     }
 
@@ -2413,11 +2600,22 @@ fn discover_nested_candidates(
         {
             continue;
         }
-        let findings = scanner.scan_path(&path).unwrap_or_default();
+        let findings: Vec<_> = scanner
+            .scan_path(&path)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|finding| finding_meets_min_size(finding, policy))
+            .collect();
         if findings.is_empty() {
             continue;
         }
-        if matches!(policy.mode, smartzip_core::EmbeddedScanMode::All) {
+        if matches!(
+            policy.mode,
+            smartzip_core::EmbeddedScanMode::Auto
+                | smartzip_core::EmbeddedScanMode::Ask
+                | smartzip_core::EmbeddedScanMode::Aggressive
+                | smartzip_core::EmbeddedScanMode::All
+        ) {
             for finding in findings {
                 candidates.push(ExtractionCandidate {
                     path: path.clone(),
@@ -2613,6 +2811,67 @@ mod tests {
     }
 
     #[test]
+    fn root_scan_is_full_while_default_nested_scan_stays_fast() {
+        let nested = ScannerConfig::default();
+        let root = full_root_scanner_config(&nested);
+
+        assert_eq!(root.mode, ScanMode::Deep);
+        assert_eq!(root.max_scan_bytes, None);
+        assert_eq!(nested.mode, ScanMode::Fast);
+        assert_eq!(nested.max_scan_bytes, Some(64 * 1024 * 1024));
+    }
+
+    #[test]
+    fn root_scan_enqueues_every_eligible_finding_with_unique_output() {
+        let root = ExtractionCandidate {
+            path: PathBuf::from("/inputs/carrier.mp4"),
+            relative_path: PathBuf::from("carrier"),
+            depth: 0,
+            source: CandidateSource::RootInput,
+            detected_format: None,
+            embedded_offset: None,
+            embedded_size: None,
+        };
+        let policy = smartzip_core::EmbeddedScanPolicy::default();
+        let findings = vec![
+            EmbeddedArchiveFinding {
+                offset: 100,
+                size: Some(policy.min_finding_size_bytes - 1),
+                format: ArchiveFormat::Zip,
+                confidence: Confidence::High,
+                description: String::new(),
+            },
+            EmbeddedArchiveFinding {
+                offset: 200,
+                size: Some(policy.min_finding_size_bytes),
+                format: ArchiveFormat::Zip,
+                confidence: Confidence::High,
+                description: String::new(),
+            },
+            EmbeddedArchiveFinding {
+                offset: 300,
+                size: None,
+                format: ArchiveFormat::SevenZip,
+                confidence: Confidence::High,
+                description: String::new(),
+            },
+        ];
+        let eligible: Vec<_> = findings
+            .into_iter()
+            .filter(|finding| finding_meets_min_size(finding, &policy))
+            .collect();
+        let candidates = root_embedded_candidates(&root, &eligible);
+
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].embedded_offset, Some(200));
+        assert_eq!(candidates[1].embedded_offset, Some(300));
+        assert_ne!(candidates[0].relative_path, candidates[1].relative_path);
+        assert!(candidates
+            .iter()
+            .all(|candidate| candidate.source == CandidateSource::EmbeddedFinding));
+    }
+
+    #[test]
     fn zip_encoding_assessment_skips_confirmation_for_ascii_names() {
         let assessment = build_zip_encoding_assessment(ArchiveListing {
             format: Some(ArchiveFormat::Zip),
@@ -2639,6 +2898,7 @@ mod tests {
         let output = tempfile::tempdir().unwrap();
 
         let result = SmartZipEngine::default()
+            .with_min_embedded_size_bytes(0)
             .extract_recursive(
                 &backend,
                 &service,
@@ -2673,6 +2933,11 @@ mod tests {
             event.kind,
             TaskEventKind::EmbeddedArchiveSelectionRequired { .. }
         )));
+    }
+
+    #[test]
+    fn cbz_extension_is_not_a_business_container() {
+        assert_eq!(ext_business_container_kind(Path::new("comic.cbz")), None);
     }
 
     #[test]
@@ -3602,7 +3867,7 @@ mod tests {
         let db = SmartZipDb::in_memory().unwrap();
         let service = PasswordService::new(PasswordRepository::new(db.connection()));
 
-        let engine = engine_with_test_recycler();
+        let engine = engine_with_test_recycler().with_min_embedded_size_bytes(0);
         let result = engine
             .extract_recursive(
                 &backend,
@@ -3616,7 +3881,7 @@ mod tests {
                     password_candidates: PasswordCandidateRequest::default(),
                     layout_policy: crate::layout::OutputLayoutPolicy::default(),
                     single_root_name_policy: crate::layout::SingleRootNamePolicy::default(),
-                    embedded_scan_mode: smartzip_core::EmbeddedScanMode::default(),
+                    embedded_scan_mode: smartzip_core::EmbeddedScanMode::Aggressive,
                     dominant_min_ratio: 0.70,
                     confirm_large_scan: false,
                     force: false,

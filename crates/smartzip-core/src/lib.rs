@@ -7,7 +7,7 @@ pub mod task;
 
 pub use embedded::{
     BusinessContainerKind, DetectionAction, DetectionDecision, DetectionKind, EmbeddedScanMode,
-    EmbeddedScanPolicy, FindingSummary,
+    EmbeddedScanPolicy, FindingSummary, DEFAULT_MIN_EMBEDDED_FINDING_SIZE,
 };
 pub use error::{Result, SmartZipError};
 pub use progress::{

@@ -219,17 +219,17 @@ fn classify_fake_docx_not_business_container() {
 }
 
 // ── nested_cbz_should_skip ─────────────────────────────────────────────────
-// ZIP with image entries → classified as Cbz
+// ZIP with image entries remains an ordinary archive.
 
 #[test]
-fn classify_cbz_entries_as_business_container() {
+fn image_only_zip_is_not_a_business_container() {
     let data = read_fixture_bytes("nested_cbz_should_skip.zip");
 
     // Header detects ZIP
     let header = detect_archive_header(&data);
     assert_eq!(header, Some((ArchiveFormat::Zip, 0)));
 
-    // Entry paths are image files → CBZ
+    // Image-only contents must not trigger business-container skipping.
     let entry_paths = vec![
         "page001.jpg".to_string(),
         "page002.jpg".to_string(),
@@ -237,7 +237,7 @@ fn classify_cbz_entries_as_business_container() {
         "cover.webp".to_string(),
     ];
     let kind = classify_zip_listing(&entry_paths, false);
-    assert_eq!(kind, Some(BusinessContainerKind::Cbz));
+    assert_eq!(kind, None);
 }
 
 // ── multi_payload_largest_80 ───────────────────────────────────────────────

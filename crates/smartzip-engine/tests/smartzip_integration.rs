@@ -958,7 +958,7 @@ async fn test_engine_interactive_password_reuses_carved_embedded_archive_path() 
     let backend = backend();
     let db = SmartZipDb::in_memory().unwrap();
     let service = PasswordService::new(PasswordRepository::new(db.connection()));
-    let engine = SmartZipEngine::default();
+    let engine = SmartZipEngine::default().with_min_embedded_size_bytes(0);
     let output = TempDir::new().unwrap();
     let prompter = StaticPasswordPrompter {
         password: "video-pass".into(),

@@ -43,20 +43,6 @@ pub fn classify_zip_listing(
         }
     }
 
-    if !entry_paths.is_empty() && !has_archive_entries {
-        let image_exts = [".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"];
-        let image_count = entry_paths
-            .iter()
-            .filter(|e| {
-                let lower = e.to_ascii_lowercase();
-                image_exts.iter().any(|ext| lower.ends_with(ext))
-            })
-            .count();
-        if image_count * 3 >= entry_paths.len() * 2 {
-            return Some(BusinessContainerKind::Cbz);
-        }
-    }
-
     None
 }
 
@@ -139,17 +125,14 @@ mod tests {
     }
 
     #[test]
-    fn detects_cbz() {
+    fn image_only_zip_is_not_a_business_container() {
         let entries = vec![
             "001.jpg".into(),
             "002.jpg".into(),
             "003.jpg".into(),
             "004.png".into(),
         ];
-        assert_eq!(
-            classify_zip_listing(&entries, false),
-            Some(BusinessContainerKind::Cbz)
-        );
+        assert_eq!(classify_zip_listing(&entries, false), None);
     }
 
     #[test]
