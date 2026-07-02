@@ -1,9 +1,9 @@
 //! SQLite persistence layer for SmartZip.
 
-pub mod embedded_archive_detection;
-pub mod encoding_detection;
+pub mod file_extractions;
+pub mod known_files;
 pub mod password;
-pub mod path_hash;
+pub mod sample_hash;
 pub mod schema;
 pub mod task;
 pub mod task_event;

@@ -1,0 +1,33 @@
+{
+  "id": "file-aware-cli-commands",
+  "name": "file-aware-cli-commands",
+  "title": "File-Aware CLI Commands (detect / list / test)",
+  "description": "承接 07-02-file-grain-history 的数据库与 extract 闭合，把 detect / list / test 三个命令接线到文件级历史与 known_files 索引：detect 复合格式+编码+内嵌报告，list 走完整管线看到内容并交互确认编码（写 confirmed_encoding），test 独立全量校验+定位坏卷（写 damaged_volumes_json）。求密码与列条目抽成引擎层共享子流程。",
+  "status": "planning",
+  "dev_type": null,
+  "scope": null,
+  "package": "smartzip-cli",
+  "priority": "P2",
+  "creator": "charl",
+  "assignee": "charl",
+  "createdAt": "2026-07-02",
+  "completedAt": null,
+  "branch": null,
+  "base_branch": "main",
+  "worktree_path": null,
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [],
+  "children": [],
+  "parent": null,
+  "relatedFiles": [
+    "crates/smartzip-cli/src/main.rs",
+    "crates/smartzip-engine/src/lib.rs",
+    "crates/smartzip-engine/src/history.rs",
+    "crates/smartzip-db/src/known_files.rs",
+    "crates/smartzip-db/src/file_extractions.rs",
+    "docs/design.md"
+  ],
+  "notes": "依赖 07-02-file-grain-history 完成（v3 schema、file_extractions/known_files repo、sample_hash、extract 闭合）。本任务只接线 detect/list/test 的写入路径与共享求密码/list_entries 子流程；hashcat crack_jobs、compress 写库、配置文件通配符密码层、GUI 编码交互仍不在范围。",
+  "meta": {}
+}

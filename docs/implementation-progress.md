@@ -13,7 +13,7 @@
 | `smartzip-core` | ✅ 已落地 | 共享类型、错误、事件模型 |
 | `smartzip-scanner` | ✅ 已落地 | binwalk 封装、内嵌归档扫描基础 |
 | `smartzip-archive` | 🟡 部分落地 | `BackendRouter`、`UnrarBackend`、`SevenZipCliBackend`、`NativeZipBackend` 已存在 |
-| `smartzip-db` | ✅ 已落地 | 密码 schema + `tasks`、`task_events`、`encoding_detections`、`embedded_archive_detections` 已落库；版本化 migration |
+| `smartzip-db` | ✅ 已落地 | v3 文件级历史：瘦身 `tasks`、`file_extractions` append 日志、`known_files` 去重/复用索引与版本化 migration |
 | `smartzip-encoding` | ✅ 已落地 | 编码检测与候选输出 |
 | `smartzip-passwords` | ✅ 已落地 | 候选生成、排序、统计 |
 | `smartzip-config` | ✅ 已落地 | TOML 配置加载 |
@@ -32,8 +32,8 @@
 | 7z 路由 | 仍依赖 `SevenZipCliBackend`；`NativeSevenZipBackend` 尚未实现 |
 | 事件模型 | 当前为 `Vec<TaskEvent>` 汇总结果 + 可选 listener；设计中的有界 `mpsc` 实时通道尚未实现 |
 | 输出布局 | 已实现 plan-execute separation 与 collision-after-layout |
-| 数据库 | 已实现 `schema_migrations`、`passwords`、`password_matches`、`tasks`、`task_events`、`encoding_detections`、`embedded_archive_detections` 全部设计表；schema 迁移已版本化（v1→v2 增量升级） |
-| 任务历史 | `extract` / `detect` 通过注入的 `TaskHistoryRecorder` 落库任务、事件、编码检测和内嵌检测；best-effort 语义，写库失败降级为 `Warning` 不中断解压；`--no-history` 可关闭 |
+| 数据库 | v3 已落库：DROP `password_matches`/`encoding_detections`/`embedded_archive_detections`，瘦身 `tasks`，新增 `file_extractions`（append 日志）+ `known_files`（`sample_hash+size` 去重/复用索引）；schema 支持 v1→v3 迁移 |
+| 任务历史 | `extract` 通过注入的 `TaskHistoryRecorder` 写 task/event/per-file 历史，并用 `known_files` 去重、复用确认编码与开包密码；`history tasks/files/show` 读路径已闭合，detect/list/test 文件级接线留后续任务 |
 | CLI 退出码 | 当前稳定使用 `0` 成功、`1` 全失败/通用错误、`2` 部分成功 |
 
 ## 里程碑进度
@@ -55,6 +55,7 @@
 | 2026-06-04 | 13 | 🟡 | 后端路由、`UnrarBackend`、`NativeZipBackend` 辅助能力；ZIP 主路径仍为 7z |
 | 2026-06-12 | 14 | ✅ | smart output layout（plan-execute separation） |
 | 2026-07-02 | 15 | ✅ | 数据库 v2 全部设计表、版本化迁移与任务/检测历史落库（`smartzip history` 子命令） |
+| 2026-07-02 | 16 | ✅ | 历史模型 v3 文件级重构：`file_extractions` + `known_files`、extract 去重/编码/密码复用、history tasks/files/show；detect/list/test 接线留后续任务 |
 
 ## 与设计的主要差距
 

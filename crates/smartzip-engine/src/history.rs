@@ -1,13 +1,15 @@
-//! Task history recording for extraction and detection workflows.
+//! Task history recording for extraction workflows (v3, file-grain).
 //!
 //! The engine emits [`TaskEvent`]s throughout its lifecycle. When a
 //! [`TaskHistoryRecorder`] is threaded into the workflow, those events are
-//! also persisted to the `tasks`, `task_events`, `encoding_detections`, and
-//! `embedded_archive_detections` tables described in `docs/design.md § 4`.
+//! persisted to the `tasks` and `task_events` tables, and every extraction
+//! *action* (one per input, nested archive, carved embedded archive, or
+//! skip) is logged to `file_extractions`. The `known_files` dedup/reuse index
+//! is consulted before extraction and updated after a success.
 //!
 //! **Best-effort semantics.** History writes never fail extraction. When a
-//! repo call errors, the engine surfaces a `TaskEventKind::Warning` and
-//! keeps going; the archive itself still extracts.
+//! repo call errors, the engine surfaces a `TaskEventKind::Warning` and keeps
+//! going; the archive itself still extracts.
 //!
 //! The trait is deliberately not `Send + Sync`. The default
 //! [`DbTaskHistoryRecorder`] holds `&rusqlite::Connection`, and rusqlite's
@@ -16,20 +18,16 @@
 //! another thread can wrap their own implementation in whatever
 //! synchronization primitive they prefer.
 
-use crate::EncodingConfirmationContext;
-use smartzip_core::{EncodingDetectionResult, EncodingMode, TaskEvent, TaskEventKind, TaskId};
+use smartzip_core::EncodingMode;
+use smartzip_core::{TaskEvent, TaskEventKind, TaskId};
 use smartzip_db::{
-    embedded_archive_detection::{
-        EmbeddedArchiveDetectionRepository, NewEmbeddedArchiveDetection,
-    },
-    encoding_detection::{EncodingDetectionRepository, NewEncodingDetection},
+    file_extractions::{FileExtractionRepository, NewFileExtraction},
+    known_files::{KnownFileRepository, NameOffset},
     password::PasswordRepository,
-    path_hash::path_hash,
     task::{NewTask, TaskFinish, TaskRepository, TaskStatus},
     task_event::{NewTaskEvent, TaskEventLevel, TaskEventRepository},
     timestamp::now_utc_iso8601,
 };
-use smartzip_scanner::{Confidence, EmbeddedArchiveFinding};
 use std::path::Path;
 
 /// Terminal status reported to [`TaskHistoryRecorder::finish`].
@@ -54,17 +52,66 @@ impl TaskCompletionStatus {
 
 /// Aggregates handed to [`TaskHistoryRecorder::finish`] on task completion.
 ///
-/// These are counted by the engine as work progresses and passed as a batch
-/// at the end so history writes stay off the extraction hot path.
+/// In the v3 file-grain model the per-file detail lives in `file_extractions`,
+/// so the parent `tasks` row only carries the denormalized terminal status and
+/// the operation-level output root.
 #[derive(Debug, Clone)]
 pub struct TaskOutcome<'a> {
     pub status: TaskCompletionStatus,
-    pub error_code: Option<&'a str>,
-    pub error_message: Option<&'a str>,
-    pub password_attempts: i64,
-    pub encoding_selected: Option<&'a str>,
-    pub embedded_found: i64,
     pub output_path: Option<&'a Path>,
+}
+
+/// One logged extraction action, passed to
+/// [`TaskHistoryRecorder::record_file_extraction`].
+///
+/// Paths are borrowed and stringified by the recorder. `sample_hash` / `size`
+/// are `None` when the content couldn't be sampled (e.g. an unknown-length
+/// carve); such rows never participate in dedup.
+#[derive(Debug, Clone)]
+pub struct FileExtractionRow<'a> {
+    pub input_path: &'a Path,
+    pub sample_hash: Option<&'a str>,
+    pub file_size: Option<i64>,
+    pub offset: Option<i64>,
+    pub output_path: Option<&'a Path>,
+    pub has_password: bool,
+    pub password_id: Option<i64>,
+    pub status: &'a str,
+    pub reason: Option<&'a str>,
+    pub encoding: Option<&'a str>,
+    pub encoding_corrected: bool,
+    pub damaged_volumes_json: Option<&'a str>,
+}
+
+/// Reuse hints returned by [`TaskHistoryRecorder::lookup_known_file`].
+#[derive(Debug, Clone, Default)]
+pub struct KnownFileHit {
+    pub password_id: Option<i64>,
+    pub confirmed_encoding: Option<String>,
+    pub last_extract_at: Option<String>,
+}
+
+/// Arguments for [`TaskHistoryRecorder::upsert_known_file_extract`], recorded
+/// after a successful extraction.
+#[derive(Debug, Clone)]
+pub struct KnownFileUpsert<'a> {
+    pub sample_hash: &'a str,
+    pub size: i64,
+    pub name: Option<&'a str>,
+    pub offset: Option<i64>,
+    pub password_id: Option<i64>,
+}
+
+/// A user-confirmed encoding for an exact known file. Unlike an extract
+/// upsert, this overwrites `confirmed_encoding` and does not touch
+/// `last_extract_at`.
+#[derive(Debug, Clone)]
+pub struct KnownFileEncodingUpsert<'a> {
+    pub sample_hash: &'a str,
+    pub size: i64,
+    pub name: Option<&'a str>,
+    pub offset: Option<i64>,
+    pub encoding: &'a str,
 }
 
 /// Recording hook the engine calls when a task history sink is attached.
@@ -73,64 +120,36 @@ pub struct TaskOutcome<'a> {
 /// should return quickly and swallow storage errors internally.
 pub trait TaskHistoryRecorder {
     /// Register a new extract task. Called once at the top of extraction.
-    fn start_extract(
-        &self,
-        task_id: &TaskId,
-        input_summary: &str,
-        output_path: Option<&Path>,
-    );
+    fn start_extract(&self, task_id: &TaskId, output_path: Option<&Path>);
 
     /// Register a new detect task. Called once at the top of `detect()`.
     fn start_detect(&self, task_id: &TaskId, path: &Path);
 
-    /// Persist a generic engine event. Both a `task_events` row and any
-    /// side-effect (e.g. bumping counters in the caller) belong here.
-    ///
-    /// The engine calls this for every event pushed through the sink, in
-    /// order. `Started` and `Completed` are recorded for the timeline but
-    /// terminal task state is written by [`Self::finish`] instead.
+    /// Persist a generic engine event into `task_events`.
     fn record_event(&self, task_id: &TaskId, event: &TaskEvent);
 
-    /// Persist a ZIP encoding assessment.
-    fn record_encoding_detection(
-        &self,
-        task_id: &TaskId,
-        archive_path: &Path,
-        archive_format: Option<&str>,
-        detected: &EncodingDetectionResult,
-        context: Option<&EncodingConfirmationContext>,
-        user_corrected: bool,
-    );
+    /// Append one row to `file_extractions` (one extraction action).
+    fn record_file_extraction(&self, task_id: &TaskId, row: FileExtractionRow<'_>);
 
-    /// Persist a batch of embedded-archive findings for a single file.
+    /// Look up the `known_files` reuse entry for a physical file.
     ///
-    /// Called once per scanned candidate with all findings; an empty slice
-    /// is a valid no-op.
-    fn record_embedded_findings(
-        &self,
-        task_id: &TaskId,
-        path: &Path,
-        findings: &[EmbeddedArchiveFinding],
-    );
-
-    /// Update the `tasks` row with terminal status and aggregated metrics.
-    fn finish(&self, task_id: &TaskId, outcome: TaskOutcome<'_>);
-
-    /// Record a password/archive-shape match outcome in `password_matches`.
-    ///
-    /// `password_id` is `None` for candidates not backed by a stored row
-    /// (empty password, manual entries not yet saved); those are ignored.
-    /// Only call with `success = false` on confirmed wrong-password results.
-    /// Defaults to a no-op so custom recorders need not implement it.
-    fn record_password_match(
-        &self,
-        password_id: Option<i64>,
-        archive_format: Option<&str>,
-        filename_pattern: Option<&str>,
-        success: bool,
-    ) {
-        let _ = (password_id, archive_format, filename_pattern, success);
+    /// Returns `None` when the file was never seen. Defaults to `None` so
+    /// custom recorders that don't back a `known_files` table need not
+    /// implement it.
+    fn lookup_known_file(&self, _sample_hash: &str, _size: i64) -> Option<KnownFileHit> {
+        None
     }
+
+    /// Record a successful extraction into the `known_files` index (writes
+    /// `last_extract_at` + `password_id`, appends the name/offset pair).
+    /// Defaults to a no-op.
+    fn upsert_known_file_extract(&self, _upsert: KnownFileUpsert<'_>) {}
+
+    /// Persist a command-line/user-confirmed encoding for future reuse.
+    fn upsert_known_file_confirmed_encoding(&self, _upsert: KnownFileEncodingUpsert<'_>) {}
+
+    /// Update the `tasks` row with terminal status and output root.
+    fn finish(&self, task_id: &TaskId, outcome: TaskOutcome<'_>);
 }
 
 /// Recorder that writes to a SQLite [`smartzip_db::SmartZipDb`].
@@ -156,16 +175,16 @@ impl<'a> DbTaskHistoryRecorder<'a> {
         TaskEventRepository::new(self.conn)
     }
 
-    fn encoding_repo(&self) -> EncodingDetectionRepository<'a> {
-        EncodingDetectionRepository::new(self.conn)
+    fn file_repo(&self) -> FileExtractionRepository<'a> {
+        FileExtractionRepository::new(self.conn)
     }
 
-    fn embedded_repo(&self) -> EmbeddedArchiveDetectionRepository<'a> {
-        EmbeddedArchiveDetectionRepository::new(self.conn)
+    fn known_repo(&self) -> KnownFileRepository<'a> {
+        KnownFileRepository::new(self.conn)
     }
 
-    /// Expose the underlying [`PasswordRepository`] so callers can record
-    /// filename/format match statistics through the same connection.
+    /// Expose the underlying [`PasswordRepository`] so callers can share the
+    /// same connection for password statistics.
     pub fn passwords(&self) -> PasswordRepository<'a> {
         PasswordRepository::new(self.conn)
     }
@@ -176,18 +195,12 @@ impl<'a> DbTaskHistoryRecorder<'a> {
 }
 
 impl<'a> TaskHistoryRecorder for DbTaskHistoryRecorder<'a> {
-    fn start_extract(
-        &self,
-        task_id: &TaskId,
-        input_summary: &str,
-        output_path: Option<&Path>,
-    ) {
+    fn start_extract(&self, task_id: &TaskId, output_path: Option<&Path>) {
         let output = output_path.map(|p| p.to_string_lossy().into_owned());
         let started_at = now_utc_iso8601();
         if let Err(error) = self.task_repo().insert(NewTask {
             id: task_id.as_str(),
             kind: "extract",
-            input_summary,
             output_path: output.as_deref(),
             started_at: &started_at,
         }) {
@@ -195,13 +208,11 @@ impl<'a> TaskHistoryRecorder for DbTaskHistoryRecorder<'a> {
         }
     }
 
-    fn start_detect(&self, task_id: &TaskId, path: &Path) {
-        let display = path.to_string_lossy().into_owned();
+    fn start_detect(&self, task_id: &TaskId, _path: &Path) {
         let started_at = now_utc_iso8601();
         if let Err(error) = self.task_repo().insert(NewTask {
             id: task_id.as_str(),
             kind: "detect",
-            input_summary: &display,
             output_path: None,
             started_at: &started_at,
         }) {
@@ -224,100 +235,85 @@ impl<'a> TaskHistoryRecorder for DbTaskHistoryRecorder<'a> {
         }
     }
 
-    fn record_encoding_detection(
-        &self,
-        _task_id: &TaskId,
-        archive_path: &Path,
-        archive_format: Option<&str>,
-        detected: &EncodingDetectionResult,
-        _context: Option<&EncodingConfirmationContext>,
-        user_corrected: bool,
-    ) {
-        let hash = path_hash(archive_path);
-        let selected = match &detected.selected {
-            EncodingMode::Auto => "auto".to_string(),
-            EncodingMode::Override(name) => name.clone(),
-        };
-        let candidates_json = match serde_json::to_string(&detected.candidates) {
-            Ok(s) => s,
-            Err(error) => {
-                Self::warn("candidates_json", error);
-                "[]".to_string()
-            }
-        };
+    fn record_file_extraction(&self, task_id: &TaskId, row: FileExtractionRow<'_>) {
+        let input = row.input_path.to_string_lossy().into_owned();
+        let output = row.output_path.map(|p| p.to_string_lossy().into_owned());
         let created_at = now_utc_iso8601();
-        if let Err(error) = self.encoding_repo().insert(NewEncodingDetection {
-            archive_path_hash: &hash,
-            archive_format,
-            selected_encoding: &selected,
-            confidence: detected.confidence,
-            user_corrected,
-            candidates_json: &candidates_json,
+        if let Err(error) = self.file_repo().insert(NewFileExtraction {
+            task_id: task_id.as_str(),
+            input_path: &input,
+            sample_hash: row.sample_hash,
+            file_size: row.file_size,
+            offset: row.offset,
+            output_path: output.as_deref(),
+            has_password: row.has_password,
+            password_id: row.password_id,
+            status: row.status,
+            reason: row.reason,
+            encoding: row.encoding,
+            encoding_corrected: row.encoding_corrected,
+            damaged_volumes_json: row.damaged_volumes_json,
             created_at: &created_at,
         }) {
-            Self::warn("encoding_detection insert", error);
+            Self::warn("file_extraction insert", error);
         }
     }
 
-    fn record_embedded_findings(
-        &self,
-        _task_id: &TaskId,
-        path: &Path,
-        findings: &[EmbeddedArchiveFinding],
-    ) {
-        if findings.is_empty() {
-            return;
-        }
-        let hash = path_hash(path);
-        let created_at = now_utc_iso8601();
-        let rows: Vec<NewEmbeddedArchiveDetection<'_>> = findings
-            .iter()
-            .map(|finding| NewEmbeddedArchiveDetection {
-                file_path_hash: &hash,
-                format: finding.format.as_str(),
-                offset: finding.offset,
-                confidence: confidence_score(finding.confidence),
-                size_hint: finding.size,
-                created_at: &created_at,
-            })
-            .collect();
-        if let Err(error) = self.embedded_repo().insert_many(&rows) {
-            Self::warn("embedded_archive_detection insert", error);
+    fn lookup_known_file(&self, sample_hash: &str, size: i64) -> Option<KnownFileHit> {
+        match self.known_repo().find(sample_hash, size) {
+            Ok(Some(known)) => Some(KnownFileHit {
+                password_id: known.password_id,
+                confirmed_encoding: known.confirmed_encoding,
+                last_extract_at: known.last_extract_at,
+            }),
+            Ok(None) => None,
+            Err(error) => {
+                Self::warn("known_file lookup", error);
+                None
+            }
         }
     }
 
-    fn record_password_match(
-        &self,
-        password_id: Option<i64>,
-        archive_format: Option<&str>,
-        filename_pattern: Option<&str>,
-        success: bool,
-    ) {
-        let Some(id) = password_id else {
-            return;
-        };
-        let repo = self.passwords();
-        let result = if success {
-            repo.record_match_success(id, archive_format, filename_pattern)
-        } else {
-            repo.record_match_failure(id, archive_format, filename_pattern)
-        };
-        if let Err(error) = result {
-            Self::warn("password_match", error);
+    fn upsert_known_file_extract(&self, upsert: KnownFileUpsert<'_>) {
+        let name_offset = upsert.name.map(|name| NameOffset {
+            name: name.to_string(),
+            offset: upsert.offset,
+        });
+        let last_extract_at = now_utc_iso8601();
+        if let Err(error) = self.known_repo().upsert_extract(
+            upsert.sample_hash,
+            upsert.size,
+            name_offset,
+            upsert.password_id,
+            &last_extract_at,
+        ) {
+            Self::warn("known_file upsert", error);
+        }
+    }
+
+    fn upsert_known_file_confirmed_encoding(&self, upsert: KnownFileEncodingUpsert<'_>) {
+        let name_offset = upsert.name.map(|name| NameOffset {
+            name: name.to_string(),
+            offset: upsert.offset,
+        });
+        if let Err(error) = self.known_repo().upsert_confirmed_encoding(
+            upsert.sample_hash,
+            upsert.size,
+            name_offset,
+            upsert.encoding,
+        ) {
+            Self::warn("known_file confirmed encoding upsert", error);
         }
     }
 
     fn finish(&self, task_id: &TaskId, outcome: TaskOutcome<'_>) {
         let finished_at = now_utc_iso8601();
-        let output = outcome.output_path.map(|p| p.to_string_lossy().into_owned());
+        let output = outcome
+            .output_path
+            .map(|p| p.to_string_lossy().into_owned());
         let finish = TaskFinish {
             status: Some(outcome.status.to_status()),
             finished_at: Some(&finished_at),
-            error_code: outcome.error_code,
-            error_message: outcome.error_message,
-            password_attempts: Some(outcome.password_attempts),
-            encoding_selected: outcome.encoding_selected,
-            embedded_found: Some(outcome.embedded_found),
             output_path: output.as_deref(),
         };
         if let Err(error) = self.task_repo().finish(task_id.as_str(), finish) {
@@ -379,9 +375,7 @@ fn describe_event(kind: &TaskEventKind) -> (TaskEventLevel, String, String, Opti
             format!("{} @ 0x{:X}", format.as_str(), offset),
             serde_json::to_string(kind).ok(),
         ),
-        TaskEventKind::EmbeddedArchiveCarved {
-            source, offset, ..
-        } => (
+        TaskEventKind::EmbeddedArchiveCarved { source, offset, .. } => (
             TaskEventLevel::Info,
             "EmbeddedArchiveCarved".into(),
             format!("{} @ 0x{:X}", source.display(), offset),
@@ -403,10 +397,7 @@ fn describe_event(kind: &TaskEventKind) -> (TaskEventLevel, String, String, Opti
         } => (
             TaskEventLevel::Warn,
             "LargeEmbeddedScanConfirmationRequired".into(),
-            format!(
-                "{}: {file_size} bytes > {threshold}",
-                path.display()
-            ),
+            format!("{}: {file_size} bytes > {threshold}", path.display()),
             serde_json::to_string(kind).ok(),
         ),
         TaskEventKind::BusinessContainerSkipped { path, kind: k } => (
@@ -427,90 +418,14 @@ fn describe_event(kind: &TaskEventKind) -> (TaskEventLevel, String, String, Opti
             message.clone(),
             None,
         ),
-        TaskEventKind::Failed { error } => (
-            TaskEventLevel::Error,
-            "Failed".into(),
-            error.clone(),
-            None,
-        ),
+        TaskEventKind::Failed { error } => {
+            (TaskEventLevel::Error, "Failed".into(), error.clone(), None)
+        }
         TaskEventKind::Completed => (
             TaskEventLevel::Info,
             "Completed".into(),
             "task completed".into(),
             None,
         ),
-    }
-}
-
-fn confidence_score(confidence: Confidence) -> f32 {
-    match confidence {
-        Confidence::Low => 0.4,
-        Confidence::Medium => 0.7,
-        Confidence::High => 0.95,
-    }
-}
-
-/// Normalize an archive filename into a stable pattern suitable for
-/// `password_matches.filename_pattern`.
-///
-/// - lowercase
-/// - drop the extension
-/// - collapse consecutive digits into a single `#` so that `dump_2024_01.zip`
-///   and `dump_2024_02.zip` share a pattern.
-///
-/// Kept in this module (not in `smartzip-db`) because it's engine-side
-/// heuristic policy rather than schema.
-pub fn normalize_filename_pattern(path: &Path) -> Option<String> {
-    let stem = path.file_stem()?.to_string_lossy().to_ascii_lowercase();
-    if stem.is_empty() {
-        return None;
-    }
-    let mut out = String::with_capacity(stem.len());
-    let mut in_digits = false;
-    for ch in stem.chars() {
-        if ch.is_ascii_digit() {
-            if !in_digits {
-                out.push('#');
-                in_digits = true;
-            }
-        } else {
-            out.push(ch);
-            in_digits = false;
-        }
-    }
-    Some(out)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::path::PathBuf;
-
-    #[test]
-    fn normalize_collapses_digit_runs() {
-        assert_eq!(
-            normalize_filename_pattern(&PathBuf::from("Dump_2024_01.zip")).as_deref(),
-            Some("dump_#_#"),
-        );
-        assert_eq!(
-            normalize_filename_pattern(&PathBuf::from("Photos-Trip.7z")).as_deref(),
-            Some("photos-trip"),
-        );
-    }
-
-    #[test]
-    fn normalize_handles_dotfile_stem() {
-        // `Path::file_stem` on ".zip" returns Some(".zip"); we accept that as
-        // a usable pattern rather than special-casing hidden files.
-        assert_eq!(
-            normalize_filename_pattern(&PathBuf::from(".zip")).as_deref(),
-            Some(".zip"),
-        );
-    }
-
-    #[test]
-    fn normalize_returns_none_when_path_has_no_stem() {
-        // Trailing slash — no filename component at all.
-        assert_eq!(normalize_filename_pattern(&PathBuf::from("/")), None);
     }
 }

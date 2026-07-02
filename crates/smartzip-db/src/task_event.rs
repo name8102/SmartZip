@@ -120,28 +120,22 @@ mod tests {
             .insert(NewTask {
                 id: "task-events",
                 kind: "extract",
-                input_summary: "a.zip",
                 output_path: None,
                 started_at: "2026-07-02T00:00:00Z",
             })
             .unwrap();
 
         let repo = TaskEventRepository::new(db.connection());
-        for (idx, (ty, msg, at)) in [
+        for (ty, msg, at) in [
             ("Started", "started", "2026-07-02T00:00:01Z"),
             ("Progress", "extracting", "2026-07-02T00:00:02Z"),
             ("Completed", "completed", "2026-07-02T00:00:03Z"),
         ]
         .iter()
-        .enumerate()
         {
             repo.insert(NewTaskEvent {
                 task_id: "task-events",
-                level: if idx == 0 {
-                    TaskEventLevel::Info
-                } else {
-                    TaskEventLevel::Info
-                },
+                level: TaskEventLevel::Info,
                 event_type: ty,
                 message: msg,
                 data_json: None,
@@ -162,7 +156,6 @@ mod tests {
             .insert(NewTask {
                 id: "task-cascade",
                 kind: "extract",
-                input_summary: "a.zip",
                 output_path: None,
                 started_at: "2026-07-02T00:00:00Z",
             })

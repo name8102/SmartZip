@@ -65,18 +65,6 @@ impl<'a> PasswordService<'a> {
         request: PasswordCandidateRequest,
     ) -> smartzip_db::Result<Vec<PasswordCandidate>> {
         let mut candidates = Vec::new();
-        let mut has_explicit_candidates = false;
-
-        if request.include_empty {
-            push_unique(
-                &mut candidates,
-                PasswordCandidate {
-                    id: None,
-                    value: String::new(),
-                    source: PasswordSource::Empty,
-                },
-            );
-        }
 
         for value in request
             .manual
@@ -84,7 +72,6 @@ impl<'a> PasswordService<'a> {
             .map(normalize_password)
             .filter(|v| !v.is_empty())
         {
-            has_explicit_candidates = true;
             push_unique(
                 &mut candidates,
                 PasswordCandidate {
@@ -100,7 +87,6 @@ impl<'a> PasswordService<'a> {
             .map(normalize_password)
             .filter(|v| !v.is_empty())
         {
-            has_explicit_candidates = true;
             push_unique(
                 &mut candidates,
                 PasswordCandidate {
@@ -111,8 +97,15 @@ impl<'a> PasswordService<'a> {
             );
         }
 
-        if has_explicit_candidates {
-            return Ok(candidates);
+        if request.include_empty {
+            push_unique(
+                &mut candidates,
+                PasswordCandidate {
+                    id: None,
+                    value: String::new(),
+                    source: PasswordSource::Empty,
+                },
+            );
         }
 
         for record in self.repo.ranked_candidates(request.limit)? {
@@ -146,6 +139,16 @@ impl<'a> PasswordService<'a> {
         }
         Ok(())
     }
+
+    /// Build a candidate from a stored password id, or `None` if the id is
+    /// unknown or the row is disabled. Used to inject the `known_files`-matched
+    /// password at the top of the try order for a specific file.
+    pub fn candidate_by_id(&self, id: i64) -> smartzip_db::Result<Option<PasswordCandidate>> {
+        Ok(self
+            .repo
+            .get_by_id(id)?
+            .and_then(|record| (!record.disabled).then(|| candidate_from_record(record))))
+    }
 }
 
 fn candidate_from_record(record: PasswordRecord) -> PasswordCandidate {
@@ -177,7 +180,7 @@ mod tests {
     use smartzip_db::{password::PasswordRepository, SmartZipDb};
 
     #[test]
-    fn candidates_include_empty_manual_clipboard_and_db_without_duplicates() {
+    fn candidates_order_explicit_before_empty_and_database_fallback() {
         let db = SmartZipDb::in_memory().unwrap();
         let service = PasswordService::new(PasswordRepository::new(db.connection()));
         service.add_password("数据库密码", "manual", false).unwrap();
@@ -192,8 +195,11 @@ mod tests {
             })
             .unwrap();
 
-        assert_eq!(candidates[0].source, PasswordSource::Empty);
-        assert!(candidates.iter().any(|c| c.value == "手动密码"));
+        assert_eq!(candidates[0].value, "手动密码");
+        assert_eq!(candidates[0].source, PasswordSource::Manual);
+        assert_eq!(candidates[1].value, "剪贴板密码");
+        assert_eq!(candidates[1].source, PasswordSource::Clipboard);
+        assert_eq!(candidates[2].source, PasswordSource::Empty);
         assert_eq!(
             candidates
                 .iter()
@@ -220,7 +226,7 @@ mod tests {
     }
 
     #[test]
-    fn manual_passwords_disable_database_fallback() {
+    fn manual_passwords_keep_database_fallback_after_explicit_candidates() {
         let db = SmartZipDb::in_memory().unwrap();
         let service = PasswordService::new(PasswordRepository::new(db.connection()));
         service.add_password("数据库密码", "manual", false).unwrap();
@@ -234,8 +240,8 @@ mod tests {
             })
             .unwrap();
 
+        assert_eq!(candidates[0].value, "手动密码");
         assert!(candidates.iter().any(|c| c.value.is_empty()));
-        assert!(candidates.iter().any(|c| c.value == "手动密码"));
-        assert!(!candidates.iter().any(|c| c.value == "数据库密码"));
+        assert!(candidates.iter().any(|c| c.value == "数据库密码"));
     }
 }

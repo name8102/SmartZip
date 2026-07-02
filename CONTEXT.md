@@ -38,7 +38,7 @@
 
 | Term | Definition |
 |------|------------|
-| **PasswordService** | 密码候选生成 + 排序 + 成功/失败记录。不持有数据库连接，通过注入的 PasswordRepository 操作。 |
+| **PasswordService** | 密码候选生成 + 排序 + 成功/失败记录。不持有数据库连接，通过注入的 PasswordRepository 操作。extract 的有效顺序为命令行 > known-files 精确命中 > 当前批次刚成功密码 > 其余数据库候选；交互密码成功后立即写库并加入任务内缓存。 |
 | **PasswordCandidate** | 单个密码候选，含 value、source（Empty/Manual/Clipboard/Database）、可选 id。 |
 | **PasswordCandidateRequest** | 控制候选生成的参数：是否含空密码、手动密码列表、剪贴板、数量上限。 |
 | **InteractivePasswordPrompter** | 异步 trait。当所有存储密码失败时调用，让用户手动输入。实现方须用 spawn_blocking 隔离阻塞 I/O。 |
@@ -47,11 +47,11 @@
 
 | Term | Definition |
 |------|------------|
-| **TaskHistoryRecorder** | 引擎注入式历史记录 trait。`extract_recursive*` 和 `detect` 在有 recorder 时把任务、事件、编码检测和内嵌检测落库。best-effort 语义：写库失败降级为 `Warning` 事件，不中断解压。与 `PasswordService` 一样由调用方注入（ADR-001）。 |
+| **TaskHistoryRecorder** | 引擎注入式历史记录 trait。`extract_recursive*` 在有 recorder 时把任务（父级 `tasks` 行）、事件时间线、per-file 解压动作（`file_extractions`）落库，并 UPSERT `known_files` 索引。best-effort 语义：写库失败降级为 `Warning` 事件，不中断解压。与 `PasswordService` 一样由调用方注入（ADR-001）。**注：v3（`07-02-file-grain-history`）后历史模型改为文件级；旧的 `record_encoding_detection` / `record_embedded_findings` / `record_password_match*` 方法随对应表删除而移除，改为 per-file 记录方法。** |
 | **DbTaskHistoryRecorder** | `TaskHistoryRecorder` 的 SQLite 实现，借用 `&rusqlite::Connection`。`Connection` 是 `!Sync`，因此 trait 不加 `Send + Sync` 约束——与已有的 `&PasswordService` 一样，解压 future 本就是 non-Send，仅 `.await` 不 spawn。 |
-| **TaskOutcome** | 任务结束时交给 `finish()` 的聚合值：终态（completed/partial/failed/cancelled）、密码尝试次数、选定编码、内嵌 finding 数、输出路径。计数在解压过程中累积，结束时一次写回。 |
-| **path_hash** | 归档/文件路径的 SHA-256 十六进制值，用作 `encoding_detections` / `embedded_archive_detections` 的 join key。优先 canonicalize，文件不存在时回退原始字节，避免把用户目录结构明文写入 schema。 |
-| **password_matches backfill** | 成功解压后按 `(password_id, archive_format, filename_pattern)` upsert 一条匹配行。`filename_pattern` 是归档名归一化结果（小写、去扩展名、连续数字折叠为 `#`），供后续文件名相似度排序使用。 |
+| **TaskOutcome** | 任务结束时交给 `finish()` 的聚合值。v3 精简为终态（completed/partial/failed/cancelled）+ 输出根路径；`encoding_selected` / `embedded_found` 等明细下沉到 `file_extractions`，不再作为 task 级聚合累积。 |
+| **sample_hash** | 采样内容哈希，用于对“重复下载的同一压缩包”去重。`BLAKE3(前 64KB ‖ 后 64KB)` + `file_size` 联合判等；文件 < 128KB 全量哈希；carve/内嵌档对 `[offset, offset+size)` 段采样，size 未知时不算、不参与去重。取代 v2 的 `path_hash`（后者随 `encoding_detections` / `embedded_archive_detections` 删除而废弃——路径不再作 join key）。 |
+| **known_files** | `UNIQUE(sample_hash, size)` 去重/复用索引。存 `password_id`（精确密码记忆）、`confirmed_encoding`（人工确认编码，自动猜测不覆盖）、`last_extract_at`（非空即成功解压过，去重判据）、`names_offsets_json`（name+offset 配对列表）。取代 v2 的 `password_matches` backfill 与 `encoding_detections` 的复用职责。 |
 
 ## Architecture Decisions (ADR-worthy)
 
@@ -85,6 +85,13 @@
 **Trade-off**: `materialize()` 现在是 async 并可能等待用户输入，engine 主循环在碰撞期间阻塞。并发解压多个归档时，碰撞提示会串行化。
 
 ### ADR-007: Best-effort task history via injected recorder
-**Decision**: 任务历史通过注入的 `TaskHistoryRecorder` trait 落库，与 backend/passwords/prompters 一样由调用方注入（`extract_recursive_with_listener_interactive` 的可选末位参数）。默认实现 `DbTaskHistoryRecorder` 借用 `&rusqlite::Connection`，与 `PasswordService` 共享同一连接。事件在 engine 内先汇总到 `EventSink`，任务结束时统一 replay 进 `task_events`；编码/内嵌检测和 `password_matches` 回填在有路径上下文的位置就地写入。
+**Decision**: 任务历史通过注入的 `TaskHistoryRecorder` trait 落库，与 backend/passwords/prompters 一样由调用方注入（`extract_recursive_with_listener_interactive` 的可选末位参数）。默认实现 `DbTaskHistoryRecorder` 借用 `&rusqlite::Connection`，与 `PasswordService` 共享同一连接。事件在 engine 内先汇总到 `EventSink`，任务结束时统一 replay 进 `task_events`；per-file 动作与 `known_files` 更新在路径、offset、密码和编码上下文完整的位置就地写入。
 **Rationale**: 与 ADR-001 的薄 engine 原则一致：engine 不持有 DB。历史写入是可选能力，CLI/GUI 决定是否注入。事件先汇总再 replay 避免把 recorder 引用穿进 `EventSink` 克隆和进度回调，降低耦合。
+
+> **v3 更新（`07-02-file-grain-history`）**：历史模型从操作级改为文件级。变化点：
+> - recorder 新增 per-file 方法（`record_file_extraction` / `lookup_known_file` / `upsert_known_file_extract`），删除 `record_encoding_detection` / `record_embedded_findings` / `record_password_match*`（对应表 DROP）。
+> - per-file 落点在 engine 主循环 `processed.push(candidate)` 处就地记录（`actual_output_dir` 现成可用，不改 materialize / `ExtractWorkflowResult`）。
+> - 跳过分支需拆开各自打 `reason`（`duplicate` / `recursion_limit` / `not_first_volume` / `business_container`），不再合并成一次 `skipped.push`。
+> - extract 解压前查 `known_files` 复用 `confirmed_encoding` + 去重跳过；求密码候选顺序注入 known_files.password_id（置顶不独占）。
+> - 完整裁决见 `.trellis/tasks/2026-07/07-02-file-grain-history/prd.md`；detect/list/test 接线见 `07-02-file-aware-cli-commands`。
 **Trade-off**: recorder 与 `PasswordService` 共享 `!Sync` 的 `Connection`，使 extract future 保持非 Send（只 await、不 spawn，符合当前 CLI 用法）。历史写入为 best-effort——任何 repo 错误降级为 `Warning` 事件，绝不中断解压；因此历史行在极端情况下可能不完整。`extract_recursive_with_listener_interactive` 参数进一步变长，后续可考虑收敛为请求结构体。

@@ -1,0 +1,44 @@
+{
+  "id": "file-grain-history",
+  "name": "file-grain-history",
+  "title": "File-Grain History & Known-Files Index",
+  "description": "把历史记录从操作级重构为文件级：DROP encoding_detections / embedded_archive_detections / password_matches，瘦身 tasks，新建 file_extractions（append-only 日志）与 known_files（hash+size 去重/复用索引，v3 迁移直接建新、不回填）。让 engine 的 extract 流程通过改造后的 recorder 写入 per-file 行、复用 confirmed_encoding、按窗口去重跳过，并按“命令行 > known_files > 密码库”顺序注入密码候选。本任务只闭合已实现的 extract 与 history 命令；未实现的 detect/test/list 仅由新表结构预留字段，命令改动留后续任务。",
+  "status": "completed",
+  "dev_type": null,
+  "scope": null,
+  "package": "smartzip-db",
+  "priority": "P1",
+  "creator": "charl",
+  "assignee": "charl",
+  "createdAt": "2026-07-02",
+  "completedAt": "2026-07-02",
+  "branch": "feat/db-history-persistence",
+  "base_branch": "main",
+  "worktree_path": null,
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [],
+  "children": [],
+  "parent": null,
+  "relatedFiles": [
+    "crates/smartzip-db/src/schema.rs",
+    "crates/smartzip-db/src/task.rs",
+    "crates/smartzip-db/src/task_event.rs",
+    "crates/smartzip-db/src/encoding_detection.rs",
+    "crates/smartzip-db/src/embedded_archive_detection.rs",
+    "crates/smartzip-db/src/password.rs",
+    "crates/smartzip-db/src/path_hash.rs",
+    "crates/smartzip-db/src/lib.rs",
+    "crates/smartzip-engine/src/history.rs",
+    "crates/smartzip-engine/src/lib.rs",
+    "crates/smartzip-cli/src/main.rs"
+  ],
+  "notes": "承接 07-02-database-history-persistence（已完成、操作级四表模型）。本任务将其重构为文件级 + known_files 索引。hashcat 深度爆破表（crack_jobs）、compress 写库、detect/test/list 的交互与接线均为后续任务；本任务只保证新表字段能容纳其未来数据。配置文件通配符密码匹配层本次仅留 TODO 占位。",
+  "meta": {
+    "phases": [
+      "db: v3 schema + file_extractions/known_files repos + sample_hash",
+      "engine: recorder 改造 + 拆分跳过打 reason + per-file 落点 + known_files 复用/去重 + 密码顺序",
+      "cli+验证: extract 接线 + history 两模式/下钻/过滤 + 测试闭合"
+    ]
+  }
+}

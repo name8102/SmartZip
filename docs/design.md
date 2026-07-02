@@ -96,11 +96,10 @@ SQLite 保存成功密码、导入密码、命名密码表、关联关系和统�
 候选顺序：
 
 ```text
-空密码
--> 直接父密码
--> 祖先链最近成功密码
--> 当前批次最近命中密码
--> 手动输入
+命令行手动输入
+-> known_files 精确命中密码
+-> 当前批次最近交互成功密码
+-> 空密码
 -> 剪贴板
 -> 置顶密码
 -> 历史成功密码
@@ -373,14 +372,13 @@ LibArchiveBackend
 
 密码来源优先级：
 
-1. 空密码。
-2. 当前任务手动输入密码。
-3. 剪贴板密码。
-4. 最近成功密码。
-5. 当前目录/文件名模式命中的历史密码。
-6. 用户置顶密码。
-7. 全局成功率 Top N。
-8. 长尾密码。
+1. 当前任务命令行手动密码。
+2. `known_files` 对当前文件的精确命中密码。
+3. 当前批次刚交互成功的密码。
+4. 空密码与剪贴板密码。
+5. 用户置顶密码。
+6. 全局成功率 Top N。
+7. 长尾密码。
 
 排序策略：
 
@@ -399,6 +397,7 @@ score =
 关键约束：
 
 - 同一任务内同一密码不得重复尝试。
+- 交互密码验证成功后立即写入密码库并加入任务内缓存，供同批后续文件复用。
 - 单次批量任务不能过度惩罚某个密码。
 - 大密码库下先取候选 Top N，再补充特定来源候选。
 - 密码可明文保存，但 GUI 必须提示。
@@ -656,7 +655,16 @@ pub enum MainTab {
 
 ## 4. 数据库设计
 
-> 当前实现状态（2026-07-02）：本节的六张表全部已落库——`schema_migrations`、`passwords`、`password_matches`、`tasks`、`task_events`、`encoding_detections`、`embedded_archive_detections`。迁移改为版本化顺序步骤（`smartzip-db/src/schema.rs`，`LATEST_VERSION = 2`），v1 建密码相关表，v2 建任务/事件/检测历史表，旧库自动升级。解压/检测工作流通过 `smartzip-engine` 的 `TaskHistoryRecorder`（默认实现 `DbTaskHistoryRecorder`）写入任务行、事件时间线、编码与内嵌检测记录，并回填 `password_matches`；写入为 best-effort，失败降级为 `Warning` 事件、不影响解压。CLI 通过 `smartzip history list` / `smartzip history show <task-id>` 读取，`--no-history` 可关闭记录。本节其余尚未实现的方向（如 `password_sets`、命名密码表）见 `docs/implementation-plan.md` Phase 3。
+> **v3 重构（2026-07-02，锚定任务 `.trellis/tasks/2026-07/07-02-file-grain-history`）**：历史模型从**操作级**改为**文件级**。相对 v2 的变化：
+> - **DROP** `password_matches`、`encoding_detections`、`embedded_archive_detections` 三张表。它们的职责被更精确的机制取代：精确密码记忆和确认编码复用改由 `known_files` 承担；`password_matches` 的 filename/path pattern 泛化匹配是只写不读的死表，泛化匹配将来改由配置文件正则/通配实现。
+> - `tasks` **瘦身**为纯操作级父表（删 `input_summary / error_code / error_message / password_attempts / encoding_selected / embedded_found`，只留 `id / kind / status / output_path / started_at / finished_at`）。这些聚合列的明细全部下沉到 `file_extractions`。
+> - 新增 `file_extractions`（append-only 文件级日志，一行 = 一次解压动作）。
+> - 新增 `known_files`（`UNIQUE(sample_hash, size)` 去重/复用索引）。
+> - 旧库无有效数据，v3 迁移直接 DROP + 建新、不回填；`LATEST_VERSION = 3`。
+>
+> 使用场景锚定“解压来自网络的压缩包”：路径可明文存、密码只存 `password_id` 不存明文；核心痛点是重复下载、老式非 UTF-8 ZIP 文件名乱码、分卷缺失、内嵌/嵌套档。完整裁决见任务 `prd.md` 的 Confirmed Facts。写入仍为 best-effort（失败降级 `Warning`、不中断解压），归 engine 通过注入的 `TaskHistoryRecorder` 完成，CLI 只建连接 + 注入。
+>
+> 本次（`07-02-file-grain-history`）只落数据库层 + 闭合 `extract` / `history`；`detect / test / list` 命令的写入接线在后续任务 `.trellis/tasks/2026-07/07-02-file-aware-cli-commands`。hashcat `crack_jobs`、配置通配符密码层、`compress` 写库见各自 Out of Scope。下面 4.1 `passwords` 不变；4.2–4.6 已按 v3 更新。
 
 ### 4.1 `passwords`
 
@@ -679,48 +687,33 @@ CREATE INDEX idx_passwords_score ON passwords(pinned, success_count, last_succes
 CREATE INDEX idx_passwords_disabled ON passwords(disabled);
 ```
 
-### 4.2 `password_matches`
+### 4.2 `password_matches` — v3 已删除
 
-```sql
-CREATE TABLE password_matches (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  password_id INTEGER NOT NULL REFERENCES passwords(id) ON DELETE CASCADE,
-  archive_format TEXT,
-  path_pattern TEXT,
-  filename_pattern TEXT,
-  directory_hash TEXT,
-  success_count INTEGER NOT NULL DEFAULT 0,
-  failure_count INTEGER NOT NULL DEFAULT 0,
-  last_success_at TEXT,
-  last_failure_at TEXT
-);
+v2 的 `password_matches` 记录 password × (archive_format / path_pattern / filename_pattern) 的命中统计，用于泛化排序。v3 **DROP** 这张表：
 
-CREATE INDEX idx_password_matches_filename ON password_matches(filename_pattern);
-CREATE INDEX idx_password_matches_path ON password_matches(path_pattern);
-CREATE INDEX idx_password_matches_password ON password_matches(password_id);
-```
+- 它是**只写不读的死表**——`ranked_candidates` 只按 `passwords` 表自身的 `success_count` / `last_success_at` 排序，从未读 `password_matches` 参与决策；`path_pattern` 列甚至从未被写入。
+- 精确的“哪个密码开了哪个确切文件”改由 `known_files.password_id` 承担（按 `sample_hash + size` 命中，更准）。
+- 泛化的“文件名/路径 pattern → 密码”将来改由**配置文件正则/通配**实现（本次仅在求密码流程留 TODO 占位）。
 
-### 4.3 `tasks`
+对应地，`smartzip-engine` 删除 `record_password_match*` / `normalize_filename_pattern`，`smartzip-db` 删除 `record_match_success/failure` / `matches_for` / `PasswordMatch`。
+
+### 4.3 `tasks` — v3 瘦身为纯操作级父表
 
 ```sql
 CREATE TABLE tasks (
   id TEXT PRIMARY KEY,
-  kind TEXT NOT NULL,
-  status TEXT NOT NULL,
-  input_summary TEXT NOT NULL,
-  output_path TEXT,
+  kind TEXT NOT NULL,           -- extract / detect / test / compress …
+  status TEXT NOT NULL,         -- 反规范化聚合缓存，供 history 列表首屏
+  output_path TEXT,             -- 用户请求的输出根目录（操作级）
   started_at TEXT NOT NULL,
-  finished_at TEXT,
-  error_code TEXT,
-  error_message TEXT,
-  password_attempts INTEGER NOT NULL DEFAULT 0,
-  encoding_selected TEXT,
-  embedded_found INTEGER NOT NULL DEFAULT 0
+  finished_at TEXT
 );
 
 CREATE INDEX idx_tasks_started_at ON tasks(started_at);
 CREATE INDEX idx_tasks_status ON tasks(status);
 ```
+
+相对 v2 删除了 `input_summary / error_code / error_message / password_attempts / encoding_selected / embedded_found`——这些聚合/明细全部下沉到 `file_extractions`。`status` 保留为反规范化缓存（避免 history 列表首屏为每行现算聚合）；操作级的输出根目录仍留 `output_path`（与 `file_extractions.output_path` 的 per-file 实际落点区分）。
 
 ### 4.4 `task_events`
 
@@ -738,38 +731,63 @@ CREATE TABLE task_events (
 CREATE INDEX idx_task_events_task ON task_events(task_id, created_at);
 ```
 
-### 4.5 `encoding_detections`
+### 4.5 `file_extractions` — v3 新增（append-only 文件级日志）
+
+一行 = **一次解压动作**（不是“一个文件”）。root 输入、每层嵌套档、每个 carve 出的内嵌档、以及被跳过的输入都各占一行。取代了 v2 的 `encoding_detections`（编码下沉为 `encoding` / `encoding_corrected` 两列）和 `embedded_archive_detections`（carve 档直接作为独立行、靠 `offset` 区分）。
 
 ```sql
-CREATE TABLE encoding_detections (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  archive_path_hash TEXT NOT NULL,
-  archive_format TEXT,
-  selected_encoding TEXT NOT NULL,
-  confidence REAL NOT NULL,
-  user_corrected INTEGER NOT NULL DEFAULT 0,
-  candidates_json TEXT NOT NULL,
-  created_at TEXT NOT NULL
+CREATE TABLE file_extractions (
+  id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+  task_id              TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  input_path           TEXT NOT NULL,      -- 明文；carve 档 = 宿主路径
+  sample_hash          TEXT,               -- 头尾采样哈希；size 未知的 carve 档为 NULL
+  file_size            INTEGER,            -- 判等的另一半；未知为 NULL
+  offset               INTEGER,            -- carve/内嵌档 = Some，普通文件 = NULL
+  output_path          TEXT,               -- 该档展平后的实际落点（per-file，区别于 tasks.output_path）
+  has_password         INTEGER NOT NULL DEFAULT 0,
+  password_id          INTEGER REFERENCES passwords(id) ON DELETE SET NULL,
+  status               TEXT NOT NULL,      -- 见下方取值表
+  reason               TEXT,               -- status=extracted 时为 NULL
+  encoding             TEXT,               -- 最终选定编码名
+  encoding_corrected   INTEGER NOT NULL DEFAULT 0,  -- 人工确认过（唯一不可再生的编码信号）
+  damaged_volumes_json TEXT,               -- test 定位的坏卷列表（本次仅预留，extract 不写）
+  created_at           TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE INDEX idx_encoding_hash ON encoding_detections(archive_path_hash);
+CREATE INDEX idx_file_extractions_task   ON file_extractions(task_id);
+CREATE INDEX idx_file_extractions_status ON file_extractions(status);
+CREATE INDEX idx_file_extractions_dedup  ON file_extractions(sample_hash, file_size, created_at);
 ```
 
-### 4.6 `embedded_archive_detections`
+`status` 全局唯一取值（靠值自证来自哪个命令，file 行不冗余 `kind`）：
+
+- `extract`：`extracted / skipped / failed / partial`
+- `detect`：`detected / unreadable`（本次仅预留，后续任务接线）
+- `test`：`intact / corrupt`（本次仅预留）
+
+`reason` 枚举：`not_found / wrong_password / corrupt / target_exists / not_first_volume / recursion_limit / duplicate / business_container / password_required`。“需密码但最终没拿到”（候选试穿 + 用户取消）统一记 `status=skipped` + `reason=password_required`，不为加密单设终态。
+
+### 4.6 `known_files` — v3 新增（去重/复用索引）
+
+每个 `(sample_hash, size)` 恰好一行（UPSERT）。与 4.5 的日志分工：日志保留重复项（同包多次解压 = 多行，回答“上次为什么失败”），索引每个文件一行、只服务匹配热路径（去重跳过、复用确认编码、复用开包密码）。
 
 ```sql
-CREATE TABLE embedded_archive_detections (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  file_path_hash TEXT NOT NULL,
-  format TEXT NOT NULL,
-  offset INTEGER NOT NULL,
-  confidence REAL NOT NULL,
-  size_hint INTEGER,
-  created_at TEXT NOT NULL
+CREATE TABLE known_files (
+  sample_hash        TEXT NOT NULL,
+  size               INTEGER NOT NULL,
+  names_offsets_json TEXT NOT NULL DEFAULT '[]',  -- [{name, offset}] 配对，遇新组合追加
+  password_id        INTEGER REFERENCES passwords(id) ON DELETE SET NULL,
+  confirmed_encoding TEXT,               -- 仅人工确认写；detect 猜测永不覆盖
+  last_extract_at    TEXT,               -- 仅 extract 写；非空即“成功解压过”（去重唯一判据）
+  PRIMARY KEY (sample_hash, size)
 );
-
-CREATE INDEX idx_embedded_file_hash ON embedded_archive_detections(file_path_hash);
 ```
+
+**sample_hash**：`BLAKE3(前 64KB ‖ 后 64KB)` + `file_size` 一起判等；< 128KB 全量哈希；carve 档对 `[offset, offset+size)` 段做同样采样，size 未知时不参与去重。
+
+**去重**（仅 `extract`）：命中 `last_extract_at` 非空且落在时间窗内（默认 1 个月，预留配置接口）→ 跳过 + 显式提示，`--force` 强制重解。不追踪输出是否还在，靠时间窗兜底。
+
+**求密码候选顺序**（`extract`）：命令行 `--password` → `known_files.password_id`（hash+size 命中，置顶但不独占）→ 当前批次刚交互成功的密码 → 配置通配符层（将来）→ `passwords` 常规排序。交互成功后立即写库并更新任务内缓存，不等 task 完成。**编码复用**顺序：命令行编码 → `known_files.confirmed_encoding`（人工确认过）→ 当场自动检测；编码与密码走同一次 `WHERE sample_hash=? AND file_size=?` 查询。
 
 ## 5. 智能解压流程
 
@@ -985,7 +1003,9 @@ Record task and events
 
 ## 8. CLI 设计
 
-### 8.1 解压
+> **命令模型（v3，锚定 `07-02-file-grain-history` / `07-02-file-aware-cli-commands`）**：三个“输入是压缩包”的命令共享同一条底层管线，按“走多远”区分——`detect` 探到格式+编码即停（纯报告）；`list` 走完整管线直到列出条目（编码确认循环、内嵌定位、求密码都在此）；`extract` 继续到落盘。`test` 是独立的全量校验命令。**detect ⊂ list 前缀子集**：编码确认循环属于 list（要列出条目让用户看乱码才能确认），不属于 detect。求密码是 list/test/extract 共享的交互子流程（候选顺序：命令行 `--password` > `known_files` 命中 > 当前批次命中 > 配置通配符[将来] > 密码库；交互成功立即写库并供同批复用；试穿+用户取消统一记 `skipped`/`password_required`）。CLI 只做基本功能，最佳编码交互体验在 GUI 实现。
+
+### 8.1 解压 `extract`
 
 ```bash
 smartzip extract archive.zip
@@ -993,9 +1013,12 @@ smartzip extract a.zip b.7z c.rar --output ~/Downloads/out
 smartzip extract archive.zip --encoding auto
 smartzip extract archive.zip --encoding gb18030
 smartzip extract suspicious.bin --scan-embedded
+smartzip extract archive.zip --force          # 忽略 known_files 去重跳过，强制重解
 ```
 
-### 8.2 压缩
+去重：命中 `known_files`（`sample_hash + size`，`last_extract_at` 在时间窗内，默认 1 个月）时**跳过并显式提示**，`--force` 绕过。命中时同时复用 `confirmed_encoding`（人工确认过的）与 `password_id`。
+
+### 8.2 压缩 `compress`
 
 ```bash
 smartzip compress file.txt
@@ -1003,15 +1026,46 @@ smartzip compress dir1 dir2 --format 7z
 smartzip compress *.jpg --format zip --level fast
 ```
 
-### 8.3 检测
+### 8.3 检测 `detect`
 
 ```bash
-smartzip detect file.bin
+smartzip detect file.bin            # 格式 + 猜测编码 + 内嵌计数 + 文件名是否加密（纯报告，非交互）
 smartzip detect file.bin --json
 smartzip detect file.bin --deep
 ```
 
-### 8.4 密码库
+detect 不列条目、不确认编码、不解压。写 `tasks` + `file_extractions`（status=`detected`/`unreadable`），**不写** `known_files`（它没让用户确认编码）。
+
+### 8.4 列条目 `list`（新，后续任务接线）
+
+```bash
+smartzip list archive.zip                     # 列出条目，用最佳猜测编码
+smartzip list archive.zip --encoding gb18030  # 乱码时指定编码重列
+smartzip list archive.zip --pick-encoding     # 候选编码预览表，选一个（半交互，非 TUI）
+```
+
+list 要求“最终必须看到内容”：乱码→切编码重列、内嵌→定位、文件名加密→走求密码流程。用户选定的编码 = 人工确认 → 写 `known_files.confirmed_encoding`；求到密码 → 写 `known_files.password_id`。
+
+### 8.5 校验 `test`（新，后续任务接线）
+
+```bash
+smartzip test archive.7z              # 全量校验，定位损坏
+smartzip test movie.part1.rar         # 分卷：定位缺失/损坏的具体卷
+```
+
+test 全量校验（后端 `t`），status=`intact`/`corrupt`，坏卷列表写 `file_extractions.damaged_volumes_json`（报全部坏卷）。加密档试穿密码库+交互询问，试出的密码写 `known_files.password_id`。**test 独立于 extract**：extract 不含 test 步骤（全量扫描代价高）。
+
+### 8.6 历史 `history`（两模式 + 下钻）
+
+```bash
+smartzip history tasks                        # 默认：操作级列表（一行一次操作）
+smartzip history files                        # 文件级列表（一行一次解压动作）
+smartzip history files --status failed        # 按 status 过滤（extracted/skipped/failed/partial/…）
+smartzip history files --reason wrong_password # 按 reason 过滤
+smartzip history show <task_id>               # 某次操作的事件时间线 + 名下所有 file 行
+```
+
+### 8.7 密码库 `password`
 
 ```bash
 smartzip password list

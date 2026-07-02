@@ -1,7 +1,7 @@
 use rusqlite::{params, Connection};
 
 /// Latest schema version this build knows how to produce.
-pub const LATEST_VERSION: u32 = 2;
+pub const LATEST_VERSION: u32 = 3;
 
 /// Apply any pending schema migrations to `conn`.
 ///
@@ -151,6 +151,63 @@ const MIGRATIONS: &[MigrationStep] = &[
             ON embedded_archive_detections(file_path_hash);
         "#,
     },
+    MigrationStep {
+        version: 3,
+        sql: r#"
+        -- v3: file-grain history. The v2 detection/match tables never held
+        -- decision-driving data, so drop them outright rather than migrate.
+        DROP TABLE IF EXISTS encoding_detections;
+        DROP TABLE IF EXISTS embedded_archive_detections;
+        DROP TABLE IF EXISTS password_matches;
+
+        -- Slim `tasks` to a pure operation-level parent (method A). Old rows
+        -- carry no meaningful history, so rebuild rather than ALTER-drop each
+        -- column. task_events cascades on tasks(id), but since we only DROP an
+        -- empty table that has no dependent rows, no event data is lost.
+        DROP TABLE IF EXISTS tasks;
+        CREATE TABLE tasks (
+            id TEXT PRIMARY KEY,
+            kind TEXT NOT NULL,
+            status TEXT NOT NULL,
+            output_path TEXT,
+            started_at TEXT NOT NULL,
+            finished_at TEXT
+        );
+        CREATE INDEX idx_tasks_started_at ON tasks(started_at);
+        CREATE INDEX idx_tasks_status ON tasks(status);
+
+        CREATE TABLE file_extractions (
+            id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id              TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            input_path           TEXT NOT NULL,
+            sample_hash          TEXT,
+            file_size            INTEGER,
+            offset               INTEGER,
+            output_path          TEXT,
+            has_password         INTEGER NOT NULL DEFAULT 0,
+            password_id          INTEGER REFERENCES passwords(id) ON DELETE SET NULL,
+            status               TEXT NOT NULL,
+            reason               TEXT,
+            encoding             TEXT,
+            encoding_corrected   INTEGER NOT NULL DEFAULT 0,
+            damaged_volumes_json TEXT,
+            created_at           TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX idx_file_extractions_task   ON file_extractions(task_id);
+        CREATE INDEX idx_file_extractions_status ON file_extractions(status);
+        CREATE INDEX idx_file_extractions_dedup  ON file_extractions(sample_hash, file_size, created_at);
+
+        CREATE TABLE known_files (
+            sample_hash        TEXT NOT NULL,
+            size               INTEGER NOT NULL,
+            names_offsets_json TEXT NOT NULL DEFAULT '[]',
+            password_id        INTEGER REFERENCES passwords(id) ON DELETE SET NULL,
+            confirmed_encoding TEXT,
+            last_extract_at    TEXT,
+            PRIMARY KEY (sample_hash, size)
+        );
+        "#,
+    },
 ];
 
 fn apply_step(conn: &Connection, step: &MigrationStep) -> rusqlite::Result<()> {
@@ -198,20 +255,58 @@ mod tests {
     }
 
     #[test]
-    fn migration_creates_all_v2_tables() {
+    fn migration_creates_all_v3_tables() {
         let conn = Connection::open_in_memory().unwrap();
         migrate(&conn).unwrap();
         for name in [
             "passwords",
-            "password_matches",
             "tasks",
             "task_events",
-            "encoding_detections",
-            "embedded_archive_detections",
+            "file_extractions",
+            "known_files",
         ] {
             assert!(table_exists(&conn, name), "table {name} missing");
         }
         assert_eq!(current_version(&conn).unwrap(), LATEST_VERSION);
+    }
+
+    #[test]
+    fn v3_drops_superseded_v2_tables() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        for name in [
+            "password_matches",
+            "encoding_detections",
+            "embedded_archive_detections",
+        ] {
+            assert!(!table_exists(&conn, name), "table {name} should be dropped");
+        }
+    }
+
+    #[test]
+    fn v3_tasks_table_is_slim() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let columns: Vec<String> = {
+            let mut stmt = conn.prepare("PRAGMA table_info(tasks)").unwrap();
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            rows
+        };
+        assert_eq!(
+            columns,
+            vec![
+                "id",
+                "kind",
+                "status",
+                "output_path",
+                "started_at",
+                "finished_at"
+            ],
+        );
     }
 
     #[test]
@@ -228,7 +323,7 @@ mod tests {
     }
 
     #[test]
-    fn upgrades_v1_database_to_v2() {
+    fn upgrades_v1_database_to_latest() {
         let conn = Connection::open_in_memory().unwrap();
         // Simulate an older database that only has v1 applied.
         conn.execute_batch(
@@ -259,9 +354,14 @@ mod tests {
 
         migrate(&conn).unwrap();
         assert_eq!(current_version(&conn).unwrap(), LATEST_VERSION);
+        // v3 end state: slim tasks + file-grain tables present, the v2
+        // detection/match tables dropped along the way.
         assert!(table_exists(&conn, "tasks"));
         assert!(table_exists(&conn, "task_events"));
-        assert!(table_exists(&conn, "encoding_detections"));
-        assert!(table_exists(&conn, "embedded_archive_detections"));
+        assert!(table_exists(&conn, "file_extractions"));
+        assert!(table_exists(&conn, "known_files"));
+        assert!(!table_exists(&conn, "encoding_detections"));
+        assert!(!table_exists(&conn, "embedded_archive_detections"));
+        assert!(!table_exists(&conn, "password_matches"));
     }
 }

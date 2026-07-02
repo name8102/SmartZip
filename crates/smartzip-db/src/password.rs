@@ -62,6 +62,17 @@ impl<'a> PasswordRepository<'a> {
             .map_err(Into::into)
     }
 
+    pub fn get_by_id(&self, id: i64) -> Result<Option<PasswordRecord>> {
+        self.conn
+            .query_row(
+                "SELECT id, value, source, pinned, disabled, success_count, failure_count, last_success_at, last_failure_at FROM passwords WHERE id = ?1",
+                params![id],
+                map_password_record,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     pub fn ranked_candidates(&self, limit: usize) -> Result<Vec<PasswordRecord>> {
         let mut stmt = self.conn.prepare(
             r#"
@@ -122,153 +133,6 @@ impl<'a> PasswordRepository<'a> {
             .execute("DELETE FROM passwords WHERE id = ?1", params![id])?;
         Ok(())
     }
-
-    /// Record a successful match between a password and an archive shape.
-    ///
-    /// `archive_format` is the SmartZip format label (`"zip"`, `"rar"`, …);
-    /// `filename_pattern` is the normalized archive stem (see engine callers).
-    /// Rows are upserted so repeat successes bump `success_count` and refresh
-    /// `last_success_at` rather than accumulating duplicates.
-    pub fn record_match_success(
-        &self,
-        password_id: i64,
-        archive_format: Option<&str>,
-        filename_pattern: Option<&str>,
-    ) -> Result<()> {
-        let existing: Option<i64> = self
-            .conn
-            .query_row(
-                r#"
-                SELECT id FROM password_matches
-                WHERE password_id = ?1
-                  AND COALESCE(archive_format, '') = COALESCE(?2, '')
-                  AND COALESCE(filename_pattern, '') = COALESCE(?3, '')
-                "#,
-                params![password_id, archive_format, filename_pattern],
-                |row| row.get(0),
-            )
-            .optional()?;
-
-        match existing {
-            Some(id) => {
-                self.conn.execute(
-                    r#"
-                    UPDATE password_matches
-                    SET success_count = success_count + 1,
-                        last_success_at = CURRENT_TIMESTAMP
-                    WHERE id = ?1
-                    "#,
-                    params![id],
-                )?;
-            }
-            None => {
-                self.conn.execute(
-                    r#"
-                    INSERT INTO password_matches(
-                        password_id, archive_format, filename_pattern,
-                        success_count, last_success_at
-                    ) VALUES (?1, ?2, ?3, 1, CURRENT_TIMESTAMP)
-                    "#,
-                    params![password_id, archive_format, filename_pattern],
-                )?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Record a wrong-password event for the same match tuple as
-    /// [`record_match_success`]. Only call this on confirmed
-    /// `SmartZipError::WrongPassword` results.
-    pub fn record_match_failure(
-        &self,
-        password_id: i64,
-        archive_format: Option<&str>,
-        filename_pattern: Option<&str>,
-    ) -> Result<()> {
-        let existing: Option<i64> = self
-            .conn
-            .query_row(
-                r#"
-                SELECT id FROM password_matches
-                WHERE password_id = ?1
-                  AND COALESCE(archive_format, '') = COALESCE(?2, '')
-                  AND COALESCE(filename_pattern, '') = COALESCE(?3, '')
-                "#,
-                params![password_id, archive_format, filename_pattern],
-                |row| row.get(0),
-            )
-            .optional()?;
-
-        match existing {
-            Some(id) => {
-                self.conn.execute(
-                    r#"
-                    UPDATE password_matches
-                    SET failure_count = failure_count + 1,
-                        last_failure_at = CURRENT_TIMESTAMP
-                    WHERE id = ?1
-                    "#,
-                    params![id],
-                )?;
-            }
-            None => {
-                self.conn.execute(
-                    r#"
-                    INSERT INTO password_matches(
-                        password_id, archive_format, filename_pattern,
-                        failure_count, last_failure_at
-                    ) VALUES (?1, ?2, ?3, 1, CURRENT_TIMESTAMP)
-                    "#,
-                    params![password_id, archive_format, filename_pattern],
-                )?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Return match rows for a password, most successful first, useful for
-    /// diagnostics and future path/filename-similarity ranking.
-    pub fn matches_for(&self, password_id: i64) -> Result<Vec<PasswordMatch>> {
-        let mut stmt = self.conn.prepare(
-            r#"
-            SELECT id, password_id, archive_format, path_pattern, filename_pattern,
-                   success_count, failure_count, last_success_at, last_failure_at
-            FROM password_matches
-            WHERE password_id = ?1
-            ORDER BY success_count DESC, id ASC
-            "#,
-        )?;
-        let rows = stmt.query_map(params![password_id], map_match)?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(Into::into)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PasswordMatch {
-    pub id: i64,
-    pub password_id: i64,
-    pub archive_format: Option<String>,
-    pub path_pattern: Option<String>,
-    pub filename_pattern: Option<String>,
-    pub success_count: i64,
-    pub failure_count: i64,
-    pub last_success_at: Option<String>,
-    pub last_failure_at: Option<String>,
-}
-
-fn map_match(row: &rusqlite::Row<'_>) -> rusqlite::Result<PasswordMatch> {
-    Ok(PasswordMatch {
-        id: row.get(0)?,
-        password_id: row.get(1)?,
-        archive_format: row.get(2)?,
-        path_pattern: row.get(3)?,
-        filename_pattern: row.get(4)?,
-        success_count: row.get(5)?,
-        failure_count: row.get(6)?,
-        last_success_at: row.get(7)?,
-        last_failure_at: row.get(8)?,
-    })
 }
 
 fn map_password_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<PasswordRecord> {
@@ -317,61 +181,5 @@ mod tests {
         assert_eq!(ranked[0].id, second);
         assert_eq!(ranked[1].id, first);
         assert_eq!(ranked[1].value, "密码一");
-    }
-
-    #[test]
-    fn record_match_success_upserts_row_and_bumps_count() {
-        let db = SmartZipDb::in_memory().unwrap();
-        let repo = PasswordRepository::new(db.connection());
-        let id = repo
-            .upsert(NewPassword {
-                value: "abc123",
-                source: "manual",
-                pinned: false,
-            })
-            .unwrap();
-
-        repo.record_match_success(id, Some("zip"), Some("photos"))
-            .unwrap();
-        repo.record_match_success(id, Some("zip"), Some("photos"))
-            .unwrap();
-        // Different tuple → distinct row.
-        repo.record_match_success(id, Some("rar"), Some("photos"))
-            .unwrap();
-
-        let matches = repo.matches_for(id).unwrap();
-        assert_eq!(matches.len(), 2);
-        let zip = matches
-            .iter()
-            .find(|m| m.archive_format.as_deref() == Some("zip"))
-            .unwrap();
-        assert_eq!(zip.success_count, 2);
-        assert!(zip.last_success_at.is_some());
-        let rar = matches
-            .iter()
-            .find(|m| m.archive_format.as_deref() == Some("rar"))
-            .unwrap();
-        assert_eq!(rar.success_count, 1);
-    }
-
-    #[test]
-    fn record_match_failure_bumps_failure_column() {
-        let db = SmartZipDb::in_memory().unwrap();
-        let repo = PasswordRepository::new(db.connection());
-        let id = repo
-            .upsert(NewPassword {
-                value: "abc123",
-                source: "manual",
-                pinned: false,
-            })
-            .unwrap();
-        repo.record_match_failure(id, Some("zip"), Some("photos"))
-            .unwrap();
-        repo.record_match_failure(id, Some("zip"), Some("photos"))
-            .unwrap();
-        let matches = repo.matches_for(id).unwrap();
-        assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0].failure_count, 2);
-        assert_eq!(matches[0].success_count, 0);
     }
 }

@@ -134,6 +134,11 @@ enum Command {
         /// Password statistics are still updated.
         #[arg(long)]
         no_history: bool,
+
+        /// Re-extract even if this file was already extracted recently,
+        /// bypassing the known_files dedup window.
+        #[arg(long)]
+        force: bool,
     },
 
     /// Preview archive entry names under several encodings.
@@ -155,9 +160,11 @@ enum Command {
     #[command(subcommand)]
     Password(PasswordCmd),
 
-    /// Inspect recorded task history.
-    #[command(subcommand)]
-    History(HistoryCmd),
+    /// Inspect recorded task history. Defaults to recent tasks.
+    History {
+        #[command(subcommand)]
+        command: Option<HistoryCmd>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -214,8 +221,8 @@ enum PasswordCmd {
 
 #[derive(Debug, Subcommand)]
 enum HistoryCmd {
-    /// List recent tasks, newest first.
-    List {
+    /// List recent tasks (operations), newest first.
+    Tasks {
         #[arg(long)]
         json: bool,
         /// Show at most this many tasks.
@@ -223,7 +230,22 @@ enum HistoryCmd {
         limit: usize,
     },
 
-    /// Show a single task with its full event timeline.
+    /// List recent per-file extraction actions, newest first.
+    Files {
+        #[arg(long)]
+        json: bool,
+        /// Show at most this many rows.
+        #[arg(long, default_value = "50")]
+        limit: usize,
+        /// Filter by status (e.g. extracted / skipped / failed).
+        #[arg(long)]
+        status: Option<String>,
+        /// Filter by reason (e.g. duplicate / wrong_password / password_required).
+        #[arg(long)]
+        reason: Option<String>,
+    },
+
+    /// Show a single task: its event timeline plus every file action logged.
     Show {
         task_id: String,
         #[arg(long)]
@@ -321,6 +343,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             embedded,
             dominant_min_ratio,
             confirm_large_scan,
+            force,
             no_history,
         } => {
             let db = open_db(cli.db)?;
@@ -340,6 +363,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 embedded,
                 dominant_min_ratio,
                 confirm_large_scan,
+                force,
                 no_history,
             )
             .await
@@ -360,9 +384,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let db = open_db(cli.db)?;
             password(&db, cmd)
         }
-        Command::History(cmd) => {
+        Command::History { command } => {
             let db = open_db(cli.db)?;
-            history(&db, cmd)
+            history(
+                &db,
+                command.unwrap_or(HistoryCmd::Tasks {
+                    json: false,
+                    limit: 20,
+                }),
+            )
         }
     }
 }
@@ -489,6 +519,7 @@ async fn extract(
     embedded: EmbeddedModeArg,
     dominant_min_ratio: f32,
     confirm_large_scan: bool,
+    force: bool,
     no_history: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if paths.is_empty() {
@@ -528,9 +559,8 @@ async fn extract(
     // History recorder shares the same connection as the password service.
     // Both borrow `&Connection` immutably, which SQLite allows. Suppressed
     // with `--no-history`; password success/failure writes happen regardless.
-    let recorder = (!no_history).then(|| {
-        smartzip_engine::history::DbTaskHistoryRecorder::new(db.connection())
-    });
+    let recorder = (!no_history)
+        .then(|| smartzip_engine::history::DbTaskHistoryRecorder::new(db.connection()));
     let recorder_ref = recorder
         .as_ref()
         .map(|r| r as &dyn smartzip_engine::history::TaskHistoryRecorder);
@@ -556,6 +586,7 @@ async fn extract(
                 embedded_scan_mode: embedded.into(),
                 dominant_min_ratio,
                 confirm_large_scan,
+                force,
             },
             Some(&StdinPrompter {
                 lock: stdin_lock.clone(),
@@ -912,11 +943,12 @@ fn password(db: &SmartZipDb, cmd: PasswordCmd) -> Result<(), Box<dyn std::error:
 }
 
 fn history(db: &SmartZipDb, cmd: HistoryCmd) -> Result<(), Box<dyn std::error::Error>> {
+    use smartzip_db::file_extractions::FileExtractionRepository;
     use smartzip_db::task::TaskRepository;
     use smartzip_db::task_event::TaskEventRepository;
 
     match cmd {
-        HistoryCmd::List { limit, json } => {
+        HistoryCmd::Tasks { limit, json } => {
             let tasks = TaskRepository::new(db.connection()).recent(limit)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&tasks)?);
@@ -930,7 +962,43 @@ fn history(db: &SmartZipDb, cmd: HistoryCmd) -> Result<(), Box<dyn std::error::E
                         t.kind,
                         t.status,
                         t.started_at,
-                        t.input_summary,
+                        t.output_path.as_deref().unwrap_or("-"),
+                    );
+                }
+            }
+        }
+        HistoryCmd::Files {
+            limit,
+            json,
+            status,
+            reason,
+        } => {
+            let repo = FileExtractionRepository::new(db.connection());
+            let rows = match (status.as_deref(), reason.as_deref()) {
+                (Some(s), Some(r)) => repo.list_by_status_and_reason(s, r, limit)?,
+                (Some(s), None) => repo.list_by_status(s, limit)?,
+                (None, Some(r)) => repo.list_by_reason(r, limit)?,
+                (None, None) => repo.recent(limit)?,
+            };
+            if json {
+                println!("{}", serde_json::to_string_pretty(&rows)?);
+            } else if rows.is_empty() {
+                println!("No file extraction history recorded.");
+            } else {
+                for r in &rows {
+                    let offset = r.offset.map(|o| format!("@0x{o:X}")).unwrap_or_default();
+                    let detail = match (&r.status, &r.reason) {
+                        (s, Some(reason)) => format!("{s} ({reason})"),
+                        (s, None) => s.clone(),
+                    };
+                    println!(
+                        "{:<10} {} {}  enc={}  damaged={}  -> {}",
+                        detail,
+                        r.input_path,
+                        offset,
+                        r.encoding.as_deref().unwrap_or("-"),
+                        r.damaged_volumes_json.as_deref().unwrap_or("-"),
+                        r.output_path.as_deref().unwrap_or("-"),
                     );
                 }
             }
@@ -941,17 +1009,18 @@ fn history(db: &SmartZipDb, cmd: HistoryCmd) -> Result<(), Box<dyn std::error::E
                 return Err(format!("no task with id {task_id}").into());
             };
             let events = TaskEventRepository::new(db.connection()).list_by_task(&task_id)?;
+            let files = FileExtractionRepository::new(db.connection()).list_by_task(&task_id)?;
             if json {
                 let output = serde_json::json!({
                     "task": task,
                     "events": events,
+                    "files": files,
                 });
                 println!("{}", serde_json::to_string_pretty(&output)?);
             } else {
                 println!("Task {}", task.id);
                 println!("  kind:      {}", task.kind);
                 println!("  status:    {}", task.status);
-                println!("  input:     {}", task.input_summary);
                 if let Some(output) = &task.output_path {
                     println!("  output:    {output}");
                 }
@@ -959,16 +1028,18 @@ fn history(db: &SmartZipDb, cmd: HistoryCmd) -> Result<(), Box<dyn std::error::E
                 if let Some(finished) = &task.finished_at {
                     println!("  finished:  {finished}");
                 }
-                println!("  passwords: {} attempt(s)", task.password_attempts);
-                if let Some(encoding) = &task.encoding_selected {
-                    println!("  encoding:  {encoding}");
-                }
-                println!("  embedded:  {} finding(s)", task.embedded_found);
-                if let Some(code) = &task.error_code {
-                    println!("  error:     {code}");
-                }
-                if let Some(message) = &task.error_message {
-                    println!("  detail:    {message}");
+                println!("  files:");
+                for f in &files {
+                    let detail = match &f.reason {
+                        Some(reason) => format!("{} ({reason})", f.status),
+                        None => f.status.clone(),
+                    };
+                    println!(
+                        "    {:<10} {} -> {}",
+                        detail,
+                        f.input_path,
+                        f.output_path.as_deref().unwrap_or("-"),
+                    );
                 }
                 println!("  events:");
                 for event in &events {
@@ -1246,10 +1317,19 @@ fn prompt_encoding_stdin(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_extract_json_output, encoding_preview_candidates, extraction_exit_code};
+    use super::{
+        build_extract_json_output, encoding_preview_candidates, extraction_exit_code, Cli, Command,
+    };
+    use clap::Parser;
     use serde_json::json;
     use smartzip_core::TaskId;
     use smartzip_engine::ExtractWorkflowResult;
+
+    #[test]
+    fn history_without_subcommand_defaults_at_dispatch_layer() {
+        let cli = Cli::try_parse_from(["smartzip", "history"]).unwrap();
+        assert!(matches!(cli.command, Command::History { command: None }));
+    }
 
     #[test]
     fn exit_code_is_success_when_all_candidates_process() {

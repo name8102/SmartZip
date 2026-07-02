@@ -139,6 +139,9 @@ pub struct ExtractWorkflowRequest {
     pub embedded_scan_mode: smartzip_core::EmbeddedScanMode,
     pub dominant_min_ratio: f32,
     pub confirm_large_scan: bool,
+    /// Bypass the `known_files` dedup skip and re-extract even when this file
+    /// was already extracted inside the dedup window.
+    pub force: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -397,6 +400,10 @@ impl SmartZipEngine {
                 exit_code: None,
                 stderr: error.to_string(),
             })?;
+        // Passwords entered interactively and accepted during this invocation.
+        // Keep them in-memory as well as in SQLite so later files in the same
+        // batch can use them without rebuilding the task-wide DB snapshot.
+        let mut batch_passwords: Vec<PasswordCandidate> = Vec::new();
 
         let collision_resolver = output_prompter.map(|p| make_collision_resolver(p));
 
@@ -404,13 +411,18 @@ impl SmartZipEngine {
         // loop runs. All history writes are best-effort — a repo error becomes
         // a Warning event through the recorder and never aborts extraction.
         if let Some(recorder) = history {
-            let summary = summarize_inputs(&request.inputs);
-            recorder.start_extract(&task_id, &summary, Some(&request.output_dir));
+            recorder.start_extract(&task_id, Some(&request.output_dir));
         }
-        let mut hist_password_attempts: i64 = 0;
-        let mut hist_encoding_selected: Option<String> = None;
-        let mut hist_embedded_found: i64 = 0;
-        let mut hist_last_output: Option<PathBuf> = None;
+        // Dedup window lower bound: skip a re-extract only when the prior
+        // success is at or after this instant. Hardcoded to 30 days for now;
+        // TODO: read the window from config once the config layer lands.
+        let dedup_window_start = {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            smartzip_db::timestamp::format_utc_seconds(now - 30 * 24 * 3600)
+        };
         let mut hist_saw_failure = false;
 
         loop {
@@ -419,10 +431,21 @@ impl SmartZipEngine {
             };
             let key = candidate_key(&candidate);
             let is_new = seen.insert(key);
-            if !is_new
-                || candidate.depth > request.recursion_limit
-                || !is_first_volume(&candidate.path)
-            {
+            // Split the merged skip so each reason lands its own file_extractions
+            // row (duplicate within this run / over recursion limit / a non-first
+            // volume of a split set).
+            if !is_new {
+                record_skip(history, &task_id, &candidate, "duplicate");
+                skipped.push(candidate);
+                continue;
+            }
+            if candidate.depth > request.recursion_limit {
+                record_skip(history, &task_id, &candidate, "recursion_limit");
+                skipped.push(candidate);
+                continue;
+            }
+            if !is_first_volume(&candidate.path) {
+                record_skip(history, &task_id, &candidate, "not_first_volume");
                 skipped.push(candidate);
                 continue;
             }
@@ -433,11 +456,10 @@ impl SmartZipEngine {
                 let mut file = match std::fs::File::open(&candidate.path) {
                     Ok(f) => f,
                     Err(_) => {
-                        return Err(smartzip_core::SmartZipError::BackendFailed {
-                            backend: "detect".into(),
-                            exit_code: None,
-                            stderr: format!("cannot open {}", candidate.path.display()),
-                        })
+                        hist_saw_failure = true;
+                        record_skip(history, &task_id, &candidate, "not_found");
+                        skipped.push(candidate);
+                        continue;
                     }
                 };
                 let mut buf = [0u8; 8192];
@@ -457,13 +479,6 @@ impl SmartZipEngine {
             } else {
                 Vec::new()
             };
-
-            if !findings.is_empty() {
-                if let Some(recorder) = history {
-                    recorder.record_embedded_findings(&task_id, &candidate.path, &findings);
-                }
-                hist_embedded_found += findings.len() as i64;
-            }
 
             // Use dominant selector for embedded findings
             if !findings.is_empty() {
@@ -558,17 +573,20 @@ impl SmartZipEngine {
                                     }
                                 }
                                 EmbeddedSelectionChoice::Skip => {
+                                    record_skip(history, &task_id, &candidate, "not_found");
                                     skipped.push(candidate);
                                     continue;
                                 }
                             },
                             None => {
+                                record_skip(history, &task_id, &candidate, "not_found");
                                 skipped.push(candidate);
                                 continue;
                             }
                         }
                     }
                     _ => {
+                        record_skip(history, &task_id, &candidate, "not_found");
                         skipped.push(candidate);
                         continue;
                     }
@@ -586,6 +604,7 @@ impl SmartZipEngine {
             }
 
             if candidate.detected_format.is_none() {
+                record_skip(history, &task_id, &candidate, "not_found");
                 skipped.push(candidate);
                 continue;
             }
@@ -595,10 +614,8 @@ impl SmartZipEngine {
             // dropped straight in, or a plain .zip whose contents match docx
             // structure) reach the main loop directly.
             if candidate.detected_format == Some(ArchiveFormat::Zip) {
-                if let Some(kind) =
-                    ext_business_container_kind(&candidate.path).or_else(|| {
-                        crate::container::classify_zip_path(&candidate.path)
-                    })
+                if let Some(kind) = ext_business_container_kind(&candidate.path)
+                    .or_else(|| crate::container::classify_zip_path(&candidate.path))
                 {
                     events.push(TaskEvent {
                         task_id: task_id.clone(),
@@ -607,6 +624,7 @@ impl SmartZipEngine {
                             kind: format!("{kind:?}"),
                         },
                     });
+                    record_skip(history, &task_id, &candidate, "business_container");
                     skipped.push(candidate);
                     continue;
                 }
@@ -614,6 +632,106 @@ impl SmartZipEngine {
 
             let archive_input = materialize_archive_input(&candidate)?;
             let archive_path = archive_input.path.clone();
+
+            // File-grain history: identify this physical file by content
+            // sampling so we can dedup, reuse a confirmed encoding, and reuse a
+            // known password. Carve candidates hash their [offset, offset+size)
+            // segment; a size-unknown carve yields no hash and skips dedup.
+            let (sample_hash, sample_size) = match candidate.embedded_offset {
+                Some(offset) if offset > 0 => smartzip_db::sample_hash::sample_hash_segment(
+                    &candidate.path,
+                    offset,
+                    candidate.embedded_size,
+                )
+                .map(|(h, s)| (Some(h), Some(s as i64)))
+                .unwrap_or((None, None)),
+                _ => smartzip_db::sample_hash::sample_hash(&archive_path)
+                    .map(|(h, s)| (Some(h), Some(s as i64)))
+                    .unwrap_or((None, None)),
+            };
+            let known_hit = match (history, sample_hash.as_deref(), sample_size) {
+                (Some(recorder), Some(hash), Some(size)) => recorder.lookup_known_file(hash, size),
+                _ => None,
+            };
+
+            // Dedup: a prior successful extract inside the window means skip,
+            // unless --force. Emit a hint event and log a skipped row.
+            if !request.force {
+                if let (Some(hash), Some(size), Some(hit)) =
+                    (sample_hash.as_deref(), sample_size, known_hit.as_ref())
+                {
+                    if hit
+                        .last_extract_at
+                        .as_deref()
+                        .is_some_and(|at| at >= dedup_window_start.as_str())
+                    {
+                        events.push(TaskEvent {
+                            task_id: task_id.clone(),
+                            kind: TaskEventKind::Warning {
+                                message: format!(
+                                    "skipping {} — already extracted within the dedup window (use --force to re-extract)",
+                                    candidate.path.display()
+                                ),
+                            },
+                        });
+                        if let Some(recorder) = history {
+                            recorder.record_file_extraction(
+                                &task_id,
+                                crate::history::FileExtractionRow {
+                                    input_path: &candidate.path,
+                                    sample_hash: Some(hash),
+                                    file_size: Some(size),
+                                    offset: candidate.embedded_offset.map(|o| o as i64),
+                                    output_path: None,
+                                    has_password: false,
+                                    password_id: None,
+                                    status: "skipped",
+                                    reason: Some("duplicate"),
+                                    encoding: None,
+                                    encoding_corrected: false,
+                                    damaged_volumes_json: None,
+                                },
+                            );
+                        }
+                        skipped.push(candidate);
+                        continue;
+                    }
+                }
+            }
+
+            // Confirmed-encoding reuse: a user-confirmed encoding for this exact
+            // file beats auto-detection, but never a command-line override.
+            // Detect-time guesses are recomputed each run, so only a confirmed
+            // encoding (written by the future `list` command) is reused here.
+            let candidate_encoding_mode = match (
+                &request.encoding_mode,
+                known_hit
+                    .as_ref()
+                    .and_then(|h| h.confirmed_encoding.clone()),
+            ) {
+                (EncodingMode::Auto, Some(enc)) => EncodingMode::Override(enc),
+                _ => request.encoding_mode.clone(),
+            };
+            // True when the encoding above came from a reused user-confirmed
+            // choice; recorded on the file_extractions row as encoding_corrected.
+            let reused_confirmed_encoding = request.encoding_mode == EncodingMode::Auto
+                && known_hit
+                    .as_ref()
+                    .map(|h| h.confirmed_encoding.is_some())
+                    .unwrap_or(false);
+
+            // Password try order: command-line/manual > exact known-file hit >
+            // passwords accepted earlier in this batch > empty/database
+            // fallback. Values are deduplicated while preserving that order.
+            let known_password = known_hit
+                .as_ref()
+                .and_then(|h| h.password_id)
+                .and_then(|id| passwords.candidate_by_id(id).ok().flatten());
+            let candidate_passwords = order_password_candidates(
+                &password_candidates,
+                known_password.as_ref(),
+                &batch_passwords,
+            );
 
             if candidate.source == CandidateSource::RootInput {
                 root_input_started += 1;
@@ -650,8 +768,10 @@ impl SmartZipEngine {
                 ))),
             });
 
+            // Skip auto-detection entirely when a user-confirmed encoding was
+            // reused from known_files — that choice already beat auto once.
             let mut zip_encoding_assessment = None;
-            if request.encoding_mode == EncodingMode::Auto
+            if candidate_encoding_mode == EncodingMode::Auto
                 && candidate.detected_format == Some(ArchiveFormat::Zip)
             {
                 let native_zip = NativeZipBackend::new();
@@ -667,18 +787,6 @@ impl SmartZipEngine {
                     task_id: task_id.clone(),
                     kind: TaskEventKind::EncodingDetected(assessment.context.detected.clone()),
                 });
-                if let Some(recorder) = history {
-                    recorder.record_encoding_detection(
-                        &task_id,
-                        &candidate.path,
-                        candidate.detected_format.as_ref().map(|f| f.as_str()),
-                        &assessment.context.detected,
-                        Some(&assessment.context),
-                        false,
-                    );
-                    hist_encoding_selected =
-                        Some(encoding_mode_label(&assessment.context.detected.selected));
-                }
             }
 
             let _key = candidate_key(&candidate);
@@ -688,14 +796,18 @@ impl SmartZipEngine {
             let mut terminal_skip = false;
             let mut last_error = None;
             let mut saw_wrong_password = false;
+            let mut password_prompt_cancelled = false;
             let mut actual_output_dir = output_dir.clone();
+            // File-grain success state, recorded once after the try loop.
+            let mut candidate_password_id: Option<i64> = None;
+            let mut candidate_has_password = false;
+            let mut candidate_encoding_used: Option<String> = None;
             let test_before_extract = backend
                 .should_test_before_extract(&archive_path, candidate.detected_format.as_ref());
-            let total_password_attempts = password_candidates.len();
-            for password in &password_candidates {
+            let total_password_attempts = candidate_passwords.len();
+            for password in &candidate_passwords {
                 let pw_value = password_value(password);
-                let attempt_index = password_attempt_index(password, &password_candidates);
-                hist_password_attempts += 1;
+                let attempt_index = password_attempt_index(password, &candidate_passwords);
                 events.push(TaskEvent {
                     task_id: task_id.clone(),
                     kind: TaskEventKind::Progress(smartzip_core::TaskProgress::indeterminate(
@@ -717,13 +829,14 @@ impl SmartZipEngine {
                             archive: archive_path.clone(),
                             format: candidate.detected_format.clone(),
                             password: pw_value.clone(),
-                            encoding: request.encoding_mode.clone(),
+                            encoding: candidate_encoding_mode.clone(),
                         }),
                     )
                     .await
                     {
                         Ok(result) if result.ok => {
-                            let matched_password_id = passwords.record_success(password).ok().flatten();
+                            let matched_password_id =
+                                passwords.record_success(password).ok().flatten();
                             events.push(TaskEvent {
                                 task_id: task_id.clone(),
                                 kind: TaskEventKind::Progress(
@@ -734,16 +847,12 @@ impl SmartZipEngine {
                                     )),
                                 ),
                             });
-                            if let Some(recorder) = history {
-                                record_password_match_success(
-                                    recorder,
-                                    matched_password_id,
-                                    &candidate,
-                                );
-                            }
+                            candidate_password_id = matched_password_id;
+                            candidate_has_password =
+                                pw_value.as_deref().map(|v| !v.is_empty()).unwrap_or(false);
 
                             if zip_encoding_assessment.is_none()
-                                && request.encoding_mode == EncodingMode::Auto
+                                && candidate_encoding_mode == EncodingMode::Auto
                                 && candidate.detected_format == Some(ArchiveFormat::Zip)
                             {
                                 let native_zip = NativeZipBackend::new();
@@ -760,31 +869,17 @@ impl SmartZipEngine {
                                             assessment.context.detected.clone(),
                                         ),
                                     });
-                                    if let Some(recorder) = history {
-                                        recorder.record_encoding_detection(
-                                            &task_id,
-                                            &candidate.path,
-                                            candidate
-                                                .detected_format
-                                                .as_ref()
-                                                .map(|f| f.as_str()),
-                                            &assessment.context.detected,
-                                            Some(&assessment.context),
-                                            false,
-                                        );
-                                    }
-                                    hist_encoding_selected =
-                                        Some(encoding_mode_label(&assessment.context.detected.selected));
                                 }
                             }
 
                             let encoding_to_use = resolve_encoding_mode(
                                 &archive_path,
-                                request.encoding_mode.clone(),
+                                candidate_encoding_mode.clone(),
                                 zip_encoding_assessment.as_ref(),
                                 encoding_prompter,
                             )
                             .await?;
+                            candidate_encoding_used = Some(encoding_mode_label(&encoding_to_use));
                             let extract_archive_path = archive_path.clone();
                             let extract_format = candidate.detected_format.clone();
                             let extract_password = pw_value.clone();
@@ -895,10 +990,18 @@ impl SmartZipEngine {
                             ),
                         )),
                     });
+                    let extract_encoding_mode = resolve_encoding_mode(
+                        &archive_path,
+                        candidate_encoding_mode.clone(),
+                        zip_encoding_assessment.as_ref(),
+                        encoding_prompter,
+                    )
+                    .await?;
+                    candidate_encoding_used = Some(encoding_mode_label(&extract_encoding_mode));
                     let extract_archive_path = archive_path.clone();
                     let extract_format = candidate.detected_format.clone();
                     let extract_password = pw_value.clone();
-                    let extract_encoding = request.encoding_mode.clone();
+                    let extract_encoding = extract_encoding_mode.clone();
                     let extraction_progress = extraction_progress_callback(
                         events.clone(),
                         task_id.clone(),
@@ -963,13 +1066,9 @@ impl SmartZipEngine {
                                     )),
                                 ),
                             });
-                            if let Some(recorder) = history {
-                                record_password_match_success(
-                                    recorder,
-                                    matched_password_id,
-                                    &candidate,
-                                );
-                            }
+                            candidate_password_id = matched_password_id;
+                            candidate_has_password =
+                                pw_value.as_deref().map(|v| !v.is_empty()).unwrap_or(false);
                             if result.output_dir != output_dir {
                                 candidate.relative_path = output_relative_path_for(
                                     &request.output_dir,
@@ -1016,7 +1115,12 @@ impl SmartZipEngine {
                             format!("Prompting for password: {}", candidate.path.display()),
                         )),
                     });
-                    if let Some(interactive_pw) = prompter.prompt(&candidate.path).await {
+                    let interactive_password = prompter.prompt(&candidate.path).await;
+                    password_prompt_cancelled = interactive_password
+                        .as_deref()
+                        .map(str::trim)
+                        .is_none_or(str::is_empty);
+                    if let Some(interactive_pw) = interactive_password {
                         let pw = interactive_pw.trim().to_string();
                         if !pw.is_empty() {
                             if test_before_extract {
@@ -1028,7 +1132,7 @@ impl SmartZipEngine {
                                         archive: archive_path.clone(),
                                         format: candidate.detected_format.clone(),
                                         password: Some(pw.clone()),
-                                        encoding: request.encoding_mode.clone(),
+                                        encoding: candidate_encoding_mode.clone(),
                                     }),
                                 )
                                 .await
@@ -1046,7 +1150,7 @@ impl SmartZipEngine {
                                             ),
                                         });
                                         if zip_encoding_assessment.is_none()
-                                            && request.encoding_mode == EncodingMode::Auto
+                                            && candidate_encoding_mode == EncodingMode::Auto
                                             && candidate.detected_format == Some(ArchiveFormat::Zip)
                                         {
                                             let native_zip = NativeZipBackend::new();
@@ -1067,11 +1171,13 @@ impl SmartZipEngine {
                                         }
                                         let encoding_to_use = resolve_encoding_mode(
                                             &archive_path,
-                                            request.encoding_mode.clone(),
+                                            candidate_encoding_mode.clone(),
                                             zip_encoding_assessment.as_ref(),
                                             encoding_prompter,
                                         )
                                         .await?;
+                                        candidate_encoding_used =
+                                            Some(encoding_mode_label(&encoding_to_use));
                                         let extract_archive_path = archive_path.clone();
                                         let extract_format = candidate.detected_format.clone();
                                         let extract_password = pw.clone();
@@ -1144,13 +1250,22 @@ impl SmartZipEngine {
                                                         );
                                                 }
                                                 actual_output_dir = result.output_dir;
-                                                let _ = passwords
-                                                    .record_success(&PasswordCandidate {
+                                                let accepted = PasswordCandidate {
                                                     id: None,
                                                     value: pw.clone(),
                                                     source:
                                                         smartzip_passwords::PasswordSource::Manual,
-                                                });
+                                                };
+                                                candidate_password_id = passwords
+                                                    .record_success(&accepted)
+                                                    .ok()
+                                                    .flatten();
+                                                candidate_has_password = true;
+                                                remember_batch_password(
+                                                    &mut batch_passwords,
+                                                    &accepted.value,
+                                                    candidate_password_id,
+                                                );
                                                 extracted = true;
                                             }
                                             Err(failure) => {
@@ -1205,11 +1320,13 @@ impl SmartZipEngine {
                                 let extract_password = pw.clone();
                                 let extract_encoding = resolve_encoding_mode(
                                     &archive_path,
-                                    request.encoding_mode.clone(),
+                                    candidate_encoding_mode.clone(),
                                     zip_encoding_assessment.as_ref(),
                                     encoding_prompter,
                                 )
                                 .await?;
+                                candidate_encoding_used =
+                                    Some(encoding_mode_label(&extract_encoding));
                                 let extraction_progress = extraction_progress_callback(
                                     events.clone(),
                                     task_id.clone(),
@@ -1285,11 +1402,19 @@ impl SmartZipEngine {
                                                 ),
                                             ),
                                         });
-                                        let _ = passwords.record_success(&PasswordCandidate {
+                                        let accepted = PasswordCandidate {
                                             id: None,
                                             value: pw.clone(),
                                             source: smartzip_passwords::PasswordSource::Manual,
-                                        });
+                                        };
+                                        candidate_password_id =
+                                            passwords.record_success(&accepted).ok().flatten();
+                                        candidate_has_password = true;
+                                        remember_batch_password(
+                                            &mut batch_passwords,
+                                            &accepted.value,
+                                            candidate_password_id,
+                                        );
                                         extracted = true;
                                     }
                                     Err(failure) => {
@@ -1324,20 +1449,93 @@ impl SmartZipEngine {
             }
 
             if !extracted && !terminal_skip {
-                if let Some(error) = last_error.or_else(|| {
+                if password_prompt_cancelled {
+                    if let Some(recorder) = history {
+                        recorder.record_file_extraction(
+                            &task_id,
+                            crate::history::FileExtractionRow {
+                                input_path: &candidate.path,
+                                sample_hash: sample_hash.as_deref(),
+                                file_size: sample_size,
+                                offset: candidate.embedded_offset.map(|o| o as i64),
+                                output_path: None,
+                                has_password: false,
+                                password_id: None,
+                                status: "skipped",
+                                reason: Some("password_required"),
+                                encoding: candidate_encoding_used.as_deref(),
+                                encoding_corrected: reused_confirmed_encoding
+                                    || matches!(request.encoding_mode, EncodingMode::Override(_)),
+                                damaged_volumes_json: None,
+                            },
+                        );
+                    }
+                } else if let Some(error) = last_error.or_else(|| {
                     saw_wrong_password.then(|| smartzip_core::SmartZipError::WrongPassword {
                         path: candidate.path.clone(),
                     })
                 }) {
                     hist_saw_failure = true;
-                    let event = TaskEvent::failed(task_id.clone(), &error);
+                    // File-grain failure: classify the reason from the error so
+                    // `history files --reason` can filter later.
+                    let reason = match &error {
+                        smartzip_core::SmartZipError::WrongPassword { .. }
+                        | smartzip_core::SmartZipError::PasswordRequired { .. } => "wrong_password",
+                        smartzip_core::SmartZipError::Io { .. } => "not_found",
+                        _ => "corrupt",
+                    };
                     if let Some(recorder) = history {
-                        recorder.record_event(&task_id, &event);
+                        recorder.record_file_extraction(
+                            &task_id,
+                            crate::history::FileExtractionRow {
+                                input_path: &candidate.path,
+                                sample_hash: sample_hash.as_deref(),
+                                file_size: sample_size,
+                                offset: candidate.embedded_offset.map(|o| o as i64),
+                                output_path: None,
+                                has_password: candidate_has_password,
+                                password_id: candidate_password_id,
+                                status: "failed",
+                                reason: Some(reason),
+                                encoding: candidate_encoding_used.as_deref(),
+                                encoding_corrected: reused_confirmed_encoding
+                                    || matches!(request.encoding_mode, EncodingMode::Override(_)),
+                                damaged_volumes_json: None,
+                            },
+                        );
                     }
+                    let event = TaskEvent::failed(task_id.clone(), &error);
                     events.push(event);
+                } else if let Some(recorder) = history {
+                    // No error and not extracted: candidates were tried but none
+                    // opened it (e.g. needed a password we never got). Record a
+                    // skip with `password_required` rather than a failure.
+                    recorder.record_file_extraction(
+                        &task_id,
+                        crate::history::FileExtractionRow {
+                            input_path: &candidate.path,
+                            sample_hash: sample_hash.as_deref(),
+                            file_size: sample_size,
+                            offset: candidate.embedded_offset.map(|o| o as i64),
+                            output_path: None,
+                            has_password: candidate_has_password,
+                            password_id: candidate_password_id,
+                            status: "skipped",
+                            reason: Some("password_required"),
+                            encoding: candidate_encoding_used.as_deref(),
+                            encoding_corrected: reused_confirmed_encoding
+                                || matches!(request.encoding_mode, EncodingMode::Override(_)),
+                            damaged_volumes_json: None,
+                        },
+                    );
                 }
             }
-            if terminal_skip || !extracted {
+            if terminal_skip {
+                record_skip(history, &task_id, &candidate, "target_exists");
+                skipped.push(candidate);
+                continue;
+            }
+            if !extracted {
                 skipped.push(candidate);
                 continue;
             }
@@ -1348,11 +1546,54 @@ impl SmartZipEngine {
                     path: actual_output_dir.clone(),
                 },
             };
-            if let Some(recorder) = history {
-                recorder.record_event(&task_id, &output_event);
-            }
             events.push(output_event);
-            hist_last_output = Some(actual_output_dir.clone());
+            // File-grain success record: one file_extractions row for this
+            // extracted candidate, and a known_files upsert so future runs can
+            // dedup and reuse its password.
+            if let Some(recorder) = history {
+                recorder.record_file_extraction(
+                    &task_id,
+                    crate::history::FileExtractionRow {
+                        input_path: &candidate.path,
+                        sample_hash: sample_hash.as_deref(),
+                        file_size: sample_size,
+                        offset: candidate.embedded_offset.map(|o| o as i64),
+                        output_path: Some(&actual_output_dir),
+                        has_password: candidate_has_password,
+                        password_id: candidate_password_id,
+                        status: "extracted",
+                        reason: None,
+                        encoding: candidate_encoding_used.as_deref(),
+                        encoding_corrected: reused_confirmed_encoding
+                            || matches!(request.encoding_mode, EncodingMode::Override(_)),
+                        damaged_volumes_json: None,
+                    },
+                );
+                if let (Some(hash), Some(size)) = (sample_hash.as_deref(), sample_size) {
+                    let name = candidate
+                        .path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned());
+                    recorder.upsert_known_file_extract(crate::history::KnownFileUpsert {
+                        sample_hash: hash,
+                        size,
+                        name: name.as_deref(),
+                        offset: candidate.embedded_offset.map(|o| o as i64),
+                        password_id: candidate_password_id,
+                    });
+                    if let EncodingMode::Override(encoding) = &request.encoding_mode {
+                        recorder.upsert_known_file_confirmed_encoding(
+                            crate::history::KnownFileEncodingUpsert {
+                                sample_hash: hash,
+                                size,
+                                name: name.as_deref(),
+                                offset: candidate.embedded_offset.map(|o| o as i64),
+                                encoding,
+                            },
+                        );
+                    }
+                }
+            }
 
             processed.push(candidate.clone());
             let output_relative_path = candidate_output_relative_path(&candidate);
@@ -1395,16 +1636,16 @@ impl SmartZipEngine {
         let snapshot = events.snapshot();
 
         // History: replay the full event timeline into task_events, then close
-        // out the task row with aggregated metrics. Detection-table rows and
-        // password_matches were written inline above where path context was
-        // available; this final pass only handles task_events + finish.
+        // out the task row. Per-file detail (encoding, password, embedded
+        // findings) now lives in file_extractions rows written inline above;
+        // this final pass only handles task_events + the slim task finish.
         if let Some(recorder) = history {
             for event in &snapshot {
                 recorder.record_event(&task_id, event);
             }
             let status = if processed.is_empty() {
                 crate::history::TaskCompletionStatus::Failed
-            } else if hist_saw_failure {
+            } else if hist_saw_failure || !skipped.is_empty() {
                 crate::history::TaskCompletionStatus::Partial
             } else {
                 crate::history::TaskCompletionStatus::Completed
@@ -1413,12 +1654,7 @@ impl SmartZipEngine {
                 &task_id,
                 crate::history::TaskOutcome {
                     status,
-                    error_code: None,
-                    error_message: None,
-                    password_attempts: hist_password_attempts,
-                    encoding_selected: hist_encoding_selected.as_deref(),
-                    embedded_found: hist_embedded_found,
-                    output_path: hist_last_output.as_deref(),
+                    output_path: Some(&request.output_dir),
                 },
             );
         }
@@ -1467,28 +1703,63 @@ fn password_value(candidate: &PasswordCandidate) -> Option<String> {
     Some(candidate.value.clone())
 }
 
-/// Summarize root inputs for the `tasks.input_summary` column. Joins the file
-/// names with commas and appends "…and N more" once the list grows long so the
-/// column stays compact for many-input batch runs.
-fn summarize_inputs(inputs: &[PathBuf]) -> String {
-    const MAX_SHOWN: usize = 5;
-    let names: Vec<String> = inputs
-        .iter()
-        .map(|p| {
-            p.file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| p.to_string_lossy().into_owned())
-        })
-        .collect();
-    if names.len() <= MAX_SHOWN {
-        return names.join(", ");
+fn order_password_candidates(
+    base: &[PasswordCandidate],
+    known: Option<&PasswordCandidate>,
+    batch: &[PasswordCandidate],
+) -> Vec<PasswordCandidate> {
+    let mut ordered = Vec::with_capacity(base.len() + batch.len() + usize::from(known.is_some()));
+
+    for candidate in base.iter().filter(|candidate| {
+        matches!(
+            candidate.source,
+            smartzip_passwords::PasswordSource::Manual
+                | smartzip_passwords::PasswordSource::Clipboard
+        )
+    }) {
+        push_password_unique(&mut ordered, candidate.clone());
     }
-    let shown = names[..MAX_SHOWN].join(", ");
-    format!("{shown}, …and {} more", names.len() - MAX_SHOWN)
+    if let Some(candidate) = known {
+        push_password_unique(&mut ordered, candidate.clone());
+    }
+    for candidate in batch {
+        push_password_unique(&mut ordered, candidate.clone());
+    }
+    for candidate in base.iter().filter(|candidate| {
+        !matches!(
+            candidate.source,
+            smartzip_passwords::PasswordSource::Manual
+                | smartzip_passwords::PasswordSource::Clipboard
+        )
+    }) {
+        push_password_unique(&mut ordered, candidate.clone());
+    }
+
+    ordered
+}
+
+fn remember_batch_password(batch: &mut Vec<PasswordCandidate>, value: &str, id: Option<i64>) {
+    if batch.iter().any(|candidate| candidate.value == value) {
+        return;
+    }
+    batch.push(PasswordCandidate {
+        id,
+        value: value.to_string(),
+        source: smartzip_passwords::PasswordSource::Recent,
+    });
+}
+
+fn push_password_unique(ordered: &mut Vec<PasswordCandidate>, candidate: PasswordCandidate) {
+    if !ordered
+        .iter()
+        .any(|existing| existing.value == candidate.value)
+    {
+        ordered.push(candidate);
+    }
 }
 
 /// Human-readable label for an [`EncodingMode`], used for the
-/// `tasks.encoding_selected` column.
+/// `file_extractions.encoding` column.
 fn encoding_mode_label(mode: &EncodingMode) -> String {
     match mode {
         EncodingMode::Auto => "auto".to_string(),
@@ -1496,20 +1767,35 @@ fn encoding_mode_label(mode: &EncodingMode) -> String {
     }
 }
 
-/// Backfill a `password_matches` success row for the archive that a password
-/// just unlocked. No-op when the password had no database id (empty password
-/// or a not-yet-persisted manual candidate).
-fn record_password_match_success(
-    recorder: &dyn crate::history::TaskHistoryRecorder,
-    password_id: Option<i64>,
+/// Append a `skipped` row to `file_extractions` for a candidate that never
+/// reached extraction. `reason` is one of the skip reason strings from the v3
+/// schema (`duplicate` / `recursion_limit` / `not_first_volume` /
+/// `business_container` / `password_required` / …). No-op without a recorder.
+fn record_skip(
+    history: Option<&dyn crate::history::TaskHistoryRecorder>,
+    task_id: &TaskId,
     candidate: &ExtractionCandidate,
+    reason: &str,
 ) {
-    let Some(id) = password_id else {
-        return;
-    };
-    let format = candidate.detected_format.as_ref().map(|f| f.as_str());
-    let pattern = crate::history::normalize_filename_pattern(&candidate.path);
-    recorder.record_password_match(Some(id), format, pattern.as_deref(), true);
+    if let Some(recorder) = history {
+        recorder.record_file_extraction(
+            task_id,
+            crate::history::FileExtractionRow {
+                input_path: &candidate.path,
+                sample_hash: None,
+                file_size: None,
+                offset: candidate.embedded_offset.map(|o| o as i64),
+                output_path: None,
+                has_password: false,
+                password_id: None,
+                status: "skipped",
+                reason: Some(reason),
+                encoding: None,
+                encoding_corrected: false,
+                damaged_volumes_json: None,
+            },
+        );
+    }
 }
 
 fn password_source_label(candidate: &PasswordCandidate) -> &'static str {
@@ -2246,7 +2532,7 @@ mod tests {
     use smartzip_passwords::{PasswordCandidateRequest, PasswordService};
     use smartzip_scanner::ScanMode;
     use std::sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
     };
     use std::time::Duration;
@@ -2265,6 +2551,39 @@ mod tests {
             .join("tests")
             .join("fixtures")
             .join(name)
+    }
+
+    fn password_candidate(
+        value: &str,
+        source: smartzip_passwords::PasswordSource,
+    ) -> PasswordCandidate {
+        PasswordCandidate {
+            id: None,
+            value: value.to_string(),
+            source,
+        }
+    }
+
+    #[test]
+    fn password_order_is_explicit_then_known_then_batch_then_database() {
+        use smartzip_passwords::PasswordSource;
+
+        let base = vec![
+            password_candidate("cli", PasswordSource::Manual),
+            password_candidate("", PasswordSource::Empty),
+            password_candidate("db", PasswordSource::Database),
+        ];
+        let known = password_candidate("known", PasswordSource::Database);
+        let batch = vec![password_candidate("batch", PasswordSource::Recent)];
+
+        let ordered = order_password_candidates(&base, Some(&known), &batch);
+        assert_eq!(
+            ordered
+                .iter()
+                .map(|candidate| candidate.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["cli", "known", "batch", "", "db"],
+        );
     }
 
     #[test]
@@ -2340,6 +2659,7 @@ mod tests {
                     embedded_scan_mode: smartzip_core::EmbeddedScanMode::Ask,
                     dominant_min_ratio: 0.70,
                     confirm_large_scan: false,
+                    force: false,
                 },
                 None,
                 None,
@@ -2537,6 +2857,7 @@ mod tests {
                     embedded_scan_mode: smartzip_core::EmbeddedScanMode::default(),
                     dominant_min_ratio: 0.70,
                     confirm_large_scan: false,
+                    force: false,
                 },
                 None,
                 None,
@@ -2610,6 +2931,7 @@ mod tests {
                     embedded_scan_mode: smartzip_core::EmbeddedScanMode::default(),
                     dominant_min_ratio: 0.70,
                     confirm_large_scan: false,
+                    force: false,
                 },
                 None,
                 None,
@@ -2693,6 +3015,7 @@ mod tests {
                     embedded_scan_mode: smartzip_core::EmbeddedScanMode::default(),
                     dominant_min_ratio: 0.70,
                     confirm_large_scan: false,
+                    force: false,
                 },
                 None,
                 Some(&output_prompter),
@@ -2812,6 +3135,7 @@ mod tests {
                     embedded_scan_mode: smartzip_core::EmbeddedScanMode::default(),
                     dominant_min_ratio: 0.70,
                     confirm_large_scan: false,
+                    force: false,
                 },
                 None,
                 None,
@@ -2935,6 +3259,7 @@ mod tests {
                     embedded_scan_mode: smartzip_core::EmbeddedScanMode::default(),
                     dominant_min_ratio: 0.70,
                     confirm_large_scan: false,
+                    force: false,
                 },
                 None,
                 None,
@@ -2957,6 +3282,159 @@ mod tests {
     #[derive(Default, Clone)]
     struct FakeBackend {
         calls: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[derive(Default, Clone)]
+    struct BatchPasswordBackend {
+        attempted_passwords: Arc<Mutex<Vec<Option<String>>>>,
+    }
+
+    #[async_trait]
+    impl ArchiveBackend for BatchPasswordBackend {
+        async fn probe(&self, path: &Path) -> smartzip_core::Result<ArchiveProbe> {
+            Ok(ArchiveProbe {
+                path: path.to_path_buf(),
+                format: Some(ArchiveFormat::Zip),
+                encrypted: Some(true),
+                supported: true,
+            })
+        }
+
+        async fn list(&self, _request: ListRequest) -> smartzip_core::Result<ArchiveListing> {
+            Ok(ArchiveListing {
+                format: Some(ArchiveFormat::Zip),
+                entries: Vec::new(),
+            })
+        }
+
+        async fn test(&self, request: TestRequest) -> smartzip_core::Result<TestResult> {
+            self.attempted_passwords
+                .lock()
+                .unwrap()
+                .push(request.password.clone());
+            if request.password.as_deref() == Some("batch-secret") {
+                Ok(TestResult {
+                    ok: true,
+                    encrypted: Some(true),
+                })
+            } else {
+                Err(smartzip_core::SmartZipError::WrongPassword {
+                    path: request.archive,
+                })
+            }
+        }
+
+        async fn extract(
+            &self,
+            request: ExtractArchiveRequest,
+        ) -> smartzip_core::Result<ExtractArchiveResult> {
+            std::fs::create_dir_all(&request.output_dir).map_err(|source| {
+                smartzip_core::SmartZipError::io(Some(request.output_dir.clone()), source)
+            })?;
+            std::fs::write(request.output_dir.join("content.txt"), b"content").map_err(
+                |source| smartzip_core::SmartZipError::io(Some(request.output_dir.clone()), source),
+            )?;
+            Ok(ExtractArchiveResult {
+                output_dir: request.output_dir,
+            })
+        }
+
+        async fn compress(
+            &self,
+            request: CompressArchiveRequest,
+        ) -> smartzip_core::Result<CompressArchiveResult> {
+            Ok(CompressArchiveResult {
+                output: request.output,
+            })
+        }
+
+        fn capabilities(&self) -> BackendCapabilities {
+            BackendCapabilities {
+                can_extract: vec![ArchiveFormat::Zip],
+                can_compress: vec![ArchiveFormat::Zip],
+                supports_passwords: true,
+                supports_listing: true,
+                supports_test: true,
+            }
+        }
+    }
+
+    struct CountingPasswordPrompter {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl InteractivePasswordPrompter for CountingPasswordPrompter {
+        async fn prompt(&self, _archive_path: &Path) -> Option<String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Some("batch-secret".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn interactive_password_is_reused_for_later_files_in_same_batch() {
+        let root = tempfile::tempdir().unwrap();
+        let first = root.path().join("first.zip");
+        let second = root.path().join("second.zip");
+        std::fs::write(&first, b"first archive").unwrap();
+        std::fs::write(&second, b"second archive").unwrap();
+
+        let backend = BatchPasswordBackend::default();
+        let db = SmartZipDb::in_memory().unwrap();
+        let service = PasswordService::new(PasswordRepository::new(db.connection()));
+        let prompter = CountingPasswordPrompter {
+            calls: AtomicUsize::new(0),
+        };
+
+        let result = SmartZipEngine::default()
+            .extract_recursive_interactive(
+                &backend,
+                &service,
+                ExtractWorkflowRequest {
+                    inputs: vec![first, second],
+                    output_dir: root.path().join("out"),
+                    recursion_limit: 0,
+                    encoding_mode: EncodingMode::Auto,
+                    scanner: ScannerConfig::default(),
+                    password_candidates: PasswordCandidateRequest {
+                        manual: Vec::new(),
+                        clipboard: None,
+                        include_empty: false,
+                        limit: 8,
+                    },
+                    layout_policy: Default::default(),
+                    single_root_name_policy: Default::default(),
+                    embedded_scan_mode: smartzip_core::EmbeddedScanMode::default(),
+                    dominant_min_ratio: 0.70,
+                    confirm_large_scan: false,
+                    force: false,
+                },
+                Some(&prompter),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.processed.len(), 2);
+        assert_eq!(
+            prompter.calls.load(Ordering::SeqCst),
+            1,
+            "the password accepted for the first file should be reused in-memory for the second",
+        );
+        assert_eq!(
+            backend.attempted_passwords.lock().unwrap().as_slice(),
+            &[
+                Some("batch-secret".to_string()),
+                Some("batch-secret".to_string())
+            ],
+        );
+        let stored = PasswordRepository::new(db.connection())
+            .get_by_value("batch-secret")
+            .unwrap()
+            .expect("the first interactive success should be persisted immediately");
+        assert_eq!(stored.success_count, 2);
     }
 
     #[async_trait]
@@ -3072,6 +3550,7 @@ mod tests {
                     embedded_scan_mode: smartzip_core::EmbeddedScanMode::default(),
                     dominant_min_ratio: 0.70,
                     confirm_large_scan: false,
+                    force: false,
                 },
                 None,
                 None,
@@ -3140,6 +3619,7 @@ mod tests {
                     embedded_scan_mode: smartzip_core::EmbeddedScanMode::default(),
                     dominant_min_ratio: 0.70,
                     confirm_large_scan: false,
+                    force: false,
                 },
                 None,
                 None,
