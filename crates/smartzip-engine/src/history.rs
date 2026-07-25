@@ -119,11 +119,21 @@ pub struct KnownFileEncodingUpsert<'a> {
 /// All methods are called synchronously from the engine's async loop; they
 /// should return quickly and swallow storage errors internally.
 pub trait TaskHistoryRecorder {
+    /// Register a new task. `kind` is one of the CLI/engine operation names
+    /// (`extract`, `detect`, `list`, `test`, ...). `output_path` is only
+    /// meaningful for operations that materialize files.
+    fn start_task(&self, task_id: &TaskId, kind: &str, output_path: Option<&Path>);
+
     /// Register a new extract task. Called once at the top of extraction.
-    fn start_extract(&self, task_id: &TaskId, output_path: Option<&Path>);
+    fn start_extract(&self, task_id: &TaskId, output_path: Option<&Path>) {
+        self.start_task(task_id, "extract", output_path)
+    }
 
     /// Register a new detect task. Called once at the top of `detect()`.
-    fn start_detect(&self, task_id: &TaskId, path: &Path);
+    fn start_detect(&self, task_id: &TaskId, path: &Path) {
+        let _ = path;
+        self.start_task(task_id, "detect", None)
+    }
 
     /// Persist a generic engine event into `task_events`.
     fn record_event(&self, task_id: &TaskId, event: &TaskEvent);
@@ -195,12 +205,12 @@ impl<'a> DbTaskHistoryRecorder<'a> {
 }
 
 impl<'a> TaskHistoryRecorder for DbTaskHistoryRecorder<'a> {
-    fn start_extract(&self, task_id: &TaskId, output_path: Option<&Path>) {
+    fn start_task(&self, task_id: &TaskId, kind: &str, output_path: Option<&Path>) {
         let output = output_path.map(|p| p.to_string_lossy().into_owned());
         let started_at = now_utc_iso8601();
         if let Err(error) = self.task_repo().insert(NewTask {
             id: task_id.as_str(),
-            kind: "extract",
+            kind,
             output_path: output.as_deref(),
             started_at: &started_at,
         }) {
@@ -208,16 +218,12 @@ impl<'a> TaskHistoryRecorder for DbTaskHistoryRecorder<'a> {
         }
     }
 
+    fn start_extract(&self, task_id: &TaskId, output_path: Option<&Path>) {
+        self.start_task(task_id, "extract", output_path);
+    }
+
     fn start_detect(&self, task_id: &TaskId, _path: &Path) {
-        let started_at = now_utc_iso8601();
-        if let Err(error) = self.task_repo().insert(NewTask {
-            id: task_id.as_str(),
-            kind: "detect",
-            output_path: None,
-            started_at: &started_at,
-        }) {
-            Self::warn("task insert", error);
-        }
+        self.start_task(task_id, "detect", None);
     }
 
     fn record_event(&self, task_id: &TaskId, event: &TaskEvent) {

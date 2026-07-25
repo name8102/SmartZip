@@ -5,9 +5,10 @@ use smartzip_core::EncodingMode;
 use smartzip_db::{password::PasswordRepository, SmartZipDb};
 use smartzip_engine::name_score;
 use smartzip_engine::{
-    DetectRequest, EmbeddedSelectionChoice, EncodingConfirmationChoice, ExtractWorkflowRequest,
-    InteractiveEmbeddedPrompter, InteractiveEncodingPrompter, InteractiveOutputPrompter,
-    InteractivePasswordPrompter, OutputCollisionStrategy, SmartZipEngine,
+    EmbeddedSelectionChoice, EncodingConfirmationChoice, ExtractWorkflowRequest,
+    FileAwareDetectResult, InspectRequest, InteractiveEmbeddedPrompter,
+    InteractiveEncodingPrompter, InteractiveOutputPrompter, InteractivePasswordPrompter,
+    ListArchiveRequest, OutputCollisionStrategy, SmartZipEngine,
 };
 use smartzip_passwords::{PasswordCandidateRequest, PasswordService};
 use smartzip_platform::PlatformPaths;
@@ -54,7 +55,7 @@ impl From<EmbeddedModeArg> for smartzip_core::EmbeddedScanMode {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Detect embedded archives or disguised archive data.
+    /// Inspect archive format, encoding, embedded findings, and password requirements.
     Detect {
         path: PathBuf,
 
@@ -63,6 +64,76 @@ enum Command {
 
         #[arg(long)]
         json: bool,
+
+        #[arg(long)]
+        max_scan_bytes: Option<u64>,
+
+        #[arg(long, value_enum, default_value_t = ConfidenceArg::Medium)]
+        min_confidence: ConfidenceArg,
+    },
+
+    /// List archive entries using shared password and encoding resolution.
+    List {
+        path: PathBuf,
+
+        /// Password to try first. May be repeated.
+        #[arg(short = 'p', long)]
+        password: Vec<String>,
+
+        /// Read password from clipboard (platform-dependent placeholder).
+        #[arg(long)]
+        use_clipboard: bool,
+
+        /// Skip empty password attempt.
+        #[arg(long)]
+        no_empty: bool,
+
+        /// Encoding for entry names: "auto", "UTF-8", "GB18030", "GBK", "Big5", "Shift_JIS", "EUC-JP", "EUC-KR".
+        #[arg(long, default_value = "auto")]
+        encoding: String,
+
+        /// Print several candidate encodings, then prompt once for one to use.
+        #[arg(long)]
+        pick_encoding: bool,
+
+        #[arg(long)]
+        json: bool,
+
+        #[arg(long)]
+        deep: bool,
+
+        #[arg(long)]
+        max_scan_bytes: Option<u64>,
+
+        #[arg(long, value_enum, default_value_t = ConfidenceArg::Medium)]
+        min_confidence: ConfidenceArg,
+    },
+
+    /// Test archive integrity using shared password and encoding resolution.
+    Test {
+        path: PathBuf,
+
+        /// Password to try first. May be repeated.
+        #[arg(short = 'p', long)]
+        password: Vec<String>,
+
+        /// Read password from clipboard (platform-dependent placeholder).
+        #[arg(long)]
+        use_clipboard: bool,
+
+        /// Skip empty password attempt.
+        #[arg(long)]
+        no_empty: bool,
+
+        /// Encoding for entry names: "auto", "UTF-8", "GB18030", "GBK", "Big5", "Shift_JIS", "EUC-JP", "EUC-KR".
+        #[arg(long, default_value = "auto")]
+        encoding: String,
+
+        #[arg(long)]
+        json: bool,
+
+        #[arg(long)]
+        deep: bool,
 
         #[arg(long)]
         max_scan_bytes: Option<u64>,
@@ -326,7 +397,49 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             json,
             max_scan_bytes,
             min_confidence,
-        } => detect(path, deep, json, max_scan_bytes, min_confidence),
+        } => {
+            let db = open_db(cli.db)?;
+            detect(&db, path, deep, json, max_scan_bytes, min_confidence).await
+        }
+        Command::List {
+            path,
+            password: manual_passwords,
+            use_clipboard: _use_clipboard,
+            no_empty,
+            encoding,
+            pick_encoding,
+            json,
+            deep,
+            max_scan_bytes,
+            min_confidence,
+        } => {
+            let db = open_db(cli.db)?;
+            list_archive(
+                &db,
+                path,
+                manual_passwords,
+                no_empty,
+                &encoding,
+                pick_encoding,
+                json,
+                deep,
+                max_scan_bytes,
+                min_confidence,
+            )
+            .await
+        }
+        Command::Test { .. } => {
+            // Interface is frozen, but the integrity-check backend (full-scan
+            // verification + reliable damaged-volume localization) is split
+            // into a dedicated task (07-03-test-command-backend-split). Until
+            // that lands, `test` must fail loudly rather than fabricate an
+            // intact/corrupt verdict or damaged-volume list.
+            eprintln!(
+                "error: `smartzip test` is not implemented yet; the integrity-check \
+                 backend is tracked separately and will not fake a result"
+            );
+            std::process::exit(1);
+        }
         Command::Extract {
             paths,
             output,
@@ -374,11 +487,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             json,
         } => preview_encodings(path, password, json).await,
         Command::Compress { paths } => {
-            println!(
-                "compress is not implemented yet; received {} path(s)",
+            // `compress` is a reserved top-level command with no backend yet.
+            // Per the frozen CLI spec it must fail loudly rather than print a
+            // "not implemented" notice and return success.
+            eprintln!(
+                "error: `smartzip compress` is not implemented yet (received {} path(s))",
                 paths.len()
             );
-            Ok(())
+            std::process::exit(1);
         }
         Command::Password(cmd) => {
             let db = open_db(cli.db)?;
@@ -446,7 +562,8 @@ fn scanner_config(deep: bool, max_scan_bytes: Option<u64>) -> ScannerConfig {
     config
 }
 
-fn detect(
+async fn detect(
+    db: &SmartZipDb,
     path: PathBuf,
     deep: bool,
     json: bool,
@@ -457,56 +574,210 @@ fn detect(
         min_confidence: min_confidence.into(),
         ..scanner_config(deep, max_scan_bytes)
     };
+    let backend = BackendRouter::locate()?;
+    let service = PasswordService::new(PasswordRepository::new(db.connection()));
     let engine = SmartZipEngine::with_scanner_config(config.clone());
-    let detect_path = path.clone();
-    let result = engine.detect(DetectRequest {
-        path,
-        scanner: config,
-    })?;
+    let recorder = smartzip_engine::history::DbTaskHistoryRecorder::new(db.connection());
+    let result = engine
+        .inspect_file_with_listener(
+            &backend,
+            &service,
+            InspectRequest {
+                path,
+                scanner: config,
+            },
+            None,
+            Some(&recorder),
+        )
+        .await?;
+
+    print_detect_result(&result, json)?;
+    Ok(())
+}
+
+async fn list_archive(
+    db: &SmartZipDb,
+    path: PathBuf,
+    manual_passwords: Vec<String>,
+    no_empty: bool,
+    encoding: &str,
+    pick_encoding: bool,
+    json: bool,
+    deep: bool,
+    max_scan_bytes: Option<u64>,
+    min_confidence: ConfidenceArg,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = ScannerConfig {
+        min_confidence: min_confidence.into(),
+        ..scanner_config(deep, max_scan_bytes)
+    };
+    let backend = BackendRouter::locate()?;
+    let service = PasswordService::new(PasswordRepository::new(db.connection()));
+    let engine = SmartZipEngine::with_scanner_config(config.clone());
+    let recorder = smartzip_engine::history::DbTaskHistoryRecorder::new(db.connection());
+    let stdin_lock = StdinLock::new();
+    let encoding_mode = select_list_encoding(path.clone(), encoding, pick_encoding)?;
+    let result = engine
+        .list_archive_with_listener_interactive(
+            &backend,
+            &service,
+            ListArchiveRequest {
+                path,
+                scanner: config,
+                encoding_mode,
+                password_candidates: PasswordCandidateRequest {
+                    manual: manual_passwords,
+                    clipboard: None,
+                    include_empty: !no_empty,
+                    limit: 128,
+                },
+            },
+            Some(&StdinPrompter {
+                lock: stdin_lock.clone(),
+            }),
+            Some(&StdinEncodingPrompter { lock: stdin_lock }),
+            None,
+            Some(&recorder),
+        )
+        .await?;
 
     if json {
-        let file_size = std::fs::metadata(&detect_path)
-            .map(|m| m.len())
-            .unwrap_or(0);
-        let policy = smartzip_core::EmbeddedScanPolicy::default();
-        let ext_is_archive = smartzip_engine::format_from_extension(&detect_path).is_some();
-        let decision = smartzip_engine::embedded::select_embedded_action(
-            file_size,
-            &result.findings,
-            &policy,
-            ext_is_archive,
-        );
-
-        let output = serde_json::json!({
-            "path": detect_path,
-            "file_size": file_size,
-            "classification": format!("{:?}", decision.kind).to_lowercase(),
-            "action": format!("{:?}", decision.action).to_lowercase(),
-            "archive_ratio": decision.archive_ratio,
-            "selected_index": decision.selected_index,
-            "reason": decision.reason,
-            "findings": result.findings,
-        });
-        println!("{}", serde_json::to_string_pretty(&output)?);
-    } else if result.findings.is_empty() {
-        println!("No embedded archives found.");
+        println!("{}", serde_json::to_string_pretty(&result)?);
     } else {
-        for finding in result.findings {
+        println!(
+            "{} [{}] enc={} password={} task-id={}",
+            result.path.display(),
+            result
+                .detected_format
+                .as_ref()
+                .map(|fmt| fmt.as_str())
+                .unwrap_or("unknown"),
+            result.encoding,
+            if result.used_password { "yes" } else { "no" },
+            result.task_id,
+        );
+        for entry in &result.entries {
+            let suffix = entry
+                .is_dir
+                .then_some("/")
+                .unwrap_or_default();
+            println!("{}{}", entry.path.display(), suffix);
+        }
+    }
+    Ok(())
+}
+
+fn print_detect_result(
+    result: &FileAwareDetectResult,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(result)?);
+        return Ok(());
+    }
+
+    println!(
+        "{} [{}] status={} embedded={} encrypted={} task-id={}",
+        result.path.display(),
+        result
+            .detected_format
+            .as_ref()
+            .map(|fmt| fmt.as_str())
+            .unwrap_or("unknown"),
+        result.status,
+        result.embedded_count,
+        match result.encrypted {
+            Some(true) => "yes",
+            Some(false) => "no",
+            None => "unknown",
+        },
+        result.task_id,
+    );
+    if let Some(encoding) = &result.encoding {
+        if let Some(confidence) = result.encoding_confidence {
+            println!("encoding: {encoding} ({:.0}%)", confidence * 100.0);
+        } else {
+            println!("encoding: {encoding}");
+        }
+    }
+    if let Some(reason) = &result.reason {
+        println!("reason: {reason}");
+    }
+    if result.needs_password {
+        println!("password: required to continue");
+    }
+    if result.known_password {
+        println!("known password: available");
+    }
+    if let Some(known_encoding) = &result.known_encoding {
+        println!("known encoding: {known_encoding}");
+    }
+    if !result.embedded_findings.is_empty() {
+        println!("embedded findings:");
+        for finding in &result.embedded_findings {
             println!(
-                "{format} @ 0x{offset:X} size={size} confidence={confidence:?} {description}",
-                format = finding.format.as_str(),
-                offset = finding.offset,
-                size = finding
+                "  - {} @ 0x{:X} size={} confidence={:?} {}",
+                finding.format.as_str(),
+                finding.offset,
+                finding
                     .size
                     .map(|size| size.to_string())
                     .unwrap_or_else(|| "unknown".into()),
-                confidence = finding.confidence,
-                description = finding.description,
+                finding.confidence,
+                finding.description,
             );
         }
     }
-
     Ok(())
+}
+
+fn parse_encoding_mode(encoding: &str) -> EncodingMode {
+    if encoding == "auto" {
+        EncodingMode::Auto
+    } else {
+        EncodingMode::Override(encoding.to_string())
+    }
+}
+
+fn select_list_encoding(
+    path: PathBuf,
+    encoding: &str,
+    pick_encoding: bool,
+) -> Result<EncodingMode, Box<dyn std::error::Error>> {
+    if pick_encoding {
+        prompt_pick_encoding(&path)
+    } else {
+        Ok(parse_encoding_mode(encoding))
+    }
+}
+
+fn prompt_pick_encoding(path: &Path) -> Result<EncodingMode, Box<dyn std::error::Error>> {
+    use std::io::{self, IsTerminal, Write};
+
+    if !io::stdin().is_terminal() {
+        return Ok(EncodingMode::Auto);
+    }
+
+    let candidates = encoding_preview_candidates();
+    eprintln!("\n  Candidate encodings for {}:", path.display());
+    for (idx, candidate) in candidates.iter().enumerate() {
+        eprintln!("  [{}] {}", idx + 1, candidate);
+    }
+    eprint!("  Pick encoding number (Enter for auto): ");
+    let _ = io::stderr().flush();
+
+    let mut choice = String::new();
+    io::stdin().read_line(&mut choice)?;
+    let trimmed = choice.trim();
+    if trimmed.is_empty() {
+        return Ok(EncodingMode::Auto);
+    }
+    let idx: usize = trimmed.parse()?;
+    let selected = candidates
+        .get(idx.saturating_sub(1))
+        .copied()
+        .ok_or_else(|| format!("invalid encoding choice: {trimmed}"))?;
+    Ok(parse_encoding_mode(selected))
 }
 
 async fn extract(

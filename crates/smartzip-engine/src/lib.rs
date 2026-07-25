@@ -121,6 +121,84 @@ pub struct DetectResult {
     pub events: Vec<TaskEvent>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InspectRequest {
+    pub path: PathBuf,
+    pub scanner: ScannerConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListArchiveRequest {
+    pub path: PathBuf,
+    pub scanner: ScannerConfig,
+    pub encoding_mode: EncodingMode,
+    pub password_candidates: PasswordCandidateRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FileAwareDetectResult {
+    pub task_id: TaskId,
+    pub path: PathBuf,
+    pub detected_format: Option<ArchiveFormat>,
+    pub embedded_findings: Vec<EmbeddedArchiveFinding>,
+    pub embedded_count: usize,
+    pub encrypted: Option<bool>,
+    pub encoding: Option<String>,
+    pub encoding_confidence: Option<f32>,
+    pub needs_password: bool,
+    pub known_password: bool,
+    pub known_encoding: Option<String>,
+    pub status: String,
+    pub reason: Option<String>,
+    pub events: Vec<TaskEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ListArchiveResult {
+    pub task_id: TaskId,
+    pub path: PathBuf,
+    pub detected_format: Option<ArchiveFormat>,
+    pub entries: Vec<smartzip_archive::ArchiveEntry>,
+    pub encrypted: Option<bool>,
+    pub encoding: String,
+    pub password_id: Option<i64>,
+    pub used_password: bool,
+    pub embedded_offset: Option<u64>,
+    pub events: Vec<TaskEvent>,
+}
+
+struct ResolvedArchive<'a> {
+    candidate: ExtractionCandidate,
+    archive_path: PathBuf,
+    _archive_temp: Option<tempfile::NamedTempFile>,
+    sample_hash: Option<String>,
+    sample_size: Option<i64>,
+    known_hit: Option<crate::history::KnownFileHit>,
+    encoding_mode: EncodingMode,
+    reused_confirmed_encoding: bool,
+    zip_encoding_assessment: Option<ZipEncodingAssessment>,
+    recorder_name: Option<String>,
+    history: Option<&'a dyn crate::history::TaskHistoryRecorder>,
+}
+
+#[derive(Debug, Clone)]
+struct ArchiveAccessOutcome {
+    password_id: Option<i64>,
+    has_password: bool,
+    // Resolved plaintext password and cancellation flag are populated by the
+    // shared password flow but only consumed by the integrity-check backend,
+    // which is split into 07-03-test-command-backend-split. Kept here so that
+    // task can wire `test` in without reshaping this struct.
+    #[allow(dead_code)]
+    used_password: Option<String>,
+    encoding_mode: EncodingMode,
+    listing: Option<ArchiveListing>,
+    encrypted: Option<bool>,
+    events: Vec<TaskEvent>,
+    #[allow(dead_code)]
+    password_prompt_cancelled: bool,
+}
+
 pub struct SmartZipEngine {
     scanner: EmbeddedScanner,
     archive_recycler: ArchiveRecycleHandler,
@@ -279,6 +357,325 @@ impl SmartZipEngine {
             path: request.path,
             findings,
             events,
+        })
+    }
+
+    pub async fn inspect_file_with_listener<B: ArchiveBackend>(
+        &self,
+        backend: &B,
+        passwords: &PasswordService<'_>,
+        request: InspectRequest,
+        listener: Option<TaskEventListener>,
+        history: Option<&dyn crate::history::TaskHistoryRecorder>,
+    ) -> smartzip_core::Result<FileAwareDetectResult> {
+        let task_id = TaskId::new();
+        let events = EventSink::new(listener);
+        events.push(TaskEvent::started(task_id.clone()));
+        if let Some(recorder) = history {
+            recorder.start_task(&task_id, "detect", None);
+        }
+
+        let candidate = resolve_root_candidate(
+            &request.path,
+            &request.scanner,
+            self.min_embedded_size_bytes,
+            &events,
+            &task_id,
+            None,
+            None,
+        )
+        .await?;
+
+        let mut detected_format = candidate.as_ref().and_then(|c| c.detected_format.clone());
+        let mut status = "unreadable".to_string();
+        let mut reason = None;
+        let mut encrypted = None;
+        let mut encoding = None;
+        let mut encoding_confidence = None;
+        let mut needs_password = false;
+        let mut known_password = false;
+        let mut known_encoding = None;
+        let findings = scan_embedded_findings(
+            &request.path,
+            &request.scanner,
+            self.min_embedded_size_bytes,
+        );
+
+        if let Some(kind) = detected_format.as_ref().and_then(|fmt| {
+            (*fmt == ArchiveFormat::Zip)
+                .then(|| {
+                    ext_business_container_kind(&request.path)
+                        .or_else(|| crate::container::classify_zip_path(&request.path))
+                })
+                .flatten()
+        }) {
+            events.push(TaskEvent {
+                task_id: task_id.clone(),
+                kind: TaskEventKind::BusinessContainerSkipped {
+                    path: request.path.clone(),
+                    kind: format!("{kind:?}"),
+                },
+            });
+            reason = Some("business_container".to_string());
+            detected_format = Some(ArchiveFormat::Zip);
+        } else if let Some(candidate) = candidate {
+            let resolved = prepare_resolved_archive(
+                &candidate,
+                EncodingMode::Auto,
+                history,
+                &events,
+                &task_id,
+            )
+            .await?;
+            known_password = resolved
+                .known_hit
+                .as_ref()
+                .and_then(|hit| hit.password_id)
+                .is_some();
+            known_encoding = resolved
+                .known_hit
+                .as_ref()
+                .and_then(|hit| hit.confirmed_encoding.clone());
+            let probe = backend
+                .probe(&resolved.archive_path)
+                .await
+                .map_err(|error| map_detect_error(error, &request.path))?;
+            encrypted = probe.encrypted;
+            detected_format = candidate.detected_format.clone().or(probe.format);
+            if encrypted == Some(true) {
+                needs_password = true;
+            }
+            if resolved.reused_confirmed_encoding {
+                encoding = resolved.known_hit.and_then(|hit| hit.confirmed_encoding);
+                encoding_confidence = Some(1.0);
+            } else if let Some(assessment) = resolved.zip_encoding_assessment {
+                encoding = Some(assessment.detected_raw.selected.clone());
+                encoding_confidence = Some(assessment.detected_raw.confidence);
+            }
+            status = "detected".to_string();
+            if let Some(recorder) = history {
+                recorder.record_file_extraction(
+                    &task_id,
+                    crate::history::FileExtractionRow {
+                        input_path: &candidate.path,
+                        sample_hash: resolved.sample_hash.as_deref(),
+                        file_size: resolved.sample_size,
+                        offset: candidate.embedded_offset.map(|o| o as i64),
+                        output_path: None,
+                        has_password: false,
+                        password_id: None,
+                        status: "detected",
+                        reason: None,
+                        encoding: encoding.as_deref(),
+                        encoding_corrected: resolved.reused_confirmed_encoding,
+                        damaged_volumes_json: None,
+                    },
+                );
+            }
+        } else {
+            reason = Some("not_found".to_string());
+            if let Some(recorder) = history {
+                recorder.record_file_extraction(
+                    &task_id,
+                    crate::history::FileExtractionRow {
+                        input_path: &request.path,
+                        sample_hash: None,
+                        file_size: None,
+                        offset: None,
+                        output_path: None,
+                        has_password: false,
+                        password_id: None,
+                        status: "unreadable",
+                        reason: Some("not_found"),
+                        encoding: None,
+                        encoding_corrected: false,
+                        damaged_volumes_json: None,
+                    },
+                );
+            }
+        }
+
+        events.push(TaskEvent {
+            task_id: task_id.clone(),
+            kind: TaskEventKind::Completed,
+        });
+        let snapshot = events.snapshot();
+        if let Some(recorder) = history {
+            for event in &snapshot {
+                recorder.record_event(&task_id, event);
+            }
+            recorder.finish(
+                &task_id,
+                crate::history::TaskOutcome {
+                    status: if status == "detected" {
+                        crate::history::TaskCompletionStatus::Completed
+                    } else {
+                        crate::history::TaskCompletionStatus::Failed
+                    },
+                    output_path: None,
+                },
+            );
+        }
+
+        Ok(FileAwareDetectResult {
+            task_id,
+            path: request.path,
+            detected_format,
+            embedded_count: findings.len(),
+            embedded_findings: findings,
+            encrypted,
+            encoding,
+            encoding_confidence,
+            needs_password,
+            known_password,
+            known_encoding,
+            status,
+            reason,
+            events: snapshot,
+        })
+    }
+
+    pub async fn list_archive_with_listener_interactive<B: ArchiveBackend>(
+        &self,
+        backend: &B,
+        passwords: &PasswordService<'_>,
+        request: ListArchiveRequest,
+        password_prompter: Option<&dyn InteractivePasswordPrompter>,
+        encoding_prompter: Option<&dyn InteractiveEncodingPrompter>,
+        listener: Option<TaskEventListener>,
+        history: Option<&dyn crate::history::TaskHistoryRecorder>,
+    ) -> smartzip_core::Result<ListArchiveResult> {
+        let task_id = TaskId::new();
+        let events = EventSink::new(listener);
+        events.push(TaskEvent::started(task_id.clone()));
+        if let Some(recorder) = history {
+            recorder.start_task(&task_id, "list", None);
+        }
+
+        let candidate = resolve_root_candidate(
+            &request.path,
+            &request.scanner,
+            self.min_embedded_size_bytes,
+            &events,
+            &task_id,
+            None,
+            None,
+        )
+        .await?
+        .ok_or_else(|| smartzip_core::SmartZipError::UnsupportedFormat {
+            path: request.path.clone(),
+            format: None,
+        })?;
+
+        let resolved = prepare_resolved_archive(
+            &candidate,
+            request.encoding_mode.clone(),
+            history,
+            &events,
+            &task_id,
+        )
+        .await?;
+        let password_candidates = load_password_candidates(passwords, request.password_candidates.clone())?;
+        let mut batch_passwords = Vec::new();
+        let outcome = access_archive_with_password(
+            backend,
+            passwords,
+            &resolved,
+            &password_candidates,
+            &mut batch_passwords,
+            password_prompter,
+            encoding_prompter,
+            &events,
+            &task_id,
+            true,
+        )
+        .await?;
+
+        for event in outcome.events {
+            events.push(event);
+        }
+
+        let listing = outcome.listing.clone().ok_or_else(|| smartzip_core::SmartZipError::UnsupportedFormat {
+            path: request.path.clone(),
+            format: candidate.detected_format.as_ref().map(|f| f.as_str().to_string()),
+        })?;
+
+        if let Some(recorder) = history {
+            recorder.record_file_extraction(
+                &task_id,
+                crate::history::FileExtractionRow {
+                    input_path: &candidate.path,
+                    sample_hash: resolved.sample_hash.as_deref(),
+                    file_size: resolved.sample_size,
+                    offset: candidate.embedded_offset.map(|o| o as i64),
+                    output_path: None,
+                    has_password: outcome.has_password,
+                    password_id: outcome.password_id,
+                    status: "detected",
+                    reason: None,
+                    encoding: Some(encoding_mode_label(&outcome.encoding_mode).as_str()),
+                    encoding_corrected: resolved.reused_confirmed_encoding
+                        || matches!(request.encoding_mode, EncodingMode::Override(_)),
+                    damaged_volumes_json: None,
+                },
+            );
+            if let (Some(hash), Some(size), EncodingMode::Override(encoding)) = (
+                resolved.sample_hash.as_deref(),
+                resolved.sample_size,
+                &request.encoding_mode,
+            ) {
+                recorder.upsert_known_file_confirmed_encoding(crate::history::KnownFileEncodingUpsert {
+                    sample_hash: hash,
+                    size,
+                    name: resolved.recorder_name.as_deref(),
+                    offset: candidate.embedded_offset.map(|o| o as i64),
+                    encoding,
+                });
+            }
+            if let (Some(hash), Some(size), Some(password_id)) = (
+                resolved.sample_hash.as_deref(),
+                resolved.sample_size,
+                outcome.password_id,
+            ) {
+                recorder.upsert_known_file_extract(crate::history::KnownFileUpsert {
+                    sample_hash: hash,
+                    size,
+                    name: resolved.recorder_name.as_deref(),
+                    offset: candidate.embedded_offset.map(|o| o as i64),
+                    password_id: Some(password_id),
+                });
+            }
+        }
+
+        events.push(TaskEvent {
+            task_id: task_id.clone(),
+            kind: TaskEventKind::Completed,
+        });
+        let snapshot = events.snapshot();
+        if let Some(recorder) = history {
+            for event in &snapshot {
+                recorder.record_event(&task_id, event);
+            }
+            recorder.finish(
+                &task_id,
+                crate::history::TaskOutcome {
+                    status: crate::history::TaskCompletionStatus::Completed,
+                    output_path: None,
+                },
+            );
+        }
+
+        Ok(ListArchiveResult {
+            task_id,
+            path: request.path,
+            detected_format: candidate.detected_format,
+            entries: listing.entries,
+            encrypted: outcome.encrypted,
+            encoding: encoding_mode_label(&outcome.encoding_mode),
+            password_id: outcome.password_id,
+            used_password: outcome.has_password,
+            embedded_offset: candidate.embedded_offset,
+            events: snapshot,
         })
     }
 
@@ -1789,6 +2186,445 @@ impl SmartZipEngine {
 impl Default for SmartZipEngine {
     fn default() -> Self {
         Self::new(EmbeddedScanner::default())
+    }
+}
+
+fn scan_embedded_findings(
+    path: &Path,
+    scanner: &ScannerConfig,
+    min_embedded_size_bytes: u64,
+) -> Vec<EmbeddedArchiveFinding> {
+    let scanner = EmbeddedScanner::new(full_root_scanner_config(scanner));
+    let mut policy = smartzip_core::EmbeddedScanPolicy::default();
+    policy.min_finding_size_bytes = min_embedded_size_bytes;
+    scanner
+        .scan_path(path)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|finding| finding_meets_min_size(finding, &policy))
+        .collect()
+}
+
+async fn resolve_root_candidate(
+    path: &Path,
+    scanner: &ScannerConfig,
+    min_embedded_size_bytes: u64,
+    events: &EventSink,
+    task_id: &TaskId,
+    embedded_prompter: Option<&dyn InteractiveEmbeddedPrompter>,
+    embedded_extract_all: Option<&mut bool>,
+) -> smartzip_core::Result<Option<ExtractionCandidate>> {
+    let mut candidate = ExtractionCandidate {
+        detected_format: None,
+        path: path.to_path_buf(),
+        relative_path: archive_output_name(path),
+        depth: 0,
+        source: CandidateSource::RootInput,
+        embedded_offset: None,
+        embedded_size: None,
+    };
+
+    let header_result = crate::detect::probe_file_header(&candidate.path);
+    let findings = scan_embedded_findings(&candidate.path, scanner, min_embedded_size_bytes);
+    if !findings.is_empty() {
+        let mut policy = smartzip_core::EmbeddedScanPolicy::default();
+        policy.min_finding_size_bytes = min_embedded_size_bytes;
+        let ext_is_archive = crate::format_from_extension(&candidate.path).is_some();
+        let file_size = std::fs::metadata(&candidate.path)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let decision = crate::embedded::select_embedded_action(
+            file_size,
+            &findings,
+            &policy,
+            ext_is_archive,
+        );
+        match decision.action {
+            smartzip_core::DetectionAction::ExtractDirect
+            | smartzip_core::DetectionAction::CarveAndExtract => {
+                if let Some(idx) = decision.selected_index {
+                    let finding = &findings[idx];
+                    candidate.detected_format = Some(finding.format.clone());
+                    candidate.embedded_offset = Some(finding.offset);
+                    candidate.embedded_size = finding.size;
+                    if matches!(decision.action, smartzip_core::DetectionAction::CarveAndExtract) {
+                        events.push(TaskEvent {
+                            task_id: task_id.clone(),
+                            kind: TaskEventKind::EmbeddedArchiveSelected {
+                                offset: finding.offset,
+                                size: finding.size,
+                                format: finding.format.clone(),
+                                reason: decision.reason,
+                            },
+                        });
+                    }
+                }
+            }
+            smartzip_core::DetectionAction::AskUser => {
+                events.push(TaskEvent {
+                    task_id: task_id.clone(),
+                    kind: TaskEventKind::EmbeddedArchiveSelectionRequired {
+                        path: candidate.path.clone(),
+                        findings_count: findings.len(),
+                    },
+                });
+                let mut extract_all = false;
+                let selection = if let Some(prompter) = embedded_prompter {
+                    Some(prompter.prompt(&candidate.path, &decision).await)
+                } else {
+                    None
+                };
+                match selection {
+                    Some(EmbeddedSelectionChoice::Extract) => {}
+                    Some(EmbeddedSelectionChoice::ExtractAll) => extract_all = true,
+                    Some(EmbeddedSelectionChoice::Skip) | None => return Ok(None),
+                }
+                if let Some(flag) = embedded_extract_all {
+                    *flag = extract_all;
+                }
+                if let Some(idx) = decision.selected_index {
+                    let finding = &findings[idx];
+                    candidate.detected_format = Some(finding.format.clone());
+                    candidate.embedded_offset = Some(finding.offset);
+                    candidate.embedded_size = finding.size;
+                }
+            }
+            _ => return Ok(None),
+        }
+    } else if candidate.detected_format.is_none() {
+        if let Some((fmt, offset)) = header_result {
+            candidate.detected_format = Some(fmt);
+            if offset > 0 {
+                candidate.embedded_offset = Some(offset);
+            }
+        } else {
+            candidate.detected_format = crate::format_from_extension(&candidate.path);
+        }
+    }
+
+    if candidate.detected_format.is_none() {
+        return Ok(None);
+    }
+    if candidate.detected_format == Some(ArchiveFormat::Zip)
+        && ext_business_container_kind(&candidate.path)
+            .or_else(|| crate::container::classify_zip_path(&candidate.path))
+            .is_some()
+    {
+        return Ok(None);
+    }
+    Ok(Some(candidate))
+}
+
+async fn prepare_resolved_archive<'a>(
+    candidate: &ExtractionCandidate,
+    requested_encoding: EncodingMode,
+    history: Option<&'a dyn crate::history::TaskHistoryRecorder>,
+    events: &EventSink,
+    task_id: &TaskId,
+) -> smartzip_core::Result<ResolvedArchive<'a>> {
+    let archive_input = materialize_archive_input(candidate)?;
+    let archive_path = archive_input.path.clone();
+    let (sample_hash, sample_size) = match candidate.embedded_offset {
+        Some(offset) if offset > 0 => smartzip_db::sample_hash::sample_hash_segment(
+            &candidate.path,
+            offset,
+            candidate.embedded_size,
+        )
+        .map(|(h, s)| (Some(h), Some(s as i64)))
+        .unwrap_or((None, None)),
+        _ => smartzip_db::sample_hash::sample_hash(&archive_path)
+            .map(|(h, s)| (Some(h), Some(s as i64)))
+            .unwrap_or((None, None)),
+    };
+    let known_hit = match (history, sample_hash.as_deref(), sample_size) {
+        (Some(recorder), Some(hash), Some(size)) => recorder.lookup_known_file(hash, size),
+        _ => None,
+    };
+    let encoding_mode = match (
+        &requested_encoding,
+        known_hit
+            .as_ref()
+            .and_then(|hit| hit.confirmed_encoding.clone()),
+    ) {
+        (EncodingMode::Auto, Some(enc)) => EncodingMode::Override(enc),
+        _ => requested_encoding.clone(),
+    };
+    let reused_confirmed_encoding = requested_encoding == EncodingMode::Auto
+        && known_hit
+            .as_ref()
+            .map(|hit| hit.confirmed_encoding.is_some())
+            .unwrap_or(false);
+    let recorder_name = candidate
+        .path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned());
+    let mut zip_encoding_assessment = None;
+    if encoding_mode == EncodingMode::Auto && candidate.detected_format == Some(ArchiveFormat::Zip) {
+        let native_zip = NativeZipBackend::new();
+        if let Ok(probe) = native_zip.probe(&archive_path).await {
+            if probe.encrypted == Some(false) {
+                zip_encoding_assessment = assess_zip_encoding(&native_zip, &archive_path, None).await;
+            }
+        }
+    }
+    if let Some(assessment) = &zip_encoding_assessment {
+        events.push(TaskEvent {
+            task_id: task_id.clone(),
+            kind: TaskEventKind::EncodingDetected(assessment.context.detected.clone()),
+        });
+    }
+    Ok(ResolvedArchive {
+        candidate: candidate.clone(),
+        archive_path,
+        _archive_temp: archive_input._temp,
+        sample_hash,
+        sample_size,
+        known_hit,
+        encoding_mode,
+        reused_confirmed_encoding,
+        zip_encoding_assessment,
+        recorder_name,
+        history,
+    })
+}
+
+fn load_password_candidates(
+    passwords: &PasswordService<'_>,
+    request: PasswordCandidateRequest,
+) -> smartzip_core::Result<Vec<PasswordCandidate>> {
+    passwords
+        .ranked_candidates(request)
+        .map_err(|error| smartzip_core::SmartZipError::BackendFailed {
+            backend: "password-db".into(),
+            exit_code: None,
+            stderr: error.to_string(),
+        })
+}
+
+async fn access_archive_with_password<B: ArchiveBackend>(
+    backend: &B,
+    passwords: &PasswordService<'_>,
+    resolved: &ResolvedArchive<'_>,
+    password_candidates: &[PasswordCandidate],
+    batch_passwords: &mut Vec<PasswordCandidate>,
+    password_prompter: Option<&dyn InteractivePasswordPrompter>,
+    encoding_prompter: Option<&dyn InteractiveEncodingPrompter>,
+    events: &EventSink,
+    task_id: &TaskId,
+    load_listing: bool,
+) -> smartzip_core::Result<ArchiveAccessOutcome> {
+    let known_password = resolved
+        .known_hit
+        .as_ref()
+        .and_then(|hit| hit.password_id)
+        .and_then(|id| passwords.candidate_by_id(id).ok().flatten());
+    let ordered_candidates = order_password_candidates(
+        password_candidates,
+        known_password.as_ref(),
+        batch_passwords,
+    );
+    let test_before_access = backend.should_test_before_extract(
+        &resolved.archive_path,
+        resolved.candidate.detected_format.as_ref(),
+    );
+    let total_password_attempts = ordered_candidates.len();
+    let mut accepted_password_id = None;
+    let mut used_password = None;
+    let mut has_password = false;
+    let mut listing = None;
+    let mut encrypted = None;
+    let mut emitted = Vec::new();
+    let mut last_error = None;
+    let mut saw_wrong_password = false;
+    let mut password_prompt_cancelled = false;
+    let mut assessment = resolved.zip_encoding_assessment.clone();
+
+    for password in &ordered_candidates {
+        let pw_value = password_value(password);
+        let attempt_index = password_attempt_index(password, &ordered_candidates);
+        emitted.push(TaskEvent {
+            task_id: task_id.clone(),
+            kind: TaskEventKind::Progress(smartzip_core::TaskProgress::indeterminate(format!(
+                "Trying password [{}/{}] ({}) for {}",
+                attempt_index,
+                total_password_attempts,
+                password_source_label(password),
+                resolved.candidate.path.display()
+            ))),
+        });
+        if test_before_access {
+            match backend_call(
+                "archive-backend",
+                "test",
+                &resolved.archive_path,
+                backend.test(TestRequest {
+                    archive: resolved.archive_path.clone(),
+                    format: resolved.candidate.detected_format.clone(),
+                    password: pw_value.clone(),
+                    encoding: resolved.encoding_mode.clone(),
+                }),
+            )
+            .await
+            {
+                Ok(result) if result.ok => {
+                    accepted_password_id = passwords.record_success(password).ok().flatten();
+                    used_password = pw_value.clone();
+                    has_password = pw_value.as_deref().map(|v| !v.is_empty()).unwrap_or(false);
+                    encrypted = result.encrypted;
+                    if assessment.is_none()
+                        && resolved.encoding_mode == EncodingMode::Auto
+                        && resolved.candidate.detected_format == Some(ArchiveFormat::Zip)
+                    {
+                        let native_zip = NativeZipBackend::new();
+                        assessment = assess_zip_encoding(
+                            &native_zip,
+                            &resolved.archive_path,
+                            pw_value.clone(),
+                        )
+                        .await;
+                    }
+                    break;
+                }
+                Ok(result) => {
+                    encrypted = result.encrypted;
+                }
+                Err(error) => {
+                    if matches!(&error, smartzip_core::SmartZipError::WrongPassword { .. }) {
+                        saw_wrong_password = true;
+                        let _ = passwords.record_failure(password);
+                    } else {
+                        last_error = Some(error);
+                    }
+                }
+            }
+        } else {
+            used_password = pw_value.clone();
+            has_password = pw_value.as_deref().map(|v| !v.is_empty()).unwrap_or(false);
+            break;
+        }
+    }
+
+    if used_password.is_none() {
+        if let Some(prompter) = password_prompter {
+            emitted.push(TaskEvent {
+                task_id: task_id.clone(),
+                kind: TaskEventKind::Progress(smartzip_core::TaskProgress::indeterminate(format!(
+                    "Prompting for password: {}",
+                    resolved.candidate.path.display()
+                ))),
+            });
+            let interactive_password = prompter.prompt(&resolved.candidate.path).await;
+            password_prompt_cancelled = interactive_password
+                .as_deref()
+                .map(str::trim)
+                .is_none_or(str::is_empty);
+            if let Some(interactive_pw) = interactive_password {
+                let pw = interactive_pw.trim().to_string();
+                if !pw.is_empty() {
+                    let accepted = PasswordCandidate {
+                        id: None,
+                        value: pw.clone(),
+                        source: smartzip_passwords::PasswordSource::Manual,
+                    };
+                    if test_before_access {
+                        let result = backend_call(
+                            "archive-backend",
+                            "test",
+                            &resolved.archive_path,
+                            backend.test(TestRequest {
+                                archive: resolved.archive_path.clone(),
+                                format: resolved.candidate.detected_format.clone(),
+                                password: Some(pw.clone()),
+                                encoding: resolved.encoding_mode.clone(),
+                            }),
+                        )
+                        .await?;
+                        if !result.ok {
+                            return Err(smartzip_core::SmartZipError::WrongPassword {
+                                path: resolved.candidate.path.clone(),
+                            });
+                        }
+                        encrypted = result.encrypted;
+                    }
+                    accepted_password_id = passwords.record_success(&accepted).ok().flatten();
+                    remember_batch_password(batch_passwords, &accepted.value, accepted_password_id);
+                    used_password = Some(pw.clone());
+                    has_password = true;
+                    if assessment.is_none()
+                        && resolved.encoding_mode == EncodingMode::Auto
+                        && resolved.candidate.detected_format == Some(ArchiveFormat::Zip)
+                    {
+                        let native_zip = NativeZipBackend::new();
+                        assessment =
+                            assess_zip_encoding(&native_zip, &resolved.archive_path, Some(pw)).await;
+                    }
+                }
+            }
+        }
+    }
+
+    if used_password.is_none() && password_prompt_cancelled {
+        return Err(smartzip_core::SmartZipError::PasswordRequired {
+            path: resolved.candidate.path.clone(),
+        });
+    }
+    if used_password.is_none() {
+        if let Some(error) = last_error {
+            return Err(error);
+        }
+        if saw_wrong_password {
+            return Err(smartzip_core::SmartZipError::WrongPassword {
+                path: resolved.candidate.path.clone(),
+            });
+        }
+    }
+
+    let encoding_mode = resolve_encoding_mode(
+        &resolved.archive_path,
+        resolved.encoding_mode.clone(),
+        assessment.as_ref(),
+        encoding_prompter,
+    )
+    .await?;
+
+    if load_listing {
+        listing = Some(
+            backend_call(
+                "archive-backend",
+                "list",
+                &resolved.archive_path,
+                backend.list(ListRequest {
+                    archive: resolved.archive_path.clone(),
+                    format: resolved.candidate.detected_format.clone(),
+                    password: used_password.clone(),
+                    encoding: encoding_mode.clone(),
+                }),
+            )
+            .await?,
+        );
+    }
+
+    Ok(ArchiveAccessOutcome {
+        password_id: accepted_password_id,
+        has_password,
+        used_password,
+        encoding_mode,
+        listing,
+        encrypted,
+        events: emitted,
+        password_prompt_cancelled,
+    })
+}
+
+fn map_detect_error(error: smartzip_core::SmartZipError, path: &Path) -> smartzip_core::SmartZipError {
+    match error {
+        smartzip_core::SmartZipError::UnsupportedFormat { .. } => {
+            smartzip_core::SmartZipError::UnsupportedFormat {
+                path: path.to_path_buf(),
+                format: None,
+            }
+        }
+        other => other,
     }
 }
 
