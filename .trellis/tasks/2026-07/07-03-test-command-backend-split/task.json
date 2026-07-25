@@ -1,0 +1,31 @@
+{
+  "id": "test-command-backend-split",
+  "name": "test-command-backend-split",
+  "title": "Test Command Backend",
+  "description": "从 file-aware CLI 任务中拆出 smartzip test 的真实后端实现：全量校验、损坏文件/坏卷定位、加密档密码处理，以及 file_extractions 上的 intact/corrupt 与 damaged_volumes_json 写入。",
+  "status": "planning",
+  "dev_type": null,
+  "scope": null,
+  "package": "smartzip-cli",
+  "priority": "P2",
+  "creator": "charl",
+  "assignee": "charl",
+  "createdAt": "2026-07-03",
+  "completedAt": null,
+  "branch": null,
+  "base_branch": "main",
+  "worktree_path": null,
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [],
+  "children": [],
+  "parent": "file-aware-cli-commands",
+  "relatedFiles": [
+    "crates/smartzip-cli/src/main.rs",
+    "crates/smartzip-engine/src/lib.rs",
+    "crates/smartzip-engine/src/history.rs",
+    "crates/smartzip-engine/tests/smartzip_integration.rs"
+  ],
+  "notes": "由 07-02-file-aware-cli-commands 拆分；前置依赖是共享求密码流程、detect/list 多输入框架与文件级 history 模型已就位。当前目标是补齐 test 真实后端，不阻塞 detect/list MVP。",
+  "meta": {}
+}

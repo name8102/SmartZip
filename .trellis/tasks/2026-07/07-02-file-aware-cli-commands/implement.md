@@ -1,6 +1,6 @@
 # Implementation Plan — File-Aware CLI Commands
 
-依赖 `07-02-file-grain-history` 完成。本任务不改 schema，只加命令行为 + 共享子流程。两阶段：engine 共享子流程 → cli 三命令接线。
+依赖 `07-02-file-grain-history` 完成。本任务不改 schema，只加命令行为 + 共享子流程。两阶段：engine 共享子流程 → cli detect/list 接线；`test` 从当前任务分离，后续单开任务实现。
 
 ---
 
@@ -8,7 +8,7 @@
 
 **求密码流程**（`smartzip-engine`，抽成共享函数/结构）
 
-- 抽出 `resolve_password(ctx) -> PasswordOutcome`，供 extract / list / test 共用。
+- 抽出 `resolve_password(ctx) -> PasswordOutcome`，供 extract / list 共用，并作为后续 test 任务的稳定接入点。
 - 候选队列构造（与 extract 已实现的顺序一致，抽出复用）：
   1. 命令行 `--password`
   2. `known_files.password_id`（`lookup_known_file(hash,size)` 命中 → 取 value，置顶不独占）
@@ -27,7 +27,7 @@
 
 ---
 
-## 阶段二：cli 三命令接线
+## 阶段二：cli detect/list 接线
 
 **detect（`smartzip-cli/src/main.rs`，语义扩张）**
 
@@ -44,19 +44,19 @@
 - 用户显式选定编码（`--encoding`/`--pick-encoding`）→ `upsert_confirmed_encoding`（写 confirmed_encoding，追加 name+offset，不写 last_extract_at）。求到密码 → 写 password_id。
 - 写 `file_extractions`：status 复用 detected/unreadable。
 
-**test（新命令）**
+**test（接口保留，后端后置）**
 
-- 后端 `t` 全量校验；解析后端输出定位坏卷 → `damaged_volumes_json`（全部坏卷）。
-- status=`intact` / `corrupt`；加密档走共享求密码流程，试出密码写 known_files.password_id。
-- 写 `file_extractions`（intact/corrupt + damaged_volumes_json）。
+- 保留顶层命令与参数占位。
+- 当前实现明确返回未实现错误与 exit 1。
+- 不伪造 `intact/corrupt`、不写 `damaged_volumes_json`、不接密码校验后端。
 
 **验证**
 
 - `cargo build` + `cargo test` 全 workspace 绿。
 - 手动：
   - 乱码 ZIP fixture → `list` 默认乱码 → `list --encoding gb18030` 正常 → 校验 known_files.confirmed_encoding 写入。
-  - 损坏分卷 fixture → `test` 报 corrupt + 坏卷列表。
-  - 加密档 → `list` / `test` 经求密码流程。
+  - 加密档 → `list` 经求密码流程。
+  - `smartzip test` → 明确未实现错误且 exit 1。
 - 清理临时产物。
 
 ---
@@ -64,6 +64,7 @@
 ## 明确不在本次范围
 
 - schema 改动（上一任务已落）。
+- `test` 后端、损坏定位、`damaged_volumes_json` 写入（拆分到后续任务）。
 - hashcat crack_jobs、compress 写库、GUI 编码交互 / TUI。
 - 配置通配符密码层（仅 TODO 钩子）。
 - extract 的去重跳过（上一任务已闭合）。

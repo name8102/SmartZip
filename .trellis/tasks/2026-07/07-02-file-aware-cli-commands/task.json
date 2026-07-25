@@ -1,8 +1,8 @@
 {
   "id": "file-aware-cli-commands",
   "name": "file-aware-cli-commands",
-  "title": "File-Aware CLI Commands (detect / list / test)",
-  "description": "承接 07-02-file-grain-history 的数据库与 extract 闭合，把 detect / list / test 三个命令接线到文件级历史与 known_files 索引：detect 复合格式+编码+内嵌报告，list 走完整管线看到内容并交互确认编码（写 confirmed_encoding），test 独立全量校验+定位坏卷（写 damaged_volumes_json）。求密码与列条目抽成引擎层共享子流程。",
+  "title": "File-Aware CLI Commands (detect / list)",
+  "description": "承接 07-02-file-grain-history 的数据库与 extract 闭合，把 detect / list 两个命令接线到文件级历史与 known_files 索引：detect 复合格式+编码+内嵌报告，list 走完整管线看到内容并交互确认编码（写 confirmed_encoding）。求密码与列条目抽成引擎层共享子流程，为后续 test 独立接入预留能力。",
   "status": "planning",
   "dev_type": null,
   "scope": null,
