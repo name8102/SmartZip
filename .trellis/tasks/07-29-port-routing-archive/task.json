@@ -1,0 +1,28 @@
+{
+  "id": "port-routing-archive",
+  "name": "port-routing-archive",
+  "title": "Rewrite archive routing stack on feat base",
+  "description": "Replace ArchiveBackend-centric archive crate with ArchiveExecutor/ArchiveAdapter + capability profiles + BackendRouter from reference. Single capability model; no BackendCapabilities dual path.",
+  "status": "planning",
+  "package": "smartzip-archive",
+  "priority": "P0",
+  "creator": "charl",
+  "assignee": "charl",
+  "createdAt": "2026-07-29",
+  "completedAt": null,
+  "branch": "integration/feat-plus-routing-clean",
+  "base_branch": "integration/feat-plus-routing-clean",
+  "parent": "07-29-feat-routing-integration",
+  "children": [],
+  "subtasks": [],
+  "relatedFiles": [
+    "crates/smartzip-archive/src/backend.rs",
+    "crates/smartzip-archive/src/router.rs",
+    "crates/smartzip-archive/src/native_zip.rs",
+    "crates/smartzip-archive/src/sevenzz.rs",
+    "crates/smartzip-archive/src/unrar.rs",
+    "crates/smartzip-config/src/lib.rs"
+  ],
+  "notes": "Depends on port-routing-core. Use c64f77b as implementation reference; rewrite on feat tree. Expect engine/cli red until their port tasks.",
+  "meta": {}
+}

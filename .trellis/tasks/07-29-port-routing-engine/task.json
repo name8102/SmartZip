@@ -1,0 +1,26 @@
+{
+  "id": "port-routing-engine",
+  "name": "port-routing-engine",
+  "title": "Retarget engine to ArchiveExecutor without losing history",
+  "description": "Rewrite engine backend bounds and extract call sites for ArchiveExecutor only; keep feat history recorder and detection behavior; one progress path.",
+  "status": "planning",
+  "package": "smartzip-engine",
+  "priority": "P0",
+  "creator": "charl",
+  "assignee": "charl",
+  "createdAt": "2026-07-29",
+  "completedAt": null,
+  "branch": "integration/feat-plus-routing-clean",
+  "base_branch": "integration/feat-plus-routing-clean",
+  "parent": "07-29-feat-routing-integration",
+  "children": [],
+  "subtasks": [],
+  "relatedFiles": [
+    "crates/smartzip-engine/src/lib.rs",
+    "crates/smartzip-engine/src/history.rs",
+    "crates/smartzip-engine/tests/smartzip_integration.rs",
+    "crates/smartzip-engine/tests/history_integration.rs"
+  ],
+  "notes": "Depends on port-routing-archive. Do not reintroduce BackendCapabilities mocks.",
+  "meta": {}
+}

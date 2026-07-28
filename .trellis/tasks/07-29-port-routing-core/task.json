@@ -1,0 +1,27 @@
+{
+  "id": "port-routing-core",
+  "name": "port-routing-core",
+  "title": "Port routing core types onto feat base",
+  "description": "Add smartzip-core routing module, route-related errors, and TaskEventKind::Route from c64f77b reference without touching archive yet.",
+  "status": "planning",
+  "package": "smartzip-core",
+  "priority": "P0",
+  "creator": "charl",
+  "assignee": "charl",
+  "createdAt": "2026-07-29",
+  "completedAt": null,
+  "branch": "integration/feat-plus-routing-clean",
+  "base_branch": "integration/feat-plus-routing-clean",
+  "parent": "07-29-feat-routing-integration",
+  "children": [],
+  "subtasks": [],
+  "relatedFiles": [
+    "crates/smartzip-core/src/routing.rs",
+    "crates/smartzip-core/src/lib.rs",
+    "crates/smartzip-core/src/error.rs",
+    "crates/smartzip-core/src/progress.rs",
+    "CONTEXT.md"
+  ],
+  "notes": "First child. Must leave workspace compilable with feat archive still on old ArchiveBackend until archive port lands—or land core as additive only.",
+  "meta": {}
+}

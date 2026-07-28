@@ -1,0 +1,24 @@
+{
+  "id": "port-routing-cli",
+  "name": "port-routing-cli",
+  "title": "Rewrite CLI backend wiring for routing + keep feat commands",
+  "description": "Coherent CLI rewrite: feat detect/list/history/extract flags plus config/forced adapter/verbose routing. No locate+from_config dual path.",
+  "status": "planning",
+  "package": "smartzip-cli",
+  "priority": "P0",
+  "creator": "charl",
+  "assignee": "charl",
+  "createdAt": "2026-07-29",
+  "completedAt": null,
+  "branch": "integration/feat-plus-routing-clean",
+  "base_branch": "integration/feat-plus-routing-clean",
+  "parent": "07-29-feat-routing-integration",
+  "children": [],
+  "subtasks": [],
+  "relatedFiles": [
+    "crates/smartzip-cli/src/main.rs",
+    "crates/smartzip-cli/Cargo.toml"
+  ],
+  "notes": "Depends on port-routing-engine. Prefer structured ExtractOptions once; do not leave positional extract and struct extract both alive.",
+  "meta": {}
+}

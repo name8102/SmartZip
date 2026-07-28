@@ -1,0 +1,21 @@
+{
+  "id": "integration-verify",
+  "name": "integration-verify",
+  "title": "Verify clean routing port and plan landing",
+  "description": "Workspace check/test, anti-hybrid grep guards, landing plan. Active branch integration/feat-plus-routing-clean.",
+  "status": "planning",
+  "package": "workspace",
+  "priority": "P1",
+  "creator": "charl",
+  "assignee": "charl",
+  "createdAt": "2026-07-29",
+  "completedAt": null,
+  "branch": "integration/feat-plus-routing-clean",
+  "base_branch": "integration/feat-plus-routing-clean",
+  "parent": "07-29-feat-routing-integration",
+  "children": [],
+  "subtasks": [],
+  "relatedFiles": ["Cargo.toml", "CONTEXT.md", "justfile"],
+  "notes": "Abandoned hybrid checkpoint must not be merged forward without full rewrite validation.",
+  "meta": {}
+}
