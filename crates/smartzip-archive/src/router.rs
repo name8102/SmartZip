@@ -547,15 +547,28 @@ impl BackendRouter {
         );
         let mut attempted = Vec::new();
         let mut last_error = None;
-        // OutputMaterializer owns this directory. The router only clears its
-        // contents between adapter attempts; it never creates nested staging.
+        // OutputMaterializer owns the caller directory. Each adapter receives
+        // an independent sibling attempt directory, never a nested temp root;
+        // only the selected tree is moved into the materializer's directory.
         ensure_empty_output_dir(&request.output_dir)?;
+        let parent = request
+            .output_dir
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
 
         for candidate in &plan.candidates {
             let registration = self
                 .registration(&candidate.adapter_id)
                 .expect("planned adapter must remain registered");
             attempted.push(candidate.adapter_id.clone());
+            let attempt = tempfile::Builder::new()
+                .prefix(".smartzip-attempt-")
+                .tempdir_in(&parent)
+                .map_err(|source| SmartZipError::io(Some(parent.clone()), source))?;
+            let attempt_dir = attempt.path().to_path_buf();
+            let mut attempt_request = request.clone();
+            attempt_request.output_dir = attempt_dir.clone();
             self.emit(
                 context,
                 RouteEvent::BackendAttemptStarted {
@@ -563,8 +576,10 @@ impl BackendRouter {
                 },
             );
 
-            match registration.adapter.extract(request.clone()).await {
+            match registration.adapter.extract(attempt_request).await {
                 Ok(_) => {
+                    move_attempt_output(&attempt_dir, &request.output_dir)?;
+                    close_attempt(attempt, &attempt_dir)?;
                     self.emit(
                         context,
                         RouteEvent::BackendSelected {
@@ -583,7 +598,7 @@ impl BackendRouter {
                             class: error_class(&error).into(),
                         },
                     );
-                    clear_output_dir(&request.output_dir)?;
+                    close_attempt(attempt, &attempt_dir)?;
                     self.emit(
                         context,
                         RouteEvent::BackendAttemptCleaned {
@@ -1149,21 +1164,32 @@ fn ensure_empty_output_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn clear_output_dir(path: &Path) -> Result<()> {
-    for entry in std::fs::read_dir(path)
-        .map_err(|source| SmartZipError::io(Some(path.to_path_buf()), source))?
-    {
-        let entry = entry.map_err(|source| SmartZipError::io(Some(path.to_path_buf()), source))?;
-        let entry_path = entry.path();
-        if entry_path.is_dir() {
-            std::fs::remove_dir_all(&entry_path)
-                .map_err(|source| SmartZipError::io(Some(entry_path), source))?;
-        } else {
-            std::fs::remove_file(&entry_path)
-                .map_err(|source| SmartZipError::io(Some(entry_path), source))?;
-        }
+fn close_attempt(attempt: tempfile::TempDir, path: &Path) -> Result<()> {
+    attempt
+        .close()
+        .map_err(|source| SmartZipError::io(Some(path.to_path_buf()), source))?;
+    if path.exists() {
+        return Err(SmartZipError::BackendProtocolError {
+            backend: "archive-router-cleanup".into(),
+            detail: format!("temporary output still exists: {}", path.display()),
+        });
     }
-    ensure_empty_output_dir(path)
+    Ok(())
+}
+
+fn move_attempt_output(attempt_dir: &Path, output_dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(output_dir)
+        .map_err(|source| SmartZipError::io(Some(output_dir.to_path_buf()), source))?;
+    for entry in std::fs::read_dir(attempt_dir)
+        .map_err(|source| SmartZipError::io(Some(attempt_dir.to_path_buf()), source))?
+    {
+        let entry =
+            entry.map_err(|source| SmartZipError::io(Some(attempt_dir.to_path_buf()), source))?;
+        let target = output_dir.join(entry.file_name());
+        std::fs::rename(entry.path(), &target)
+            .map_err(|source| SmartZipError::io(Some(target), source))?;
+    }
+    Ok(())
 }
 
 pub fn format_from_extension(path: impl AsRef<Path>) -> Option<ArchiveFormat> {
