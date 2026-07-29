@@ -9,7 +9,7 @@ use smartzip_core::{
     ArchiveFacts, ArchiveFormat, ArchiveOperation, ArchiveRequirement, ArchiveRequirements,
     BackendCapabilityProfile, CapabilityId, CapabilityRule, NegativeCapabilityKey, RejectedAdapter,
     RequirementClass, Result, RouteCandidate, RouteEvent, RoutePlan, SmartZipError, SupportState,
-    TaskRouteContext,
+    TaskEvent, TaskEventKind, TaskEventSink, TaskId, TaskRouteContext,
 };
 use std::collections::HashSet;
 use std::future::Future;
@@ -54,12 +54,27 @@ impl AdapterRegistration {
     }
 }
 
+#[derive(Clone)]
+struct RouteTimeline {
+    task_id: TaskId,
+    sink: Arc<dyn TaskEventSink>,
+}
+
+impl std::fmt::Debug for RouteTimeline {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RouteTimeline")
+            .field("task_id", &self.task_id)
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct BackendRouter {
     adapters: Vec<AdapterRegistration>,
     forced_adapter: Option<String>,
     context: Arc<Mutex<TaskRouteContext>>,
-    events: Arc<Mutex<Vec<RouteEvent>>>,
+    timeline: Arc<Mutex<Option<RouteTimeline>>>,
     warnings: Vec<String>,
 }
 
@@ -87,13 +102,9 @@ impl BackendRouter {
             adapters,
             forced_adapter: None,
             context: Arc::new(Mutex::new(TaskRouteContext::default())),
-            events: Arc::new(Mutex::new(Vec::new())),
+            timeline: Arc::new(Mutex::new(None)),
             warnings: Vec::new(),
         }
-    }
-
-    pub fn locate() -> Result<Self> {
-        Self::from_config(&BackendConfig::default())
     }
 
     /// Build a registry from explicit installations, then supplement it with known tools.
@@ -223,20 +234,6 @@ impl BackendRouter {
 
     pub fn warnings(&self) -> &[String] {
         &self.warnings
-    }
-
-    pub fn route_events(&self) -> Vec<RouteEvent> {
-        self.events
-            .lock()
-            .expect("route event lock poisoned")
-            .clone()
-    }
-
-    pub fn clear_route_events(&self) {
-        self.events
-            .lock()
-            .expect("route event lock poisoned")
-            .clear();
     }
 
     pub fn plan_for_facts(
@@ -415,10 +412,17 @@ impl BackendRouter {
     }
 
     fn emit(&self, event: RouteEvent) {
-        self.events
+        let timeline = self
+            .timeline
             .lock()
-            .expect("route event lock poisoned")
-            .push(event);
+            .expect("route timeline lock poisoned")
+            .clone();
+        if let Some(timeline) = timeline {
+            timeline.sink.push(TaskEvent {
+                task_id: timeline.task_id,
+                kind: TaskEventKind::Route(event),
+            });
+        }
     }
 
     fn remember_retryable(
@@ -560,29 +564,21 @@ impl BackendRouter {
         let plan = self.plan(ArchiveOperation::Extract, container.as_ref(), requirements);
         let mut attempted = Vec::new();
         let mut last_error = None;
+        // OutputMaterializer owns this directory. The router only clears its
+        // contents between adapter attempts; it never creates nested staging.
+        ensure_empty_output_dir(&request.output_dir)?;
 
         for candidate in &plan.candidates {
             let registration = self
                 .registration(&candidate.adapter_id)
                 .expect("planned adapter must remain registered");
             attempted.push(candidate.adapter_id.clone());
-            std::fs::create_dir_all(&request.output_dir)
-                .map_err(|source| SmartZipError::io(Some(request.output_dir.clone()), source))?;
-            let attempt = tempfile::Builder::new()
-                .prefix(".smartzip-attempt-")
-                .tempdir_in(&request.output_dir)
-                .map_err(|source| SmartZipError::io(Some(request.output_dir.clone()), source))?;
-            let attempt_dir = attempt.path().to_path_buf();
-            let mut attempt_request = request.clone();
-            attempt_request.output_dir = attempt_dir.clone();
             self.emit(RouteEvent::BackendAttemptStarted {
                 adapter_id: candidate.adapter_id.clone(),
             });
 
-            match registration.adapter.extract(attempt_request).await {
+            match registration.adapter.extract(request.clone()).await {
                 Ok(_) => {
-                    move_attempt_output(&attempt_dir, &request.output_dir)?;
-                    close_attempt(attempt, &attempt_dir)?;
                     self.emit(RouteEvent::BackendSelected {
                         adapter_id: candidate.adapter_id.clone(),
                     });
@@ -595,7 +591,7 @@ impl BackendRouter {
                         adapter_id: candidate.adapter_id.clone(),
                         class: error_class(&error).into(),
                     });
-                    close_attempt(attempt, &attempt_dir)?;
+                    clear_output_dir(&request.output_dir)?;
                     self.emit(RouteEvent::BackendAttemptCleaned {
                         adapter_id: candidate.adapter_id.clone(),
                     });
@@ -619,9 +615,12 @@ impl BackendRouter {
 
 #[async_trait]
 impl ArchiveExecutor for BackendRouter {
-    fn begin_task(&self) {
+    fn begin_task(&self, task_id: TaskId, events: Arc<dyn TaskEventSink>) {
         *self.context.lock().expect("route context lock poisoned") = TaskRouteContext::default();
-        self.clear_route_events();
+        *self.timeline.lock().expect("route timeline lock poisoned") = Some(RouteTimeline {
+            task_id,
+            sink: events,
+        });
     }
 
     async fn probe(&self, path: &Path) -> Result<ArchiveProbe> {
@@ -683,6 +682,14 @@ impl ArchiveExecutor for BackendRouter {
 
     async fn extract(&self, request: ExtractArchiveRequest) -> Result<ExtractArchiveResult> {
         self.extract_isolated(request).await
+    }
+
+    async fn extract_with_facts(
+        &self,
+        request: ExtractArchiveRequest,
+        facts: &ArchiveFacts,
+    ) -> Result<ExtractArchiveResult> {
+        BackendRouter::extract_with_facts(self, request, facts).await
     }
 
     async fn compress(&self, request: CompressArchiveRequest) -> Result<CompressArchiveResult> {
@@ -901,43 +908,57 @@ fn request_requirements(
     requirements
 }
 
-pub(crate) fn profile_from_legacy_capabilities(
-    capabilities: &BackendCapabilities,
+pub(crate) fn builtin_profile(
+    can_extract: &[ArchiveFormat],
+    can_compress: &[ArchiveFormat],
+    supports_passwords: bool,
+    supports_listing: bool,
+    supports_test: bool,
 ) -> BackendCapabilityProfile {
     let mut rules = Vec::new();
-    for operation in [
+    rules.push(global_rule(
+        capability_id("operation", "probe"),
         ArchiveOperation::Probe,
+        !can_extract.is_empty(),
+    ));
+    rules.push(global_rule(
+        capability_id("operation", "list"),
         ArchiveOperation::List,
+        supports_listing,
+    ));
+    rules.push(global_rule(
+        capability_id("operation", "test"),
         ArchiveOperation::Test,
-    ] {
-        let supported = match operation {
-            ArchiveOperation::List => capabilities.supports_listing,
-            ArchiveOperation::Test => capabilities.supports_test,
-            _ => !capabilities.can_extract.is_empty(),
-        };
-        rules.push(global_rule(
-            capability_id("operation", operation_name(operation)),
-            operation,
-            supported,
-        ));
-    }
+        supports_test,
+    ));
     rules.push(global_rule(
         capability_id("operation", "extract"),
         ArchiveOperation::Extract,
-        !capabilities.can_extract.is_empty(),
+        !can_extract.is_empty(),
     ));
     rules.push(global_rule(
         capability_id("operation", "compress"),
         ArchiveOperation::Compress,
-        !capabilities.can_compress.is_empty(),
+        !can_compress.is_empty(),
     ));
-    for format in &capabilities.can_extract {
+    for operation in [
+        ArchiveOperation::List,
+        ArchiveOperation::Test,
+        ArchiveOperation::Extract,
+    ] {
+        rules.push(global_rule(
+            capability_id("password", "provided"),
+            operation,
+            supports_passwords,
+        ));
+    }
+    for format in can_extract {
         rules.push(container_rule(format.clone(), ArchiveOperation::Probe));
         rules.push(container_rule(format.clone(), ArchiveOperation::List));
         rules.push(container_rule(format.clone(), ArchiveOperation::Test));
         rules.push(container_rule(format.clone(), ArchiveOperation::Extract));
     }
-    for format in &capabilities.can_compress {
+    for format in can_compress {
         rules.push(container_rule(format.clone(), ArchiveOperation::Compress));
     }
     BackendCapabilityProfile { rules }
@@ -1039,32 +1060,43 @@ fn infer_format(requested: Option<ArchiveFormat>, path: &Path) -> Option<Archive
     requested.or_else(|| format_from_extension(path))
 }
 
-fn close_attempt(attempt: tempfile::TempDir, path: &Path) -> Result<()> {
-    attempt
-        .close()
+fn ensure_empty_output_dir(path: &Path) -> Result<()> {
+    std::fs::create_dir_all(path)
         .map_err(|source| SmartZipError::io(Some(path.to_path_buf()), source))?;
-    if path.exists() {
+    let mut entries = std::fs::read_dir(path)
+        .map_err(|source| SmartZipError::io(Some(path.to_path_buf()), source))?;
+    if entries
+        .next()
+        .transpose()
+        .map_err(|source| SmartZipError::io(Some(path.to_path_buf()), source))?
+        .is_some()
+    {
         return Err(SmartZipError::BackendProtocolError {
-            backend: "archive-router-cleanup".into(),
-            detail: format!("temporary output still exists: {}", path.display()),
+            backend: "router".into(),
+            detail: format!(
+                "routed extraction requires an empty staging directory: {}",
+                path.display()
+            ),
         });
     }
     Ok(())
 }
 
-fn move_attempt_output(attempt_dir: &Path, output_dir: &Path) -> Result<()> {
-    std::fs::create_dir_all(output_dir)
-        .map_err(|source| SmartZipError::io(Some(output_dir.to_path_buf()), source))?;
-    for entry in std::fs::read_dir(attempt_dir)
-        .map_err(|source| SmartZipError::io(Some(attempt_dir.to_path_buf()), source))?
+fn clear_output_dir(path: &Path) -> Result<()> {
+    for entry in std::fs::read_dir(path)
+        .map_err(|source| SmartZipError::io(Some(path.to_path_buf()), source))?
     {
-        let entry =
-            entry.map_err(|source| SmartZipError::io(Some(attempt_dir.to_path_buf()), source))?;
-        let target = output_dir.join(entry.file_name());
-        std::fs::rename(entry.path(), &target)
-            .map_err(|source| SmartZipError::io(Some(target), source))?;
+        let entry = entry.map_err(|source| SmartZipError::io(Some(path.to_path_buf()), source))?;
+        let entry_path = entry.path();
+        if entry_path.is_dir() {
+            std::fs::remove_dir_all(&entry_path)
+                .map_err(|source| SmartZipError::io(Some(entry_path), source))?;
+        } else {
+            std::fs::remove_file(&entry_path)
+                .map_err(|source| SmartZipError::io(Some(entry_path), source))?;
+        }
     }
-    Ok(())
+    ensure_empty_output_dir(path)
 }
 
 pub fn format_from_extension(path: impl AsRef<Path>) -> Option<ArchiveFormat> {
@@ -1092,6 +1124,15 @@ mod tests {
     use smartzip_core::{CompressionLevel, EncodingMode};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Clone, Default)]
+    struct RecordingSink(Arc<Mutex<Vec<TaskEvent>>>);
+
+    impl TaskEventSink for RecordingSink {
+        fn push(&self, event: TaskEvent) {
+            self.0.lock().unwrap().push(event);
+        }
+    }
 
     #[derive(Clone)]
     struct FakeAdapter {
@@ -1203,13 +1244,13 @@ mod tests {
         }
 
         fn profile(&self) -> smartzip_core::BackendCapabilityProfile {
-            crate::router::profile_from_legacy_capabilities(&BackendCapabilities {
-                can_extract: vec![ArchiveFormat::SevenZip],
-                can_compress: vec![ArchiveFormat::SevenZip],
-                supports_passwords: true,
-                supports_listing: true,
-                supports_test: true,
-            })
+            crate::router::builtin_profile(
+                &[ArchiveFormat::SevenZip],
+                &[ArchiveFormat::SevenZip],
+                true,
+                true,
+                true,
+            )
         }
     }
 
@@ -1303,6 +1344,8 @@ mod tests {
         let second = FakeAdapter::new("7z", None);
         let router =
             BackendRouter::from_adapters(vec![registration(first, 20), registration(second, 10)]);
+        let sink = RecordingSink::default();
+        router.begin_task(TaskId::new(), Arc::new(sink.clone()));
         let temp = tempfile::tempdir().unwrap();
         router
             .extract(extract_request(temp.path().to_path_buf()))
@@ -1313,10 +1356,11 @@ mod tests {
             std::fs::read_to_string(temp.path().join("success.txt")).unwrap(),
             "7z"
         );
-        let events = router.route_events();
+        let events = sink.0.lock().unwrap().clone();
         assert!(events.iter().any(|event| matches!(
-            event,
-            RouteEvent::BackendAttemptCleaned { adapter_id } if adapter_id == "7zz"
+            &event.kind,
+            TaskEventKind::Route(RouteEvent::BackendAttemptCleaned { adapter_id })
+                if adapter_id == "7zz"
         )));
         assert!(!format!("{events:?}").contains("secret"));
     }
@@ -1436,7 +1480,7 @@ mod tests {
             .iter()
             .any(|adapter| adapter.adapter_id == "7zz"));
 
-        router.begin_task();
+        router.begin_task(TaskId::new(), Arc::new(RecordingSink::default()));
         let reset_plan = router.plan(
             ArchiveOperation::Extract,
             Some(&ArchiveFormat::SevenZip),

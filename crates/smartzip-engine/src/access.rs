@@ -1,8 +1,6 @@
 //! Root resolve, prepare archive, password access loop.
 
-use smartzip_archive::{
-    ArchiveAdapter, ArchiveExecutor, ListRequest, NativeZipBackend, TestRequest,
-};
+use smartzip_archive::{ArchiveAdapter, ArchiveExecutor, ListRequest, NativeZipBackend};
 use smartzip_core::{ArchiveFormat, EncodingMode, TaskEvent, TaskEventKind, TaskId};
 use smartzip_passwords::{PasswordCandidate, PasswordService};
 use smartzip_scanner::{EmbeddedArchiveFinding, EmbeddedScanner, ScannerConfig};
@@ -246,15 +244,12 @@ pub(crate) async fn access_archive_with_password<B: ArchiveExecutor>(
         known_password.as_ref(),
         batch_passwords,
     );
-    // The executor owns backend selection; test before extraction for every
-    // archive so password failures are classified before materialization.
-    let test_before_access = true;
     let total_password_attempts = ordered_candidates.len();
     let mut accepted_password_id = None;
     let mut used_password = None;
     let mut has_password = false;
     let mut listing = None;
-    let mut encrypted = None;
+    let encrypted = None;
     let mut emitted = Vec::new();
     let mut last_error = None;
     let mut saw_wrong_password = false;
@@ -274,55 +269,48 @@ pub(crate) async fn access_archive_with_password<B: ArchiveExecutor>(
                 resolved.candidate.path.display()
             ))),
         });
-        if test_before_access {
-            match backend_call(
-                "archive-backend",
-                "test",
-                &resolved.archive_path,
-                backend.test(TestRequest {
-                    archive: resolved.archive_path.clone(),
-                    format: resolved.candidate.detected_format.clone(),
-                    password: pw_value.clone(),
-                    encoding: resolved.encoding_mode.clone(),
-                }),
-            )
-            .await
-            {
-                Ok(result) if result.ok => {
-                    accepted_password_id = passwords.record_success(password).ok().flatten();
-                    used_password = pw_value.clone();
-                    has_password = pw_value.as_deref().map(|v| !v.is_empty()).unwrap_or(false);
-                    encrypted = result.encrypted;
-                    if assessment.is_none()
-                        && resolved.encoding_mode == EncodingMode::Auto
-                        && resolved.candidate.detected_format == Some(ArchiveFormat::Zip)
-                    {
-                        let native_zip = NativeZipBackend::new();
-                        assessment = assess_zip_encoding(
-                            &native_zip,
-                            &resolved.archive_path,
-                            pw_value.clone(),
-                        )
-                        .await;
-                    }
-                    break;
-                }
-                Ok(result) => {
-                    encrypted = result.encrypted;
-                }
-                Err(error) => {
-                    if matches!(&error, smartzip_core::SmartZipError::WrongPassword { .. }) {
-                        saw_wrong_password = true;
-                        let _ = passwords.record_failure(password);
-                    } else {
-                        last_error = Some(error);
-                    }
-                }
-            }
-        } else {
+        if !load_listing {
             used_password = pw_value.clone();
             has_password = pw_value.as_deref().map(|v| !v.is_empty()).unwrap_or(false);
             break;
+        }
+        match backend_call(
+            "archive-backend",
+            "list",
+            &resolved.archive_path,
+            backend.list(ListRequest {
+                archive: resolved.archive_path.clone(),
+                format: resolved.candidate.detected_format.clone(),
+                password: pw_value.clone(),
+                encoding: resolved.encoding_mode.clone(),
+            }),
+        )
+        .await
+        {
+            Ok(result) => {
+                accepted_password_id = passwords.record_success(password).ok().flatten();
+                used_password = pw_value.clone();
+                has_password = pw_value.as_deref().map(|v| !v.is_empty()).unwrap_or(false);
+                listing = Some(result);
+                if assessment.is_none()
+                    && resolved.encoding_mode == EncodingMode::Auto
+                    && resolved.candidate.detected_format == Some(ArchiveFormat::Zip)
+                {
+                    let native_zip = NativeZipBackend::new();
+                    assessment =
+                        assess_zip_encoding(&native_zip, &resolved.archive_path, pw_value.clone())
+                            .await;
+                }
+                break;
+            }
+            Err(error) => {
+                if matches!(&error, smartzip_core::SmartZipError::WrongPassword { .. }) {
+                    saw_wrong_password = true;
+                    let _ = passwords.record_failure(password);
+                } else {
+                    last_error = Some(error);
+                }
+            }
         }
     }
 
@@ -348,25 +336,33 @@ pub(crate) async fn access_archive_with_password<B: ArchiveExecutor>(
                         value: pw.clone(),
                         source: smartzip_passwords::PasswordSource::Manual,
                     };
-                    if test_before_access {
-                        let result = backend_call(
-                            "archive-backend",
-                            "test",
-                            &resolved.archive_path,
-                            backend.test(TestRequest {
-                                archive: resolved.archive_path.clone(),
-                                format: resolved.candidate.detected_format.clone(),
-                                password: Some(pw.clone()),
-                                encoding: resolved.encoding_mode.clone(),
-                            }),
-                        )
-                        .await?;
-                        if !result.ok {
-                            return Err(smartzip_core::SmartZipError::WrongPassword {
-                                path: resolved.candidate.path.clone(),
-                            });
-                        }
-                        encrypted = result.encrypted;
+                    if load_listing {
+                        listing = Some(
+                            backend_call(
+                                "archive-backend",
+                                "list",
+                                &resolved.archive_path,
+                                backend.list(ListRequest {
+                                    archive: resolved.archive_path.clone(),
+                                    format: resolved.candidate.detected_format.clone(),
+                                    password: Some(pw.clone()),
+                                    encoding: resolved.encoding_mode.clone(),
+                                }),
+                            )
+                            .await
+                            .map_err(|error| {
+                                if matches!(
+                                    error,
+                                    smartzip_core::SmartZipError::WrongPassword { .. }
+                                ) {
+                                    smartzip_core::SmartZipError::WrongPassword {
+                                        path: resolved.candidate.path.clone(),
+                                    }
+                                } else {
+                                    error
+                                }
+                            })?,
+                        );
                     }
                     accepted_password_id = passwords.record_success(&accepted).ok().flatten();
                     remember_batch_password(batch_passwords, &accepted.value, accepted_password_id);

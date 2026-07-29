@@ -12,7 +12,8 @@ pub use embedded::{
 };
 pub use error::{Result, SmartZipError};
 pub use progress::{
-    EncodingCandidate, EncodingDetectionResult, TaskEvent, TaskEventKind, TaskProgress,
+    EncodingCandidate, EncodingDetectionResult, TaskEvent, TaskEventKind, TaskEventSink,
+    TaskProgress,
 };
 pub use routing::{
     ArchiveFact, ArchiveFacts, ArchiveOperation, ArchiveRequirement, ArchiveRequirements,

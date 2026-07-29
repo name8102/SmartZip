@@ -1,18 +1,26 @@
 use crate::types::*;
 use async_trait::async_trait;
-use smartzip_core::Result;
+use smartzip_core::{ArchiveFacts, Result, TaskEventSink, TaskId};
 use std::path::Path;
+use std::sync::Arc;
 
 /// Execution seam injected into the engine. Routers implement this trait.
 #[async_trait]
 pub trait ArchiveExecutor: Send + Sync {
     /// Reset task-local routing observations before a new top-level workflow.
-    fn begin_task(&self) {}
+    fn begin_task(&self, _task_id: TaskId, _events: Arc<dyn TaskEventSink>) {}
 
     async fn probe(&self, path: &Path) -> Result<ArchiveProbe>;
     async fn list(&self, request: ListRequest) -> Result<ArchiveListing>;
     async fn test(&self, request: TestRequest) -> Result<TestResult>;
     async fn extract(&self, request: ExtractArchiveRequest) -> Result<ExtractArchiveResult>;
+    async fn extract_with_facts(
+        &self,
+        request: ExtractArchiveRequest,
+        _facts: &ArchiveFacts,
+    ) -> Result<ExtractArchiveResult> {
+        self.extract(request).await
+    }
     async fn compress(&self, request: CompressArchiveRequest) -> Result<CompressArchiveResult>;
 }
 

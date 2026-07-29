@@ -1,6 +1,6 @@
 //! Task event sink and listener types.
 
-use smartzip_core::TaskEvent;
+use smartzip_core::{TaskEvent, TaskEventSink};
 use std::sync::{Arc, Mutex};
 
 pub type TaskEventListener = Arc<dyn Fn(&TaskEvent) + Send + Sync>;
@@ -9,6 +9,12 @@ pub type TaskEventListener = Arc<dyn Fn(&TaskEvent) + Send + Sync>;
 pub(crate) struct EventSink {
     events: Arc<Mutex<Vec<TaskEvent>>>,
     listener: Option<TaskEventListener>,
+}
+
+impl TaskEventSink for EventSink {
+    fn push(&self, event: TaskEvent) {
+        Self::push(self, event);
+    }
 }
 
 impl EventSink {

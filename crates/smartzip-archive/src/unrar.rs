@@ -240,13 +240,7 @@ impl ArchiveAdapter for UnrarBackend {
     }
 
     fn profile(&self) -> smartzip_core::BackendCapabilityProfile {
-        crate::router::profile_from_legacy_capabilities(&BackendCapabilities {
-            can_extract: vec![ArchiveFormat::Rar],
-            can_compress: Vec::new(),
-            supports_passwords: true,
-            supports_listing: true,
-            supports_test: true,
-        })
+        crate::router::builtin_profile(&[ArchiveFormat::Rar], &[], true, true, true)
     }
 }
 

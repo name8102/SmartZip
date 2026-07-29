@@ -3,15 +3,6 @@ use smartzip_core::{ArchiveFormat, CompressionLevel, EncodingMode};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BackendCapabilities {
-    pub can_extract: Vec<ArchiveFormat>,
-    pub can_compress: Vec<ArchiveFormat>,
-    pub supports_passwords: bool,
-    pub supports_listing: bool,
-    pub supports_test: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArchiveProbe {
     pub path: PathBuf,
     pub format: Option<ArchiveFormat>,

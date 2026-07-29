@@ -184,13 +184,13 @@ impl ArchiveAdapter for NativeZipBackend {
     }
 
     fn profile(&self) -> smartzip_core::BackendCapabilityProfile {
-        crate::router::profile_from_legacy_capabilities(&BackendCapabilities {
-            can_extract: vec![ArchiveFormat::Zip],
-            can_compress: vec![ArchiveFormat::Zip],
-            supports_passwords: true,
-            supports_listing: true,
-            supports_test: true,
-        })
+        crate::router::builtin_profile(
+            &[ArchiveFormat::Zip],
+            &[ArchiveFormat::Zip],
+            true,
+            true,
+            true,
+        )
     }
 }
 

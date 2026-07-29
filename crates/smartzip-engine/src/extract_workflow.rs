@@ -3,7 +3,9 @@
 use smartzip_archive::{
     ArchiveAdapter, ArchiveExecutor, ExtractArchiveRequest, NativeZipBackend, TestRequest,
 };
-use smartzip_core::{ArchiveFormat, EncodingMode, TaskEvent, TaskEventKind, TaskId};
+use smartzip_core::{
+    ArchiveFact, ArchiveFacts, ArchiveFormat, EncodingMode, TaskEvent, TaskEventKind, TaskId,
+};
 use smartzip_passwords::{PasswordCandidate, PasswordService};
 use smartzip_scanner::{Confidence, EmbeddedArchiveFinding, EmbeddedScanner};
 use std::collections::{HashSet, VecDeque};
@@ -24,16 +26,16 @@ use crate::nested::{
     recyclable_nested_archive_path, recycle_archive, root_embedded_candidates,
 };
 use crate::password_order::{
-    order_password_candidates, password_attempt_index,
-    password_source_label, password_value, remember_batch_password,
+    order_password_candidates, password_attempt_index, password_source_label, password_value,
+    remember_batch_password,
 };
 use crate::policy::{
-    embedded_policy_from_request, ext_business_container_kind,
-    finding_meets_min_size, full_root_scanner_config, should_scan_candidate_for_embedded,
+    embedded_policy_from_request, ext_business_container_kind, finding_meets_min_size,
+    full_root_scanner_config, should_scan_candidate_for_embedded,
 };
 use crate::types::{
-    ArchiveRecycleHandler, CandidateSource, ExtractWorkflowRequest,
-    ExtractWorkflowResult, ExtractionCandidate,
+    ArchiveRecycleHandler, CandidateSource, ExtractWorkflowRequest, ExtractWorkflowResult,
+    ExtractionCandidate,
 };
 
 /// Override how successfully processed nested archives are recycled.
@@ -55,8 +57,9 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
     listener: Option<TaskEventListener>,
     history: Option<&dyn crate::history::TaskHistoryRecorder>,
 ) -> smartzip_core::Result<ExtractWorkflowResult> {
-    backend.begin_task();
     let task_id = TaskId::new();
+    let events = EventSink::new(listener);
+    backend.begin_task(task_id.clone(), std::sync::Arc::new(events.clone()));
     let nested_scanner = if request.scanner == *engine_scanner.config() {
         None
     } else {
@@ -65,7 +68,6 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
     let nested_scanner = nested_scanner.as_ref().unwrap_or(engine_scanner);
     let root_scanner = EmbeddedScanner::new(full_root_scanner_config(&request.scanner));
 
-    let events = EventSink::new(listener);
     events.push(TaskEvent::started(task_id.clone()));
     let mut queue = VecDeque::new();
     let mut seen = HashSet::new();
@@ -598,6 +600,13 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
         }
 
         let _key = candidate_key(&candidate);
+        let archive_facts = ArchiveFacts {
+            container: candidate.detected_format.clone().map(|value| ArchiveFact {
+                value,
+                source: "engine header detection".into(),
+            }),
+            ..ArchiveFacts::default()
+        };
         let output_dir = output_dir_for_candidate(&request.output_dir, &candidate);
 
         let mut extracted = false;
@@ -687,6 +696,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                         let extract_format = candidate.detected_format.clone();
                         let extract_password = pw_value.clone();
                         let extract_encoding = encoding_to_use.clone();
+                        let extract_facts = archive_facts.clone();
                         events.push(TaskEvent {
                             task_id: task_id.clone(),
                             kind: TaskEventKind::Progress(
@@ -717,13 +727,16 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                                         "archive-backend",
                                         "extract",
                                         &extract_archive_path,
-                                        backend.extract(ExtractArchiveRequest {
+                                        backend.extract_with_facts(
+                                            ExtractArchiveRequest {
                                                 archive: extract_archive_path.clone(),
                                                 format: extract_format,
                                                 output_dir: temp_output_dir,
                                                 password: extract_password,
                                                 encoding: extract_encoding,
-                                            }),
+                                            },
+                                            &extract_facts,
+                                        ),
                                     )
                                     .await
                                     .map(|_| ())
@@ -796,6 +809,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                 let extract_format = candidate.detected_format.clone();
                 let extract_password = pw_value.clone();
                 let extract_encoding = extract_encoding_mode.clone();
+                let extract_facts = archive_facts.clone();
                 events.push(TaskEvent {
                     task_id: task_id.clone(),
                     kind: TaskEventKind::Progress(smartzip_core::TaskProgress::indeterminate(
@@ -823,13 +837,16 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                                 "archive-backend",
                                 "extract",
                                 &extract_archive_path,
-                                backend.extract(ExtractArchiveRequest {
+                                backend.extract_with_facts(
+                                    ExtractArchiveRequest {
                                         archive: extract_archive_path.clone(),
                                         format: extract_format,
                                         output_dir: temp_output_dir,
                                         password: extract_password,
                                         encoding: extract_encoding,
-                                    }),
+                                    },
+                                    &extract_facts,
+                                ),
                             )
                             .await
                             .map(|_| ())
@@ -962,6 +979,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                                     let extract_format = candidate.detected_format.clone();
                                     let extract_password = pw.clone();
                                     let extract_encoding = encoding_to_use.clone();
+                                    let extract_facts = archive_facts.clone();
                                     events.push(TaskEvent {
                                         task_id: task_id.clone(),
                                         kind: TaskEventKind::Progress(
@@ -992,13 +1010,16 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                                                     "archive-backend",
                                                     "extract",
                                                     &extract_archive_path,
-                                                    backend.extract(ExtractArchiveRequest {
+                                                    backend.extract_with_facts(
+                                                        ExtractArchiveRequest {
                                                             archive: extract_archive_path.clone(),
                                                             format: extract_format,
                                                             output_dir: temp_output_dir,
                                                             password: Some(extract_password),
                                                             encoding: extract_encoding,
-                                                        }),
+                                                        },
+                                                        &extract_facts,
+                                                    ),
                                                 )
                                                 .await
                                                 .map(|_| ())
@@ -1082,6 +1103,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                             let extract_archive_path = archive_path.clone();
                             let extract_format = candidate.detected_format.clone();
                             let extract_password = pw.clone();
+                            let extract_facts = archive_facts.clone();
                             let extract_encoding = resolve_encoding_mode(
                                 &archive_path,
                                 candidate_encoding_mode.clone(),
@@ -1119,13 +1141,16 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                                             "archive-backend",
                                             "extract",
                                             &extract_archive_path,
-                                            backend.extract(ExtractArchiveRequest {
+                                            backend.extract_with_facts(
+                                                ExtractArchiveRequest {
                                                     archive: extract_archive_path.clone(),
                                                     format: extract_format,
                                                     output_dir: temp_output_dir,
                                                     password: Some(extract_password),
                                                     encoding: extract_encoding,
-                                                }),
+                                                },
+                                                &extract_facts,
+                                            ),
                                         )
                                         .await
                                         .map(|_| ())

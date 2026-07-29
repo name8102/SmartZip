@@ -9,21 +9,15 @@ use crate::access::{
     access_archive_with_password, prepare_resolved_archive, resolve_root_candidate,
     scan_embedded_findings,
 };
-use crate::backend_util::{
-    confidence_score, map_detect_error,
-};
+use crate::backend_util::{confidence_score, map_detect_error};
 use crate::encoding_flow::encoding_mode_label;
 use crate::events::{EventSink, TaskEventListener};
-use crate::interactive::{
-    InteractiveEncodingPrompter, InteractivePasswordPrompter,
-};
+use crate::interactive::{InteractiveEncodingPrompter, InteractivePasswordPrompter};
 use crate::password_order::load_password_candidates;
-use crate::policy::{
-    default_root_scanner_config, ext_business_container_kind,
-};
+use crate::policy::{default_root_scanner_config, ext_business_container_kind};
 use crate::types::{
-    DetectRequest, DetectResult, FileAwareDetectResult, InspectRequest,
-    ListArchiveRequest, ListArchiveResult,
+    DetectRequest, DetectResult, FileAwareDetectResult, InspectRequest, ListArchiveRequest,
+    ListArchiveResult,
 };
 
 /// Override how successfully processed nested archives are recycled.
@@ -91,6 +85,7 @@ pub(crate) async fn inspect_file_with_listener<B: ArchiveExecutor>(
 ) -> smartzip_core::Result<FileAwareDetectResult> {
     let task_id = TaskId::new();
     let events = EventSink::new(listener);
+    backend.begin_task(task_id.clone(), std::sync::Arc::new(events.clone()));
     events.push(TaskEvent::started(task_id.clone()));
     if let Some(recorder) = history {
         recorder.start_task(&task_id, "detect", None);
@@ -259,6 +254,7 @@ pub(crate) async fn list_archive_with_listener_interactive<B: ArchiveExecutor>(
 ) -> smartzip_core::Result<ListArchiveResult> {
     let task_id = TaskId::new();
     let events = EventSink::new(listener);
+    backend.begin_task(task_id.clone(), std::sync::Arc::new(events.clone()));
     events.push(TaskEvent::started(task_id.clone()));
     if let Some(recorder) = history {
         recorder.start_task(&task_id, "list", None);

@@ -103,6 +103,12 @@ pub struct TaskEvent {
     pub kind: TaskEventKind,
 }
 
+/// Sink used by executors to append operation events to the owning task timeline.
+/// Implementations must not expose a second side-channel for route observations.
+pub trait TaskEventSink: Send + Sync {
+    fn push(&self, event: TaskEvent);
+}
+
 impl TaskEvent {
     pub fn started(task_id: TaskId) -> Self {
         Self {
