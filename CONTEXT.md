@@ -6,17 +6,24 @@
 
 | Term | Definition |
 |------|------------|
-| **ArchiveBackend** | 压缩后端抽象 trait。定义 `probe` / `list` / `test` / `extract` / `compress`。所有后端实现（Rust 原生 lib 或 7zz CLI）统一实现此 trait。 |
-| **NativeBackend** | 原生后端门面。长期目标是让 `NativeZipBackend` 承担 ZIP 编码恢复、路径安全和高性能密码验证；当前实现中 ZIP 的主提取路径仍优先走 `SevenZipBackend`，`NativeZipBackend` 主要保留为少量特例能力、测试能力和后备路径。 |
+| **ArchiveBackend** | 当前压缩后端抽象 trait。定义 `probe` / `list` / `test` / `extract` / `compress`。所有后端实现（Rust 原生 lib 或 7zz CLI）统一实现此 trait；在路由迁移完成前保留。 |
+| **ArchiveExecutor** | 目标中面向 `SmartZipEngine` 的归档执行 seam，定义 `probe` / `list` / `test` / `extract` / `compress`。`BackendRouter` 实现此 interface；engine 不接触 adapter 发现、能力 profile、排序或 fallback。 |
+| **ArchiveAdapter** | 面向 `BackendRouter` 的后端 adapter seam。每个 Rust 原生实现或外部程序实例（包括不同路径或版本的 `7z`、`7zz`）都是独立 adapter，并保留自己的身份和能力，不在进入路由前合并。 |
+| **BackendCapabilityProfile** | adapter 的持久化多维能力配置。按 operation、container 和 capability identifier 声明四态支持结果（Supported / Unsupported / Conditional / Unknown），覆盖 codec/filter、分卷、密码与加密、元数据保真度、进度/取消等特殊能力；能力证据来源与支持状态分开记录。 |
+| **ArchiveFacts** | 对归档自身已知事实的结构化描述，包括容器、codec/filter 链、加密、分卷、solid 模式和文件名元数据；事实保留来源及 unknown 状态，不包含后端选择策略。 |
+| **ArchiveRequirements** | 由 `ArchiveFacts` 与调用方意图生成的路由约束，分为 Required、Preferred 和 Diagnostic。Required 用于排除 adapter，Preferred 用于稳定排序。 |
+| **RoutePlan** | 针对单个归档和 operation 生成的可解释 adapter 顺序，记录候选、排除原因与 fallback 规则。list/test/extract/compress 分别规划；同一任务复用 facts、profile 和 extract 顺序。 |
+| **NativeBackend** | 原生 adapter。`NativeZipBackend` 负责 ZIP ZipCrypto / AES、原始文件名字节、编码信息和路径安全；它作为需要这些特殊能力的显式路径使用，不是普通 ZIP 密码路径的默认后端。密码候选通过直接解压验证，`test` 仅用于显式完整性检查。复杂格式由 `BackendRouter` 交给其他 adapter。 |
 | **SmartZipEngine** | 解压/检测/压缩工作流编排器。自身不持有后端、密码服务等依赖——由调用方（CLI/GUI）注入。 |
 | **ExtractionCandidate** | 待解压候选条目。包含路径、深度、来源类型、检测格式、内嵌偏移等。 |
+| **CandidateAttempt** | 对单个 `ExtractionCandidate` 的核心处理尝试。负责检测决策、内嵌归档材质化、编码检测、密码尝试、后端解压、输出材质化和结果事件；BFS 队列仍由 `SmartZipEngine` 管理。 |
 | **CandidateSource** | 候选来源枚举：`RootInput`（用户直接输入）、`ExtractedFile`（解压产物中找到的）、`EmbeddedFinding`（扫描器在二进制偏移处发现的）。 |
-| **Recursive extraction** | BFS 队列驱动的递归解压。队列中每个候选经过同一管线：格式检测 → 编码检测 → 密码尝试 → 解压 → 输出扫描 → 嵌套候选入队。 |
+| **Recursive extraction** | BFS 队列驱动的递归解压。队列中每个候选经过同一管线：格式检测 → 编码检测 → 有界密码候选直接解压到 `OutputMaterializer` → 输出扫描 → 嵌套候选入队。 |
 | **Collapse single output** | 解压产出唯一条目时的优化：将该条目提到父目录，去掉中间层空目录。现在由 `LayoutPlanKind` 的各种 `Commit*` 变体实现，包括内容上移（`CommitSingleDirContentsAsArchiveName`）和直接重命名（`CommitSingleDirAsInnerName`/`CommitSingleFileAsInnerName`）。 |
 | **ArchiveNode** | 下一阶段动态节点模型。记录父节点、来源、深度、状态、指纹和成功密码。节点在父归档解压后增量产生，不要求预先构造完整 DAG。 |
 | **VolumeSet** | 分卷归档集合。识别首卷、成员、缺卷和重复卷，仅将首卷交给后端。 |
 | **ExtractionLimits** | 不可信归档的资源预算：递归深度、内层候选数、文件数、磁盘安全余量和内嵌 finding 数量。 |
-| **OutputMaterializer** | 事务式输出策略：规划目标路径、同盘临时目录解压、校验、智能整理、碰撞处理、提交或回滚。失败时默认清理临时目录；开发模式可保留临时目录用于诊断。碰撞处理在布局规划之后执行，通过 `CollisionResolver` 回调解交互。 |
+| **OutputMaterializer** | 事务式输出策略与 **extraction staging** 的唯一所有者：为 adapter 尝试提供隔离目录、在失败后验证清理、对成功树做布局规划与碰撞处理，再 `CommitCommand` 提交或回滚。失败时默认清理临时目录；开发模式可保留**已选中**成功树用于诊断（失败 adapter 树必须删除）。碰撞在布局规划之后，经 `CollisionResolver` 交互。 |
 | **LayoutPlan** | 智能整理规划结果。包含 `source`（待移动项）、`kind`（整理策略）、`target`（最终目标路径）、`reason`（决策原因）。由 `plan_layout()` 在解压到临时目录后生成。 |
 | **PlanSource** | 待移动项来源：`WholeTempDir`（整个临时目录）、`SingleDir`（单目录）、`SingleDirContents`（单目录内容）、`SingleFile`（单文件）。 |
 | **LayoutPlanKind** | 整理策略枚举：`CommitWholeTempAsArchiveDir`（归档名容器）、`CommitSingleDirContentsAsArchiveName`（泛名目录内容上移到归档名）、`CommitSingleDirAsInnerName`（内层目录名）、`CommitSingleFileAsArchiveName`（文件用归档名）、`CommitSingleFileAsInnerName`（文件用内层名）、`PreserveBothSingleDir`（保留双层目录）、`PreserveBothSingleFile`（保留双层文件）、`RawArchiveDir`（原样输出）、`Empty`（空解压）。 |
@@ -25,14 +32,18 @@
 | **NameScore** | 名称质量评分。基于语义 token 数量、版本号、括号信息、泛名惩罚、hash 惩罚计算总分。用于决定归档名和内层名哪个更有信息量。 |
 | **CollisionResolver** | 异步回调，在布局规划后、提交前检测目标路径冲突。接收 `(archive_path, target_path, layout_plan)`，返回 `CollisionAction`（Skip/Overwrite/Rename）。 |
 | **MaterializeFailureKind** | 材质化失败类型：`ExtractFailed`（后端解压失败）、`CommitFailed`（提交失败）、`CollisionSkipped`（用户选择跳过碰撞）。 |
+| **Extraction staging** | 单次材质化周期内的隔离写盘能力：为每个 `ArchiveAdapter` 尝试提供独立目录；成功则选中该树交给布局/提交，失败则在进入下一 adapter 前删除并确认不存在。由 `OutputMaterializer` 实现，供 `BackendRouter` 在 extract 路径上使用；engine 与 CLI 不直接操作 staging。实现类型名未冻结。 |
+| **Attempt output** | staging 借出的一次 adapter 写目录句柄：提供路径、成功时交还选中、失败时丢弃并验证清理。不得嵌套在另一层「材质化临时根」之下。实现类型名未冻结。 |
 
 ## Event Model
 
 | Term | Definition |
 |------|------------|
-| **TaskEvent** | 工作流中产生的事件：Started / Progress / PasswordTried / EncodingDetected / EmbeddedArchiveFound / OutputCreated / Warning / Failed / Completed。 |
-| **Event channel** | 目标设计是有界 `tokio::sync::mpsc` 实时事件流；当前实现仍以 `ExtractWorkflowResult` 中汇总的 `Vec<TaskEvent>` 为主，并支持可选 listener 回调。 |
-| **ExtractWorkflowResult** | `extract_recursive` 的返回值。包含 processed/skipped/enqueued 列表 + 完整事件集合。供调用方做最终统计和断言。 |
+| **TaskEvent** | 工作流唯一任务可观测时间线：生命周期、进度、密码、编码、内嵌归档、输出，以及经 `TaskEventKind::Route` 承载的路由观测。默认输出摘要，verbose 展示排除原因与 fallback 链；密码及敏感参数不得进入事件。 |
+| **RouteEvent** | 路由域载荷（RoutePlanned / BackendAttempt* / BackendSelected / RouteExhausted 等），**不是**独立收集通道。只作为 `TaskEvent` 的一部分出现在任务时间线中。 |
+| **Task-scoped execution context** | 单次工作流任务内的可变作用域：持有有序 `TaskEvent` 列表、任务级负面能力缓存（原 `TaskRouteContext` 语义），并可被 engine 与 `ArchiveExecutor` 共享写入。实现类型名未冻结；最终形态可扩展 `ArchiveExecutor` 各 operation 的参数，或经 `begin_task` 绑定的 sink 分阶段落地。 |
+| **Event channel** | ADR-002：有界 `tokio::sync::mpsc` 在统一 `TaskEvent` 时间线**之后**接入；实时推送与最终 `ExtractWorkflowResult` 事件集合并存。背压策略不得拖慢解压。 |
+| **ExtractWorkflowResult** | `extract_recursive` 的返回值。包含 processed/skipped/enqueued 列表 + **完整**任务事件集合（含路由事件）。CLI/GUI 与测试以该集合为权威观测面，不从 `BackendRouter` 再取旁路事件。 |
 
 ## Password Model
 
@@ -65,10 +76,15 @@
 **Rationale**: 消除 CLI 的"卡死感"——用户实时看到进度。返回值保留供测试断言和最终统计。
 **Trade-off**: 有界通道需要定义背压策略，不能让高频进度事件拖慢解压。
 
-### ADR-003: Mixed backend — Rust libs + format-specific fallback
-**Decision**: 保留混合后端方向：RAR 增加 `UnrarBackend`，优先评估 `unrar` crate，必要时使用 `unrar` CLI；7z 继续评估 `NativeSevenZipBackend`，先看 `sevenz-rust2`，备选 `zesven`；复杂格式和库级能力缺口继续通过 `SevenZipCliBackend` fallback。ZIP 的长期目标仍是增强 `NativeZipBackend`，但当前实现里 ZIP 默认仍优先路由到 `SevenZipBackend`，`NativeZipBackend` 只承担有限特例能力和后备路径。路由对 engine 透明。
-**Rationale**: ZIP 是编码恢复、路径安全和高性能密码表遍历的关键格式；RAR 在 7zz 解压中已出现部分失败，需要格式专用后端提高成功率和诊断质量；7zz 仍覆盖 Rust 生态未支持的复杂格式。
-**Trade-off**: 多后端增加测试矩阵，同一功能在不同后端上的能力必须明确标记，并记录实际后端、失败原因和 fallback 链路。
+### ADR-003: Capability-aware mixed backend routing
+
+**Decision**: 目标是将现有后端抽象拆为面向 engine 的 `ArchiveExecutor` seam 和面向 router 的 `ArchiveAdapter` seam。`BackendRouter` 保留所有 adapter 的身份和持久化 `BackendCapabilityProfile`，根据 `ArchiveRequirements` 先约束过滤、再稳定排序、最后执行显式错误 fallback；`7z` 与 `7zz` 等不同程序或版本是独立 adapter。能力 profile 由 family baseline、version profile 和 installation override 三层组合，核心字段类型化，可扩展能力使用 namespaced identifier。显式配置优先，自动发现补充；版本不一致只警告。运行结果不改写持久化 profile，但明确的 UnsupportedContainer / UnsupportedCodec 会加入任务级负面缓存。
+
+每个 `ExtractionCandidate` 独立管理临时输出。adapter 失败后立即清理当前候选的临时产物，确认清理成功后才交给下一个 adapter；清理失败终止当前候选，但不影响任务中的其他候选。只有 UnsupportedContainer、UnsupportedCodec、BackendUnavailable 和 BackendProtocolError 允许 fallback；密码错误、损坏、安全、资源、权限、磁盘和取消错误均终止当前 route。router 产生可解释 `RoutePlan` 和结构化 attempt/cleanup/selection 事件。迁移完成前，现有 `ArchiveBackend` stack 保持不变。
+
+**Rationale**: 容器格式不足以表达真实兼容性；codec/filter、分卷、加密方式、原始文件名字节等能力同时决定 adapter 是否适用。持久化 profile 让选择可重复，执行 fallback 处理配置与现实偏差，独立候选清理避免失败 adapter 的部分输出污染后续 adapter。
+
+**Trade-off**: 配置 schema、adapter profile 和路由测试矩阵显著增加；外部程序能力配置可能陈旧，因此需要版本警告、可解释排除原因、任务级负面缓存和严格的失败清理。
 
 ### ADR-004: Two-phase incremental implementation
 **Decision**: 不整体迁移，不提前拆分新的 graph/scheduler/events crate。先修复现有行为错误和安全预算，再实现 Native ZIP、密码 worker pool、动态 ArchiveNode，最后接入事件流和 GUI。
@@ -95,3 +111,15 @@
 > - extract 解压前查 `known_files` 复用 `confirmed_encoding` + 去重跳过；求密码候选顺序注入 known_files.password_id（置顶不独占）。
 > - 完整裁决见 `.trellis/tasks/2026-07/07-02-file-grain-history/prd.md`；detect/list/test 接线见 `07-02-file-aware-cli-commands`。
 **Trade-off**: recorder 与 `PasswordService` 共享 `!Sync` 的 `Connection`，使 extract future 保持非 Send（只 await、不 spawn，符合当前 CLI 用法）。历史写入为 best-effort——任何 repo 错误降级为 `Warning` 事件，绝不中断解压；因此历史行在极端情况下可能不完整。`extract_recursive_with_listener_interactive` 参数进一步变长，后续可考虑收敛为请求结构体。
+
+### ADR-008: Single TaskEvent timeline (route events included)
+
+**Decision**: 任务可观测性只有一条时间线：`TaskEvent`。`RouteEvent` 仅作为 `TaskEventKind::Route` 载荷。删除 `BackendRouter` 旁路事件缓冲作为生产观测面；CLI 只读 `ExtractWorkflowResult.events`。直接 `router.extract` 测试仍可在不经 engine 的情况下注入 task-scoped context / sink 断言路由事件。端态：将 task-scoped execution context 贯穿 `ArchiveExecutor` 各 operation（任务级负面缓存与事件同属该作用域）。分阶段允许先用 `begin_task` 绑定 sink 减少 churn。ADR-002 的 mpsc 在统一时间线之后接入，不另开 `RouteEvent` 通道。
+**Rationale**: 双收集器迫使 CLI 依赖具体 `BackendRouter`，破坏 `ArchiveExecutor` 深度；已存在未使用的 `TaskEventKind::Route`。
+**Trade-off**: executor 签名最终会变；过渡期可能同时存在 sink 与参数两种绑定方式，需尽快收敛。
+
+### ADR-009: Single extraction staging owner
+
+**Decision**: 取消 materialize 临时根下再嵌套 router attempt 临时目录的双重隔离。`OutputMaterializer` 拥有 **extraction staging**：每 adapter 独立 attempt 目录；失败删除并**确认不存在**后才允许下一 adapter；成功选中该树再 `plan_layout` / 碰撞 / `CommitCommand`。密码重试仍完整重新 `materialize`（新 staging）。`BackendSelected` 之后的布局/碰撞/提交失败不得再 fallback 到其他 adapter。实现类型名未冻结；允许先落地 staging 语义再定名。
+**Rationale**: 嵌套 temp + `move_attempt_output` 把清理规则拆到两个 module，违反 ADR-003 的单一清理语义。
+**Trade-off**: extract 请求不再把「最终输出路径」伪装成 adapter 写路径；adapter 与 executor 签名需调整；严格 cleanup 确认在部分文件系统上可能更慢，但不放宽。

@@ -1,4 +1,5 @@
 use crate::error::SmartZipError;
+use crate::routing::RouteEvent;
 use crate::task::{ArchiveFormat, EncodingMode, TaskId};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -84,6 +85,7 @@ pub enum TaskEventKind {
     OutputCreated {
         path: PathBuf,
     },
+    Route(RouteEvent),
     Warning {
         message: String,
     },
