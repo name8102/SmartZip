@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use clap::{Parser, Subcommand, ValueEnum};
 use smartzip_archive::{ArchiveExecutor, BackendRouter};
 use smartzip_config::SmartZipConfig;
-use smartzip_core::EncodingMode;
+use smartzip_core::{EncodingMode, TaskEvent, TaskEventSink, TaskId};
 use smartzip_db::{password::PasswordRepository, SmartZipDb};
 use smartzip_engine::name_score;
 use smartzip_engine::{
@@ -402,10 +402,11 @@ async fn main() {
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+    let verbose_routing = cli.verbose_routing;
     let backend = build_backend(
         cli.config.as_deref(),
         cli.backend.as_deref(),
-        cli.verbose_routing,
+        verbose_routing,
     )?;
 
     match cli.command {
@@ -425,6 +426,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 json,
                 max_scan_bytes,
                 min_confidence,
+                verbose_routing,
             )
             .await
         }
@@ -453,6 +455,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 deep,
                 max_scan_bytes,
                 min_confidence,
+                verbose_routing,
             )
             .await
         }
@@ -507,6 +510,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 confirm_large_scan,
                 force,
                 no_history,
+                verbose_routing,
             )
             .await
         }
@@ -514,7 +518,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             path,
             password,
             json,
-        } => preview_encodings(&backend, path, password, json).await,
+        } => preview_encodings(&backend, path, password, json, verbose_routing).await,
         Command::Compress { paths } => {
             // `compress` is a reserved top-level command with no backend yet.
             // Per the frozen CLI spec it must fail loudly rather than print a
@@ -621,6 +625,7 @@ async fn detect(
     json: bool,
     max_scan_bytes: Option<u64>,
     min_confidence: ConfidenceArg,
+    verbose_routing: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config = ScannerConfig {
         min_confidence: min_confidence.into(),
@@ -637,7 +642,7 @@ async fn detect(
                 path,
                 scanner: config,
             },
-            None,
+            routing_listener(json, verbose_routing),
             Some(&recorder),
         )
         .await?;
@@ -658,6 +663,7 @@ async fn list_archive(
     deep: bool,
     max_scan_bytes: Option<u64>,
     min_confidence: ConfidenceArg,
+    verbose_routing: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config = ScannerConfig {
         min_confidence: min_confidence.into(),
@@ -687,7 +693,7 @@ async fn list_archive(
                 lock: stdin_lock.clone(),
             }),
             Some(&StdinEncodingPrompter { lock: stdin_lock }),
-            None,
+            routing_listener(json, verbose_routing),
             Some(&recorder),
         )
         .await?;
@@ -848,6 +854,7 @@ async fn extract(
     confirm_large_scan: bool,
     force: bool,
     no_history: bool,
+    verbose_routing: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if paths.is_empty() {
         return Err("no paths provided".into());
@@ -879,8 +886,7 @@ async fn extract(
 
     let stdin_lock = StdinLock::new();
     let engine = SmartZipEngine::default();
-    let event_listener = (!json)
-        .then(|| std::sync::Arc::new(render_extract_event) as smartzip_engine::TaskEventListener);
+    let event_listener = routing_listener(json, verbose_routing);
 
     // History recorder shares the same connection as the password service.
     // Both borrow `&Connection` immutably, which SQLite allows. Suppressed
@@ -955,7 +961,26 @@ async fn extract(
     std::process::exit(exit_code);
 }
 
-fn render_extract_event(event: &smartzip_core::TaskEvent) {
+struct RoutingPrintSink;
+
+impl TaskEventSink for RoutingPrintSink {
+    fn push(&self, event: TaskEvent) {
+        render_extract_event(&event, true);
+    }
+}
+
+fn routing_listener(
+    json: bool,
+    verbose_routing: bool,
+) -> Option<smartzip_engine::TaskEventListener> {
+    (!json).then(|| {
+        std::sync::Arc::new(move |event: &smartzip_core::TaskEvent| {
+            render_extract_event(event, verbose_routing)
+        }) as smartzip_engine::TaskEventListener
+    })
+}
+
+fn render_extract_event(event: &smartzip_core::TaskEvent, verbose_routing: bool) {
     match &event.kind {
         smartzip_core::TaskEventKind::Progress(progress) => match progress.percent {
             Some(percent) => println!("  {percent:>3.0}%  {}", progress.message),
@@ -999,6 +1024,32 @@ fn render_extract_event(event: &smartzip_core::TaskEvent) {
         smartzip_core::TaskEventKind::OutputCreated { path } => {
             println!("  -> {}", path.display());
         }
+        smartzip_core::TaskEventKind::Route(route) if verbose_routing => {
+            use smartzip_core::RouteEvent;
+            match route {
+                RouteEvent::RoutePlanned { plan } => println!(
+                    "  route: {:?} candidates={} rejected={}",
+                    plan.operation,
+                    plan.candidates.len(),
+                    plan.rejected.len()
+                ),
+                RouteEvent::BackendAttemptStarted { adapter_id } => {
+                    println!("  route: trying {adapter_id}")
+                }
+                RouteEvent::BackendAttemptFailed { adapter_id, class } => {
+                    println!("  route: {adapter_id} failed ({class})")
+                }
+                RouteEvent::BackendAttemptCleaned { adapter_id } => {
+                    println!("  route: cleaned {adapter_id} output")
+                }
+                RouteEvent::BackendSelected { adapter_id } => {
+                    println!("  route: selected {adapter_id}")
+                }
+                RouteEvent::RouteExhausted { attempted } => {
+                    println!("  route: exhausted [{}]", attempted.join(", "))
+                }
+            }
+        }
         smartzip_core::TaskEventKind::Failed { error } => eprintln!("  FAILED: {error}"),
         smartzip_core::TaskEventKind::Warning { message } => {
             eprintln!("  warning: {message}")
@@ -1020,6 +1071,7 @@ async fn preview_encodings(
     path: PathBuf,
     password: Option<String>,
     json: bool,
+    verbose_routing: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let candidates = encoding_preview_candidates();
     let mut previews = Vec::new();
@@ -1035,7 +1087,15 @@ async fn preview_encodings(
             password: password.clone(),
             encoding: mode,
         };
-        let listing = backend.list(request).await;
+        let listing = if verbose_routing {
+            let context = backend.begin_task(
+                TaskId::new(),
+                std::sync::Arc::new(RoutingPrintSink),
+            );
+            backend.list_with_context(request, context.as_ref()).await
+        } else {
+            backend.list(request).await
+        };
         match listing {
             Ok(listing) => previews.push(EncodingPreviewEntry {
                 encoding: encoding.to_string(),

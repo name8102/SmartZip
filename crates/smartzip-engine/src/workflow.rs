@@ -1,7 +1,9 @@
 //! Extract/detect/list orchestration (scheduler over capability modules).
 
 use smartzip_archive::ArchiveExecutor;
-use smartzip_core::{ArchiveFormat, EncodingMode, TaskEvent, TaskEventKind, TaskId};
+use smartzip_core::{
+    ArchiveFormat, EncodingMode, TaskEvent, TaskEventKind, TaskId,
+};
 use smartzip_passwords::PasswordService;
 use smartzip_scanner::EmbeddedScanner;
 
@@ -85,7 +87,8 @@ pub(crate) async fn inspect_file_with_listener<B: ArchiveExecutor>(
 ) -> smartzip_core::Result<FileAwareDetectResult> {
     let task_id = TaskId::new();
     let events = EventSink::new(listener);
-    backend.begin_task(task_id.clone(), std::sync::Arc::new(events.clone()));
+    let task_context =
+        backend.begin_task(task_id.clone(), std::sync::Arc::new(events.clone()));
     events.push(TaskEvent::started(task_id.clone()));
     if let Some(recorder) = history {
         recorder.start_task(&task_id, "detect", None);
@@ -144,7 +147,7 @@ pub(crate) async fn inspect_file_with_listener<B: ArchiveExecutor>(
             .as_ref()
             .and_then(|hit| hit.confirmed_encoding.clone());
         let probe = backend
-            .probe(&resolved.archive_path)
+            .probe_with_context(&resolved.archive_path, &task_context)
             .await
             .map_err(|error| map_detect_error(error, &request.path))?;
         encrypted = probe.encrypted;
@@ -254,7 +257,8 @@ pub(crate) async fn list_archive_with_listener_interactive<B: ArchiveExecutor>(
 ) -> smartzip_core::Result<ListArchiveResult> {
     let task_id = TaskId::new();
     let events = EventSink::new(listener);
-    backend.begin_task(task_id.clone(), std::sync::Arc::new(events.clone()));
+    let task_context =
+        backend.begin_task(task_id.clone(), std::sync::Arc::new(events.clone()));
     events.push(TaskEvent::started(task_id.clone()));
     if let Some(recorder) = history {
         recorder.start_task(&task_id, "list", None);
@@ -288,6 +292,7 @@ pub(crate) async fn list_archive_with_listener_interactive<B: ArchiveExecutor>(
     let mut batch_passwords = Vec::new();
     let outcome = access_archive_with_password(
         backend,
+        &task_context,
         passwords,
         &resolved,
         &password_candidates,

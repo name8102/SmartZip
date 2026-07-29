@@ -9,13 +9,13 @@ use smartzip_core::{
     ArchiveFacts, ArchiveFormat, ArchiveOperation, ArchiveRequirement, ArchiveRequirements,
     BackendCapabilityProfile, CapabilityId, CapabilityRule, NegativeCapabilityKey, RejectedAdapter,
     RequirementClass, Result, RouteCandidate, RouteEvent, RoutePlan, SmartZipError, SupportState,
-    TaskEvent, TaskEventKind, TaskEventSink, TaskId, TaskRouteContext,
+    TaskEventSink, TaskExecutionContext, TaskId,
 };
 use std::collections::HashSet;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct AdapterRegistration {
@@ -54,55 +54,18 @@ impl AdapterRegistration {
     }
 }
 
-#[derive(Clone)]
-struct RouteTimeline {
-    task_id: TaskId,
-    sink: Arc<dyn TaskEventSink>,
-}
-
-impl std::fmt::Debug for RouteTimeline {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("RouteTimeline")
-            .field("task_id", &self.task_id)
-            .finish()
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct BackendRouter {
     adapters: Vec<AdapterRegistration>,
     forced_adapter: Option<String>,
-    context: Arc<Mutex<TaskRouteContext>>,
-    timeline: Arc<Mutex<Option<RouteTimeline>>>,
     warnings: Vec<String>,
 }
 
 impl BackendRouter {
-    /// Compatibility constructor. New code may use `from_adapters` to register any adapter set.
-    pub fn new(
-        zip: NativeZipBackend,
-        unrar: Option<UnrarBackend>,
-        sevenzip: Option<SevenZipBackend>,
-    ) -> Self {
-        let mut adapters = Vec::new();
-        // Native ZIP remains a specialist path and ranks after CLI for ordinary ZIP routing.
-        adapters.push(AdapterRegistration::from_adapter(zip, -10));
-        if let Some(unrar) = unrar {
-            adapters.push(AdapterRegistration::from_adapter(unrar, 20));
-        }
-        if let Some(sevenzip) = sevenzip {
-            adapters.push(AdapterRegistration::from_adapter(sevenzip, 10));
-        }
-        Self::from_adapters(adapters)
-    }
-
     pub fn from_adapters(adapters: Vec<AdapterRegistration>) -> Self {
         Self {
             adapters,
             forced_adapter: None,
-            context: Arc::new(Mutex::new(TaskRouteContext::default())),
-            timeline: Arc::new(Mutex::new(None)),
             warnings: Vec::new(),
         }
     }
@@ -258,6 +221,16 @@ impl BackendRouter {
         container: Option<&ArchiveFormat>,
         requirements: ArchiveRequirements,
     ) -> RoutePlan {
+        self.plan_with_context(operation, container, requirements, None)
+    }
+
+    fn plan_with_context(
+        &self,
+        operation: ArchiveOperation,
+        container: Option<&ArchiveFormat>,
+        requirements: ArchiveRequirements,
+        context: Option<&TaskExecutionContext>,
+    ) -> RoutePlan {
         let mut candidates = Vec::new();
         let mut rejected = Vec::new();
 
@@ -288,25 +261,25 @@ impl BackendRouter {
                 container: container.cloned(),
                 capability: None,
             };
-            let context = self.context.lock().expect("route context lock poisoned");
-            if let Some(reason) = context.rejection(&negative) {
-                reasons.push(format!("task-local incompatibility: {reason}"));
-            }
-            for requirement in &requirements.items {
-                let feature_negative = NegativeCapabilityKey {
-                    adapter_id: adapter_id.to_owned(),
-                    operation,
-                    container: container.cloned(),
-                    capability: Some(requirement.capability.clone()),
-                };
-                if let Some(reason) = context.rejection(&feature_negative) {
-                    reasons.push(format!(
-                        "task-local incompatibility for {}: {reason}",
-                        requirement.capability
-                    ));
+            if let Some(context) = context {
+                if let Some(reason) = context.rejection(&negative) {
+                    reasons.push(format!("task-local incompatibility: {reason}"));
+                }
+                for requirement in &requirements.items {
+                    let feature_negative = NegativeCapabilityKey {
+                        adapter_id: adapter_id.to_owned(),
+                        operation,
+                        container: container.cloned(),
+                        capability: Some(requirement.capability.clone()),
+                    };
+                    if let Some(reason) = context.rejection(&feature_negative) {
+                        reasons.push(format!(
+                            "task-local incompatibility for {}: {reason}",
+                            requirement.capability
+                        ));
+                    }
                 }
             }
-            drop(context);
 
             let operation_capability = capability_id("operation", operation_name(operation));
             reject_unsupported(
@@ -401,7 +374,9 @@ impl BackendRouter {
             rejected,
             forced_adapter: self.forced_adapter.clone(),
         };
-        self.emit(RouteEvent::RoutePlanned { plan: plan.clone() });
+        if let Some(context) = context {
+            context.emit_route(RouteEvent::RoutePlanned { plan: plan.clone() });
+        }
         plan
     }
 
@@ -411,22 +386,13 @@ impl BackendRouter {
             .find(|registration| registration.adapter.id() == adapter_id)
     }
 
-    fn emit(&self, event: RouteEvent) {
-        let timeline = self
-            .timeline
-            .lock()
-            .expect("route timeline lock poisoned")
-            .clone();
-        if let Some(timeline) = timeline {
-            timeline.sink.push(TaskEvent {
-                task_id: timeline.task_id,
-                kind: TaskEventKind::Route(event),
-            });
-        }
+    fn emit(&self, context: &TaskExecutionContext, event: RouteEvent) {
+        context.emit_route(event);
     }
 
     fn remember_retryable(
         &self,
+        context: &TaskExecutionContext,
         adapter_id: &str,
         operation: ArchiveOperation,
         container: Option<ArchiveFormat>,
@@ -451,22 +417,20 @@ impl BackendRouter {
             SmartZipError::UnsupportedCodec { codec: None, .. } => return,
             _ => return,
         };
-        self.context
-            .lock()
-            .expect("route context lock poisoned")
-            .record(
-                NegativeCapabilityKey {
-                    adapter_id: adapter_id.to_owned(),
-                    operation,
-                    container,
-                    capability,
-                },
-                reason,
-            );
+        context.record_rejection(
+            NegativeCapabilityKey {
+                adapter_id: adapter_id.to_owned(),
+                operation,
+                container,
+                capability,
+            },
+            reason,
+        );
     }
 
     async fn route<T, F>(
         &self,
+        context: &TaskExecutionContext,
         operation: ArchiveOperation,
         container: Option<ArchiveFormat>,
         requirements: ArchiveRequirements,
@@ -477,7 +441,12 @@ impl BackendRouter {
             &'a dyn ArchiveAdapter,
         ) -> Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>,
     {
-        let plan = self.plan(operation, container.as_ref(), requirements);
+        let plan = self.plan_with_context(
+            operation,
+            container.as_ref(),
+            requirements,
+            Some(context),
+        );
         let mut attempted = Vec::new();
         let mut last_error = None;
         for candidate in &plan.candidates {
@@ -485,25 +454,35 @@ impl BackendRouter {
                 .registration(&candidate.adapter_id)
                 .expect("planned adapter must remain registered");
             attempted.push(candidate.adapter_id.clone());
-            self.emit(RouteEvent::BackendAttemptStarted {
-                adapter_id: candidate.adapter_id.clone(),
-            });
+            self.emit(
+                context,
+                RouteEvent::BackendAttemptStarted {
+                    adapter_id: candidate.adapter_id.clone(),
+                },
+            );
             match invoke(registration.adapter.as_ref()).await {
                 Ok(value) => {
-                    self.emit(RouteEvent::BackendSelected {
-                        adapter_id: candidate.adapter_id.clone(),
-                    });
+                    self.emit(
+                        context,
+                        RouteEvent::BackendSelected {
+                            adapter_id: candidate.adapter_id.clone(),
+                        },
+                    );
                     return Ok(value);
                 }
                 Err(error) => {
-                    self.emit(RouteEvent::BackendAttemptFailed {
-                        adapter_id: candidate.adapter_id.clone(),
-                        class: error_class(&error).into(),
-                    });
+                    self.emit(
+                        context,
+                        RouteEvent::BackendAttemptFailed {
+                            adapter_id: candidate.adapter_id.clone(),
+                            class: error_class(&error).into(),
+                        },
+                    );
                     if !is_retryable(&error) || self.forced_adapter.is_some() {
                         return Err(error);
                     }
                     self.remember_retryable(
+                        context,
                         &candidate.adapter_id,
                         operation,
                         container.clone(),
@@ -513,14 +492,15 @@ impl BackendRouter {
                 }
             }
         }
-        self.emit(RouteEvent::RouteExhausted { attempted });
+        self.emit(context, RouteEvent::RouteExhausted { attempted });
         Err(last_error.unwrap_or_else(|| no_compatible_backend(operation, &plan)))
     }
 
-    pub async fn extract_with_facts(
+    async fn extract_with_facts_in_context(
         &self,
         request: ExtractArchiveRequest,
         facts: &ArchiveFacts,
+        context: &TaskExecutionContext,
     ) -> Result<ExtractArchiveResult> {
         let container = facts
             .container
@@ -536,13 +516,14 @@ impl BackendRouter {
         requirements
             .items
             .extend(ArchiveRequirements::from_facts(facts).items);
-        self.extract_isolated_planned(request, container, requirements)
+        self.extract_isolated_planned(request, container, requirements, context)
             .await
     }
 
     async fn extract_isolated(
         &self,
         request: ExtractArchiveRequest,
+        context: &TaskExecutionContext,
     ) -> Result<ExtractArchiveResult> {
         let container = infer_format(request.format.clone(), &request.archive);
         let requirements = request_requirements(
@@ -551,7 +532,7 @@ impl BackendRouter {
             request.password.as_deref(),
             Some(&request.encoding),
         );
-        self.extract_isolated_planned(request, container, requirements)
+        self.extract_isolated_planned(request, container, requirements, context)
             .await
     }
 
@@ -560,8 +541,14 @@ impl BackendRouter {
         request: ExtractArchiveRequest,
         container: Option<ArchiveFormat>,
         requirements: ArchiveRequirements,
+        context: &TaskExecutionContext,
     ) -> Result<ExtractArchiveResult> {
-        let plan = self.plan(ArchiveOperation::Extract, container.as_ref(), requirements);
+        let plan = self.plan_with_context(
+            ArchiveOperation::Extract,
+            container.as_ref(),
+            requirements,
+            Some(context),
+        );
         let mut attempted = Vec::new();
         let mut last_error = None;
         // OutputMaterializer owns this directory. The router only clears its
@@ -573,32 +560,45 @@ impl BackendRouter {
                 .registration(&candidate.adapter_id)
                 .expect("planned adapter must remain registered");
             attempted.push(candidate.adapter_id.clone());
-            self.emit(RouteEvent::BackendAttemptStarted {
-                adapter_id: candidate.adapter_id.clone(),
-            });
+            self.emit(
+                context,
+                RouteEvent::BackendAttemptStarted {
+                    adapter_id: candidate.adapter_id.clone(),
+                },
+            );
 
             match registration.adapter.extract(request.clone()).await {
                 Ok(_) => {
-                    self.emit(RouteEvent::BackendSelected {
-                        adapter_id: candidate.adapter_id.clone(),
-                    });
+                    self.emit(
+                        context,
+                        RouteEvent::BackendSelected {
+                            adapter_id: candidate.adapter_id.clone(),
+                        },
+                    );
                     return Ok(ExtractArchiveResult {
                         output_dir: request.output_dir,
                     });
                 }
                 Err(error) => {
-                    self.emit(RouteEvent::BackendAttemptFailed {
-                        adapter_id: candidate.adapter_id.clone(),
-                        class: error_class(&error).into(),
-                    });
+                    self.emit(
+                        context,
+                        RouteEvent::BackendAttemptFailed {
+                            adapter_id: candidate.adapter_id.clone(),
+                            class: error_class(&error).into(),
+                        },
+                    );
                     clear_output_dir(&request.output_dir)?;
-                    self.emit(RouteEvent::BackendAttemptCleaned {
-                        adapter_id: candidate.adapter_id.clone(),
-                    });
+                    self.emit(
+                        context,
+                        RouteEvent::BackendAttemptCleaned {
+                            adapter_id: candidate.adapter_id.clone(),
+                        },
+                    );
                     if !is_retryable(&error) || self.forced_adapter.is_some() {
                         return Err(error);
                     }
                     self.remember_retryable(
+                        context,
                         &candidate.adapter_id,
                         ArchiveOperation::Extract,
                         container.clone(),
@@ -608,26 +608,32 @@ impl BackendRouter {
                 }
             }
         }
-        self.emit(RouteEvent::RouteExhausted { attempted });
+        self.emit(context, RouteEvent::RouteExhausted { attempted });
         Err(last_error.unwrap_or_else(|| no_compatible_backend(ArchiveOperation::Extract, &plan)))
     }
 }
 
 #[async_trait]
 impl ArchiveExecutor for BackendRouter {
-    fn begin_task(&self, task_id: TaskId, events: Arc<dyn TaskEventSink>) {
-        *self.context.lock().expect("route context lock poisoned") = TaskRouteContext::default();
-        *self.timeline.lock().expect("route timeline lock poisoned") = Some(RouteTimeline {
-            task_id,
-            sink: events,
-        });
+    fn begin_task(&self, task_id: TaskId, events: Arc<dyn TaskEventSink>) -> Arc<TaskExecutionContext> {
+        Arc::new(TaskExecutionContext::new(task_id, events))
     }
 
     async fn probe(&self, path: &Path) -> Result<ArchiveProbe> {
+        let context = TaskExecutionContext::detached();
+        self.probe_with_context(path, &context).await
+    }
+
+    async fn probe_with_context(
+        &self,
+        path: &Path,
+        context: &TaskExecutionContext,
+    ) -> Result<ArchiveProbe> {
         let container = format_from_extension(path);
         let requirements = base_requirements(ArchiveOperation::Probe, container.as_ref());
         let path = path.to_path_buf();
         self.route(
+            context,
             ArchiveOperation::Probe,
             container,
             requirements,
@@ -651,6 +657,15 @@ impl ArchiveExecutor for BackendRouter {
     }
 
     async fn list(&self, request: ListRequest) -> Result<ArchiveListing> {
+        let context = TaskExecutionContext::detached();
+        self.list_with_context(request, &context).await
+    }
+
+    async fn list_with_context(
+        &self,
+        request: ListRequest,
+        context: &TaskExecutionContext,
+    ) -> Result<ArchiveListing> {
         let container = infer_format(request.format.clone(), &request.archive);
         let requirements = request_requirements(
             ArchiveOperation::List,
@@ -658,7 +673,7 @@ impl ArchiveExecutor for BackendRouter {
             request.password.as_deref(),
             Some(&request.encoding),
         );
-        self.route(ArchiveOperation::List, container, requirements, |adapter| {
+        self.route(context, ArchiveOperation::List, container, requirements, |adapter| {
             let request = request.clone();
             Box::pin(async move { adapter.list(request).await })
         })
@@ -666,6 +681,15 @@ impl ArchiveExecutor for BackendRouter {
     }
 
     async fn test(&self, request: TestRequest) -> Result<TestResult> {
+        let context = TaskExecutionContext::detached();
+        self.test_with_context(request, &context).await
+    }
+
+    async fn test_with_context(
+        &self,
+        request: TestRequest,
+        context: &TaskExecutionContext,
+    ) -> Result<TestResult> {
         let container = infer_format(request.format.clone(), &request.archive);
         let requirements = request_requirements(
             ArchiveOperation::Test,
@@ -673,7 +697,7 @@ impl ArchiveExecutor for BackendRouter {
             request.password.as_deref(),
             Some(&request.encoding),
         );
-        self.route(ArchiveOperation::Test, container, requirements, |adapter| {
+        self.route(context, ArchiveOperation::Test, container, requirements, |adapter| {
             let request = request.clone();
             Box::pin(async move { adapter.test(request).await })
         })
@@ -681,7 +705,16 @@ impl ArchiveExecutor for BackendRouter {
     }
 
     async fn extract(&self, request: ExtractArchiveRequest) -> Result<ExtractArchiveResult> {
-        self.extract_isolated(request).await
+        let context = TaskExecutionContext::detached();
+        self.extract_with_context(request, &context).await
+    }
+
+    async fn extract_with_context(
+        &self,
+        request: ExtractArchiveRequest,
+        context: &TaskExecutionContext,
+    ) -> Result<ExtractArchiveResult> {
+        self.extract_isolated(request, context).await
     }
 
     async fn extract_with_facts(
@@ -689,10 +722,31 @@ impl ArchiveExecutor for BackendRouter {
         request: ExtractArchiveRequest,
         facts: &ArchiveFacts,
     ) -> Result<ExtractArchiveResult> {
-        BackendRouter::extract_with_facts(self, request, facts).await
+        let context = TaskExecutionContext::detached();
+        self.extract_with_facts_and_context(request, facts, &context)
+            .await
+    }
+
+    async fn extract_with_facts_and_context(
+        &self,
+        request: ExtractArchiveRequest,
+        facts: &ArchiveFacts,
+        context: &TaskExecutionContext,
+    ) -> Result<ExtractArchiveResult> {
+        self.extract_with_facts_in_context(request, facts, context)
+            .await
     }
 
     async fn compress(&self, request: CompressArchiveRequest) -> Result<CompressArchiveResult> {
+        let context = TaskExecutionContext::detached();
+        self.compress_with_context(request, &context).await
+    }
+
+    async fn compress_with_context(
+        &self,
+        request: CompressArchiveRequest,
+        context: &TaskExecutionContext,
+    ) -> Result<CompressArchiveResult> {
         let container = Some(request.format.clone());
         let requirements = request_requirements(
             ArchiveOperation::Compress,
@@ -701,6 +755,7 @@ impl ArchiveExecutor for BackendRouter {
             None,
         );
         self.route(
+            context,
             ArchiveOperation::Compress,
             container,
             requirements,
@@ -1121,9 +1176,12 @@ pub fn format_from_extension(path: impl AsRef<Path>) -> Option<ArchiveFormat> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use smartzip_core::{CompressionLevel, EncodingMode};
+    use smartzip_core::{
+        CompressionLevel, EncodingMode, TaskEvent, TaskEventKind, TaskEventSink,
+    };
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
 
     #[derive(Clone, Default)]
     struct RecordingSink(Arc<Mutex<Vec<TaskEvent>>>);
@@ -1345,10 +1403,10 @@ mod tests {
         let router =
             BackendRouter::from_adapters(vec![registration(first, 20), registration(second, 10)]);
         let sink = RecordingSink::default();
-        router.begin_task(TaskId::new(), Arc::new(sink.clone()));
+        let context = router.begin_task(TaskId::new(), Arc::new(sink.clone()));
         let temp = tempfile::tempdir().unwrap();
         router
-            .extract(extract_request(temp.path().to_path_buf()))
+            .extract_with_context(extract_request(temp.path().to_path_buf()), context.as_ref())
             .await
             .unwrap();
         assert!(!temp.path().join("partial.txt").exists());
@@ -1452,7 +1510,9 @@ mod tests {
             registration(FakeAdapter::new("7zz", None), 20),
             registration(FakeAdapter::new("7z", None), 10),
         ]);
+        let context = TaskExecutionContext::detached();
         router.remember_retryable(
+            &context,
             "7zz",
             ArchiveOperation::Extract,
             Some(ArchiveFormat::SevenZip),
@@ -1470,21 +1530,24 @@ mod tests {
                 reason: "archive method".into(),
             }],
         };
-        let plan = router.plan(
+        let plan = router.plan_with_context(
             ArchiveOperation::Extract,
             Some(&ArchiveFormat::SevenZip),
             zstd.clone(),
+            Some(&context),
         );
         assert!(plan
             .rejected
             .iter()
             .any(|adapter| adapter.adapter_id == "7zz"));
 
-        router.begin_task(TaskId::new(), Arc::new(RecordingSink::default()));
-        let reset_plan = router.plan(
+        let reset_context =
+            router.begin_task(TaskId::new(), Arc::new(RecordingSink::default()));
+        let reset_plan = router.plan_with_context(
             ArchiveOperation::Extract,
             Some(&ArchiveFormat::SevenZip),
             zstd,
+            Some(reset_context.as_ref()),
         );
         assert!(reset_plan
             .candidates

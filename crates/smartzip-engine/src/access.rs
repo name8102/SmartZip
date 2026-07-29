@@ -1,7 +1,9 @@
 //! Root resolve, prepare archive, password access loop.
 
 use smartzip_archive::{ArchiveAdapter, ArchiveExecutor, ListRequest, NativeZipBackend};
-use smartzip_core::{ArchiveFormat, EncodingMode, TaskEvent, TaskEventKind, TaskId};
+use smartzip_core::{
+    ArchiveFormat, EncodingMode, TaskEvent, TaskEventKind, TaskExecutionContext, TaskId,
+};
 use smartzip_passwords::{PasswordCandidate, PasswordService};
 use smartzip_scanner::{EmbeddedArchiveFinding, EmbeddedScanner, ScannerConfig};
 use std::path::Path;
@@ -224,6 +226,7 @@ pub(crate) async fn prepare_resolved_archive(
 
 pub(crate) async fn access_archive_with_password<B: ArchiveExecutor>(
     backend: &B,
+    task_context: &TaskExecutionContext,
     passwords: &PasswordService<'_>,
     resolved: &ResolvedArchive,
     password_candidates: &[PasswordCandidate],
@@ -278,12 +281,12 @@ pub(crate) async fn access_archive_with_password<B: ArchiveExecutor>(
             "archive-backend",
             "list",
             &resolved.archive_path,
-            backend.list(ListRequest {
+            backend.list_with_context(ListRequest {
                 archive: resolved.archive_path.clone(),
                 format: resolved.candidate.detected_format.clone(),
                 password: pw_value.clone(),
                 encoding: resolved.encoding_mode.clone(),
-            }),
+            }, task_context),
         )
         .await
         {
@@ -342,12 +345,12 @@ pub(crate) async fn access_archive_with_password<B: ArchiveExecutor>(
                                 "archive-backend",
                                 "list",
                                 &resolved.archive_path,
-                                backend.list(ListRequest {
+                                backend.list_with_context(ListRequest {
                                     archive: resolved.archive_path.clone(),
                                     format: resolved.candidate.detected_format.clone(),
                                     password: Some(pw.clone()),
                                     encoding: resolved.encoding_mode.clone(),
-                                }),
+                                }, task_context),
                             )
                             .await
                             .map_err(|error| {
@@ -412,12 +415,12 @@ pub(crate) async fn access_archive_with_password<B: ArchiveExecutor>(
                 "archive-backend",
                 "list",
                 &resolved.archive_path,
-                backend.list(ListRequest {
+                backend.list_with_context(ListRequest {
                     archive: resolved.archive_path.clone(),
                     format: resolved.candidate.detected_format.clone(),
                     password: used_password.clone(),
                     encoding: encoding_mode.clone(),
-                }),
+                }, task_context),
             )
             .await?,
         );

@@ -6,6 +6,7 @@
 - `cargo test -p smartzip-core -p smartzip-archive -p smartzip-db -p smartzip-engine -p smartzip-cli` passed.
 - Production guard searches are empty for `ArchiveBackend`, `extract_with_progress`, `BackendCapabilities`, router side-channel events, and `BackendRouter::locate`.
 - Route observations now enter `TaskEventKind::Route`; extraction staging has one owner and facts-aware extraction is part of the executor seam.
+- `--verbose-routing` renders route planning, attempts, cleanup, selection, and exhaustion for engine-backed CLI operations.
 - Engine facade is 221 lines; workflow scheduling is separated from recursive implementation and capability modules.
 - DB/history tests remain on the feat fine-grained model and pass.
 

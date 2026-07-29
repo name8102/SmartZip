@@ -1,7 +1,10 @@
+use crate::progress::{TaskEvent, TaskEventKind, TaskEventSink};
+use crate::task::TaskId;
 use crate::ArchiveFormat;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::{Arc, Mutex};
 
 /// Archive operation considered by capability routing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -279,6 +282,56 @@ impl TaskRouteContext {
 
     pub fn rejection(&self, key: &NegativeCapabilityKey) -> Option<&str> {
         self.unsupported.get(key).map(String::as_str)
+    }
+}
+
+/// Per-workflow routing context. It keeps route observations and negative
+/// capability decisions isolated when one router serves concurrent tasks.
+pub struct TaskExecutionContext {
+    task_id: TaskId,
+    sink: Arc<dyn TaskEventSink>,
+    route: Mutex<TaskRouteContext>,
+}
+
+struct DiscardingTaskEventSink;
+
+impl TaskEventSink for DiscardingTaskEventSink {
+    fn push(&self, _event: TaskEvent) {}
+}
+
+impl TaskExecutionContext {
+    pub fn detached() -> Self {
+        Self::new(TaskId::new(), Arc::new(DiscardingTaskEventSink))
+    }
+
+    pub fn new(task_id: TaskId, sink: Arc<dyn TaskEventSink>) -> Self {
+        Self {
+            task_id,
+            sink,
+            route: Mutex::new(TaskRouteContext::default()),
+        }
+    }
+
+    pub fn record_rejection(&self, key: NegativeCapabilityKey, reason: impl Into<String>) {
+        self.route
+            .lock()
+            .expect("task route context lock poisoned")
+            .record(key, reason);
+    }
+
+    pub fn rejection(&self, key: &NegativeCapabilityKey) -> Option<String> {
+        self.route
+            .lock()
+            .expect("task route context lock poisoned")
+            .rejection(key)
+            .map(str::to_owned)
+    }
+
+    pub fn emit_route(&self, event: RouteEvent) {
+        self.sink.push(TaskEvent {
+            task_id: self.task_id.clone(),
+            kind: TaskEventKind::Route(event),
+        });
     }
 }
 
