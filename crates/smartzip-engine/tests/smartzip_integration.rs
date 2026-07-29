@@ -8,8 +8,8 @@
 use async_trait::async_trait;
 use rstest::*;
 use smartzip_archive::{
-    ArchiveBackend, BackendRouter, ExtractArchiveRequest, ListRequest, SevenZipBackend,
-    SevenZipLocator, TestRequest,
+    ArchiveExecutor, BackendRouter, ExtractArchiveRequest, ListRequest, NativeZipBackend,
+    SevenZipBackend, SevenZipLocator, TestRequest,
 };
 use smartzip_core::{ArchiveFormat, EncodingMode};
 use smartzip_db::{password::PasswordRepository, SmartZipDb};
@@ -43,9 +43,10 @@ fn fixture_path(name: &str) -> PathBuf {
     fixture_dir().join(name)
 }
 
-fn backend() -> SevenZipBackend {
-    SevenZipBackend::locate(&SevenZipLocator::default())
-        .expect("7z/7zz must be available in PATH to run integration tests")
+fn backend() -> BackendRouter {
+    let seven_zip = SevenZipBackend::locate(&SevenZipLocator::default())
+        .expect("7z/7zz must be available in PATH to run integration tests");
+    BackendRouter::new(NativeZipBackend::new(), None, Some(seven_zip))
 }
 
 fn engine_with_test_recycler() -> (SmartZipEngine, Arc<Mutex<Vec<PathBuf>>>) {
@@ -63,7 +64,8 @@ fn engine_with_test_recycler() -> (SmartZipEngine, Arc<Mutex<Vec<PathBuf>>>) {
 }
 
 fn router() -> BackendRouter {
-    BackendRouter::locate().expect("backend router should initialize")
+    BackendRouter::from_config(&smartzip_config::BackendConfig::default())
+        .expect("backend router should initialize")
 }
 
 fn create_split_encrypted_zip(root: &Path, password: &str) -> PathBuf {

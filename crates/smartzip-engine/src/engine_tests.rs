@@ -1,9 +1,6 @@
 //! Unit tests moved out of lib.rs.
 
-use crate::access::*;
-use crate::backend_util::*;
 use crate::encoding_flow::*;
-use crate::events::*;
 use crate::interactive::*;
 use crate::nested::*;
 use crate::password_order::*;
@@ -179,7 +176,7 @@ fn zip_encoding_assessment_skips_confirmation_for_ascii_names() {
 #[tokio::test]
 async fn embedded_ask_without_prompter_skips_archive() {
     let archive = fixture_path("video_7z_pass.mp4");
-    let backend = BackendRouter::locate().unwrap();
+    let backend = BackendRouter::from_config(&smartzip_config::BackendConfig::default()).unwrap();
     let db = SmartZipDb::in_memory().unwrap();
     let service = PasswordService::new(PasswordRepository::new(db.connection()));
     let output = tempfile::tempdir().unwrap();
@@ -589,7 +586,7 @@ struct EncodingAwareBackend {
 }
 
 #[async_trait]
-impl ArchiveBackend for EncodingAwareBackend {
+impl ArchiveExecutor for EncodingAwareBackend {
     async fn probe(&self, path: &std::path::Path) -> smartzip_core::Result<ArchiveProbe> {
         Ok(ArchiveProbe {
             path: path.to_path_buf(),
@@ -642,15 +639,7 @@ impl ArchiveBackend for EncodingAwareBackend {
         })
     }
 
-    fn capabilities(&self) -> BackendCapabilities {
-        BackendCapabilities {
-            can_extract: vec![ArchiveFormat::Zip],
-            can_compress: vec![ArchiveFormat::Zip],
-            supports_passwords: true,
-            supports_listing: true,
-            supports_test: true,
-        }
-    }
+    
 }
 
 #[tokio::test]
@@ -708,7 +697,7 @@ async fn explicit_encoding_override_is_preserved_for_test_and_extract() {
 struct FailingTestBackend;
 
 #[async_trait]
-impl ArchiveBackend for FailingTestBackend {
+impl ArchiveExecutor for FailingTestBackend {
     async fn probe(&self, path: &std::path::Path) -> smartzip_core::Result<ArchiveProbe> {
         Ok(ArchiveProbe {
             path: path.to_path_buf(),
@@ -751,15 +740,7 @@ impl ArchiveBackend for FailingTestBackend {
         })
     }
 
-    fn capabilities(&self) -> BackendCapabilities {
-        BackendCapabilities {
-            can_extract: vec![ArchiveFormat::Zip],
-            can_compress: vec![ArchiveFormat::Zip],
-            supports_passwords: true,
-            supports_listing: true,
-            supports_test: true,
-        }
-    }
+    
 }
 
 #[tokio::test]
@@ -838,7 +819,7 @@ struct BatchPasswordBackend {
 }
 
 #[async_trait]
-impl ArchiveBackend for BatchPasswordBackend {
+impl ArchiveExecutor for BatchPasswordBackend {
     async fn probe(&self, path: &Path) -> smartzip_core::Result<ArchiveProbe> {
         Ok(ArchiveProbe {
             path: path.to_path_buf(),
@@ -896,15 +877,7 @@ impl ArchiveBackend for BatchPasswordBackend {
         })
     }
 
-    fn capabilities(&self) -> BackendCapabilities {
-        BackendCapabilities {
-            can_extract: vec![ArchiveFormat::Zip],
-            can_compress: vec![ArchiveFormat::Zip],
-            supports_passwords: true,
-            supports_listing: true,
-            supports_test: true,
-        }
-    }
+    
 }
 
 struct CountingPasswordPrompter {
@@ -986,7 +959,7 @@ async fn interactive_password_is_reused_for_later_files_in_same_batch() {
 }
 
 #[async_trait]
-impl ArchiveBackend for FakeBackend {
+impl ArchiveExecutor for FakeBackend {
     async fn probe(&self, path: &std::path::Path) -> smartzip_core::Result<ArchiveProbe> {
         Ok(ArchiveProbe {
             path: path.to_path_buf(),
@@ -1044,15 +1017,7 @@ impl ArchiveBackend for FakeBackend {
         })
     }
 
-    fn capabilities(&self) -> BackendCapabilities {
-        BackendCapabilities {
-            can_extract: vec![ArchiveFormat::Zip],
-            can_compress: vec![ArchiveFormat::Zip],
-            supports_passwords: true,
-            supports_listing: true,
-            supports_test: true,
-        }
-    }
+    
 }
 
 #[tokio::test]
@@ -1074,8 +1039,9 @@ async fn extract_via_real_seven_zip_with_smart_output() {
     assert!(status.success(), "7z must be available in PATH");
     std::fs::remove_file(&extracted_file).unwrap();
 
-    let backend = SevenZipBackend::locate(&smartzip_archive::SevenZipLocator::default())
+    let seven_zip = SevenZipBackend::locate(&smartzip_archive::SevenZipLocator::default())
         .expect("7z/7zz must be available");
+    let backend = BackendRouter::new(NativeZipBackend::new(), None, Some(seven_zip));
     let db = SmartZipDb::in_memory().unwrap();
     let service = PasswordService::new(PasswordRepository::new(db.connection()));
 
@@ -1196,7 +1162,7 @@ struct EmbeddedAwareFakeBackend {
 }
 
 #[async_trait]
-impl ArchiveBackend for EmbeddedAwareFakeBackend {
+impl ArchiveExecutor for EmbeddedAwareFakeBackend {
     async fn probe(&self, path: &std::path::Path) -> smartzip_core::Result<ArchiveProbe> {
         Ok(ArchiveProbe {
             path: path.to_path_buf(),
@@ -1256,13 +1222,5 @@ impl ArchiveBackend for EmbeddedAwareFakeBackend {
         })
     }
 
-    fn capabilities(&self) -> BackendCapabilities {
-        BackendCapabilities {
-            can_extract: vec![ArchiveFormat::Zip],
-            can_compress: vec![ArchiveFormat::Zip],
-            supports_passwords: true,
-            supports_listing: true,
-            supports_test: true,
-        }
-    }
+    
 }

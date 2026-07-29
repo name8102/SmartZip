@@ -5,6 +5,7 @@
 //! `known_files` tables receive the expected rows. Requires `7z`/`7zz` in
 //! PATH, like the other engine integration suites.
 
+use smartzip_archive::{BackendRouter, NativeZipBackend, SevenZipBackend, SevenZipLocator};
 use smartzip_core::EncodingMode;
 use smartzip_db::{
     file_extractions::FileExtractionRepository, known_files::KnownFileRepository,
@@ -28,9 +29,10 @@ fn fixture_path(name: &str) -> PathBuf {
         .join(name)
 }
 
-fn backend() -> smartzip_archive::SevenZipBackend {
-    smartzip_archive::SevenZipBackend::locate(&smartzip_archive::SevenZipLocator::default())
-        .expect("7z/7zz must be available in PATH to run integration tests")
+fn backend() -> BackendRouter {
+    let seven_zip = SevenZipBackend::locate(&SevenZipLocator::default())
+        .expect("7z/7zz must be available in PATH to run integration tests");
+    BackendRouter::new(NativeZipBackend::new(), None, Some(seven_zip))
 }
 
 fn request(inputs: Vec<PathBuf>, output_dir: PathBuf) -> ExtractWorkflowRequest {

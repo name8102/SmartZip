@@ -13,6 +13,7 @@ async-trait.workspace = true
 rusqlite.workspace = true
 smartzip-archive.workspace = true
 smartzip-core.workspace = true
+smartzip-config.workspace = true
 smartzip-db.workspace = true
 smartzip-encoding.workspace = true
 smartzip-passwords.workspace = true

@@ -1,6 +1,6 @@
 //! Encoding mode resolve, zip assessment, mojibake heuristics.
 
-use smartzip_archive::{ArchiveBackend, ArchiveListing, ListRequest, NativeZipBackend};
+use smartzip_archive::{ArchiveAdapter, ArchiveListing, ListRequest, NativeZipBackend};
 use smartzip_core::{ArchiveFormat, EncodingMode};
 use std::path::Path;
 

@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use clap::{Parser, Subcommand, ValueEnum};
-use smartzip_archive::{ArchiveBackend, BackendRouter, NativeZipBackend};
+use smartzip_archive::{ArchiveExecutor, BackendRouter};
+use smartzip_config::SmartZipConfig;
 use smartzip_core::EncodingMode;
 use smartzip_db::{password::PasswordRepository, SmartZipDb};
 use smartzip_engine::name_score;
@@ -25,6 +26,18 @@ struct Cli {
     /// Path to database file. Defaults to the platform data directory if not set.
     #[arg(long)]
     db: Option<PathBuf>,
+
+    /// Path to the TOML routing configuration.
+    #[arg(long)]
+    config: Option<PathBuf>,
+
+    /// Force one configured/discovered backend adapter by ID.
+    #[arg(long)]
+    backend: Option<String>,
+
+    /// Print router warnings and route diagnostics.
+    #[arg(long)]
+    verbose_routing: bool,
 
     #[command(subcommand)]
     command: Command,
@@ -389,6 +402,11 @@ async fn main() {
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+    let backend = build_backend(
+        cli.config.as_deref(),
+        cli.backend.as_deref(),
+        cli.verbose_routing,
+    )?;
 
     match cli.command {
         Command::Detect {
@@ -399,7 +417,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             min_confidence,
         } => {
             let db = open_db(cli.db)?;
-            detect(&db, path, deep, json, max_scan_bytes, min_confidence).await
+            detect(
+                &backend,
+                &db,
+                path,
+                deep,
+                json,
+                max_scan_bytes,
+                min_confidence,
+            )
+            .await
         }
         Command::List {
             path,
@@ -415,6 +442,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             let db = open_db(cli.db)?;
             list_archive(
+                &backend,
                 &db,
                 path,
                 manual_passwords,
@@ -461,6 +489,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             let db = open_db(cli.db)?;
             extract(
+                &backend,
                 &db,
                 paths,
                 output,
@@ -485,7 +514,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             path,
             password,
             json,
-        } => preview_encodings(path, password, json).await,
+        } => preview_encodings(&backend, path, password, json).await,
         Command::Compress { paths } => {
             // `compress` is a reserved top-level command with no backend yet.
             // Per the frozen CLI spec it must fail loudly rather than print a
@@ -511,6 +540,28 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             )
         }
     }
+}
+
+fn build_backend(
+    config_path: Option<&Path>,
+    forced_adapter: Option<&str>,
+    verbose_routing: bool,
+) -> Result<BackendRouter, Box<dyn std::error::Error>> {
+    let config = match config_path {
+        Some(path) => SmartZipConfig::load(path)?,
+        None => SmartZipConfig::default(),
+    };
+    let mut backend = BackendRouter::from_config(&config.backends)?;
+    if let Some(adapter) = forced_adapter {
+        backend = backend.with_forced_adapter(adapter);
+    }
+    if verbose_routing {
+        for warning in backend.warnings() {
+            eprintln!("routing warning: {warning}");
+        }
+        eprintln!("routing adapters: {}", backend.adapter_ids().join(", "));
+    }
+    Ok(backend)
 }
 
 fn open_db(path: Option<PathBuf>) -> Result<SmartZipDb, Box<dyn std::error::Error>> {
@@ -563,6 +614,7 @@ fn scanner_config(deep: bool, max_scan_bytes: Option<u64>) -> ScannerConfig {
 }
 
 async fn detect(
+    backend: &BackendRouter,
     db: &SmartZipDb,
     path: PathBuf,
     deep: bool,
@@ -574,13 +626,12 @@ async fn detect(
         min_confidence: min_confidence.into(),
         ..scanner_config(deep, max_scan_bytes)
     };
-    let backend = BackendRouter::locate()?;
     let service = PasswordService::new(PasswordRepository::new(db.connection()));
     let engine = SmartZipEngine::with_scanner_config(config.clone());
     let recorder = smartzip_engine::history::DbTaskHistoryRecorder::new(db.connection());
     let result = engine
         .inspect_file_with_listener(
-            &backend,
+            backend,
             &service,
             InspectRequest {
                 path,
@@ -596,6 +647,7 @@ async fn detect(
 }
 
 async fn list_archive(
+    backend: &BackendRouter,
     db: &SmartZipDb,
     path: PathBuf,
     manual_passwords: Vec<String>,
@@ -611,7 +663,6 @@ async fn list_archive(
         min_confidence: min_confidence.into(),
         ..scanner_config(deep, max_scan_bytes)
     };
-    let backend = BackendRouter::locate()?;
     let service = PasswordService::new(PasswordRepository::new(db.connection()));
     let engine = SmartZipEngine::with_scanner_config(config.clone());
     let recorder = smartzip_engine::history::DbTaskHistoryRecorder::new(db.connection());
@@ -619,7 +670,7 @@ async fn list_archive(
     let encoding_mode = select_list_encoding(path.clone(), encoding, pick_encoding)?;
     let result = engine
         .list_archive_with_listener_interactive(
-            &backend,
+            backend,
             &service,
             ListArchiveRequest {
                 path,
@@ -657,10 +708,8 @@ async fn list_archive(
             result.task_id,
         );
         for entry in &result.entries {
-            let suffix = entry
-                .is_dir
-                .then_some("/")
-                .unwrap_or_default();
+            let suffix = if entry
+                .is_dir { "/" } else { Default::default() };
             println!("{}{}", entry.path.display(), suffix);
         }
     }
@@ -781,6 +830,7 @@ fn prompt_pick_encoding(path: &Path) -> Result<EncodingMode, Box<dyn std::error:
 }
 
 async fn extract(
+    backend: &BackendRouter,
     db: &SmartZipDb,
     paths: Vec<PathBuf>,
     output: Option<PathBuf>,
@@ -825,7 +875,6 @@ async fn extract(
 
     let output_dir = output.unwrap_or_else(|| default_output_dir(paths.first().unwrap()));
 
-    let backend = BackendRouter::locate()?;
     let service = PasswordService::new(PasswordRepository::new(db.connection()));
 
     let stdin_lock = StdinLock::new();
@@ -844,7 +893,7 @@ async fn extract(
 
     let result = engine
         .extract_recursive_with_listener_interactive(
-            &backend,
+            backend,
             &service,
             ExtractWorkflowRequest {
                 inputs: paths,
@@ -967,12 +1016,11 @@ struct EncodingPreviewEntry {
 }
 
 async fn preview_encodings(
+    backend: &BackendRouter,
     path: PathBuf,
     password: Option<String>,
     json: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let backend = BackendRouter::locate()?;
-    let native_zip = NativeZipBackend::new();
     let candidates = encoding_preview_candidates();
     let mut previews = Vec::new();
 
@@ -987,13 +1035,7 @@ async fn preview_encodings(
             password: password.clone(),
             encoding: mode,
         };
-        let listing = if smartzip_engine::format_from_extension(&path)
-            == Some(smartzip_core::ArchiveFormat::Zip)
-        {
-            native_zip.list(request).await
-        } else {
-            backend.list(request).await
-        };
+        let listing = backend.list(request).await;
         match listing {
             Ok(listing) => previews.push(EncodingPreviewEntry {
                 encoding: encoding.to_string(),

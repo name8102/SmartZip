@@ -1,15 +1,10 @@
-//! Backend call wrappers, panic mapping, progress callback glue.
+//! Backend call wrappers and panic mapping.
 
 use futures_util::FutureExt;
-use smartzip_archive::ExtractionProgressCallback;
-use smartzip_core::{TaskEvent, TaskEventKind, TaskId};
 use std::any::Any;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-
-use crate::events::EventSink;
+use std::path::Path;
 
 pub(crate) fn map_detect_error(
     error: smartzip_core::SmartZipError,
@@ -24,22 +19,6 @@ pub(crate) fn map_detect_error(
         }
         other => other,
     }
-}
-
-pub(crate) fn extraction_progress_callback(
-    events: EventSink,
-    task_id: TaskId,
-    archive: PathBuf,
-) -> ExtractionProgressCallback {
-    Arc::new(move |percent| {
-        events.push(TaskEvent {
-            task_id: task_id.clone(),
-            kind: TaskEventKind::Progress(smartzip_core::TaskProgress::percent(
-                percent,
-                format!("Extracting {}", archive.display()),
-            )),
-        });
-    })
 }
 
 pub(crate) fn confidence_score(confidence: smartzip_scanner::Confidence) -> f32 {

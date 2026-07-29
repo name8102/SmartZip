@@ -1,6 +1,6 @@
 //! Extract/detect/list orchestration (scheduler over capability modules).
 
-use smartzip_archive::ArchiveBackend;
+use smartzip_archive::ArchiveExecutor;
 use smartzip_core::{ArchiveFormat, EncodingMode, TaskEvent, TaskEventKind, TaskId};
 use smartzip_passwords::PasswordService;
 use smartzip_scanner::EmbeddedScanner;
@@ -81,7 +81,7 @@ pub(crate) fn detect(
     })
 }
 
-pub(crate) async fn inspect_file_with_listener<B: ArchiveBackend>(
+pub(crate) async fn inspect_file_with_listener<B: ArchiveExecutor>(
     min_embedded_size_bytes: u64,
     backend: &B,
     _passwords: &PasswordService<'_>,
@@ -247,7 +247,7 @@ pub(crate) async fn inspect_file_with_listener<B: ArchiveBackend>(
     })
 }
 
-pub(crate) async fn list_archive_with_listener_interactive<B: ArchiveBackend>(
+pub(crate) async fn list_archive_with_listener_interactive<B: ArchiveExecutor>(
     min_embedded_size_bytes: u64,
     backend: &B,
     passwords: &PasswordService<'_>,

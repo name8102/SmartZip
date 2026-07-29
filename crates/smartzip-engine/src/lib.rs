@@ -28,7 +28,7 @@ mod workflow;
 #[cfg(test)]
 mod engine_tests;
 
-use smartzip_archive::ArchiveBackend;
+use smartzip_archive::ArchiveExecutor;
 use smartzip_passwords::PasswordService;
 use smartzip_scanner::{EmbeddedScanner, ScannerConfig};
 use std::sync::Arc;
@@ -74,7 +74,7 @@ impl SmartZipEngine {
         workflow::detect(&self.scanner, request)
     }
 
-    pub async fn inspect_file_with_listener<B: ArchiveBackend>(
+    pub async fn inspect_file_with_listener<B: ArchiveExecutor>(
         &self,
         backend: &B,
         passwords: &PasswordService<'_>,
@@ -93,7 +93,7 @@ impl SmartZipEngine {
         .await
     }
 
-    pub async fn list_archive_with_listener_interactive<B: ArchiveBackend>(
+    pub async fn list_archive_with_listener_interactive<B: ArchiveExecutor>(
         &self,
         backend: &B,
         passwords: &PasswordService<'_>,
@@ -116,7 +116,7 @@ impl SmartZipEngine {
         .await
     }
 
-    pub async fn extract_recursive<B: ArchiveBackend>(
+    pub async fn extract_recursive<B: ArchiveExecutor>(
         &self,
         backend: &B,
         passwords: &PasswordService<'_>,
@@ -138,7 +138,7 @@ impl SmartZipEngine {
         .await
     }
 
-    pub async fn extract_recursive_interactive<B: ArchiveBackend>(
+    pub async fn extract_recursive_interactive<B: ArchiveExecutor>(
         &self,
         backend: &B,
         passwords: &PasswordService<'_>,
@@ -162,7 +162,7 @@ impl SmartZipEngine {
         .await
     }
 
-    pub async fn extract_recursive_with_listener<B: ArchiveBackend>(
+    pub async fn extract_recursive_with_listener<B: ArchiveExecutor>(
         &self,
         backend: &B,
         passwords: &PasswordService<'_>,
@@ -185,7 +185,7 @@ impl SmartZipEngine {
         .await
     }
 
-    pub async fn extract_recursive_with_listener_interactive<B: ArchiveBackend>(
+    pub async fn extract_recursive_with_listener_interactive<B: ArchiveExecutor>(
         &self,
         backend: &B,
         passwords: &PasswordService<'_>,

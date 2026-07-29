@@ -1,6 +1,8 @@
 //! Root resolve, prepare archive, password access loop.
 
-use smartzip_archive::{ArchiveBackend, ListRequest, NativeZipBackend, TestRequest};
+use smartzip_archive::{
+    ArchiveAdapter, ArchiveExecutor, ListRequest, NativeZipBackend, TestRequest,
+};
 use smartzip_core::{ArchiveFormat, EncodingMode, TaskEvent, TaskEventKind, TaskId};
 use smartzip_passwords::{PasswordCandidate, PasswordService};
 use smartzip_scanner::{EmbeddedArchiveFinding, EmbeddedScanner, ScannerConfig};
@@ -223,7 +225,7 @@ pub(crate) async fn prepare_resolved_archive<'a>(
     })
 }
 
-pub(crate) async fn access_archive_with_password<B: ArchiveBackend>(
+pub(crate) async fn access_archive_with_password<B: ArchiveExecutor>(
     backend: &B,
     passwords: &PasswordService<'_>,
     resolved: &ResolvedArchive<'_>,
@@ -245,10 +247,9 @@ pub(crate) async fn access_archive_with_password<B: ArchiveBackend>(
         known_password.as_ref(),
         batch_passwords,
     );
-    let test_before_access = backend.should_test_before_extract(
-        &resolved.archive_path,
-        resolved.candidate.detected_format.as_ref(),
-    );
+    // The executor owns backend selection; test before extraction for every
+    // archive so password failures are classified before materialization.
+    let test_before_access = true;
     let total_password_attempts = ordered_candidates.len();
     let mut accepted_password_id = None;
     let mut used_password = None;

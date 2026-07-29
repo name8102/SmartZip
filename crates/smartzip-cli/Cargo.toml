@@ -16,6 +16,7 @@ clap.workspace = true
 serde_json.workspace = true
 smartzip-archive.workspace = true
 smartzip-core.workspace = true
+smartzip-config.workspace = true
 smartzip-db.workspace = true
 smartzip-engine.workspace = true
 smartzip-passwords.workspace = true
