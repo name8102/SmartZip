@@ -1,15 +1,15 @@
 {
   "id": "port-routing-cli",
   "name": "port-routing-cli",
-  "title": "Rewrite CLI backend wiring for routing + keep feat commands",
-  "description": "Coherent CLI rewrite: feat detect/list/history/extract flags plus config/forced adapter/verbose routing. No locate+from_config dual path.",
-  "status": "planning",
+  "title": "CLI backend wiring for routing (keep feat commands for now)",
+  "description": "Wiring-only: single BackendRouter::from_config (or shared helper) for feat detect/list/history/extract; add routing flags as needed. No locate+from_config dual path. CLI product redesign is a separate future task.",
+  "status": "completed",
   "package": "smartzip-cli",
   "priority": "P0",
   "creator": "charl",
   "assignee": "charl",
   "createdAt": "2026-07-29",
-  "completedAt": null,
+  "completedAt": "2026-07-29",
   "branch": "integration/feat-plus-routing-clean",
   "base_branch": "integration/feat-plus-routing-clean",
   "parent": "07-29-feat-routing-integration",
@@ -19,6 +19,6 @@
     "crates/smartzip-cli/src/main.rs",
     "crates/smartzip-cli/Cargo.toml"
   ],
-  "notes": "Depends on port-routing-engine. Prefer structured ExtractOptions once; do not leave positional extract and struct extract both alive.",
+  "notes": "Depends on port-routing-engine. Scope = backend wiring + keep current feat command surface. Do not fold DB/CLI redesign here — open separate tasks when ideas harden. Prefer one ExtractOptions/helper; no dual extract plumbing.",
   "meta": {}
 }

@@ -150,13 +150,13 @@ pub(crate) async fn resolve_root_candidate(
     Ok(Some(candidate))
 }
 
-pub(crate) async fn prepare_resolved_archive<'a>(
+pub(crate) async fn prepare_resolved_archive(
     candidate: &ExtractionCandidate,
     requested_encoding: EncodingMode,
-    history: Option<&'a dyn crate::history::TaskHistoryRecorder>,
+    history: Option<&dyn crate::history::TaskHistoryRecorder>,
     events: &EventSink,
     task_id: &TaskId,
-) -> smartzip_core::Result<ResolvedArchive<'a>> {
+) -> smartzip_core::Result<ResolvedArchive> {
     let archive_input = materialize_archive_input(candidate)?;
     let archive_path = archive_input.path.clone();
     let (sample_hash, sample_size) = match candidate.embedded_offset {
@@ -221,14 +221,13 @@ pub(crate) async fn prepare_resolved_archive<'a>(
         reused_confirmed_encoding,
         zip_encoding_assessment,
         recorder_name,
-        history,
     })
 }
 
 pub(crate) async fn access_archive_with_password<B: ArchiveExecutor>(
     backend: &B,
     passwords: &PasswordService<'_>,
-    resolved: &ResolvedArchive<'_>,
+    resolved: &ResolvedArchive,
     password_candidates: &[PasswordCandidate],
     batch_passwords: &mut Vec<PasswordCandidate>,
     password_prompter: Option<&dyn InteractivePasswordPrompter>,

@@ -2,8 +2,8 @@
   "id": "feat-routing-integration",
   "name": "feat-routing-integration",
   "title": "Port capability-aware routing onto feat history base (clean rewrite)",
-  "description": "Do not hybrid-merge. Keep feat DB/history/CLI behavior as base; rewrite routing from workspace reference (c64f77b) as the single backend stack. Abandoned hybrid checkpoint: integration/feat-plus-routing@5146265.",
-  "status": "planning",
+  "description": "Do not hybrid-merge. Keep feat DB/history/CLI behavior as base; first modularize the overweight engine facade, then rewrite routing from workspace reference (c64f77b) as the single backend stack. Abandoned hybrid checkpoint: integration/feat-plus-routing@5146265.",
+  "status": "completed",
   "dev_type": null,
   "scope": null,
   "package": "workspace",
@@ -11,13 +11,14 @@
   "creator": "charl",
   "assignee": "charl",
   "createdAt": "2026-07-29",
-  "completedAt": null,
+  "completedAt": "2026-07-29",
   "branch": "integration/feat-plus-routing-clean",
   "base_branch": "origin/feat/db-history-persistence",
   "worktree_path": null,
   "commit": null,
   "pr_url": null,
   "subtasks": [
+    "07-29-engine-modularize",
     "07-29-port-routing-core",
     "07-29-port-routing-archive",
     "07-29-port-routing-engine",
@@ -25,6 +26,7 @@
     "07-29-integration-verify"
   ],
   "children": [
+    "07-29-engine-modularize",
     "07-29-port-routing-core",
     "07-29-port-routing-archive",
     "07-29-port-routing-engine",
@@ -40,12 +42,13 @@
     "crates/smartzip-cli/src/main.rs",
     "CONTEXT.md"
   ],
-  "notes": "Reference: wip/routing-gui-worktree (c64f77b). Abandoned hybrid: integration/feat-plus-routing (5146265). Active: integration/feat-plus-routing-clean.",
+  "notes": "Reference: wip/routing-gui-worktree (c64f77b). Abandoned hybrid: integration/feat-plus-routing (5146265). Active: integration/feat-plus-routing-clean. Engine modularize is P0 structural prep before executor retarget.",
   "meta": {
     "decisions": {
       "db": "feat fine-grained only; discard main redo",
+      "engine": "feat behavior freeze; split lib.rs so facade only schedules",
       "routing": "rewrite from workspace reference; no hybrid traits",
-      "strategy": "clean port sequential layers"
+      "strategy": "modularize engine, then clean port routing layers"
     }
   }
 }

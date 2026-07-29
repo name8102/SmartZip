@@ -1,0 +1,37 @@
+{
+  "id": "engine-modularize",
+  "name": "engine-modularize",
+  "title": "Modularize feat engine: thin facade, extract capabilities",
+  "description": "Behavior-preserving split of smartzip-engine lib.rs: SmartZipEngine stays a thin scheduler; password/encoding/nested/access/events/interactive move into dedicated modules. Must complete before ArchiveExecutor retarget. No routing trait rename in this task.",
+  "status": "completed",
+  "package": "smartzip-engine",
+  "priority": "P0",
+  "creator": "charl",
+  "assignee": "charl",
+  "createdAt": "2026-07-29",
+  "completedAt": "2026-07-29",
+  "branch": "integration/feat-plus-routing-clean",
+  "base_branch": "integration/feat-plus-routing-clean",
+  "parent": "07-29-feat-routing-integration",
+  "children": [],
+  "subtasks": [],
+  "relatedFiles": [
+    "crates/smartzip-engine/src/lib.rs",
+    "crates/smartzip-engine/src/history.rs",
+    "crates/smartzip-engine/src/layout.rs",
+    "crates/smartzip-engine/src/materialize.rs",
+    "crates/smartzip-engine/src/detect.rs",
+    "crates/smartzip-engine/src/embedded.rs",
+    "crates/smartzip-engine/tests/smartzip_integration.rs",
+    "crates/smartzip-engine/tests/history_integration.rs",
+    "CONTEXT.md"
+  ],
+  "notes": "Product behavior = feat (confirmed). Problem = single-file weight (~4828 LOC lib.rs), not wrong semantics. Blocks safe 07-29-port-routing-engine. DB/CLI redesign is out of scope; keep current TaskHistoryRecorder call sites stable so later swaps are cheap.",
+  "meta": {
+    "decisions": {
+      "behavior": "freeze feat extract/detect/list/history semantics",
+      "structure": "engine schedules only; capabilities in modules",
+      "backend_trait": "keep ArchiveBackend until port-routing-engine"
+    }
+  }
+}

@@ -70,7 +70,7 @@ pub struct ListArchiveResult {
     pub events: Vec<TaskEvent>,
 }
 
-pub(crate) struct ResolvedArchive<'a> {
+pub(crate) struct ResolvedArchive {
     pub(crate) candidate: ExtractionCandidate,
     pub(crate) archive_path: PathBuf,
     pub(crate) _archive_temp: Option<tempfile::NamedTempFile>,
@@ -81,7 +81,6 @@ pub(crate) struct ResolvedArchive<'a> {
     pub(crate) reused_confirmed_encoding: bool,
     pub(crate) zip_encoding_assessment: Option<ZipEncodingAssessment>,
     pub(crate) recorder_name: Option<String>,
-    pub(crate) history: Option<&'a dyn crate::history::TaskHistoryRecorder>,
 }
 
 #[derive(Debug, Clone)]
