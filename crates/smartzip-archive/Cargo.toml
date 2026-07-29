@@ -9,12 +9,13 @@ rust-version.workspace = true
 [dependencies]
 async-trait.workspace = true
 serde.workspace = true
+smartzip-config.workspace = true
 smartzip-core.workspace = true
 smartzip-encoding.workspace = true
+tempfile.workspace = true
 tokio.workspace = true
 zip.workspace = true
 
 [dev-dependencies]
 crc32fast = "1"
 rstest.workspace = true
-tempfile.workspace = true

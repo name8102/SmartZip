@@ -1,19 +1,34 @@
-use crate::backend::ArchiveBackend;
+use crate::backend::ArchiveAdapter;
 use crate::types::*;
 use async_trait::async_trait;
 use smartzip_core::{ArchiveFormat, Result, SmartZipError};
 use std::fs::File;
-use std::io::{self, Read};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use zip::write::SimpleFileOptions;
 use zip::{ZipArchive, ZipWriter};
 
-#[derive(Debug, Clone, Default)]
-pub struct NativeZipBackend;
+#[derive(Debug, Clone)]
+pub struct NativeZipBackend {
+    id: String,
+}
+
+impl Default for NativeZipBackend {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl NativeZipBackend {
     pub fn new() -> Self {
-        Self
+        Self {
+            id: "native-zip".into(),
+        }
+    }
+
+    pub fn with_id(mut self, id: impl Into<String>) -> Self {
+        self.id = id.into();
+        self
     }
 
     fn open_archive_read(path: &Path) -> Result<ZipArchive<File>> {
@@ -60,28 +75,17 @@ impl NativeZipBackend {
             .by_index(index)
             .map_err(|source| map_zip_error(source, archive_path))
     }
-
-    fn decode_entry_name(
-        raw_name: &[u8],
-        encoding: &smartzip_core::EncodingMode,
-    ) -> Result<String> {
-        match encoding {
-            smartzip_core::EncodingMode::Override(enc) => {
-                smartzip_encoding::decode_name(raw_name, enc).ok_or_else(|| {
-                    SmartZipError::UnsafeArchivePath {
-                        entry: String::from_utf8_lossy(raw_name).into_owned(),
-                    }
-                })
-            }
-            smartzip_core::EncodingMode::Auto => Ok(String::from_utf8_lossy(raw_name).into_owned()),
-        }
-    }
 }
 
 #[async_trait]
-impl ArchiveBackend for NativeZipBackend {
+impl ArchiveAdapter for NativeZipBackend {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
     async fn probe(&self, path: &Path) -> Result<ArchiveProbe> {
-        let mut archive = Self::open_archive_read(path)?;
+        let mut archive = Self::open_archive_read(path)
+            .map_err(|error| with_backend_identity(error, &self.id))?;
         let encrypted = Self::has_encrypted_entries(&mut archive);
         Ok(ArchiveProbe {
             path: path.to_path_buf(),
@@ -92,14 +96,18 @@ impl ArchiveBackend for NativeZipBackend {
     }
 
     async fn list(&self, request: ListRequest) -> Result<ArchiveListing> {
-        let mut archive = Self::open_archive_read(&request.archive)?;
+        let mut archive = Self::open_archive_read(&request.archive)
+            .map_err(|error| with_backend_identity(error, &self.id))?;
         let mut entries = Vec::new();
         for i in 0..archive.len() {
             let entry = archive
                 .by_index_raw(i)
-                .map_err(|source| map_zip_error(source, &request.archive))?;
+                .map_err(|source| map_zip_error(source, &request.archive))
+                .map_err(|error| with_backend_identity(error, &self.id))?;
             let name_bytes = entry.name_raw();
-            let name = Self::decode_entry_name(name_bytes, &request.encoding)?;
+            // Prefer archive metadata UTF-8 (bit11 / 0x7075 rewritten by zip crate),
+            // then caller override, then Bandizip-style auto-detect on raw bytes.
+            let name = decode_entry_name(name_bytes, &request.encoding);
             entries.push(ArchiveEntry {
                 path: PathBuf::from(&name),
                 raw_name: name_bytes.to_vec(),
@@ -116,13 +124,15 @@ impl ArchiveBackend for NativeZipBackend {
     }
 
     async fn test(&self, request: TestRequest) -> Result<TestResult> {
-        let mut archive = Self::open_archive_read(&request.archive)?;
+        let mut archive = Self::open_archive_read(&request.archive)
+            .map_err(|error| with_backend_identity(error, &self.id))?;
         let has_encrypted = Self::has_encrypted_entries(&mut archive);
         let len = archive.len();
         let mut buf = vec![0u8; 8192];
 
         for i in 0..len {
-            let mut entry = Self::open_entry(&mut archive, i, &request.password, &request.archive)?;
+            let mut entry = Self::open_entry(&mut archive, i, &request.password, &request.archive)
+                .map_err(|error| with_backend_identity(error, &self.id))?;
             loop {
                 let n = entry
                     .read(&mut buf)
@@ -142,30 +152,35 @@ impl ArchiveBackend for NativeZipBackend {
     async fn extract(&self, request: ExtractArchiveRequest) -> Result<ExtractArchiveResult> {
         let path = request.archive.clone();
         let password = request.password.clone();
-        tokio::task::spawn_blocking(move || extract_sync(&path, &password, &request))
+        let backend_id = self.id.clone();
+        let result = tokio::task::spawn_blocking(move || extract_sync(&path, &password, &request))
             .await
-            .map_err(|e| SmartZipError::BackendFailed {
-                backend: "native-zip".into(),
+            .map_err(|error| SmartZipError::BackendFailed {
+                backend: backend_id.clone(),
                 exit_code: None,
-                stderr: format!("task join error: {e}"),
-            })?
+                stderr: format!("task join error: {error}"),
+            })?;
+        result.map_err(|error| with_backend_identity(error, &backend_id))
     }
 
     async fn compress(&self, request: CompressArchiveRequest) -> Result<CompressArchiveResult> {
         if request.format != ArchiveFormat::Zip {
-            return Err(SmartZipError::UnsupportedFormat {
+            return Err(SmartZipError::UnsupportedContainer {
+                backend: self.id.clone(),
                 path: request.output.clone(),
-                format: Some(request.format.as_str().to_string()),
+                container: Some(request.format.as_str().to_string()),
             });
         }
         let path = request.output.clone();
-        tokio::task::spawn_blocking(move || compress_sync(&path, &request))
+        let backend_id = self.id.clone();
+        let result = tokio::task::spawn_blocking(move || compress_sync(&path, &request))
             .await
-            .map_err(|e| SmartZipError::BackendFailed {
-                backend: "native-zip".into(),
+            .map_err(|error| SmartZipError::BackendFailed {
+                backend: backend_id.clone(),
                 exit_code: None,
-                stderr: format!("task join error: {e}"),
-            })?
+                stderr: format!("task join error: {error}"),
+            })?;
+        result.map_err(|error| with_backend_identity(error, &backend_id))
     }
 
     fn capabilities(&self) -> BackendCapabilities {
@@ -201,6 +216,28 @@ fn collect_files(input: &Path) -> Result<Vec<PathBuf>> {
     }
     files.sort();
     Ok(files)
+}
+
+
+/// Decode a ZIP entry name using override encoding or auto-detection.
+///
+/// When `raw` is already valid UTF-8 (GPBF bit11 / Info-ZIP 0x7075 handled by
+/// the `zip` crate), that wins. Otherwise Auto runs the Bandizip-inspired
+/// detector; Override forces a specific encoding_rs label.
+fn decode_entry_name(raw: &[u8], encoding: &smartzip_core::EncodingMode) -> String {
+    match encoding {
+        smartzip_core::EncodingMode::Override(enc) => smartzip_encoding::decode_name(raw, enc)
+            .or_else(|| decode_name_auto(raw))
+            .unwrap_or_else(|| String::from_utf8_lossy(raw).into_owned()),
+        smartzip_core::EncodingMode::Auto => decode_name_auto(raw)
+            .unwrap_or_else(|| String::from_utf8_lossy(raw).into_owned()),
+    }
+}
+
+fn decode_name_auto(raw: &[u8]) -> Option<String> {
+    let mut detector = smartzip_encoding::ArchiveEncodingDetector::new();
+    let detected = detector.detect(raw);
+    smartzip_encoding::decode_name(raw, &detected.selected)
 }
 
 fn extract_sync(
@@ -267,26 +304,29 @@ fn extract_sync(
         }
 
         let raw_name = entry.name_raw();
-        let relative_path = match &request.encoding {
-            smartzip_core::EncodingMode::Override(_) => {
-                let decoded = NativeZipBackend::decode_entry_name(raw_name, &request.encoding)?;
-                crate::safety::safe_entry_path(decoded.as_bytes())
-                    .ok_or(SmartZipError::UnsafeArchivePath { entry: decoded })?
-            }
-            smartzip_core::EncodingMode::Auto => crate::safety::safe_entry_path(raw_name)
-                .ok_or_else(|| SmartZipError::UnsafeArchivePath {
-                    entry: String::from_utf8_lossy(raw_name).into_owned(),
-                })?,
-        };
+        let decoded_name = decode_entry_name(raw_name, &request.encoding);
+        let relative_path = crate::safety::safe_entry_path(decoded_name.as_bytes()).ok_or(
+            SmartZipError::UnsafeArchivePath {
+                entry: decoded_name,
+            },
+        )?;
+        let output_path = request.output_dir.join(relative_path);
+
         if entry.is_dir() {
-            create_output_dir(&request.output_dir, &relative_path)?;
+            std::fs::create_dir_all(&output_path)
+                .map_err(|source| SmartZipError::io(Some(output_path.clone()), source))?;
             continue;
         }
 
-        let (mut outfile, actual_output_path) =
-            create_output_file(&request.output_dir, &relative_path)?;
+        if let Some(parent) = output_path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|source| SmartZipError::io(Some(parent.to_path_buf()), source))?;
+        }
+
+        let mut outfile = File::create(&output_path)
+            .map_err(|source| SmartZipError::io(Some(output_path.clone()), source))?;
         let written = std::io::copy(&mut entry, &mut outfile)
-            .map_err(|source| SmartZipError::io(Some(actual_output_path), source))?;
+            .map_err(|source| SmartZipError::io(Some(output_path), source))?;
         total_written += written;
 
         if total_written > limits.max_total_output_bytes {
@@ -304,43 +344,6 @@ fn extract_sync(
     Ok(ExtractArchiveResult {
         output_dir: request.output_dir.clone(),
     })
-}
-
-fn create_output_dir(output_root: &Path, relative_path: &Path) -> Result<PathBuf> {
-    let output_path = output_root.join(relative_path);
-    match std::fs::create_dir_all(&output_path) {
-        Ok(()) => Ok(output_path),
-        Err(source) if source.kind() == io::ErrorKind::InvalidFilename => {
-            let fallback =
-                output_root.join(crate::safety::shorten_overlong_components(relative_path));
-            std::fs::create_dir_all(&fallback)
-                .map_err(|source| SmartZipError::io(Some(fallback.clone()), source))?;
-            Ok(fallback)
-        }
-        Err(source) => Err(SmartZipError::io(Some(output_path), source)),
-    }
-}
-
-fn create_output_file(output_root: &Path, relative_path: &Path) -> Result<(File, PathBuf)> {
-    let output_path = output_root.join(relative_path);
-    match create_file_and_parents(&output_path) {
-        Ok(file) => Ok((file, output_path)),
-        Err(source) if source.kind() == io::ErrorKind::InvalidFilename => {
-            let fallback =
-                output_root.join(crate::safety::shorten_overlong_components(relative_path));
-            let file = create_file_and_parents(&fallback)
-                .map_err(|source| SmartZipError::io(Some(fallback.clone()), source))?;
-            Ok((file, fallback))
-        }
-        Err(source) => Err(SmartZipError::io(Some(output_path), source)),
-    }
-}
-
-fn create_file_and_parents(path: &Path) -> io::Result<File> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    File::create(path)
 }
 
 fn compress_sync(
@@ -381,11 +384,37 @@ fn compress_sync(
     })
 }
 
+fn with_backend_identity(error: SmartZipError, backend_id: &str) -> SmartZipError {
+    match error {
+        SmartZipError::UnsupportedContainer {
+            path, container, ..
+        } => SmartZipError::UnsupportedContainer {
+            backend: backend_id.to_owned(),
+            path,
+            container,
+        },
+        SmartZipError::UnsupportedCodec { path, codec, .. } => SmartZipError::UnsupportedCodec {
+            backend: backend_id.to_owned(),
+            path,
+            codec,
+        },
+        SmartZipError::BackendFailed {
+            exit_code, stderr, ..
+        } => SmartZipError::BackendFailed {
+            backend: backend_id.to_owned(),
+            exit_code,
+            stderr,
+        },
+        other => other,
+    }
+}
+
 fn map_zip_error(source: zip::result::ZipError, path: &Path) -> SmartZipError {
     match source {
-        zip::result::ZipError::UnsupportedArchive(feature) => SmartZipError::UnsupportedFormat {
+        zip::result::ZipError::UnsupportedArchive(feature) => SmartZipError::UnsupportedCodec {
+            backend: "native-zip".into(),
             path: path.to_path_buf(),
-            format: Some(feature.to_string()),
+            codec: Some(feature.to_string()),
         },
         zip::result::ZipError::Io(source) => SmartZipError::io(Some(path.to_path_buf()), source),
         zip::result::ZipError::InvalidArchive(detail) => SmartZipError::CorruptedArchive {
@@ -906,46 +935,6 @@ mod tests {
     // ── Tests: path safety ───────────────────────────────────────────
 
     #[tokio::test]
-    async fn native_zip_extract_retries_with_stable_name_after_filename_too_long() {
-        let temp = tempfile::tempdir().unwrap();
-        let archive = temp.path().join("long-name.zip");
-        let long_name = format!("{}.txt", "a".repeat(300));
-        let file = File::create(&archive).unwrap();
-        let mut writer = ZipWriter::new(file);
-        writer
-            .start_file(&long_name, SimpleFileOptions::default())
-            .unwrap();
-        writer.write_all(b"long filename content").unwrap();
-        writer.finish().unwrap();
-
-        let backend = NativeZipBackend::new();
-        let output_dir = temp.path().join("output");
-        backend
-            .extract(ExtractArchiveRequest {
-                archive,
-                format: Some(ArchiveFormat::Zip),
-                output_dir: output_dir.clone(),
-                password: None,
-                encoding: EncodingMode::Auto,
-            })
-            .await
-            .unwrap();
-
-        let extracted: Vec<_> = std::fs::read_dir(&output_dir)
-            .unwrap()
-            .map(|entry| entry.unwrap().path())
-            .collect();
-        assert_eq!(extracted.len(), 1);
-        assert_eq!(
-            std::fs::read(&extracted[0]).unwrap(),
-            b"long filename content"
-        );
-        let extracted_name = extracted[0].file_name().unwrap().to_string_lossy();
-        assert!(extracted_name.len() < long_name.len());
-        assert!(extracted_name.ends_with(".txt"));
-    }
-
-    #[tokio::test]
     async fn native_zip_extract_rejects_zip_slip() {
         let temp = tempfile::tempdir().unwrap();
         let archive = temp.path().join("zipslip.zip");
@@ -1064,8 +1053,9 @@ mod tests {
             .unwrap();
         assert_eq!(listing.entries.len(), 1);
         assert_eq!(listing.entries[0].raw_name, gbk_name);
-        // path is lossy-converted but raw_name preserves original bytes
-        assert!(listing.entries[0].raw_name == gbk_name);
+        // raw_name keeps original bytes; path is auto-decoded under EncodingMode::Auto.
+        let expected = smartzip_encoding::decode_name(gbk_name, "gbk").unwrap();
+        assert_eq!(listing.entries[0].path, PathBuf::from(&expected));
     }
 
     #[tokio::test]
@@ -1089,55 +1079,36 @@ mod tests {
             .unwrap();
         assert_eq!(listing.entries.len(), 1);
         assert_eq!(listing.entries[0].raw_name, sjis_name);
+        let expected = smartzip_encoding::decode_name(sjis_name, "shift_jis").unwrap();
+        assert_eq!(listing.entries[0].path, PathBuf::from(&expected));
     }
 
     #[tokio::test]
-    async fn native_zip_list_override_encoding_gbk_decodes_display_path() {
+    async fn native_zip_extract_auto_encoding_gbk() {
         let temp = tempfile::tempdir().unwrap();
         let archive = temp.path().join("gbk.zip");
-        let gbk_name = b"\xb2\xe2\xca\xd4\xce\xc4\xbc\xfe.txt";
-        create_raw_zip_with_encoding(&archive, &[(gbk_name, b"hello")]);
+        // Longer sample so Auto can score GBK over other CJK pages.
+        let gbk_name =
+            b"\xC4\xE3\xBA\xC3\xCA\xC0\xBD\xE7\xBB\xB6\xD3\xAD.txt"; // 你好世界欢迎.txt
+        let content = b"content";
+        create_raw_zip_with_encoding(&archive, &[(gbk_name, content)]);
 
         let backend = NativeZipBackend::new();
-        let listing = backend
-            .list(ListRequest {
+        let output_dir = temp.path().join("output");
+        backend
+            .extract(ExtractArchiveRequest {
                 archive,
                 format: Some(ArchiveFormat::Zip),
+                output_dir: output_dir.clone(),
                 password: None,
-                encoding: EncodingMode::Override("gb18030".into()),
+                encoding: EncodingMode::Auto,
             })
             .await
             .unwrap();
-
-        assert_eq!(listing.entries.len(), 1);
-        assert_eq!(
-            listing.entries[0].path,
-            PathBuf::from(smartzip_encoding::decode_name(gbk_name, "gb18030").unwrap())
-        );
-    }
-
-    #[tokio::test]
-    async fn native_zip_list_override_encoding_shift_jis_decodes_display_path() {
-        let temp = tempfile::tempdir().unwrap();
-        let archive = temp.path().join("sjis.zip");
-        let sjis_name = b"\x83\x65\x83\x58\x83\x67.txt";
-        create_raw_zip_with_encoding(&archive, &[(sjis_name, b"hello")]);
-
-        let backend = NativeZipBackend::new();
-        let listing = backend
-            .list(ListRequest {
-                archive,
-                format: Some(ArchiveFormat::Zip),
-                password: None,
-                encoding: EncodingMode::Override("shift_jis".into()),
-            })
-            .await
-            .unwrap();
-
-        assert_eq!(listing.entries.len(), 1);
-        assert_eq!(
-            listing.entries[0].path,
-            PathBuf::from(smartzip_encoding::decode_name(sjis_name, "shift_jis").unwrap())
+        let expected_name = smartzip_encoding::decode_name(gbk_name, "gbk").unwrap();
+        assert!(
+            output_dir.join(&expected_name).exists(),
+            "expected auto-decoded path {expected_name}"
         );
     }
 

@@ -1,13 +1,88 @@
-use crate::backend::{ArchiveBackend, ExtractionProgressCallback};
+use crate::backend::ArchiveAdapter;
 use crate::types::*;
 use async_trait::async_trait;
 use smartzip_core::{ArchiveFormat, Result, SmartZipError};
-use std::fs::File;
-use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use tokio::io::{AsyncRead, AsyncReadExt};
+use std::sync::Arc;
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SevenZipOperation {
+    Extract,
+    Test,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SevenZipDiagnosticSeverity {
+    Warning,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum SevenZipEvent {
+    Progress {
+        operation: SevenZipOperation,
+        percent: f32,
+        item: Option<String>,
+    },
+    Diagnostic {
+        severity: SevenZipDiagnosticSeverity,
+        text: String,
+    },
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SevenZipReport {
+    pub warnings: Vec<String>,
+    pub errors: Vec<String>,
+    pub archive_type: Option<String>,
+    pub physical_size: Option<u64>,
+    pub encrypted: Option<bool>,
+    pub files: Option<u64>,
+    pub folders: Option<u64>,
+    pub unpacked_size: Option<u64>,
+    pub compressed_size: Option<u64>,
+    pub elapsed_millis: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SevenZipExitStatus {
+    Success,
+    Warning,
+    Fatal,
+    CommandLineError,
+    OutOfMemory,
+    Cancelled,
+    Unknown(Option<i32>),
+}
+
+impl SevenZipExitStatus {
+    fn from_code(code: Option<i32>) -> Self {
+        match code {
+            Some(0) => Self::Success,
+            Some(1) => Self::Warning,
+            Some(2) => Self::Fatal,
+            Some(7) => Self::CommandLineError,
+            Some(8) => Self::OutOfMemory,
+            Some(255) => Self::Cancelled,
+            code => Self::Unknown(code),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SevenZipResult<T> {
+    /// Present only for an unambiguous exit-0 completion.
+    pub value: Option<T>,
+    pub report: SevenZipReport,
+    pub status: SevenZipExitStatus,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+type Observer = Arc<dyn Fn(SevenZipEvent) + Send + Sync>;
 
 #[derive(Debug, Clone)]
 pub struct SevenZipLocator {
@@ -33,30 +108,78 @@ impl SevenZipLocator {
     }
 
     pub fn locate(&self) -> Option<PathBuf> {
+        self.locate_all().into_iter().next()
+    }
+
+    /// Find every independent installation, normalized and deduplicated by path.
+    pub fn locate_all(&self) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
         if let Some(path) = &self.bundled {
             if path.exists() {
-                return Some(path.clone());
+                paths.push(normalize_executable_path(path));
             }
         }
-
-        self.candidates.iter().find_map(|candidate| {
-            std::env::var_os("PATH").and_then(|paths| {
-                std::env::split_paths(&paths)
-                    .map(|dir| dir.join(candidate))
-                    .find(|path| path.exists())
-            })
-        })
+        if let Some(search_path) = std::env::var_os("PATH") {
+            for candidate in &self.candidates {
+                for directory in std::env::split_paths(&search_path) {
+                    let path = directory.join(candidate);
+                    if path.exists() {
+                        let path = normalize_executable_path(&path);
+                        if !paths.contains(&path) {
+                            paths.push(path);
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        paths
     }
 }
 
-#[derive(Debug, Clone)]
+fn normalize_executable_path(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+#[derive(Clone)]
 pub struct SevenZipBackend {
+    id: String,
     executable: PathBuf,
+    observer: Option<Observer>,
+}
+
+impl std::fmt::Debug for SevenZipBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SevenZipBackend")
+            .field("id", &self.id)
+            .field("executable", &self.executable)
+            .field("has_observer", &self.observer.is_some())
+            .finish()
+    }
 }
 
 impl SevenZipBackend {
     pub fn new(executable: PathBuf) -> Self {
-        Self { executable }
+        let executable = normalize_executable_path(&executable);
+        let id = format!("sevenzip:{}", executable.display());
+        Self {
+            id,
+            executable,
+            observer: None,
+        }
+    }
+
+    pub fn with_id(mut self, id: impl Into<String>) -> Self {
+        self.id = id.into();
+        self
+    }
+
+    pub fn with_observer(
+        mut self,
+        observer: impl Fn(SevenZipEvent) + Send + Sync + 'static,
+    ) -> Self {
+        self.observer = Some(Arc::new(observer));
+        self
     }
 
     pub fn locate(locator: &SevenZipLocator) -> Result<Self> {
@@ -72,13 +195,23 @@ impl SevenZipBackend {
         &self.executable
     }
 
+    fn map_start_error(&self, source: std::io::Error) -> SmartZipError {
+        if source.kind() == std::io::ErrorKind::NotFound {
+            SmartZipError::BackendUnavailable {
+                backend: self.id.clone(),
+            }
+        } else {
+            SmartZipError::io(Some(self.executable.clone()), source)
+        }
+    }
+
     async fn run(&self, args: &[String]) -> Result<BackendCommandOutput> {
         let output = Command::new(&self.executable)
             .args(args)
             .stdin(Stdio::null())
             .output()
             .await
-            .map_err(|source| SmartZipError::io(Some(self.executable.clone()), source))?;
+            .map_err(|source| self.map_start_error(source))?;
 
         Ok(BackendCommandOutput {
             status: output.status.code(),
@@ -87,10 +220,10 @@ impl SevenZipBackend {
         })
     }
 
-    async fn run_with_progress(
+    async fn run_streaming(
         &self,
         args: &[String],
-        progress: Option<ExtractionProgressCallback>,
+        operation: SevenZipOperation,
     ) -> Result<BackendCommandOutput> {
         let mut child = Command::new(&self.executable)
             .args(args)
@@ -98,49 +231,47 @@ impl SevenZipBackend {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
+            .map_err(|source| self.map_start_error(source))?;
+        let stdout = child.stdout.take().ok_or_else(|| {
+            SmartZipError::io(
+                Some(self.executable.clone()),
+                std::io::Error::other("7z child stdout pipe was unavailable"),
+            )
+        })?;
+        let stderr = child.stderr.take().ok_or_else(|| {
+            SmartZipError::io(
+                Some(self.executable.clone()),
+                std::io::Error::other("7z child stderr pipe was unavailable"),
+            )
+        })?;
+        let observer = self.observer.clone();
+        let stdout_task = tokio::spawn(read_stream(stdout, observer.clone(), Some(operation)));
+        let stderr_task = tokio::spawn(read_stream(stderr, observer, None));
+        let status = child
+            .wait()
+            .await
             .map_err(|source| SmartZipError::io(Some(self.executable.clone()), source))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| SmartZipError::BackendFailed {
+        let stdout = stdout_task
+            .await
+            .map_err(|source| SmartZipError::BackendFailed {
                 backend: "7zz".into(),
-                exit_code: None,
-                stderr: "failed to capture 7z stdout".into(),
-            })?;
-        let mut stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| SmartZipError::BackendFailed {
+                exit_code: status.code(),
+                stderr: source.to_string(),
+            })?
+            .map_err(|source| SmartZipError::io(None, source))?;
+        let stderr = stderr_task
+            .await
+            .map_err(|source| SmartZipError::BackendFailed {
                 backend: "7zz".into(),
-                exit_code: None,
-                stderr: "failed to capture 7z stderr".into(),
-            })?;
-
-        let stdout_future = read_progress_stream(stdout, progress);
-        let stderr_future = async {
-            let mut bytes = Vec::new();
-            stderr.read_to_end(&mut bytes).await?;
-            Ok::<_, std::io::Error>(bytes)
-        };
-        let wait_future = child.wait();
-        let (stdout, stderr, status) = tokio::try_join!(stdout_future, stderr_future, wait_future)
-            .map_err(|source| SmartZipError::io(Some(self.executable.clone()), source))?;
-
+                exit_code: status.code(),
+                stderr: source.to_string(),
+            })?
+            .map_err(|source| SmartZipError::io(None, source))?;
         Ok(BackendCommandOutput {
             status: status.code(),
             stdout: String::from_utf8_lossy(&stdout).into_owned(),
             stderr: String::from_utf8_lossy(&stderr).into_owned(),
         })
-    }
-
-    fn output_indicates_failure(output: &BackendCommandOutput) -> bool {
-        let combined = format!("{}\n{}", output.stdout, output.stderr);
-        let lower = combined.to_ascii_lowercase();
-        lower.contains("error:")
-            || lower.contains("errors:")
-            || lower.contains("headers error")
-            || lower.contains("unexpected end of archive")
-            || lower.contains("can not open the file as archive")
     }
 
     fn encoding_arg(encoding: &smartzip_core::EncodingMode) -> Option<String> {
@@ -166,24 +297,138 @@ impl SevenZipBackend {
     fn map_failure(&self, output: &BackendCommandOutput, path: &Path) -> SmartZipError {
         let combined = format!("{}\n{}", output.stdout, output.stderr);
         let lower = combined.to_lowercase();
-        if lower.contains("wrong password")
-            || (lower.contains("password") && lower.contains("error"))
-        {
+        if output.status == Some(255) {
+            return SmartZipError::Cancelled;
+        }
+        if lower.contains("wrong password") || lower.contains("can not open encrypted archive") {
             SmartZipError::WrongPassword {
                 path: path.to_path_buf(),
             }
-        } else if lower.contains("unsupported") {
-            SmartZipError::UnsupportedFormat {
+        } else if lower.contains("password is required") || lower.contains("enter password") {
+            SmartZipError::PasswordRequired {
                 path: path.to_path_buf(),
-                format: None,
             }
+        } else if lower.contains("crc failed")
+            || lower.contains("data error")
+            || lower.contains("unexpected end of data")
+            || lower.contains("unexpected end of archive")
+        {
+            SmartZipError::CorruptedArchive {
+                path: path.to_path_buf(),
+                detail: combined,
+            }
+        } else if lower.contains("unsupported method") {
+            SmartZipError::UnsupportedCodec {
+                backend: self.id.clone(),
+                path: path.to_path_buf(),
+                codec: extract_unsupported_method(&combined),
+            }
+        } else if lower.contains("is not archive")
+            || lower.contains("as archive")
+            || lower.contains("unsupported archive")
+        {
+            SmartZipError::UnsupportedContainer {
+                backend: self.id.clone(),
+                path: path.to_path_buf(),
+                container: None,
+            }
+        } else if lower.contains("no such file")
+            || lower.contains("the system cannot find the file")
+            || lower.contains("cannot find the file")
+            || lower.contains("file not found")
+        {
+            SmartZipError::io(
+                Some(path.to_path_buf()),
+                std::io::Error::new(std::io::ErrorKind::NotFound, combined),
+            )
+        } else if lower.contains("permission denied") || lower.contains("access is denied") {
+            SmartZipError::io(
+                Some(path.to_path_buf()),
+                std::io::Error::new(std::io::ErrorKind::PermissionDenied, combined),
+            )
         } else {
             SmartZipError::BackendFailed {
-                backend: "7zz".into(),
+                backend: self.id.clone(),
                 exit_code: output.status,
                 stderr: combined,
             }
         }
+    }
+
+    fn map_reported_failure<T>(&self, result: &SevenZipResult<T>, path: &Path) -> SmartZipError {
+        let status = match result.status {
+            SevenZipExitStatus::Success => Some(0),
+            SevenZipExitStatus::Warning => Some(1),
+            SevenZipExitStatus::Fatal => Some(2),
+            SevenZipExitStatus::CommandLineError => Some(7),
+            SevenZipExitStatus::OutOfMemory => Some(8),
+            SevenZipExitStatus::Cancelled => Some(255),
+            SevenZipExitStatus::Unknown(code) => code,
+        };
+        self.map_failure(
+            &BackendCommandOutput {
+                status,
+                stdout: result.stdout.clone(),
+                stderr: result.stderr.clone(),
+            },
+            path,
+        )
+    }
+
+    pub async fn test_with_report(
+        &self,
+        request: TestRequest,
+    ) -> Result<SevenZipResult<TestResult>> {
+        let mut args: Vec<String> = vec!["t".into(), "-bsp1".into()];
+        if let Some(pw) = Self::password_arg(&request.password) {
+            args.push(pw);
+        }
+        if let Some(enc) = Self::encoding_arg(&request.encoding) {
+            args.push(enc);
+        }
+        args.push(request.archive.to_string_lossy().into_owned());
+        let output = self.run_streaming(&args, SevenZipOperation::Test).await?;
+        let report = parse_report(&format!("{}\n{}", output.stdout, output.stderr));
+        let status = SevenZipExitStatus::from_code(output.status);
+        Ok(SevenZipResult {
+            value: (status == SevenZipExitStatus::Success).then_some(TestResult {
+                ok: true,
+                encrypted: report.encrypted,
+            }),
+            report,
+            status,
+            stdout: output.stdout,
+            stderr: output.stderr,
+        })
+    }
+
+    pub async fn extract_with_report(
+        &self,
+        request: ExtractArchiveRequest,
+    ) -> Result<SevenZipResult<ExtractArchiveResult>> {
+        let mut args: Vec<String> = vec!["x".into(), "-y".into(), "-bsp1".into()];
+        if let Some(pw) = Self::password_arg(&request.password) {
+            args.push(pw);
+        }
+        if let Some(enc) = Self::encoding_arg(&request.encoding) {
+            args.push(enc);
+        }
+        args.push(format!("-o{}", request.output_dir.display()));
+        args.push(request.archive.to_string_lossy().into_owned());
+        let output = self
+            .run_streaming(&args, SevenZipOperation::Extract)
+            .await?;
+        let report = parse_report(&format!("{}\n{}", output.stdout, output.stderr));
+        let status = SevenZipExitStatus::from_code(output.status);
+        Ok(SevenZipResult {
+            value: (status == SevenZipExitStatus::Success).then_some(ExtractArchiveResult {
+                output_dir: request.output_dir,
+            }),
+            report,
+            status,
+            stdout: output.stdout,
+            stderr: output.stderr,
+        })
     }
 
     fn password_arg(password: &Option<String>) -> Option<String> {
@@ -197,66 +442,32 @@ impl SevenZipBackend {
     }
 }
 
-fn cheap_probe_format(path: &Path) -> Option<ArchiveFormat> {
-    let mut file = File::open(path).ok()?;
-    let mut buf = [0u8; 512];
-    let n = file.read(&mut buf).ok()?;
-    let bytes = &buf[..n];
-
-    if bytes.starts_with(b"PK\x03\x04") || bytes.starts_with(b"PK\x05\x06") {
-        return Some(ArchiveFormat::Zip);
-    }
-    if bytes.starts_with(b"Rar!\x1a\x07\x00") || bytes.starts_with(b"Rar!\x1a\x07\x01\x00") {
-        return Some(ArchiveFormat::Rar);
-    }
-    if bytes.starts_with(b"\x37\x7a\xbc\xaf\x27\x1c") {
-        return Some(ArchiveFormat::SevenZip);
-    }
-    if bytes.starts_with(b"\x1f\x8b") {
-        return Some(ArchiveFormat::Gzip);
-    }
-    if bytes.starts_with(b"BZh") || bytes.starts_with(b"BZ") {
-        return Some(ArchiveFormat::Bzip2);
-    }
-    if bytes.starts_with(b"\xfd\x37\x7a\x58\x5a\x00") {
-        return Some(ArchiveFormat::Xz);
-    }
-    if bytes.len() >= 263 && &bytes[257..263] == b"ustar\0" {
-        return Some(ArchiveFormat::Tar);
-    }
-
-    match path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .map(|extension| extension.to_ascii_lowercase())
-        .as_deref()
-    {
-        Some("7z") => Some(ArchiveFormat::SevenZip),
-        Some("rar") => Some(ArchiveFormat::Rar),
-        Some("tar") => Some(ArchiveFormat::Tar),
-        Some("gz") | Some("tgz") => Some(ArchiveFormat::Gzip),
-        Some("bz2") | Some("tbz2") => Some(ArchiveFormat::Bzip2),
-        Some("xz") | Some("txz") => Some(ArchiveFormat::Xz),
-        Some("cab") => Some(ArchiveFormat::Cab),
-        Some("iso") => Some(ArchiveFormat::Iso),
-        Some("dmg") => Some(ArchiveFormat::Dmg),
-        Some("zst") | Some("zstd") => Some(ArchiveFormat::Zstd),
-        Some("lz4") => Some(ArchiveFormat::Lz4),
-        Some("lzma") => Some(ArchiveFormat::Lzma),
-        Some("zip") => Some(ArchiveFormat::Zip),
-        _ => None,
-    }
-}
-
 #[async_trait]
-impl ArchiveBackend for SevenZipBackend {
+impl ArchiveAdapter for SevenZipBackend {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
     async fn probe(&self, path: &Path) -> Result<ArchiveProbe> {
-        let format = cheap_probe_format(path);
+        let request = TestRequest {
+            archive: path.to_path_buf(),
+            format: None,
+            password: Some(String::new()),
+            encoding: smartzip_core::EncodingMode::Auto,
+        };
+        let result = self.test(request).await;
+        let (supported, encrypted) = match result {
+            Ok(result) => (result.ok, result.encrypted),
+            Err(SmartZipError::WrongPassword { .. })
+            | Err(SmartZipError::PasswordRequired { .. }) => (true, Some(true)),
+            Err(SmartZipError::UnsupportedContainer { .. }) => (false, None),
+            Err(error) => return Err(error),
+        };
         Ok(ArchiveProbe {
             path: path.to_path_buf(),
-            format: format.clone(),
-            encrypted: None,
-            supported: format.is_some(),
+            format: None,
+            encrypted,
+            supported,
         })
     }
 
@@ -270,66 +481,38 @@ impl ArchiveBackend for SevenZipBackend {
         }
         args.push(request.archive.to_string_lossy().into_owned());
         let output = self.run(&args).await?;
-        if output.status != Some(0) || Self::output_indicates_failure(&output) {
+        if output.status != Some(0) {
             return Err(self.map_failure(&output, &request.archive));
         }
+        let report = parse_slt_archive_report(&output.stdout);
         Ok(ArchiveListing {
-            format: None,
+            format: report.archive_type.as_deref().map(parse_archive_format),
             entries: parse_entries(&output.stdout),
         })
     }
 
     async fn test(&self, request: TestRequest) -> Result<TestResult> {
-        let mut args: Vec<String> = vec!["t".into()];
-        if let Some(pw) = Self::password_arg(&request.password) {
-            args.push(pw);
+        let path = request.archive.clone();
+        let result = self.test_with_report(request).await?;
+        if result.value.is_none() {
+            return Err(self.map_reported_failure(&result, &path));
         }
-        if let Some(enc) = Self::encoding_arg(&request.encoding) {
-            args.push(enc);
+        match result.value {
+            Some(value) => Ok(value),
+            None => unreachable!("checked above"),
         }
-        args.push(request.archive.to_string_lossy().into_owned());
-        let output = self.run(&args).await?;
-        if output.status != Some(0) || Self::output_indicates_failure(&output) {
-            return Err(self.map_failure(&output, &request.archive));
-        }
-        Ok(TestResult {
-            ok: true,
-            encrypted: None,
-        })
     }
 
     async fn extract(&self, request: ExtractArchiveRequest) -> Result<ExtractArchiveResult> {
-        self.extract_with_progress(request, None).await
-    }
-
-    async fn extract_with_progress(
-        &self,
-        request: ExtractArchiveRequest,
-        progress: Option<ExtractionProgressCallback>,
-    ) -> Result<ExtractArchiveResult> {
-        let mut args: Vec<String> = vec!["x".into(), "-y".into()];
-        if progress.is_some() {
-            args.push("-bsp1".into());
+        let path = request.archive.clone();
+        let result = self.extract_with_report(request).await?;
+        if result.value.is_none() {
+            return Err(self.map_reported_failure(&result, &path));
         }
-        if let Some(pw) = Self::password_arg(&request.password) {
-            args.push(pw);
+        match result.value {
+            Some(value) => Ok(value),
+            None => unreachable!("checked above"),
         }
-        if let Some(enc) = Self::encoding_arg(&request.encoding) {
-            args.push(enc);
-        }
-        args.push(format!("-o{}", request.output_dir.display()));
-        args.push(request.archive.to_string_lossy().into_owned());
-        let completion_callback = progress.clone();
-        let output = self.run_with_progress(&args, progress).await?;
-        if output.status != Some(0) || Self::output_indicates_failure(&output) {
-            return Err(self.map_failure(&output, &request.archive));
-        }
-        if let Some(callback) = completion_callback {
-            callback(100.0);
-        }
-        Ok(ExtractArchiveResult {
-            output_dir: request.output_dir,
-        })
     }
 
     async fn compress(&self, request: CompressArchiveRequest) -> Result<CompressArchiveResult> {
@@ -371,91 +554,45 @@ impl ArchiveBackend for SevenZipBackend {
             supports_test: true,
         }
     }
-
-    fn should_test_before_extract(&self, _archive: &Path, _format: Option<&ArchiveFormat>) -> bool {
-        false
-    }
 }
 
-async fn read_progress_stream(
-    mut reader: impl AsyncRead + Unpin,
-    progress: Option<ExtractionProgressCallback>,
-) -> std::io::Result<Vec<u8>> {
-    let mut output = Vec::new();
-    let mut pending = Vec::new();
-    let mut buffer = [0u8; 4096];
-    let mut last_percent = None;
-
-    loop {
-        let read = reader.read(&mut buffer).await?;
-        if read == 0 {
-            break;
-        }
-        output.extend_from_slice(&buffer[..read]);
-        pending.extend_from_slice(&buffer[..read]);
-
-        let mut start = 0;
-        for index in 0..pending.len() {
-            if matches!(pending[index], b'\r' | b'\n') {
-                report_progress(&pending[start..index], &progress, &mut last_percent);
-                start = index + 1;
-            }
-        }
-        if start > 0 {
-            pending.drain(..start);
-        }
-    }
-    report_progress(&pending, &progress, &mut last_percent);
-    Ok(output)
-}
-
-fn report_progress(
-    line: &[u8],
-    callback: &Option<ExtractionProgressCallback>,
-    last_percent: &mut Option<u8>,
-) {
-    let Some(percent) = parse_progress_percent(line) else {
-        return;
-    };
-    if last_percent.replace(percent) != Some(percent) {
-        if let Some(callback) = callback {
-            callback(f32::from(percent));
-        }
-    }
-}
-
-fn parse_progress_percent(line: &[u8]) -> Option<u8> {
-    let percent_index = line.iter().position(|byte| *byte == b'%')?;
-    let digits_end = line[..percent_index]
-        .iter()
-        .rposition(|byte| byte.is_ascii_digit())?
-        + 1;
-    let digits_start = line[..digits_end]
-        .iter()
-        .rposition(|byte| !byte.is_ascii_digit())
-        .map_or(0, |index| index + 1);
-    let value = std::str::from_utf8(&line[digits_start..digits_end])
-        .ok()?
-        .parse::<u8>()
-        .ok()?;
-    (value <= 100).then_some(value)
+fn extract_unsupported_method(output: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        let lower = line.to_ascii_lowercase();
+        let index = lower.find("unsupported method")?;
+        let value = line[index + "unsupported method".len()..]
+            .trim_start_matches([' ', ':', '='])
+            .trim();
+        (!value.is_empty()
+            && !value
+                .chars()
+                .any(|character| character.is_ascii_lowercase())
+            && value.chars().all(|character| {
+                character.is_ascii_uppercase()
+                    || character.is_ascii_digit()
+                    || matches!(character, '-' | '_' | ':')
+            }))
+        .then(|| value.to_ascii_lowercase())
+    })
 }
 
 fn parse_entries(stdout: &str) -> Vec<ArchiveEntry> {
     let mut entries = Vec::new();
     let mut current_path: Option<PathBuf> = None;
     let mut current_size: Option<u64> = None;
+    let mut current_packed_size: Option<u64> = None;
     let mut current_is_dir = false;
     let mut current_is_archive = false;
 
-    for line in stdout.lines() {
+    for line in stdout.split_terminator('\n') {
+        let line = line.strip_suffix('\r').unwrap_or(line);
         if let Some(path) = line.strip_prefix("Path = ") {
             if let Some(path) = current_path.take() {
                 if !current_is_archive {
                     entries.push(ArchiveEntry {
                         path,
                         raw_name: Vec::new(),
-                        compressed_size: None,
+                        compressed_size: current_packed_size,
                         uncompressed_size: current_size,
                         is_dir: current_is_dir,
                     });
@@ -463,12 +600,15 @@ fn parse_entries(stdout: &str) -> Vec<ArchiveEntry> {
             }
             current_path = Some(PathBuf::from(path));
             current_size = None;
+            current_packed_size = None;
             current_is_dir = false;
             current_is_archive = false;
         } else if let Some(_type) = line.strip_prefix("Type = ") {
             current_is_archive = true;
         } else if let Some(size) = line.strip_prefix("Size = ") {
             current_size = size.parse().ok();
+        } else if let Some(size) = line.strip_prefix("Packed Size = ") {
+            current_packed_size = size.parse().ok();
         } else if let Some(attributes) = line.strip_prefix("Attributes = ") {
             current_is_dir = attributes.contains('D');
         }
@@ -479,7 +619,7 @@ fn parse_entries(stdout: &str) -> Vec<ArchiveEntry> {
             entries.push(ArchiveEntry {
                 path,
                 raw_name: Vec::new(),
-                compressed_size: None,
+                compressed_size: current_packed_size,
                 uncompressed_size: current_size,
                 is_dir: current_is_dir,
             });
@@ -489,9 +629,196 @@ fn parse_entries(stdout: &str) -> Vec<ArchiveEntry> {
     entries
 }
 
+const MAX_RECORD: usize = 64 * 1024;
+
+async fn read_stream<R: tokio::io::AsyncRead + Unpin>(
+    mut reader: R,
+    observer: Option<Observer>,
+    operation: Option<SevenZipOperation>,
+) -> std::io::Result<Vec<u8>> {
+    let mut raw = Vec::new();
+    let mut record = Vec::new();
+    let mut oversized = false;
+    let mut chunk = [0_u8; 4096];
+    loop {
+        let count = reader.read(&mut chunk).await?;
+        if count == 0 {
+            break;
+        }
+        raw.extend_from_slice(&chunk[..count]);
+        for &byte in &chunk[..count] {
+            if matches!(byte, b'\r' | b'\n' | 0x08) {
+                if !oversized {
+                    emit_record(&record, observer.as_ref(), operation);
+                }
+                record.clear();
+                oversized = false;
+            } else if record.len() < MAX_RECORD {
+                record.push(byte);
+            } else {
+                oversized = true;
+            }
+        }
+    }
+    if !oversized {
+        emit_record(&record, observer.as_ref(), operation);
+    }
+    Ok(raw)
+}
+
+fn emit_record(record: &[u8], observer: Option<&Observer>, operation: Option<SevenZipOperation>) {
+    let Some(observer) = observer else {
+        return;
+    };
+    let text = String::from_utf8_lossy(record);
+    if let (Some(operation), Some((percent, item))) = (operation, parse_progress(&text)) {
+        observer(SevenZipEvent::Progress {
+            operation,
+            percent,
+            item,
+        });
+    } else if let Some(severity) = diagnostic_severity(&text) {
+        observer(SevenZipEvent::Diagnostic {
+            severity,
+            text: text.trim().to_owned(),
+        });
+    }
+}
+
+fn parse_progress(line: &str) -> Option<(f32, Option<String>)> {
+    let line = line.trim();
+    let percent_end = line.find('%')?;
+    let number = line[..percent_end].trim();
+    if number.is_empty() || !number.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let percent = number.parse::<f32>().ok()?.clamp(0.0, 100.0);
+    let mut remainder = line[percent_end + 1..].trim();
+    if let Some((index, item)) = remainder.split_once(" - ") {
+        if index.bytes().all(|byte| byte.is_ascii_digit()) {
+            remainder = item.trim();
+        }
+    } else {
+        remainder = remainder.trim_start_matches(['-', ' ']).trim();
+    }
+    if remainder.contains("Everything is Ok") || remainder.chars().any(char::is_control) {
+        return None;
+    }
+    let item = (!remainder.is_empty()).then(|| remainder.to_owned());
+    Some((percent, item))
+}
+
+fn diagnostic_severity(line: &str) -> Option<SevenZipDiagnosticSeverity> {
+    let lower = line.trim().to_ascii_lowercase();
+    if lower.starts_with("warning:") || lower.starts_with("warning ") {
+        Some(SevenZipDiagnosticSeverity::Warning)
+    } else if lower.starts_with("error:")
+        || lower.starts_with("error ")
+        || lower.contains("data error")
+        || lower.contains("crc failed")
+    {
+        Some(SevenZipDiagnosticSeverity::Error)
+    } else {
+        None
+    }
+}
+
+fn parse_report(output: &str) -> SevenZipReport {
+    let mut report = SevenZipReport::default();
+    for line in output
+        .split(['\r', '\n', '\u{8}'])
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        match diagnostic_severity(line) {
+            Some(SevenZipDiagnosticSeverity::Warning) => report.warnings.push(line.to_owned()),
+            Some(SevenZipDiagnosticSeverity::Error) => report.errors.push(line.to_owned()),
+            None => {}
+        }
+        let Some((key, value)) = line
+            .split_once(" = ")
+            .or_else(|| line.split_once(':').map(|(key, value)| (key, value.trim())))
+        else {
+            continue;
+        };
+        match key {
+            "Type" => report.archive_type = Some(value.to_owned()),
+            "Physical Size" => report.physical_size = value.parse().ok(),
+            "Encrypted" => {
+                report.encrypted = match value {
+                    "+" | "1" | "true" => Some(true),
+                    "-" | "0" | "false" => Some(false),
+                    _ => None,
+                }
+            }
+            "Files" => report.files = value.parse().ok(),
+            "Folders" => report.folders = value.parse().ok(),
+            "Size" => report.unpacked_size = value.parse().ok(),
+            "Compressed" | "Packed Size" => report.compressed_size = value.parse().ok(),
+            "Elapsed Time" | "Global Time" => report.elapsed_millis = parse_elapsed_millis(value),
+            _ => {}
+        }
+    }
+    report
+}
+
+fn parse_slt_archive_report(output: &str) -> SevenZipReport {
+    let mut record = String::new();
+    for line in output.split_terminator('\n') {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if line.is_empty() {
+            if record.lines().any(|line| line.starts_with("Type = ")) {
+                return parse_report(&record);
+            }
+            record.clear();
+        } else {
+            if !record.is_empty() {
+                record.push('\n');
+            }
+            record.push_str(line);
+        }
+    }
+    if record.lines().any(|line| line.starts_with("Type = ")) {
+        parse_report(&record)
+    } else {
+        SevenZipReport::default()
+    }
+}
+
+fn parse_elapsed_millis(value: &str) -> Option<u64> {
+    let seconds = value.trim_end_matches(" sec").parse::<f64>().ok()?;
+    (seconds.is_finite() && seconds >= 0.0).then(|| (seconds * 1000.0).round() as u64)
+}
+
+fn parse_archive_format(value: &str) -> ArchiveFormat {
+    match value.to_ascii_lowercase().as_str() {
+        "zip" => ArchiveFormat::Zip,
+        "7z" => ArchiveFormat::SevenZip,
+        "rar" => ArchiveFormat::Rar,
+        "tar" => ArchiveFormat::Tar,
+        "gzip" | "gz" => ArchiveFormat::Gzip,
+        "bzip2" | "bz2" => ArchiveFormat::Bzip2,
+        "xz" => ArchiveFormat::Xz,
+        "cab" => ArchiveFormat::Cab,
+        other => ArchiveFormat::Unknown(other.to_owned()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn fake_executable(script: &str) -> (tempfile::TempDir, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("fake-7z");
+        std::fs::write(&path, format!("#!/bin/sh\nset -eu\n{script}\n")).unwrap();
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        (root, path)
+    }
 
     #[test]
     fn locator_finds_bundled_path() {
@@ -502,12 +829,308 @@ mod tests {
 
     #[test]
     fn parses_slt_entries() {
-        let stdout = "Path = archive.zip\nType = zip\n\nPath = file.txt\nSize = 42\nAttributes = A\n\nPath = dir\nSize = 0\nAttributes = D\n";
+        let stdout = "Path = archive.zip\nType = zip\n\nPath = file.txt\nSize = 42\nPacked Size = 21\nAttributes = A\n\nPath = dir\nSize = 0\nAttributes = D\n";
         let entries = parse_entries(stdout);
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].path, PathBuf::from("file.txt"));
         assert_eq!(entries[0].uncompressed_size, Some(42));
+        assert_eq!(entries[0].compressed_size, Some(21));
         assert!(entries[1].is_dir);
+    }
+
+    #[test]
+    fn parses_only_well_formed_progress() {
+        assert_eq!(
+            parse_progress(" 42% - 目录/file name.txt "),
+            Some((42.0, Some("目录/file name.txt".into())))
+        );
+        assert_eq!(parse_progress("123%"), Some((100.0, None)));
+        assert_eq!(
+            parse_progress("42% 1 - modern 26.01/路径.txt"),
+            Some((42.0, Some("modern 26.01/路径.txt".into())))
+        );
+        for invalid in [
+            "Everything is Ok",
+            "-1% file",
+            "1.5% file",
+            "% file",
+            "warning: 5%",
+        ] {
+            assert_eq!(parse_progress(invalid), None, "{invalid}");
+        }
+    }
+
+    #[tokio::test]
+    async fn framing_handles_split_utf8_and_final_record() {
+        let bytes = "10% - 你好.txt\r55% - second file\n100% - done".as_bytes();
+        for split in 0..=bytes.len() {
+            let (mut writer, reader) = tokio::io::duplex(128);
+            let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let captured = Arc::clone(&events);
+            let observer: Observer = Arc::new(move |event| captured.lock().unwrap().push(event));
+            let task = tokio::spawn(read_stream(
+                reader,
+                Some(observer),
+                Some(SevenZipOperation::Test),
+            ));
+            tokio::io::AsyncWriteExt::write_all(&mut writer, &bytes[..split])
+                .await
+                .unwrap();
+            tokio::io::AsyncWriteExt::write_all(&mut writer, &bytes[split..])
+                .await
+                .unwrap();
+            drop(writer);
+            task.await.unwrap().unwrap();
+            assert_eq!(events.lock().unwrap().len(), 3, "split {split}");
+        }
+    }
+
+    #[tokio::test]
+    async fn framing_handles_p7zip_backspace_overwrites_without_garbage() {
+        let bytes = b"  0M Scan foo\x08\x08\x08  0% 1 - first.txt\x08\x08 42% 2 - second file.txt\x08100%\x08Everything is Ok";
+        let (mut writer, reader) = tokio::io::duplex(256);
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&events);
+        let observer: Observer = Arc::new(move |event| captured.lock().unwrap().push(event));
+        let task = tokio::spawn(read_stream(
+            reader,
+            Some(observer),
+            Some(SevenZipOperation::Extract),
+        ));
+        tokio::io::AsyncWriteExt::write_all(&mut writer, bytes)
+            .await
+            .unwrap();
+        drop(writer);
+        task.await.unwrap().unwrap();
+        let events = events.lock().unwrap();
+        assert!(events.iter().any(|event| matches!(event, SevenZipEvent::Progress { percent, item: Some(item), .. } if *percent == 42.0 && item == "second file.txt")));
+        assert!(!events
+            .iter()
+            .any(|event| format!("{event:?}").contains("Everything is Ok")));
+    }
+
+    #[tokio::test]
+    async fn oversized_records_are_discarded_instead_of_emitting_prefixes() {
+        let mut bytes = b"42% - ".to_vec();
+        bytes.resize(MAX_RECORD + 10, b'x');
+        bytes.push(b'\n');
+        let (mut writer, reader) = tokio::io::duplex(bytes.len() + 1);
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&events);
+        let observer: Observer = Arc::new(move |event| captured.lock().unwrap().push(event));
+        let task = tokio::spawn(read_stream(
+            reader,
+            Some(observer),
+            Some(SevenZipOperation::Test),
+        ));
+        tokio::io::AsyncWriteExt::write_all(&mut writer, &bytes)
+            .await
+            .unwrap();
+        drop(writer);
+        task.await.unwrap().unwrap();
+        assert!(events.lock().unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fake_child_delivers_before_completion_drains_both_pipes_and_flushes_tail() {
+        let temp = tempfile::tempdir().unwrap();
+        let release = temp.path().join("observer-released-child");
+        let script = format!(
+            "printf '%s\\r' '25% 1 - early.txt'\nwaits=0\nwhile [ ! -f '{}' ] && [ $waits -lt 100 ]; do sleep 0.01; waits=$((waits + 1)); done\n[ -f '{}' ] || exit 99\ni=0\nwhile [ $i -lt 6000 ]; do printf 'stdout-padding-%04d\\n' \"$i\"; printf 'stderr-padding-%04d\\n' \"$i\" >&2; i=$((i + 1)); done\nprintf '%s\\rFiles: 2\\nGlobal Time = 0.010 sec\\n' '100% 2 - final.txt'\nprintf 'WARNING: final diagnostic' >&2",
+            release.display(),
+            release.display()
+        );
+        let (_root, executable) = fake_executable(&script);
+        let release_from_observer = release.clone();
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&events);
+        let backend = SevenZipBackend::new(executable).with_observer(move |event| {
+            if matches!(event, SevenZipEvent::Progress { percent, .. } if percent == 25.0) {
+                std::fs::write(&release_from_observer, b"go").unwrap();
+            }
+            captured.lock().unwrap().push(event);
+        });
+        let request = TestRequest {
+            archive: PathBuf::from("fixture.7z"),
+            format: None,
+            password: None,
+            encoding: smartzip_core::EncodingMode::Auto,
+        };
+        let result = backend.test_with_report(request).await.unwrap();
+        assert_eq!(result.status, SevenZipExitStatus::Success);
+        assert!(result.value.is_some());
+        assert_eq!(result.report.files, Some(2));
+        assert_eq!(result.report.elapsed_millis, Some(10));
+        assert!(result.stderr.ends_with("WARNING: final diagnostic"));
+        assert!(result
+            .report
+            .warnings
+            .iter()
+            .any(|line| line == "WARNING: final diagnostic"));
+        assert!(events.lock().unwrap().iter().any(|event| matches!(event, SevenZipEvent::Progress { percent, item: Some(item), .. } if *percent == 100.0 && item == "final.txt")));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn warning_exit_preserves_report_and_raw_diagnostics_without_success_value() {
+        let (_root, executable) = fake_executable(
+            "printf '%s\\rFiles: 1\\n' '50% 1 - partial.txt'\nprintf 'WARNING: file could not be opened' >&2\nexit 1",
+        );
+        let backend = SevenZipBackend::new(executable);
+        let result = backend
+            .test_with_report(TestRequest {
+                archive: PathBuf::from("fixture.7z"),
+                format: None,
+                password: None,
+                encoding: smartzip_core::EncodingMode::Auto,
+            })
+            .await
+            .unwrap();
+        assert_eq!(result.status, SevenZipExitStatus::Warning);
+        assert!(result.value.is_none());
+        assert_eq!(result.report.files, Some(1));
+        assert!(result.stderr.contains("file could not be opened"));
+        assert_eq!(
+            result.report.warnings,
+            ["WARNING: file could not be opened"]
+        );
+    }
+
+    #[test]
+    fn parses_report_without_fabricating_missing_fields() {
+        let report = parse_report("Type = 7z\nPhysical Size = 120\nEncrypted = +\nFiles = 3\nFolders = 1\nSize = 400\nCompressed = 120\nElapsed Time = 0.125 sec\nWARNING: one file skipped\n");
+        assert_eq!(report.archive_type.as_deref(), Some("7z"));
+        assert_eq!(report.physical_size, Some(120));
+        assert_eq!(report.encrypted, Some(true));
+        assert_eq!(report.files, Some(3));
+        assert_eq!(report.elapsed_millis, Some(125));
+        assert_eq!(report.warnings, ["WARNING: one file skipped"]);
+        assert!(report.errors.is_empty());
+    }
+
+    #[test]
+    fn parses_colon_summaries_and_global_time() {
+        let report = parse_report(
+            "Size: 400\nCompressed: 120\nFiles: 3\nFolders: 2\nGlobal Time = 0.250 sec\n",
+        );
+        assert_eq!(report.unpacked_size, Some(400));
+        assert_eq!(report.compressed_size, Some(120));
+        assert_eq!(report.files, Some(3));
+        assert_eq!(report.folders, Some(2));
+        assert_eq!(report.elapsed_millis, Some(250));
+    }
+
+    #[test]
+    fn slt_entry_metadata_does_not_override_archive_header() {
+        let output = "Path = archive.7z\nType = 7z\nPhysical Size = 100\nEncrypted = -\n\nPath = secret.txt\nSize = 200\nPacked Size = 50\nEncrypted = +\n";
+        let report = parse_slt_archive_report(output);
+        assert_eq!(report.archive_type.as_deref(), Some("7z"));
+        assert_eq!(report.physical_size, Some(100));
+        assert_eq!(report.encrypted, Some(false));
+    }
+
+    #[test]
+    fn parses_crlf_slt_without_trimming_legitimate_path_spaces() {
+        let output = "Path = archive.7z\r\nType = 7z\r\nPhysical Size = 100\r\nEncrypted = -\r\n\r\nPath = name with trailing space \r\nSize = 200\r\nPacked Size = 50\r\nAttributes = A\r\nEncrypted = +\r\n\r\nPath = folder\r\nSize = 0\r\nAttributes = D\r\n";
+        let entries = parse_entries(output);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].path, PathBuf::from("name with trailing space "));
+        assert_eq!(entries[0].uncompressed_size, Some(200));
+        assert_eq!(entries[0].compressed_size, Some(50));
+        assert!(!entries[0].is_dir);
+        assert_eq!(entries[1].path, PathBuf::from("folder"));
+        assert!(entries[1].is_dir);
+
+        let report = parse_slt_archive_report(output);
+        assert_eq!(report.archive_type.as_deref(), Some("7z"));
+        assert_eq!(report.physical_size, Some(100));
+        assert_eq!(report.encrypted, Some(false));
+    }
+
+    #[test]
+    fn classifies_specific_failures_before_generic_statuses() {
+        let backend = SevenZipBackend::new("7z".into());
+        let path = Path::new("archive.7z");
+        let output = |status, text: &str| BackendCommandOutput {
+            status: Some(status),
+            stdout: String::new(),
+            stderr: text.into(),
+        };
+        assert!(matches!(
+            backend.map_failure(&output(2, "ERROR: Wrong password"), path),
+            SmartZipError::WrongPassword { .. }
+        ));
+        for (code, expected) in [
+            (0, SevenZipExitStatus::Success),
+            (1, SevenZipExitStatus::Warning),
+            (2, SevenZipExitStatus::Fatal),
+            (7, SevenZipExitStatus::CommandLineError),
+            (8, SevenZipExitStatus::OutOfMemory),
+            (255, SevenZipExitStatus::Cancelled),
+        ] {
+            assert_eq!(SevenZipExitStatus::from_code(Some(code)), expected);
+        }
+        assert!(matches!(
+            backend.map_failure(&output(2, "ERROR: Password is required"), path),
+            SmartZipError::PasswordRequired { .. }
+        ));
+        assert!(matches!(
+            backend.map_failure(&output(2, "ERROR: CRC Failed"), path),
+            SmartZipError::CorruptedArchive { .. }
+        ));
+        assert!(matches!(
+            backend.map_failure(&output(2, "ERROR: Unsupported Method : ZSTD"), path),
+            SmartZipError::UnsupportedCodec { codec: Some(ref codec), .. } if codec == "zstd"
+        ));
+        assert!(matches!(
+            backend.map_failure(&output(2, "ERROR: Unsupported Method : payload.txt"), path),
+            SmartZipError::UnsupportedCodec { codec: None, .. }
+        ));
+        assert!(matches!(
+            backend.map_failure(&output(255, "Break signaled"), path),
+            SmartZipError::Cancelled
+        ));
+        assert!(matches!(
+            backend.map_failure(&output(7, "Command Line Error"), path),
+            SmartZipError::BackendFailed {
+                exit_code: Some(7),
+                ..
+            }
+        ));
+        assert!(matches!(
+            backend.map_failure(&output(8, "Not enough memory"), path),
+            SmartZipError::BackendFailed {
+                exit_code: Some(8),
+                ..
+            }
+        ));
+        match backend.map_failure(&output(2, "ERROR: No such file or directory"), path) {
+            SmartZipError::Io {
+                path: error_path,
+                source,
+            } => {
+                assert_eq!(error_path.as_deref(), Some(path));
+                assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
+                assert!(source.to_string().contains("No such file"));
+            }
+            other => panic!("expected not-found I/O error, got {other:?}"),
+        }
+        match backend.map_failure(&output(2, "ERROR: Access is denied"), path) {
+            SmartZipError::Io {
+                path: error_path,
+                source,
+            } => {
+                assert_eq!(error_path.as_deref(), Some(path));
+                assert_eq!(source.kind(), std::io::ErrorKind::PermissionDenied);
+                assert!(source.to_string().contains("Access is denied"));
+            }
+            other => panic!("expected permission I/O error, got {other:?}"),
+        }
+        assert!(matches!(
+            backend.map_failure(&output(2, "ERROR: Can not open file as archive"), path),
+            SmartZipError::UnsupportedContainer { .. }
+        ));
     }
 
     #[test]
@@ -536,28 +1159,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn detects_fatal_markers_even_when_exit_code_is_missing() {
-        let output = BackendCommandOutput {
-            status: Some(0),
-            stdout: "ERRORS:\nHeaders Error\n".into(),
-            stderr: String::new(),
-        };
-        assert!(SevenZipBackend::output_indicates_failure(&output));
-    }
-
-    #[test]
-    fn parses_7z_progress_lines() {
-        assert_eq!(parse_progress_percent(b"  0%"), Some(0));
-        assert_eq!(
-            parse_progress_percent(b" 42% 12 - nested/path/file.txt"),
-            Some(42)
-        );
-        assert_eq!(parse_progress_percent(b"100% Everything is Ok"), Some(100));
-        assert_eq!(parse_progress_percent(b"Size = 42"), None);
-        assert_eq!(parse_progress_percent(b"101% invalid"), None);
-    }
-
     #[tokio::test]
     async fn probe_handles_encrypted_archives_without_prompting() {
         let root = std::env::temp_dir().join(format!("smartzip-probe-{}", std::process::id()));
@@ -581,55 +1182,7 @@ mod tests {
         let probe = backend.probe(&archive).await.unwrap();
 
         assert!(probe.supported);
-        assert_eq!(probe.format, Some(ArchiveFormat::SevenZip));
-        assert_eq!(probe.encrypted, None);
+        assert_eq!(probe.encrypted, Some(true));
         let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
-    async fn extract_reports_progress_and_writes_output() {
-        use std::sync::{Arc, Mutex};
-
-        let root = tempfile::tempdir().unwrap();
-        let archive = root.path().join("progress.7z");
-        let input = root.path().join("hello.txt");
-        let output = root.path().join("output");
-        std::fs::write(&input, b"hello progress").unwrap();
-
-        let status = std::process::Command::new("7z")
-            .arg("a")
-            .arg(&archive)
-            .arg(&input)
-            .status()
-            .unwrap();
-        assert!(status.success(), "7z must be available in PATH");
-
-        let percentages = Arc::new(Mutex::new(Vec::new()));
-        let callback_values = Arc::clone(&percentages);
-        let callback: ExtractionProgressCallback = Arc::new(move |percent| {
-            callback_values.lock().unwrap().push(percent);
-        });
-        let backend =
-            SevenZipBackend::locate(&SevenZipLocator::default()).expect("7z/7zz must be available");
-
-        backend
-            .extract_with_progress(
-                ExtractArchiveRequest {
-                    archive,
-                    format: Some(ArchiveFormat::SevenZip),
-                    output_dir: output.clone(),
-                    password: None,
-                    encoding: smartzip_core::EncodingMode::Auto,
-                },
-                Some(callback),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(percentages.lock().unwrap().last(), Some(&100.0));
-        assert_eq!(
-            std::fs::read(output.join("hello.txt")).unwrap(),
-            b"hello progress"
-        );
     }
 }

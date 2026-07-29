@@ -1,4 +1,4 @@
-use crate::backend::ArchiveBackend;
+use crate::backend::ArchiveAdapter;
 use crate::types::*;
 use async_trait::async_trait;
 use smartzip_core::{ArchiveFormat, Result, SmartZipError};
@@ -36,12 +36,19 @@ impl UnrarLocator {
 
 #[derive(Debug, Clone)]
 pub struct UnrarBackend {
+    id: String,
     executable: PathBuf,
 }
 
 impl UnrarBackend {
     pub fn new(executable: PathBuf) -> Self {
-        Self { executable }
+        let id = format!("unrar:{}", executable.display());
+        Self { id, executable }
+    }
+
+    pub fn with_id(mut self, id: impl Into<String>) -> Self {
+        self.id = id.into();
+        self
     }
 
     pub fn locate(locator: &UnrarLocator) -> Result<Self> {
@@ -63,7 +70,15 @@ impl UnrarBackend {
             .stdin(Stdio::null())
             .output()
             .await
-            .map_err(|source| SmartZipError::io(Some(self.executable.clone()), source))?;
+            .map_err(|source| {
+                if source.kind() == std::io::ErrorKind::NotFound {
+                    SmartZipError::BackendUnavailable {
+                        backend: self.id.clone(),
+                    }
+                } else {
+                    SmartZipError::io(Some(self.executable.clone()), source)
+                }
+            })?;
 
         Ok(BackendCommandOutput {
             status: output.status.code(),
@@ -82,10 +97,7 @@ impl UnrarBackend {
     fn map_failure(&self, output: &BackendCommandOutput, path: &Path) -> SmartZipError {
         let combined = format!("{}\n{}", output.stdout, output.stderr);
         let lower = combined.to_lowercase();
-        if lower.contains("wrong password")
-            || lower.contains("incorrect password")
-            || lower.contains("checksum error")
-        {
+        if lower.contains("wrong password") || lower.contains("incorrect password") {
             SmartZipError::WrongPassword {
                 path: path.to_path_buf(),
             }
@@ -93,10 +105,17 @@ impl UnrarBackend {
             SmartZipError::PasswordRequired {
                 path: path.to_path_buf(),
             }
-        } else if lower.contains("unknown method") || lower.contains("unsupported") {
-            SmartZipError::UnsupportedFormat {
+        } else if lower.contains("unknown method") {
+            SmartZipError::UnsupportedCodec {
+                backend: self.id.clone(),
                 path: path.to_path_buf(),
-                format: Some("rar".into()),
+                codec: None,
+            }
+        } else if lower.contains("unsupported") || lower.contains("not rar archive") {
+            SmartZipError::UnsupportedContainer {
+                backend: self.id.clone(),
+                path: path.to_path_buf(),
+                container: Some("rar".into()),
             }
         } else if lower.contains("checksum") || lower.contains("corrupt") {
             SmartZipError::CorruptedArchive {
@@ -105,7 +124,7 @@ impl UnrarBackend {
             }
         } else {
             SmartZipError::BackendFailed {
-                backend: "unrar".into(),
+                backend: self.id.clone(),
                 exit_code: output.status,
                 stderr: combined,
             }
@@ -114,7 +133,11 @@ impl UnrarBackend {
 }
 
 #[async_trait]
-impl ArchiveBackend for UnrarBackend {
+impl ArchiveAdapter for UnrarBackend {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
     async fn probe(&self, path: &Path) -> Result<ArchiveProbe> {
         let result = self
             .test(TestRequest {
@@ -128,7 +151,8 @@ impl ArchiveBackend for UnrarBackend {
             Ok(result) => (result.ok, result.encrypted),
             Err(SmartZipError::WrongPassword { .. })
             | Err(SmartZipError::PasswordRequired { .. }) => (true, Some(true)),
-            Err(_) => (false, None),
+            Err(SmartZipError::UnsupportedContainer { .. }) => (false, None),
+            Err(error) => return Err(error),
         };
         Ok(ArchiveProbe {
             path: path.to_path_buf(),

@@ -5568,6 +5568,7 @@ dependencies = [
  "crc32fast",
  "rstest",
  "serde",
+ "smartzip-config",
  "smartzip-core",
  "smartzip-encoding",
  "tempfile",

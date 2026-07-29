@@ -1,7 +1,4 @@
-use std::ffi::OsStr;
-use std::path::{Component, Path, PathBuf};
-
-const FALLBACK_COMPONENT_BYTES: usize = 200;
+use std::path::{Component, PathBuf};
 
 /// Reject Windows drive-letter paths and UNC/network paths in a
 /// platform-independent way. Operates on the **normalized** string
@@ -53,50 +50,6 @@ pub fn safe_entry_path(raw_name: &[u8]) -> Option<PathBuf> {
         }
     }
     (!path.as_os_str().is_empty()).then_some(path)
-}
-
-/// Produce a stable fallback path for a filesystem that rejected an archive
-/// entry with `ENAMETOOLONG`.
-///
-/// Callers must first try the original path. Keeping this conversion on the
-/// error path avoids silently renaming valid filenames on filesystems with
-/// larger limits.
-pub(crate) fn shorten_overlong_components(path: &Path) -> PathBuf {
-    path.components()
-        .map(|component| match component {
-            Component::Normal(part) => shorten_component(part),
-            _ => component.as_os_str().to_os_string(),
-        })
-        .collect()
-}
-
-fn shorten_component(component: &OsStr) -> std::ffi::OsString {
-    let name = component.to_string_lossy();
-    if name.len() <= FALLBACK_COMPONENT_BYTES {
-        return component.to_os_string();
-    }
-
-    let hash = stable_hash(name.as_bytes());
-    let extension = Path::new(name.as_ref())
-        .extension()
-        .and_then(OsStr::to_str)
-        .filter(|extension| extension.len() <= 32)
-        .map(|extension| format!(".{extension}"))
-        .unwrap_or_default();
-    let suffix = format!("~{hash:016x}{extension}");
-    let prefix_budget = FALLBACK_COMPONENT_BYTES.saturating_sub(suffix.len());
-    let mut prefix_end = prefix_budget.min(name.len());
-    while !name.is_char_boundary(prefix_end) {
-        prefix_end -= 1;
-    }
-
-    format!("{}{}", &name[..prefix_end], suffix).into()
-}
-
-fn stable_hash(bytes: &[u8]) -> u64 {
-    bytes.iter().fold(0xcbf29ce484222325, |hash, byte| {
-        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
-    })
 }
 
 #[cfg(test)]
@@ -169,36 +122,5 @@ mod tests {
     #[test]
     fn rejects_backslash_traversal() {
         assert_eq!(safe_entry_path(b"foo\\..\\..\\etc\\passwd"), None);
-    }
-
-    #[test]
-    fn normal_components_are_not_shortened() {
-        let path = Path::new("folder/ordinary-name.txt");
-        assert_eq!(shorten_overlong_components(path), path);
-    }
-
-    #[test]
-    fn overlong_components_are_shortened_stably_and_keep_extension() {
-        let name = format!("{}.txt", "文".repeat(100));
-        let path = PathBuf::from("folder").join(&name);
-
-        let shortened = shorten_overlong_components(&path);
-        let shortened_name = shortened.file_name().unwrap().to_string_lossy();
-
-        assert!(shortened_name.len() <= FALLBACK_COMPONENT_BYTES);
-        assert!(shortened_name.ends_with(".txt"));
-        assert_eq!(shortened, shorten_overlong_components(&path));
-        assert_ne!(shortened, path);
-    }
-
-    #[test]
-    fn overlong_names_with_same_prefix_do_not_collide() {
-        let first = PathBuf::from(format!("{}-first.txt", "a".repeat(240)));
-        let second = PathBuf::from(format!("{}-second.txt", "a".repeat(240)));
-
-        assert_ne!(
-            shorten_overlong_components(&first),
-            shorten_overlong_components(&second)
-        );
     }
 }
