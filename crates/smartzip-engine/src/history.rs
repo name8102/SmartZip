@@ -352,6 +352,12 @@ fn describe_event(kind: &TaskEventKind) -> (TaskEventLevel, String, String, Opti
             },
             serde_json::to_string(&serde_json::json!({ "candidate_id": candidate_id })).ok(),
         ),
+        TaskEventKind::Route(route) => (
+            TaskEventLevel::Info,
+            "Route".into(),
+            format!("{route:?}"),
+            serde_json::to_string(route).ok(),
+        ),
         TaskEventKind::EncodingDetected(result) => {
             let name = match &result.selected {
                 EncodingMode::Auto => "auto".to_string(),

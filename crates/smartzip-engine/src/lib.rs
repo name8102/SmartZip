@@ -16,6 +16,7 @@ pub mod name_score;
 mod access;
 mod backend_util;
 mod encoding_flow;
+mod extract_workflow;
 mod events;
 pub mod interactive;
 mod nested;
