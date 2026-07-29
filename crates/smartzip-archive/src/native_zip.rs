@@ -183,14 +183,14 @@ impl ArchiveAdapter for NativeZipBackend {
         result.map_err(|error| with_backend_identity(error, &backend_id))
     }
 
-    fn capabilities(&self) -> BackendCapabilities {
-        BackendCapabilities {
+    fn profile(&self) -> smartzip_core::BackendCapabilityProfile {
+        crate::router::profile_from_legacy_capabilities(&BackendCapabilities {
             can_extract: vec![ArchiveFormat::Zip],
             can_compress: vec![ArchiveFormat::Zip],
             supports_passwords: true,
             supports_listing: true,
             supports_test: true,
-        }
+        })
     }
 }
 
@@ -828,9 +828,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_zip_capabilities_supports_passwords() {
+    async fn native_zip_profile_contains_builtin_rules() {
         let backend = NativeZipBackend::new();
-        assert!(backend.capabilities().supports_passwords);
+        assert!(!backend.profile().rules.is_empty());
     }
 
     // ── Restored: end-to-end compress → list → test → extract ────────

@@ -49,7 +49,7 @@ impl AdapterRegistration {
     }
 
     pub fn from_adapter(adapter: impl ArchiveAdapter + 'static, priority: i32) -> Self {
-        let profile = profile_from_legacy_capabilities(&adapter.capabilities());
+        let profile = adapter.profile();
         Self::new(adapter, profile, priority)
     }
 }
@@ -711,7 +711,7 @@ fn configured_registration<A: ArchiveAdapter + 'static>(
     installation: &BackendInstallation,
     configured_profile: &BackendCapabilityProfile,
 ) -> Result<AdapterRegistration> {
-    let mut profile = profile_from_legacy_capabilities(&adapter.capabilities());
+    let mut profile = adapter.profile();
     // `configured_profile` is already family -> version -> installation ordered.
     // Appending preserves that layer precedence after the built-in family baseline.
     profile
@@ -735,7 +735,7 @@ fn discovered_registration<A: ArchiveAdapter + 'static>(
     priority: i32,
     warnings: &mut Vec<String>,
 ) -> AdapterRegistration {
-    let mut profile = profile_from_legacy_capabilities(&adapter.capabilities());
+    let mut profile = adapter.profile();
     if let Some(family) = config.family_profiles.get(family_key) {
         profile
             .rules
@@ -901,7 +901,7 @@ fn request_requirements(
     requirements
 }
 
-fn profile_from_legacy_capabilities(
+pub(crate) fn profile_from_legacy_capabilities(
     capabilities: &BackendCapabilities,
 ) -> BackendCapabilityProfile {
     let mut rules = Vec::new();
@@ -1202,14 +1202,14 @@ mod tests {
             })
         }
 
-        fn capabilities(&self) -> BackendCapabilities {
-            BackendCapabilities {
+        fn profile(&self) -> smartzip_core::BackendCapabilityProfile {
+            crate::router::profile_from_legacy_capabilities(&BackendCapabilities {
                 can_extract: vec![ArchiveFormat::SevenZip],
                 can_compress: vec![ArchiveFormat::SevenZip],
                 supports_passwords: true,
                 supports_listing: true,
                 supports_test: true,
-            }
+            })
         }
     }
 
@@ -1231,7 +1231,7 @@ mod tests {
     fn route_plan_is_stable_and_explains_rejections() {
         let incapable = FakeAdapter::new("7zz", None);
         let capable = FakeAdapter::new("7z", None);
-        let mut unsupported = profile_from_legacy_capabilities(&incapable.capabilities());
+        let mut unsupported = incapable.profile();
         unsupported.rules.push(CapabilityRule {
             capability: capability_id("codec", "zstd"),
             precedence: 0,
@@ -1268,7 +1268,7 @@ mod tests {
     #[test]
     fn forced_adapter_bypasses_profile_rejection() {
         let adapter = FakeAdapter::new("diagnostic", None);
-        let mut profile = profile_from_legacy_capabilities(&adapter.capabilities());
+        let mut profile = adapter.profile();
         profile.rules.push(CapabilityRule {
             capability: capability_id("codec", "zstd"),
             precedence: 1,

@@ -536,8 +536,8 @@ impl ArchiveAdapter for SevenZipBackend {
         })
     }
 
-    fn capabilities(&self) -> BackendCapabilities {
-        BackendCapabilities {
+    fn profile(&self) -> smartzip_core::BackendCapabilityProfile {
+        crate::router::profile_from_legacy_capabilities(&BackendCapabilities {
             can_extract: vec![
                 ArchiveFormat::Zip,
                 ArchiveFormat::SevenZip,
@@ -552,7 +552,7 @@ impl ArchiveAdapter for SevenZipBackend {
             supports_passwords: true,
             supports_listing: true,
             supports_test: true,
-        }
+        })
     }
 }
 
