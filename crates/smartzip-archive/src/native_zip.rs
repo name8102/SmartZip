@@ -218,7 +218,6 @@ fn collect_files(input: &Path) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
-
 /// Decode a ZIP entry name using override encoding or auto-detection.
 ///
 /// When `raw` is already valid UTF-8 (GPBF bit11 / Info-ZIP 0x7075 handled by
@@ -229,8 +228,9 @@ fn decode_entry_name(raw: &[u8], encoding: &smartzip_core::EncodingMode) -> Stri
         smartzip_core::EncodingMode::Override(enc) => smartzip_encoding::decode_name(raw, enc)
             .or_else(|| decode_name_auto(raw))
             .unwrap_or_else(|| String::from_utf8_lossy(raw).into_owned()),
-        smartzip_core::EncodingMode::Auto => decode_name_auto(raw)
-            .unwrap_or_else(|| String::from_utf8_lossy(raw).into_owned()),
+        smartzip_core::EncodingMode::Auto => {
+            decode_name_auto(raw).unwrap_or_else(|| String::from_utf8_lossy(raw).into_owned())
+        }
     }
 }
 
@@ -1088,8 +1088,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let archive = temp.path().join("gbk.zip");
         // Longer sample so Auto can score GBK over other CJK pages.
-        let gbk_name =
-            b"\xC4\xE3\xBA\xC3\xCA\xC0\xBD\xE7\xBB\xB6\xD3\xAD.txt"; // 你好世界欢迎.txt
+        let gbk_name = b"\xC4\xE3\xBA\xC3\xCA\xC0\xBD\xE7\xBB\xB6\xD3\xAD.txt"; // 你好世界欢迎.txt
         let content = b"content";
         create_raw_zip_with_encoding(&archive, &[(gbk_name, content)]);
 

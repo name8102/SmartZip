@@ -1,8 +1,6 @@
 use crate::types::*;
 use async_trait::async_trait;
-use smartzip_core::{
-    ArchiveFacts, Result, TaskEventSink, TaskExecutionContext, TaskId,
-};
+use smartzip_core::{ArchiveFacts, Result, TaskEventSink, TaskExecutionContext, TaskId};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -10,7 +8,11 @@ use std::sync::Arc;
 #[async_trait]
 pub trait ArchiveExecutor: Send + Sync {
     /// Reset task-local routing observations before a new top-level workflow.
-    fn begin_task(&self, task_id: TaskId, events: Arc<dyn TaskEventSink>) -> Arc<TaskExecutionContext> {
+    fn begin_task(
+        &self,
+        task_id: TaskId,
+        events: Arc<dyn TaskEventSink>,
+    ) -> Arc<TaskExecutionContext> {
         Arc::new(TaskExecutionContext::new(task_id, events))
     }
 

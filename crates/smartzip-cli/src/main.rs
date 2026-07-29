@@ -714,8 +714,11 @@ async fn list_archive(
             result.task_id,
         );
         for entry in &result.entries {
-            let suffix = if entry
-                .is_dir { "/" } else { Default::default() };
+            let suffix = if entry.is_dir {
+                "/"
+            } else {
+                Default::default()
+            };
             println!("{}{}", entry.path.display(), suffix);
         }
     }
@@ -965,7 +968,9 @@ struct RoutingPrintSink;
 
 impl TaskEventSink for RoutingPrintSink {
     fn push(&self, event: TaskEvent) {
-        render_extract_event(&event, true);
+        if let smartzip_core::TaskEventKind::Route(route) = &event.kind {
+            render_route_event(route, true);
+        }
     }
 }
 
@@ -1025,36 +1030,59 @@ fn render_extract_event(event: &smartzip_core::TaskEvent, verbose_routing: bool)
             println!("  -> {}", path.display());
         }
         smartzip_core::TaskEventKind::Route(route) if verbose_routing => {
-            use smartzip_core::RouteEvent;
-            match route {
-                RouteEvent::RoutePlanned { plan } => println!(
-                    "  route: {:?} candidates={} rejected={}",
-                    plan.operation,
-                    plan.candidates.len(),
-                    plan.rejected.len()
-                ),
-                RouteEvent::BackendAttemptStarted { adapter_id } => {
-                    println!("  route: trying {adapter_id}")
-                }
-                RouteEvent::BackendAttemptFailed { adapter_id, class } => {
-                    println!("  route: {adapter_id} failed ({class})")
-                }
-                RouteEvent::BackendAttemptCleaned { adapter_id } => {
-                    println!("  route: cleaned {adapter_id} output")
-                }
-                RouteEvent::BackendSelected { adapter_id } => {
-                    println!("  route: selected {adapter_id}")
-                }
-                RouteEvent::RouteExhausted { attempted } => {
-                    println!("  route: exhausted [{}]", attempted.join(", "))
-                }
-            }
+            render_route_event(route, false);
         }
         smartzip_core::TaskEventKind::Failed { error } => eprintln!("  FAILED: {error}"),
         smartzip_core::TaskEventKind::Warning { message } => {
             eprintln!("  warning: {message}")
         }
         _ => {}
+    }
+}
+
+fn render_route_event(route: &smartzip_core::RouteEvent, stderr: bool) {
+    macro_rules! output {
+        ($($args:tt)*) => {
+            if stderr {
+                eprintln!($($args)*);
+            } else {
+                println!($($args)*);
+            }
+        };
+    }
+
+    match route {
+        smartzip_core::RouteEvent::RoutePlanned { plan } => {
+            output!("  route: {:?}", plan.operation);
+            for candidate in &plan.candidates {
+                output!("    candidate: {}", candidate.adapter_id);
+                for note in &candidate.notes {
+                    output!("      note: {note}");
+                }
+            }
+            for rejected in &plan.rejected {
+                output!(
+                    "    rejected: {} ({})",
+                    rejected.adapter_id,
+                    rejected.reasons.join("; ")
+                );
+            }
+        }
+        smartzip_core::RouteEvent::BackendAttemptStarted { adapter_id } => {
+            output!("  route: trying {adapter_id}")
+        }
+        smartzip_core::RouteEvent::BackendAttemptFailed { adapter_id, class } => {
+            output!("  route: {adapter_id} failed ({class})")
+        }
+        smartzip_core::RouteEvent::BackendAttemptCleaned { adapter_id } => {
+            output!("  route: cleaned {adapter_id} output")
+        }
+        smartzip_core::RouteEvent::BackendSelected { adapter_id } => {
+            output!("  route: selected {adapter_id}")
+        }
+        smartzip_core::RouteEvent::RouteExhausted { attempted } => {
+            output!("  route: exhausted [{}]", attempted.join(", "))
+        }
     }
 }
 
@@ -1088,10 +1116,7 @@ async fn preview_encodings(
             encoding: mode,
         };
         let listing = if verbose_routing {
-            let context = backend.begin_task(
-                TaskId::new(),
-                std::sync::Arc::new(RoutingPrintSink),
-            );
+            let context = backend.begin_task(TaskId::new(), std::sync::Arc::new(RoutingPrintSink));
             backend.list_with_context(request, context.as_ref()).await
         } else {
             backend.list(request).await

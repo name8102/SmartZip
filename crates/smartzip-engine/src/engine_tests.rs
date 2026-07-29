@@ -638,8 +638,6 @@ impl ArchiveExecutor for EncodingAwareBackend {
             output: request.output,
         })
     }
-
-    
 }
 
 #[tokio::test]
@@ -739,8 +737,6 @@ impl ArchiveExecutor for FailingTestBackend {
             output: request.output,
         })
     }
-
-    
 }
 
 #[tokio::test]
@@ -876,8 +872,6 @@ impl ArchiveExecutor for BatchPasswordBackend {
             output: request.output,
         })
     }
-
-    
 }
 
 struct CountingPasswordPrompter {
@@ -1016,8 +1010,6 @@ impl ArchiveExecutor for FakeBackend {
             output: request.output,
         })
     }
-
-    
 }
 
 #[tokio::test]
@@ -1224,6 +1216,4 @@ impl ArchiveExecutor for EmbeddedAwareFakeBackend {
             output: request.output,
         })
     }
-
-    
 }

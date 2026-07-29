@@ -441,12 +441,8 @@ impl BackendRouter {
             &'a dyn ArchiveAdapter,
         ) -> Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>,
     {
-        let plan = self.plan_with_context(
-            operation,
-            container.as_ref(),
-            requirements,
-            Some(context),
-        );
+        let plan =
+            self.plan_with_context(operation, container.as_ref(), requirements, Some(context));
         let mut attempted = Vec::new();
         let mut last_error = None;
         for candidate in &plan.candidates {
@@ -615,7 +611,11 @@ impl BackendRouter {
 
 #[async_trait]
 impl ArchiveExecutor for BackendRouter {
-    fn begin_task(&self, task_id: TaskId, events: Arc<dyn TaskEventSink>) -> Arc<TaskExecutionContext> {
+    fn begin_task(
+        &self,
+        task_id: TaskId,
+        events: Arc<dyn TaskEventSink>,
+    ) -> Arc<TaskExecutionContext> {
         Arc::new(TaskExecutionContext::new(task_id, events))
     }
 
@@ -673,10 +673,16 @@ impl ArchiveExecutor for BackendRouter {
             request.password.as_deref(),
             Some(&request.encoding),
         );
-        self.route(context, ArchiveOperation::List, container, requirements, |adapter| {
-            let request = request.clone();
-            Box::pin(async move { adapter.list(request).await })
-        })
+        self.route(
+            context,
+            ArchiveOperation::List,
+            container,
+            requirements,
+            |adapter| {
+                let request = request.clone();
+                Box::pin(async move { adapter.list(request).await })
+            },
+        )
         .await
     }
 
@@ -697,10 +703,16 @@ impl ArchiveExecutor for BackendRouter {
             request.password.as_deref(),
             Some(&request.encoding),
         );
-        self.route(context, ArchiveOperation::Test, container, requirements, |adapter| {
-            let request = request.clone();
-            Box::pin(async move { adapter.test(request).await })
-        })
+        self.route(
+            context,
+            ArchiveOperation::Test,
+            container,
+            requirements,
+            |adapter| {
+                let request = request.clone();
+                Box::pin(async move { adapter.test(request).await })
+            },
+        )
         .await
     }
 
@@ -1176,9 +1188,7 @@ pub fn format_from_extension(path: impl AsRef<Path>) -> Option<ArchiveFormat> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use smartzip_core::{
-        CompressionLevel, EncodingMode, TaskEvent, TaskEventKind, TaskEventSink,
-    };
+    use smartzip_core::{CompressionLevel, EncodingMode, TaskEvent, TaskEventKind, TaskEventSink};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
@@ -1541,8 +1551,7 @@ mod tests {
             .iter()
             .any(|adapter| adapter.adapter_id == "7zz"));
 
-        let reset_context =
-            router.begin_task(TaskId::new(), Arc::new(RecordingSink::default()));
+        let reset_context = router.begin_task(TaskId::new(), Arc::new(RecordingSink::default()));
         let reset_plan = router.plan_with_context(
             ArchiveOperation::Extract,
             Some(&ArchiveFormat::SevenZip),

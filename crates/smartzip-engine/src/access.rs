@@ -233,7 +233,7 @@ pub(crate) async fn access_archive_with_password<B: ArchiveExecutor>(
     batch_passwords: &mut Vec<PasswordCandidate>,
     password_prompter: Option<&dyn InteractivePasswordPrompter>,
     encoding_prompter: Option<&dyn InteractiveEncodingPrompter>,
-    _events: &EventSink,
+    events: &EventSink,
     task_id: &TaskId,
     load_listing: bool,
 ) -> smartzip_core::Result<ArchiveAccessOutcome> {
@@ -253,7 +253,6 @@ pub(crate) async fn access_archive_with_password<B: ArchiveExecutor>(
     let mut has_password = false;
     let mut listing = None;
     let encrypted = None;
-    let mut emitted = Vec::new();
     let mut last_error = None;
     let mut saw_wrong_password = false;
     let mut password_prompt_cancelled = false;
@@ -262,7 +261,7 @@ pub(crate) async fn access_archive_with_password<B: ArchiveExecutor>(
     for password in &ordered_candidates {
         let pw_value = password_value(password);
         let attempt_index = password_attempt_index(password, &ordered_candidates);
-        emitted.push(TaskEvent {
+        events.push(TaskEvent {
             task_id: task_id.clone(),
             kind: TaskEventKind::Progress(smartzip_core::TaskProgress::indeterminate(format!(
                 "Trying password [{}/{}] ({}) for {}",
@@ -281,12 +280,15 @@ pub(crate) async fn access_archive_with_password<B: ArchiveExecutor>(
             "archive-backend",
             "list",
             &resolved.archive_path,
-            backend.list_with_context(ListRequest {
-                archive: resolved.archive_path.clone(),
-                format: resolved.candidate.detected_format.clone(),
-                password: pw_value.clone(),
-                encoding: resolved.encoding_mode.clone(),
-            }, task_context),
+            backend.list_with_context(
+                ListRequest {
+                    archive: resolved.archive_path.clone(),
+                    format: resolved.candidate.detected_format.clone(),
+                    password: pw_value.clone(),
+                    encoding: resolved.encoding_mode.clone(),
+                },
+                task_context,
+            ),
         )
         .await
         {
@@ -319,7 +321,7 @@ pub(crate) async fn access_archive_with_password<B: ArchiveExecutor>(
 
     if used_password.is_none() {
         if let Some(prompter) = password_prompter {
-            emitted.push(TaskEvent {
+            events.push(TaskEvent {
                 task_id: task_id.clone(),
                 kind: TaskEventKind::Progress(smartzip_core::TaskProgress::indeterminate(format!(
                     "Prompting for password: {}",
@@ -345,12 +347,15 @@ pub(crate) async fn access_archive_with_password<B: ArchiveExecutor>(
                                 "archive-backend",
                                 "list",
                                 &resolved.archive_path,
-                                backend.list_with_context(ListRequest {
-                                    archive: resolved.archive_path.clone(),
-                                    format: resolved.candidate.detected_format.clone(),
-                                    password: Some(pw.clone()),
-                                    encoding: resolved.encoding_mode.clone(),
-                                }, task_context),
+                                backend.list_with_context(
+                                    ListRequest {
+                                        archive: resolved.archive_path.clone(),
+                                        format: resolved.candidate.detected_format.clone(),
+                                        password: Some(pw.clone()),
+                                        encoding: resolved.encoding_mode.clone(),
+                                    },
+                                    task_context,
+                                ),
                             )
                             .await
                             .map_err(|error| {
@@ -415,12 +420,15 @@ pub(crate) async fn access_archive_with_password<B: ArchiveExecutor>(
                 "archive-backend",
                 "list",
                 &resolved.archive_path,
-                backend.list_with_context(ListRequest {
-                    archive: resolved.archive_path.clone(),
-                    format: resolved.candidate.detected_format.clone(),
-                    password: used_password.clone(),
-                    encoding: encoding_mode.clone(),
-                }, task_context),
+                backend.list_with_context(
+                    ListRequest {
+                        archive: resolved.archive_path.clone(),
+                        format: resolved.candidate.detected_format.clone(),
+                        password: used_password.clone(),
+                        encoding: encoding_mode.clone(),
+                    },
+                    task_context,
+                ),
             )
             .await?,
         );
@@ -433,7 +441,7 @@ pub(crate) async fn access_archive_with_password<B: ArchiveExecutor>(
         encoding_mode,
         listing,
         encrypted,
-        events: emitted,
+        events: Vec::new(),
         password_prompt_cancelled,
     })
 }
