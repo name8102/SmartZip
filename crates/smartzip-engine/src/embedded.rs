@@ -59,18 +59,15 @@ pub fn select_embedded_action(
 
     let dominated = find_dominant(findings, file_size);
 
-    match policy.mode {
-        EmbeddedScanMode::Ignore => {
-            return DetectionDecision {
-                kind: DetectionKind::EmbeddedPayload,
-                action: DetectionAction::SkipByDefault,
-                selected_index: None,
-                findings_summary: summaries,
-                archive_ratio: dominated.map(|(_, r)| r),
-                reason: "scan mode is Ignore".into(),
-            };
-        }
-        _ => {}
+    if policy.mode == EmbeddedScanMode::Ignore {
+        return DetectionDecision {
+            kind: DetectionKind::EmbeddedPayload,
+            action: DetectionAction::SkipByDefault,
+            selected_index: None,
+            findings_summary: summaries,
+            archive_ratio: dominated.map(|(_, r)| r),
+            reason: "scan mode is Ignore".into(),
+        };
     }
 
     if let Some((idx, ratio)) = dominated {
