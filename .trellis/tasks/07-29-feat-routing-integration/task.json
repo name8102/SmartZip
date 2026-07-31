@@ -15,7 +15,7 @@
   "branch": "integration/feat-plus-routing-clean",
   "base_branch": "origin/feat/db-history-persistence",
   "worktree_path": null,
-  "commit": null,
+  "commit": "0d8d742",
   "pr_url": null,
   "subtasks": [
     "07-29-engine-modularize",
