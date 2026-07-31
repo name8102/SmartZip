@@ -15,8 +15,10 @@ That is exactly the class of conflict / duplication / redundancy we refuse. Pref
 
 1. **Product base**: `origin/feat/db-history-persistence` (fine-grained DB + history + header-first detection + file-aware CLI).
 2. **Discard**: local `main` simple DB redo (`history.rs` / `known_file.rs` style).
-3. **Routing direction**: workspace capability-aware routing (`c64f77b` / `wip/routing-gui-worktree`) is the **spec and reference implementation**, not a patch to splice blindly.
-4. **No hybrid traits**: one executor seam, one adapter seam, one capability model (profiles), one construction path for the router.
+3. **Engine structure**: feat **behavior is correct** but `engine` `lib.rs` is overweight; modularize so `SmartZipEngine` only **schedules** and capabilities live in dedicated modules **before** retargeting the backend trait (`07-29-engine-modularize`).
+4. **Routing direction**: workspace capability-aware routing (`c64f77b` / `wip/routing-gui-worktree`) is the **spec and reference implementation**, not a patch to splice blindly.
+5. **No hybrid traits**: one executor seam, one adapter seam, one capability model (profiles), one construction path for the router.
+6. **DB/CLI product redesign** (if any) is **out of band** of the routing port: hang off stable engine hooks after modularize; do not re-litigate file-grain vs simple DB inside hybrid merges.
 
 ## Working branches
 
@@ -37,7 +39,8 @@ That is exactly the class of conflict / duplication / redundancy we refuse. Pref
 
 ```
 CLI/GUI
-  -> SmartZipEngine (feat history + extract workflow)
+  -> SmartZipEngine (thin facade / scheduler)
+       -> workflow + access + encoding + nested + history + layout/…
        -> ArchiveExecutor (BackendRouter only)
             -> ArchiveAdapter[] (native zip / 7z / unrar / …)
                  profiles from smartzip-config (family/version/installation)
@@ -49,22 +52,28 @@ CLI/GUI
 
 ## Child task sequence (strict order)
 
-1. **`07-29-port-routing-core`** — add `smartzip-core` routing types + errors + `TaskEventKind::Route` from reference; no archive yet.
-2. **`07-29-port-routing-archive`** — rewrite archive/config router & adapters on feat tree using reference; delete old capability dual paths.
-3. **`07-29-port-routing-engine`** — point engine only at `ArchiveExecutor`; preserve history; remove `extract_with_progress` dual call sites in favor of one design.
-4. **`07-29-port-routing-cli`** — feat CLI commands + routing flags/config in one coherent `main.rs` rewrite of the extract/backend wiring (not conflict resolution).
-5. **`07-29-integration-verify`** — check/test + landing plan.
+1. **`07-29-engine-modularize`** — behavior-preserving split of feat `smartzip-engine` (`lib.rs` → modules; facade schedules only). May run **in parallel** with step 2.
+2. **`07-29-port-routing-core`** — add `smartzip-core` routing types + errors + `TaskEventKind::Route` from reference; no archive yet. Parallel-safe with step 1.
+3. **`07-29-port-routing-archive`** — rewrite archive/config router & adapters on feat tree using reference; delete old capability dual paths.
+4. **`07-29-port-routing-engine`** — point **already-modular** engine only at `ArchiveExecutor`; preserve history; one progress design. **Requires step 1.**
+5. **`07-29-port-routing-cli`** — **wiring only**: single backend construction path + routing flags on the **current** feat command surface (not a CLI product redesign; not conflict resolution).
+6. **`07-29-integration-verify`** — check/test + structure/routing guards + landing plan (depends on modularize + all port children).
 
-Optional later (not blocking routing port): GUI prototype binary from `c64f77b` if still desired.
+**All of the above child tasks remain in force** under the revised plan (engine modularize first; routing chain kept). Do not drop core/archive/engine/cli/verify because structure work was added.
+
+Optional later (not blocking this umbrella): GUI prototype from `c64f77b`; **separate** `db-*` / `cli-surface-*` tasks when redesign ideas harden.
 
 ## Explicit non-goals
 
 - Continuing conflict resolution on `integration/feat-plus-routing`
 - “Keeping both” BackendCapabilities and BackendCapabilityProfile
 - Cherry-picking local main DB commits
+- Replacing feat engine behavior with wip’s thinner extract path
+- Shipping DB/CLI redesign inside the routing port PRs
 
 ## Success criteria
 
+- [ ] Engine facade is modular (scheduler vs capabilities) **before or as gate for** executor retarget
 - [ ] Clean branch has **no** `ArchiveBackend` symbol
 - [ ] Clean branch has **no** adapter `fn capabilities(&self) -> BackendCapabilities` as the routing authority
 - [ ] Engine history + DB tests still express feat behavior

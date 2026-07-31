@@ -6,11 +6,12 @@
 
 ## Depends on
 
-`07-29-port-routing-archive`
+- `07-29-port-routing-archive`
+- **`07-29-engine-modularize`** (workflow/access/encoding/nested boundaries exist; do not retarget the god-file)
 
 ## Goal
 
-Feat engine behavior stays; backend injection becomes `ArchiveExecutor` only.
+Feat engine behavior stays on the **modular** facade; backend injection becomes `ArchiveExecutor` only. Trait/generic renames and progress unification land in `workflow` / `access` / `backend_util` (or equivalent), not by re-expanding a monolith `lib.rs`.
 
 ## Must preserve
 
