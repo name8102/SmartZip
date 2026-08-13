@@ -546,6 +546,7 @@ impl ArchiveAdapter for SevenZipBackend {
                 ArchiveFormat::Gzip,
                 ArchiveFormat::Bzip2,
                 ArchiveFormat::Xz,
+                ArchiveFormat::Zstd,
                 ArchiveFormat::Cab,
             ],
             &[ArchiveFormat::Zip, ArchiveFormat::SevenZip],
@@ -799,6 +800,7 @@ fn parse_archive_format(value: &str) -> ArchiveFormat {
         "gzip" | "gz" => ArchiveFormat::Gzip,
         "bzip2" | "bz2" => ArchiveFormat::Bzip2,
         "xz" => ArchiveFormat::Xz,
+        "zstd" | "zst" => ArchiveFormat::Zstd,
         "cab" => ArchiveFormat::Cab,
         other => ArchiveFormat::Unknown(other.to_owned()),
     }
@@ -1139,6 +1141,26 @@ mod tests {
             SevenZipBackend::password_arg(&Some(String::new())),
             Some("-p\"\"".into())
         );
+    }
+
+    #[test]
+    fn profile_declares_zstd_stream_support() {
+        let backend = SevenZipBackend::new(PathBuf::from("7z"));
+        let profile = backend.profile();
+        let capability = smartzip_core::CapabilityId::new("container:zstd").unwrap();
+        assert_eq!(
+            profile.support(
+                &capability,
+                smartzip_core::ArchiveOperation::Extract,
+                Some(&ArchiveFormat::Zstd),
+            ),
+            smartzip_core::SupportState::Supported
+        );
+    }
+
+    #[test]
+    fn parses_zstd_archive_type() {
+        assert_eq!(parse_archive_format("zstd"), ArchiveFormat::Zstd);
     }
 
     #[test]

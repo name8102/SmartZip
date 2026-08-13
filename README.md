@@ -20,6 +20,13 @@ SmartZip 是一个用 Rust 重写的跨平台压缩包辅助工具，目标是�
 
 ## 快速开始
 
+全局安装 CLI（安装到 Cargo 的用户级 bin 目录）：
+
+```bash
+just install
+smartzip --help
+```
+
 查看帮助：
 
 ```bash

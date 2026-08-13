@@ -1046,6 +1046,47 @@ pub(crate) fn builtin_profile(
     BackendCapabilityProfile { rules }
 }
 
+/// Make a specialized built-in adapter explicitly reject known containers it
+/// does not implement. Without these rules, an omitted container claim is
+/// `Unknown` and remains routable, which can put a terminal adapter such as
+/// unrar after 7z for unrelated formats.
+pub(crate) fn restrict_profile_to_containers(
+    profile: &mut BackendCapabilityProfile,
+    supported: &[ArchiveFormat],
+) {
+    for format in [
+        ArchiveFormat::Zip,
+        ArchiveFormat::SevenZip,
+        ArchiveFormat::Rar,
+        ArchiveFormat::Tar,
+        ArchiveFormat::Gzip,
+        ArchiveFormat::Bzip2,
+        ArchiveFormat::Xz,
+        ArchiveFormat::Cab,
+        ArchiveFormat::Iso,
+        ArchiveFormat::Dmg,
+        ArchiveFormat::Zstd,
+        ArchiveFormat::Lz4,
+        ArchiveFormat::Lzma,
+    ] {
+        if supported.contains(&format) {
+            continue;
+        }
+        for operation in [
+            ArchiveOperation::Probe,
+            ArchiveOperation::List,
+            ArchiveOperation::Test,
+            ArchiveOperation::Extract,
+        ] {
+            profile.rules.push(container_rule_with_support(
+                format.clone(),
+                operation,
+                SupportState::Unsupported,
+            ));
+        }
+    }
+}
+
 fn global_rule(
     capability: CapabilityId,
     operation: ArchiveOperation,
@@ -1066,12 +1107,20 @@ fn global_rule(
 }
 
 fn container_rule(format: ArchiveFormat, operation: ArchiveOperation) -> CapabilityRule {
+    container_rule_with_support(format, operation, SupportState::Supported)
+}
+
+fn container_rule_with_support(
+    format: ArchiveFormat,
+    operation: ArchiveOperation,
+    support: SupportState,
+) -> CapabilityRule {
     CapabilityRule {
         capability: capability_id("container", format.as_str()),
         precedence: 0,
         operations: vec![operation],
         containers: vec![format],
-        support: SupportState::Supported,
+        support,
         evidence: Some("adapter family baseline".into()),
     }
 }
@@ -1206,6 +1255,7 @@ pub fn format_from_extension(path: impl AsRef<Path>) -> Option<ArchiveFormat> {
         "gz" | "tgz" => Some(ArchiveFormat::Gzip),
         "bz2" | "tbz2" => Some(ArchiveFormat::Bzip2),
         "xz" | "txz" => Some(ArchiveFormat::Xz),
+        "zst" | "zstd" => Some(ArchiveFormat::Zstd),
         "cab" => Some(ArchiveFormat::Cab),
         _ => None,
     }
@@ -1679,7 +1729,37 @@ mod tests {
     fn format_from_extension_covers_supported_aliases() {
         assert_eq!(format_from_extension("a.7z"), Some(ArchiveFormat::SevenZip));
         assert_eq!(format_from_extension("a.tgz"), Some(ArchiveFormat::Gzip));
+        assert_eq!(
+            format_from_extension("a.tar.zst"),
+            Some(ArchiveFormat::Zstd)
+        );
         assert_eq!(format_from_extension("a.unknown"), None);
+    }
+
+    #[test]
+    fn sevenzip_is_final_fallback_for_non_rar_formats() {
+        let router = BackendRouter::from_adapters(vec![
+            AdapterRegistration::from_adapter(UnrarBackend::new(PathBuf::from("unrar")), 20),
+            AdapterRegistration::from_adapter(SevenZipBackend::new(PathBuf::from("7z")), 10),
+            AdapterRegistration::from_adapter(NativeZipBackend::new(), -10),
+        ]);
+
+        let zstd_plan = router.plan(
+            ArchiveOperation::Extract,
+            Some(&ArchiveFormat::Zstd),
+            ArchiveRequirements::default(),
+        );
+        assert_eq!(zstd_plan.candidates.len(), 1);
+        assert!(zstd_plan.candidates[0].adapter_id.starts_with("sevenzip:"));
+
+        let rar_plan = router.plan(
+            ArchiveOperation::Extract,
+            Some(&ArchiveFormat::Rar),
+            ArchiveRequirements::default(),
+        );
+        assert_eq!(rar_plan.candidates.len(), 2);
+        assert!(rar_plan.candidates[0].adapter_id.starts_with("unrar:"));
+        assert!(rar_plan.candidates[1].adapter_id.starts_with("sevenzip:"));
     }
 
     #[allow(dead_code)]

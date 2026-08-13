@@ -184,13 +184,15 @@ impl ArchiveAdapter for NativeZipBackend {
     }
 
     fn profile(&self) -> smartzip_core::BackendCapabilityProfile {
-        crate::router::builtin_profile(
+        let mut profile = crate::router::builtin_profile(
             &[ArchiveFormat::Zip],
             &[ArchiveFormat::Zip],
             true,
             true,
             true,
-        )
+        );
+        crate::router::restrict_profile_to_containers(&mut profile, &[ArchiveFormat::Zip]);
+        profile
     }
 }
 
