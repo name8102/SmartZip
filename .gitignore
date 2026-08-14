@@ -55,3 +55,6 @@ __pycache__/
 
 # Generated test fixtures (rebuild with tests/fixtures/embedded/generate.py)
 tests/fixtures/embedded/root_embedded_zip_low_ratio.bin
+
+# Task attachment assets (screenshots, mockups, etc.)
+.trellis/tasks/*/assets/
