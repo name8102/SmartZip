@@ -12,21 +12,13 @@ target/
 
 # Local tool installs generated during development
 .tools/
-graphify-out/cache/
-graphify-out/.graphify_python
-graphify-out/.graphify_root
-graphify-out/cost.json
-graphify-out/.graphify_labels.json
+graphify-out/
 
 # Local agent / workflow runtime artifacts
 .agents/skills/trellis-*/
 .claude/
 .codex/
-.pi/agents/
-.pi/extensions/
-.pi/prompts/
-.pi/settings.json
-.pi/skills/trellis-*/
+.pi/
 .trellis/.developer
 .trellis/.gitignore
 .trellis/.runtime/
