@@ -53,3 +53,13 @@ graphify-out/.graphify_labels.json
 lcov.info
 mimocode.json
 smartzip-passwords.txt
+
+# macOS / editor junk
+.DS_Store
+
+# Python bytecode caches
+__pycache__/
+*.pyc
+
+# Generated test fixtures (rebuild with tests/fixtures/embedded/generate.py)
+tests/fixtures/embedded/root_embedded_zip_low_ratio.bin
