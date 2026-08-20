@@ -576,18 +576,37 @@ fn resolve_hypothesis(
 
     // If we have members but not all slots filled (gaps), we already warned but not incomplete. So proceed to resolved.
 
-    // Sort members by filename_ordinal (already in order due to iteration)
-    final_members.sort_by_key(|m| m.filename_ordinal.unwrap_or(0));
+    // Authoritative ordering: if every member has a logical volume index (RAR/ZIP), use it; filename ordinal is only hypothesis.
+    let has_all_logical = final_members.iter().all(|m| m.logical_index.is_some());
+    if has_all_logical {
+        let mut seen = HashSet::new();
+        for m in &final_members {
+            if !seen.insert(m.logical_index.unwrap()) {
+                return HypothesisOutcome::Ambiguous(VolumeSetHypothesis {
+                    format: format.clone(),
+                    members: final_members.clone(),
+                    warnings: warnings.clone(),
+                });
+            }
+        }
+        final_members.sort_by_key(|m| m.logical_index.unwrap());
+    } else {
+        final_members.sort_by_key(|m| m.filename_ordinal.unwrap_or(0));
+    }
 
-    // Determine ZIP split mechanism for materializer (do not guess via filename alone; use members' probe and naming as structural evidence already validated)
+    // Determine ZIP split mechanism via structural evidence, not filename guess.
     let zip_kind = if format == ArchiveFormat::Zip {
-        let is_raw = final_members.iter().any(|m| {
-            m.path.file_name().and_then(|n| n.to_str()).map_or(false, |name| {
-                let lower = name.to_ascii_lowercase();
-                lower.contains(".zip.") && lower.rsplit('.').next().map_or(false, |ext| ext.chars().all(|c| c.is_ascii_digit()))
-            })
-        });
-        Some(if is_raw { ZipSplitKind::Raw } else { ZipSplitKind::Spanned })
+        let mut is_spanned = false;
+        for m in &final_members {
+            if let VolumeProbeResult::MultiVolume(s) = probe_volume_structure(&m.path) {
+                if s.expected_volume_count.map_or(false, |c| c > 1) || s.is_last_volume == Some(true) && s.logical_volume_index.map_or(false, |idx| idx > 0) {
+                    is_spanned = true;
+                    break;
+                }
+            }
+        }
+        // Also check Possibly with total_disks? For raw, EOCD will be single-disk, so is_spanned remains false.
+        Some(if is_spanned { ZipSplitKind::Spanned } else { ZipSplitKind::Raw })
     } else {
         None
     };
@@ -631,11 +650,10 @@ fn compute_clip_indices(candidates: &BTreeMap<u64, Vec<PathBuf>>, format: &Archi
         for path in paths {
             let probe = probe_volume_structure(path);
             match &probe {
-                VolumeProbeResult::MultiVolume(s) | VolumeProbeResult::PossiblyMultiVolume(s) => {
+                VolumeProbeResult::MultiVolume(s) => {
                     if s.logical_volume_index == Some(0) {
                         if let Some(prev) = start {
                             if prev != *ord {
-                                // Multiple distinct start anchors -> ambiguous grouping
                                 return Err(HypothesisOutcome::Ambiguous(VolumeSetHypothesis {
                                     format: format.clone(),
                                     members: Vec::new(),
@@ -659,6 +677,9 @@ fn compute_clip_indices(candidates: &BTreeMap<u64, Vec<PathBuf>>, format: &Archi
                             end = Some(*ord);
                         }
                     }
+                }
+                VolumeProbeResult::PossiblyMultiVolume(_) => {
+                    // Weak evidence: do not use as strong start/end anchor
                 }
                 VolumeProbeResult::Standalone(_) => {
                     if format == &ArchiveFormat::Zip {

@@ -167,8 +167,14 @@ fn try_reflink_linux(src: &Path, dst: &Path) -> io::Result<()> {
 
 #[cfg(target_os = "macos")]
 fn try_clonefile_macos(src: &Path, dst: &Path) -> io::Result<()> {
-    // Use clonefile(2) via libc if available? On macOS, clonefile is not in libc; we can use fclonefileat? Simplify: try std::fs::copy with APFS CoW may already? Just fallback.
-    // Attempt via `std::process::Command::new("cp").arg("-c")`? Not.
-    // We'll try using `nix`? Instead, just fail to fallback.
-    Err(io::Error::new(io::ErrorKind::Unsupported, "clonefile not implemented, fallback"))
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let src_c = CString::new(src.as_os_str().as_bytes()).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    let dst_c = CString::new(dst.as_os_str().as_bytes()).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    let ret = unsafe { libc::clonefile(src_c.as_ptr(), dst_c.as_ptr(), 0) };
+    if ret == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
 }

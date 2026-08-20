@@ -18,10 +18,10 @@ pub fn probe_rar(path: &Path) -> Option<VolumeProbeResult> {
         return None;
     }
     if n >= 8 && header[..8] == RAR5_MAGIC[..8] {
-        return Some(probe_rar5(&header, path, &mut file));
+        return Some(probe_rar5(&header[..n], path, &mut file));
     }
     if n >= 7 && header[..7] == RAR4_MAGIC[..7] {
-        return Some(probe_rar4(&header, path, &mut file));
+        return Some(probe_rar4(&header[..n], path, &mut file));
     }
     None
 }
@@ -76,9 +76,6 @@ fn parse_rar5_main_flags(data: &[u8]) -> Option<(bool, Option<u32>)> {
     let hdr_flags = read_vint(data, &mut pos)?;
     let has_extra = (hdr_flags & 0x01) != 0;
     let extra_size = if has_extra { read_vint(data, &mut pos)? } else { 0 };
-    // For RAR5 main header, Archive flags follow immediately after Extra area size, not in Data area.
-    // Layout: Header flags, [Extra area size], Archive flags, [Volume number], [Extra area]
-    // Archive flags 0x0001 = Volume, 0x0002 = Volume number present.
     if data.len() < pos + 1 {
         return None;
     }
@@ -87,10 +84,12 @@ fn parse_rar5_main_flags(data: &[u8]) -> Option<(bool, Option<u32>)> {
     let has_vol_number = (arc_flags & 0x02) != 0;
     let vol_number = if has_vol_number {
         Some(read_vint(data, &mut pos)? as u32)
+    } else if is_volume {
+        // First volume has no explicit number field; it is logical 0
+        Some(0)
     } else {
         None
     };
-    // Validate extra area fits (if present, it follows after archive flags/volume number)
     if has_extra && data.len() < pos + extra_size as usize {
         return None;
     }
@@ -128,10 +127,7 @@ fn read_vint(data: &[u8], pos: &mut usize) -> Option<u64> {
 }
 
 fn probe_rar4(header: &[u8], _path: &Path, file: &mut File) -> VolumeProbeResult {
-    // RAR3/4: after 7-byte magic, main header: [HEAD_CRC 2][HEAD_TYPE 1][HEAD_FLAGS 2][HEAD_SIZE 2]...
-    // HEAD_TYPE 0x73 = MAIN_HEAD, flags 0x0001 = volume, 0x0002 = comment, 0x0100 = solid, etc.
-    // Also at offset 10-11 flags, 12-13 size, 14-15 high pos? etc.
-    // We'll read flags directly.
+    // header is already truncated to actually read bytes (&header[..n])
     if header.len() < 13 {
         return VolumeProbeResult::PossiblyMultiVolume(VolumeStructure {
             format: ArchiveFormat::Rar,
