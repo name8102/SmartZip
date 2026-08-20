@@ -17,7 +17,7 @@ pub fn probe_rar(path: &Path) -> Option<VolumeProbeResult> {
     if n < 8 {
         return None;
     }
-    if header[..7] == RAR5_MAGIC[..7] {
+    if n >= 8 && header[..8] == RAR5_MAGIC[..8] {
         return Some(probe_rar5(&header, path, &mut file));
     }
     if n >= 7 && header[..7] == RAR4_MAGIC[..7] {
@@ -27,22 +27,11 @@ pub fn probe_rar(path: &Path) -> Option<VolumeProbeResult> {
 }
 
 fn probe_rar5(header: &[u8], _path: &Path, _file: &mut File) -> VolumeProbeResult {
-    // RAR5 structure: after 8-byte signature, headers are blocks.
-    // For cheap probe, look at main header if present.
-    // RAR5 main header flags: bit 0x0001 = volume, bit 0x0002 = volume number.
-    // We parse minimally: after signature, first header is archive header.
-    // Hard to parse fully without full spec; use heuristic.
-    // If we see volume flag in bytes near main header, treat as MultiVolume.
-    // For now, attempt simple parse: skip signature, read header.
-    // Archive header type = 1, flags in vint.
-    // We do bounded scan for volume presence.
-    // Simplify: if file contains "vol"?? Instead, treat any RAR5 as possibly multivolume
-    // if multivolume flag present, else standalone.
-    // For robust but cheap: check byte at offset 9-12 for flag bits.
-    // This is best-effort; resolver will combine with filename hypotheses.
-    // We'll try to read main header flags via vint parsing.
-    let mut off = 8usize;
-    if header.len() <= off {
+    // RAR5 after 8-byte signature: sequence of headers each starting with CRC32.
+    // Main header (type 1) general flags 0x0001 = extra area present, 0x0002 = data area present.
+    // Archive flags (volume 0x0001, volume number present 0x0002) are inside data area, not header flags.
+    // Correct parsing must skip extra area and read archive flags from data.
+    if header.len() <= 8 {
         return VolumeProbeResult::PossiblyMultiVolume(VolumeStructure {
             format: ArchiveFormat::Rar,
             logical_volume_index: None,
@@ -51,10 +40,7 @@ fn probe_rar5(header: &[u8], _path: &Path, _file: &mut File) -> VolumeProbeResul
             is_last_volume: None,
         });
     }
-    // RAR5 headers: [CRC32 4][header size vint][type vint][flags vint][extra size vint][data size vint]...
-    // We attempt to parse first header after signature to extract flags.
-    // If parsing fails, fallback to PossiblyMultiVolume.
-    match parse_rar5_main_flags(&header[off..]) {
+    match parse_rar5_main_flags(&header[8..]) {
         Some((is_volume, volume_number)) => {
             if is_volume {
                 VolumeProbeResult::MultiVolume(VolumeStructure {
@@ -62,11 +48,9 @@ fn probe_rar5(header: &[u8], _path: &Path, _file: &mut File) -> VolumeProbeResul
                     logical_volume_index: volume_number,
                     expected_volume_count: None,
                     expected_logical_size: None,
-                    is_last_volume: Some(false), // not last if volume flag set but no end flag; need more precise
+                    is_last_volume: Some(false),
                 })
             } else {
-                // Check for end-of-archive block? RAR5 end block type 5.
-                // If file is standalone, we treat as standalone.
                 VolumeProbeResult::Standalone(ArchiveFormat::Rar)
             }
         }
@@ -81,20 +65,39 @@ fn probe_rar5(header: &[u8], _path: &Path, _file: &mut File) -> VolumeProbeResul
 }
 
 fn parse_rar5_main_flags(data: &[u8]) -> Option<(bool, Option<u32>)> {
-    // Very cheap vint parser.
     let mut pos = 0usize;
     let _crc = read_bytes(data, &mut pos, 4)?;
-    let header_size = read_vint(data, &mut pos)?;
+    let _header_size = read_vint(data, &mut pos)?;
     let header_type = read_vint(data, &mut pos)?;
     if header_type != 1 {
         return None;
     }
-    let flags = read_vint(data, &mut pos)? as u16;
-    let is_volume = (flags & 0x0001) != 0;
-    // Volume number is optional extra? In RAR5, volume number stored as extra field?
-    // We ignore for now.
-    let _ = header_size;
-    Some((is_volume, None))
+    let hdr_flags = read_vint(data, &mut pos)?;
+    let has_extra = (hdr_flags & 0x01) != 0;
+    let has_data = (hdr_flags & 0x02) != 0;
+    let extra_size = if has_extra { read_vint(data, &mut pos)? } else { 0 };
+    let data_size = if has_data { read_vint(data, &mut pos)? } else { 0 };
+    // Validate we have enough bytes for extra+data
+    if data.len() < pos + extra_size as usize + data_size as usize {
+        return None;
+    }
+    // Data area for main header contains archive flags (and optional volume number)
+    if data_size == 0 {
+        // No data means no archive flags -> treat as not volume (standalone without extra)
+        return Some((false, None));
+    }
+    let data_start = pos + extra_size as usize;
+    let data_slice = &data[data_start..data_start + data_size as usize];
+    let mut dpos = 0usize;
+    let arc_flags = read_vint(data_slice, &mut dpos)?;
+    let is_volume = (arc_flags & 0x01) != 0;
+    let has_vol_number = (arc_flags & 0x02) != 0;
+    let vol_number = if has_vol_number {
+        Some(read_vint(data_slice, &mut dpos)? as u32)
+    } else {
+        None
+    };
+    Some((is_volume, vol_number))
 }
 
 fn read_bytes<'a>(data: &'a [u8], pos: &mut usize, n: usize) -> Option<&'a [u8]> {

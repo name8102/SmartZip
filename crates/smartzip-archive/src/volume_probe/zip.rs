@@ -39,8 +39,8 @@ pub fn probe_zip(path: &Path) -> Option<VolumeProbeResult> {
             if let Some(z64) = probe_zip64(&buf, eocd_pos, file_len) {
                 return Some(z64);
             }
-            // If ZIP64 needed but not found, treat as possibly multivolume (definitely not standalone).
-            return Some(VolumeProbeResult::MultiVolume(VolumeStructure {
+            // ZIP64 placeholder but locator not found or invalid -> not definite MultiVolume, downgrade to Possibly
+            return Some(VolumeProbeResult::PossiblyMultiVolume(VolumeStructure {
                 format: ArchiveFormat::Zip,
                 logical_volume_index: Some(this_disk),
                 expected_volume_count: None,
@@ -85,20 +85,16 @@ pub fn probe_zip(path: &Path) -> Option<VolumeProbeResult> {
             }));
         }
     } else {
-        // No EOCD found: check for local file header at offset 0?
-        // Local header magic at 0 is not sufficient proof of standalone completeness.
-        // If file starts with PK\x03\x04 but no EOCD, it may be a split part without EOCD (e.g., .z01).
-        // Treat as PossiblyMultiVolume if local header present.
+        // No EOCD found: local header alone is not proof of standalone, and also not proof of definite MultiVolume (could be truncated).
         let mut head = [0u8; 4];
         file.seek(SeekFrom::Start(0)).ok()?;
         if file.read_exact(&mut head).is_ok() && head == [0x50, 0x4b, 0x03, 0x04] {
-            // Has local header but no EOCD → likely not standalone, need continuation.
-            return Some(VolumeProbeResult::MultiVolume(VolumeStructure {
+            return Some(VolumeProbeResult::PossiblyMultiVolume(VolumeStructure {
                 format: ArchiveFormat::Zip,
                 logical_volume_index: None,
                 expected_volume_count: None,
                 expected_logical_size: None,
-                is_last_volume: Some(false),
+                is_last_volume: None,
             }));
         }
     }
@@ -127,8 +123,8 @@ fn find_eocd(buf: &[u8]) -> Option<usize> {
     None
 }
 
-fn probe_zip64(buf: &[u8], eocd_pos: usize, file_len: u64) -> Option<VolumeProbeResult> {
-    // Search for ZIP64 EOCD locator before EOCD.
+fn probe_zip64(buf: &[u8], eocd_pos: usize, _file_len: u64) -> Option<VolumeProbeResult> {
+    // ZIP64 EOCD locator is 20 bytes: 0:sig, 4:disk with ZIP64 EOCD, 8:offset to ZIP64 EOCD (8 bytes), 16:total disks (4 bytes)
     if eocd_pos < 20 {
         return None;
     }
@@ -144,22 +140,27 @@ fn probe_zip64(buf: &[u8], eocd_pos: usize, file_len: u64) -> Option<VolumeProbe
     if locator + 20 > buf.len() {
         return None;
     }
-    let cd_start_disk_zip64 = u32::from_le_bytes([buf[locator + 8], buf[locator + 9], buf[locator + 10], buf[locator + 11]]);
+    let disk_with_eocd = u32::from_le_bytes([buf[locator + 4], buf[locator + 5], buf[locator + 6], buf[locator + 7]]);
+    // let zip64_eocd_offset = u64::from_le_bytes([buf[locator+8], buf[locator+9], buf[locator+10], buf[locator+11], buf[locator+12], buf[locator+13], buf[locator+14], buf[locator+15]]);
     let total_disks = u32::from_le_bytes([buf[locator + 16], buf[locator + 17], buf[locator + 18], buf[locator + 19]]);
-    // Also read ZIP64 EOCD itself? Locator points to it via offset.
-    // For standalone check, need to see if disks are 1.
-    let this_disk = 0; // EOCD's this_disk already read? But ZIP64 overrides.
-    // Hard to get exact: read ZIP64 EOCD at locator's offset.
-    // We'll approximate: if total_disks == 1 => standalone else multivolume
-    if total_disks == 1 && cd_start_disk_zip64 == 0 {
+    // For standalone single-disk ZIP64, total_disks ==1 and disk_with_eocd ==0
+    if total_disks == 1 && disk_with_eocd == 0 {
         return Some(VolumeProbeResult::Standalone(ArchiveFormat::Zip));
-    } else {
+    } else if total_disks > 1 {
         return Some(VolumeProbeResult::MultiVolume(VolumeStructure {
             format: ArchiveFormat::Zip,
-            logical_volume_index: Some(cd_start_disk_zip64),
+            logical_volume_index: Some(disk_with_eocd),
             expected_volume_count: Some(total_disks),
             expected_logical_size: None,
             is_last_volume: Some(true),
+        }));
+    } else {
+        return Some(VolumeProbeResult::PossiblyMultiVolume(VolumeStructure {
+            format: ArchiveFormat::Zip,
+            logical_volume_index: Some(disk_with_eocd),
+            expected_volume_count: Some(total_disks),
+            expected_logical_size: None,
+            is_last_volume: None,
         }));
     }
 }

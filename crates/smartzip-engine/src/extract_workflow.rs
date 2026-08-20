@@ -88,9 +88,6 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
 
     for input in &request.inputs {
         let relative_path = archive_output_name(input);
-        // Header-first: leave detected_format empty here. The main loop
-        // resolves format from file header, embedded findings, and finally
-        // the extension as a hint.
         queue.push_back(ExtractionCandidate {
             detected_format: None,
             path: input.clone(),
@@ -100,6 +97,31 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
             embedded_offset: None,
             embedded_size: None,
         });
+    }
+    // P1-5: coalesce multiple explicit roots that resolve to the same logical VolumeSet before queueing (
+    // avoid marking coalesced duplicates as skipped -> Partial). Use a temporary resolver for pre-queue.
+    {
+        let mut tmp_resolver = VolumeResolver::new();
+        let mut seen_volume_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut filtered: VecDeque<ExtractionCandidate> = VecDeque::new();
+        for cand in queue.into_iter() {
+            if cand.source == CandidateSource::RootInput {
+                match tmp_resolver.resolve(&cand) {
+                    VolumeResolution::Resolved(set) | VolumeResolution::ResolvedWithWarnings { set, .. } => {
+                        let key = volume_set_key(&set);
+                        if seen_volume_keys.contains(&key) {
+                            continue;
+                        }
+                        seen_volume_keys.insert(key);
+                        filtered.push_back(cand);
+                    }
+                    _ => filtered.push_back(cand),
+                }
+            } else {
+                filtered.push_back(cand);
+            }
+        }
+        queue = filtered;
     }
 
     // C6: Cache password candidates once before the extraction loop.
@@ -166,8 +188,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
             VolumeResolution::Resolved(set) => {
                 let key = volume_set_key(&set);
                 if processed_volume_keys.contains(&key) {
-                    record_skip(history, &task_id, &candidate, "duplicate");
-                    skipped.push(candidate);
+                    // Already processed this logical VolumeSet (e.g., another physical member or nested duplicate) – coalesce without marking as skipped for Partial status.
                     continue;
                 }
                 processed_volume_keys.insert(key);
@@ -220,8 +241,6 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                 }
                 let key = volume_set_key(&set);
                 if processed_volume_keys.contains(&key) {
-                    record_skip(history, &task_id, &candidate, "duplicate");
-                    skipped.push(candidate);
                     continue;
                 }
                 processed_volume_keys.insert(key);
@@ -1588,7 +1607,34 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
             queue.push_back(nested);
         }
 
-        if let Some(path) = recyclable_nested_archive_path(&candidate, &request.output_dir) {
+        // For volume sets, recycle all members that are inside the managed output root; for singles, recycle the single candidate.
+        if let Some(set) = volume_set_for_candidate {
+            for member in set.members {
+                let synthetic = ExtractionCandidate {
+                    path: member.path.clone(),
+                    relative_path: member.path.clone(),
+                    depth: candidate.depth,
+                    source: CandidateSource::ExtractedFile,
+                    detected_format: Some(set.format.clone()),
+                    embedded_offset: None,
+                    embedded_size: None,
+                };
+                if let Some(path) = recyclable_nested_archive_path(&synthetic, &request.output_dir) {
+                    if let Err(error) = recycle_archive(archive_recycler.clone(), path.clone()).await {
+                        events.push(TaskEvent {
+                            task_id: task_id.clone(),
+                            kind: TaskEventKind::Warning {
+                                message: format!(
+                                    "failed to move processed nested archive {} to trash: {}",
+                                    path.display(),
+                                    error
+                                ),
+                            },
+                        });
+                    }
+                }
+            }
+        } else if let Some(path) = recyclable_nested_archive_path(&candidate, &request.output_dir) {
             if let Err(error) = recycle_archive(archive_recycler.clone(), path.clone()).await {
                 events.push(TaskEvent {
                     task_id: task_id.clone(),

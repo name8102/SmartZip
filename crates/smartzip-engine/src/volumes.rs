@@ -175,24 +175,22 @@ impl VolumeResolver {
             }
         }
 
-        // Decision per spec:
-        // - Use outcomes equivalent to Single/Resolved/WithWarnings/Incomplete/GroupingAmbiguous
-        // - Resolved must not claim contents fully tested.
-        // - Filename gaps alone never cause Incomplete.
-        // - Definite missing-volume structure causes Incomplete.
-        // - Multiple plausible groupings fail as GroupingAmbiguous.
-        // - Strong structural evidence may clip unrelated files before start or after determinable end.
-        // - Do not perform arbitrary subset search inside interval.
-
-        if resolved_hypotheses.is_empty() && !incomplete_reasons.is_empty() {
-            // If all hypotheses lead to Incomplete due to definite missing volumes, return Incomplete
-            // If multiple hypotheses are incomplete, pick first.
-            return VolumeResolution::Incomplete(incomplete_reasons.into_iter().next().unwrap());
+        // Decision per spec (P1-7): any remaining plausible alternative makes GroupingAmbiguous, even if one path resolves uniquely.
+        if !ambiguous_hypotheses.is_empty() {
+            let mut hypos = ambiguous_hypotheses;
+            for (set, warnings) in resolved_hypotheses {
+                hypos.push(VolumeSetHypothesis {
+                    format: set.format.clone(),
+                    members: set.members.clone(),
+                    warnings,
+                });
+            }
+            // Also include incomplete hypotheses as ambiguous alternatives if they were plausible membership?
+            // Prioritize ambiguous over incomplete when both exist.
+            return VolumeResolution::GroupingAmbiguous { hypotheses: hypos };
         }
-        if resolved_hypotheses.is_empty() && !ambiguous_hypotheses.is_empty() {
-            return VolumeResolution::GroupingAmbiguous {
-                hypotheses: ambiguous_hypotheses,
-            };
+        if !incomplete_reasons.is_empty() && resolved_hypotheses.is_empty() {
+            return VolumeResolution::Incomplete(incomplete_reasons.into_iter().next().unwrap());
         }
         if resolved_hypotheses.len() == 1 {
             let (set, warnings) = resolved_hypotheses.into_iter().next().unwrap();
@@ -312,8 +310,19 @@ fn resolve_hypothesis(
     // Now add alias candidates that fill gaps or add alternate views.
     let mut slot_candidates: BTreeMap<u64, Vec<PathBuf>> = BTreeMap::new();
     for (ord, files) in &hyp.groups {
-        let mut paths: Vec<PathBuf> = files.iter().map(|f| f.path.clone()).collect();
+        let paths: Vec<PathBuf> = files.iter().map(|f| f.path.clone()).collect();
         slot_candidates.insert(*ord, paths);
+    }
+    // P1-6: standalone archive among multiple members is strong counter-evidence for multivolume hypothesis.
+    // If any candidate is Standalone and we have >1 distinct ordinals, the hypothesis is not viable.
+    if slot_candidates.len() > 1 {
+        for paths in slot_candidates.values() {
+            for p in paths {
+                if matches!(probe_volume_structure(p), VolumeProbeResult::Standalone(_)) {
+                    return HypothesisOutcome::NotViable;
+                }
+            }
+        }
     }
 
     // Alias handling: for each file that has alias_stripped_name matching hypothesis pattern, compute its stripped ordinal value, and add as alternate candidate to that slot.
@@ -497,12 +506,50 @@ fn resolve_hypothesis(
         _ => None,
     };
     if let Some(exp_size) = expected_logical {
-        let total_size: u64 = final_members.iter().filter_map(|m| std::fs::metadata(&m.path).ok().map(|md| md.len())).sum();
-        if total_size < exp_size {
-            // If total size less than expected logical, data missing. But for 7z split, total size includes headers plus packed data; sum of physical files should be at least exp_size.
-            // If less, incomplete.
-            // However for 7z, expected logical is just header extent, not total archive size? Actually expected_logical_size is NextHeader extent inside first file only; physical split size may be larger. So not good.
-            // We'll not use this for incomplete unless clearly truncated.
+        if format == ArchiveFormat::SevenZip {
+            // For 7z, expected is 32 + NextHeaderOffset + NextHeaderSize = logical archive size.
+            // Sum of physical volume file sizes should equal expected when set is complete.
+            // Use cumulative size to detect missing or to find strong end anchor.
+            final_members.sort_by_key(|m| m.filename_ordinal.unwrap_or(0));
+            let mut cumulative: u64 = 0;
+            let mut end_anchor: Option<u64> = None;
+            let mut reached_exact = false;
+            for m in &final_members {
+                let sz = std::fs::metadata(&m.path).map(|md| md.len()).unwrap_or(0);
+                cumulative = cumulative.saturating_add(sz);
+                if cumulative == exp_size {
+                    end_anchor = m.filename_ordinal;
+                    reached_exact = true;
+                    break;
+                } else if cumulative > exp_size {
+                    // Overshoot: do not guess, treat as ambiguous if we have not yet proven completeness
+                    // For now, break and let normal clipping handle; the set is not incomplete but may be overfull.
+                    break;
+                }
+            }
+            if !reached_exact && cumulative < exp_size {
+                return HypothesisOutcome::Incomplete(VolumeProblem {
+                    reason: format!("7z logical size {} > cumulative {} (missing volumes)", exp_size, cumulative),
+                    format: Some(format.clone()),
+                });
+            }
+            if let Some(end_ord) = end_anchor {
+                // Strong end anchor: clip any members beyond end_ord
+                let orig_len = final_members.len();
+                final_members.retain(|m| m.filename_ordinal.unwrap_or(0) <= end_ord);
+                if final_members.len() < orig_len {
+                    warnings.push(VolumeWarning::SuffixClipped { clipped: orig_len - final_members.len() });
+                }
+            }
+        } else {
+            // For other formats, expected_logical_size not defined; ignore.
+            let total_size: u64 = final_members.iter().filter_map(|m| std::fs::metadata(&m.path).ok().map(|md| md.len())).sum();
+            if total_size < exp_size {
+                return HypothesisOutcome::Incomplete(VolumeProblem {
+                    reason: format!("expected logical size {} > cumulative {}", exp_size, total_size),
+                    format: Some(format.clone()),
+                });
+            }
         }
     }
 
@@ -966,22 +1013,18 @@ mod tests {
         let p1 = dir.path().join("\u{8cc7}\u{6e90}\u{2460}.jpg"); // 资源①.jpg
         let p2 = dir.path().join("\u{8cc7}\u{6e90}\u{2461}.jpg");
         let p3 = dir.path().join("\u{8cc7}\u{6e90}\u{2462}.jpg");
-        // First is 7z start, others raw
-        create_fake_7z_start(&p1, 0, 0); // minimal 7z with expected logical within file -> standalone? need split case: make expected beyond file
-        // Overwrite p1 to be split start: expected beyond file
-        fs::remove_file(&p1).unwrap();
-        create_fake_7z_start(&p1, 1000, 1000); // expected 2032 > file len 1032? Actually file len will be 32+1000+1000 =2032, so expected 2032 <= len, would be standalone. To make split, we need expected > len, so we create file with smaller content than expected.
-        // Simplify: create 7z with large expected but small file: we need to manually write header with large offset but not pad fully.
+        // First is 7z start, others raw. Create header with expected equal to sum of all 3 file sizes (132 + 18 + 18 = 168)
+        // So NextHeaderOffset+NextHeaderSize = 136 (168-32)
         {
             let mut header = [0u8; 32];
             header[0..6].copy_from_slice(b"\x37\x7a\xbc\xaf\x27\x1c");
-            header[12..20].copy_from_slice(&5000u64.to_le_bytes());
-            header[20..28].copy_from_slice(&5000u64.to_le_bytes());
+            header[12..20].copy_from_slice(&68u64.to_le_bytes());
+            header[20..28].copy_from_slice(&68u64.to_le_bytes());
             let crc = crc32fast::hash(&header[12..32]);
             header[8..12].copy_from_slice(&crc.to_le_bytes());
             let mut f = fs::File::create(&p1).unwrap();
             f.write_all(&header).unwrap();
-            f.write_all(&vec![0u8; 100]).unwrap(); // file len 132, expected 10032 -> beyond
+            f.write_all(&vec![0u8; 100]).unwrap(); // file len 132, expected 168
         }
         create_raw_file(&p2, b"raw continuation 2");
         create_raw_file(&p3, b"raw continuation 3");
@@ -1128,19 +1171,19 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let p1 = dir.path().join("video.001");
         let p2 = dir.path().join("video.002");
-        // 7z split with only 2 members, first has header, second raw
+        // 7z split with only 2 members, first has header, second raw. Sum = 132 + 12 =144, expected 144 => offset 56, size 56
         {
             let mut header = [0u8; 32];
             header[0..6].copy_from_slice(b"\x37\x7a\xbc\xaf\x27\x1c");
-            header[12..20].copy_from_slice(&5000u64.to_le_bytes());
-            header[20..28].copy_from_slice(&5000u64.to_le_bytes());
+            header[12..20].copy_from_slice(&56u64.to_le_bytes());
+            header[20..28].copy_from_slice(&56u64.to_le_bytes());
             let crc = crc32fast::hash(&header[12..32]);
             header[8..12].copy_from_slice(&crc.to_le_bytes());
             let mut f = fs::File::create(&p1).unwrap();
             f.write_all(&header).unwrap();
-            f.write_all(&vec![0u8; 100]).unwrap();
+            f.write_all(&vec![0u8; 100]).unwrap(); // 132
         }
-        create_raw_file(&p2, b"continuation");
+        create_raw_file(&p2, b"continuation"); // 12
         let mut resolver = VolumeResolver::new();
         let cand = make_candidate(p1.clone());
         match resolver.resolve(&cand) {
@@ -1247,20 +1290,19 @@ mod tests {
     #[test]
     fn prefix_suffix_clipping_via_strong_evidence() {
         let dir = TempDir::new().unwrap();
-        // Create 5 files 01..05, but real set is 02..04 where 02 is 7z start.
+        // Create 5 files 01..05, but real set is 02..05 where 02 is 7z start. Use small expected matching sum of 02..05 (132 + 3*3 =141 => offset+size=109)
         for i in 1..=5 {
             let p = dir.path().join(format!("clip{:02}.dat", i));
             if i == 2 {
-                // 02 is 7z start with large expected
                 let mut header = [0u8; 32];
                 header[0..6].copy_from_slice(b"\x37\x7a\xbc\xaf\x27\x1c");
-                header[12..20].copy_from_slice(&5000u64.to_le_bytes());
-                header[20..28].copy_from_slice(&5000u64.to_le_bytes());
+                header[12..20].copy_from_slice(&54u64.to_le_bytes());
+                header[20..28].copy_from_slice(&55u64.to_le_bytes());
                 let crc = crc32fast::hash(&header[12..32]);
                 header[8..12].copy_from_slice(&crc.to_le_bytes());
                 let mut f = fs::File::create(&p).unwrap();
                 f.write_all(&header).unwrap();
-                f.write_all(&vec![0u8; 100]).unwrap();
+                f.write_all(&vec![0u8; 100]).unwrap(); // 132, expected 141 matches 02..05 sum
             } else {
                 create_raw_file(&p, b"raw");
             }

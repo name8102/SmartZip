@@ -260,7 +260,9 @@ pub(crate) async fn list_archive_with_listener_interactive<B: ArchiveExecutor>(
         recorder.start_task(&task_id, "list", None);
     }
 
-    let mut candidate = resolve_root_candidate(
+    // P1-4: list must handle raw continuation as seed (e.g., disguised 7z .002) where resolve_root_candidate returns None.
+    // Try volume resolver directly on raw file before giving up.
+    let mut candidate = match resolve_root_candidate(
         &request.path,
         &request.scanner,
         min_embedded_size_bytes,
@@ -269,11 +271,31 @@ pub(crate) async fn list_archive_with_listener_interactive<B: ArchiveExecutor>(
         None,
         None,
     )
-    .await?
-    .ok_or_else(|| smartzip_core::SmartZipError::UnsupportedFormat {
-        path: request.path.clone(),
-        format: None,
-    })?;
+    .await? {
+        Some(c) => c,
+        None => {
+            let synthetic = crate::types::ExtractionCandidate {
+                path: request.path.clone(),
+                relative_path: std::path::PathBuf::from(request.path.file_name().unwrap_or_default()),
+                depth: 0,
+                source: crate::types::CandidateSource::RootInput,
+                detected_format: None,
+                embedded_offset: None,
+                embedded_size: None,
+            };
+            let mut check = crate::volumes::VolumeResolver::new();
+            match check.resolve(&synthetic) {
+                crate::volumes::VolumeResolution::Resolved(_) | crate::volumes::VolumeResolution::ResolvedWithWarnings { .. } => synthetic,
+                crate::volumes::VolumeResolution::Incomplete(p) => {
+                    return Err(smartzip_core::SmartZipError::CorruptedArchive { path: request.path.clone(), detail: p.reason })
+                }
+                crate::volumes::VolumeResolution::GroupingAmbiguous { .. } => {
+                    return Err(smartzip_core::SmartZipError::CorruptedArchive { path: request.path.clone(), detail: "grouping ambiguous".into() })
+                }
+                _ => return Err(smartzip_core::SmartZipError::UnsupportedFormat { path: request.path.clone(), format: None }),
+            }
+        }
+    };
 
     // Shared volume resolution (same semantics as extract) – list must not use filename-only heuristics.
     let mut volume_resolver = crate::volumes::VolumeResolver::new();

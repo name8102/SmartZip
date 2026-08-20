@@ -49,11 +49,23 @@ pub fn materialize_volume_set(
     let canonical_stem = "payload";
 
     // Members are already sorted by filename_ordinal.
+    // For ZIP, distinguish spanned (z01/zip) vs raw split (zip.001) via source names.
+    let zip_is_raw_split = if set.format == ArchiveFormat::Zip {
+        set.members.iter().any(|m| {
+            m.path.file_name().and_then(|n| n.to_str()).map_or(false, |name| {
+                // raw split like archive.zip.001 -> contains ".zip." + digits
+                let lower = name.to_ascii_lowercase();
+                lower.contains(".zip.") && lower.rsplit('.').next().map_or(false, |ext| ext.chars().all(|c| c.is_ascii_digit()))
+            })
+        })
+    } else { false };
     let total = set.members.len();
     for (idx, member) in set.members.iter().enumerate() {
         let seq = idx + 1; // 1-based canonical order
         let canonical_name = if set.format == ArchiveFormat::Zip {
-            if seq == total {
+            if zip_is_raw_split {
+                format!("{canonical_stem}.zip.{:03}", seq)
+            } else if seq == total {
                 format!("{canonical_stem}.zip")
             } else {
                 format!("{canonical_stem}.z{:02}", seq)
@@ -66,10 +78,11 @@ pub fn materialize_volume_set(
         canonical_members.push(dest);
     }
 
-    // Entrypoint depends on format: for ZIP, last disk contains EOCD, so entrypoint is last.
-    // For 7z and RAR, first.
+    // Entrypoint depends on format and split style: ZIP spanned last contains EOCD, ZIP raw split first is entry, 7z/RAR first.
     let entry_idx = match set.format {
-        ArchiveFormat::Zip => canonical_members.len().saturating_sub(1),
+        ArchiveFormat::Zip => {
+            if zip_is_raw_split { 0 } else { canonical_members.len().saturating_sub(1) }
+        }
         _ => 0,
     };
     let canonical_entrypoint = canonical_members[entry_idx].clone();
