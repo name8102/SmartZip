@@ -1,0 +1,52 @@
+{
+  "id": "volume-resolver",
+  "name": "volume-resolver",
+  "title": "Robust split-volume resolution",
+  "description": "Replace filename-only first-volume skipping with a content-first, Unicode-aware split-volume resolver for RAR/ZIP/7z. Resolve disguised filenames, alternate copies, missing/ambiguous members, and materialize canonical backend-visible volume names through CoW clone/copy staging.",
+  "status": "planning",
+  "dev_type": null,
+  "scope": null,
+  "package": "smartzip-engine",
+  "priority": "P1",
+  "creator": "charl",
+  "assignee": "charl",
+  "createdAt": "2026-08-20",
+  "completedAt": null,
+  "branch": null,
+  "base_branch": "main",
+  "worktree_path": null,
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [],
+  "children": [],
+  "parent": null,
+  "relatedFiles": [
+    "crates/smartzip-archive/src/lib.rs",
+    "crates/smartzip-archive/src/sevenzz.rs",
+    "crates/smartzip-archive/src/unrar.rs",
+    "crates/smartzip-engine/src/detect.rs",
+    "crates/smartzip-engine/src/extract_workflow.rs",
+    "crates/smartzip-engine/src/nested.rs",
+    "crates/smartzip-engine/src/lib.rs",
+    "crates/smartzip-engine/Cargo.toml",
+    "Cargo.toml",
+    "crates/smartzip-engine/tests/smartzip_integration.rs"
+  ],
+  "notes": "Current main-loop is_first_volume() is filename-only and runs before structural detection. This task replaces that shortcut with a shared resolver used by list/extract and nested candidates. Generic arbitrary byte-split files and cross-file continuation of embedded archives are explicitly out of scope.",
+  "meta": {
+    "decisions": {
+      "filename_role": "sequence hypothesis and relative ordering only; never authoritative completeness",
+      "missing_volume": "definite static missing-volume evidence is terminal for the current logical archive",
+      "grouping_ambiguity": "fail instead of guessing",
+      "completeness_uncertain": "continue when membership/order are uniquely resolved",
+      "sequence_model": "one ordinal token varies per hypothesis",
+      "unicode": "use mature normalization/numeral libraries; do not maintain custom numeral tables",
+      "non_archive_magic": "replace handwritten common-file magic with infer",
+      "alternate_candidates": "allow bounded alias recovery and sampled fingerprinting; no full-file hash",
+      "membership_search": "allow strong-evidence prefix/suffix interval clipping; forbid arbitrary subset search",
+      "materialization": "canonical staging via CoW/reflink clone with regular copy fallback",
+      "generic_split": "out of scope",
+      "embedded_cross_file_volume": "out of scope"
+    }
+  }
+}
