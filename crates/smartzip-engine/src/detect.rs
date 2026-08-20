@@ -14,14 +14,6 @@ const MAGIC_BZIP2_FULL: &[u8] = b"BZh";
 const MAGIC_XZ: &[u8] = b"\xfd\x37\x7a\x58\x5a\x00";
 const MAGIC_TAR_AT_OFFSET_257: &[u8] = b"ustar\0";
 
-const MAGIC_JPEG: &[u8] = b"\xff\xd8\xff";
-const MAGIC_PNG: &[u8] = b"\x89PNG\r\n\x1a\n";
-const MAGIC_MP4: &[u8] = b"\x00\x00\x00";
-const MAGIC_PDF: &[u8] = b"%PDF";
-const MAGIC_ELF: &[u8] = b"\x7fELF";
-const MAGIC_RIFF: &[u8] = b"RIFF";
-const MAGIC_EXE: &[u8] = b"MZ";
-
 fn matches_prefix(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.len() >= needle.len() && &haystack[..needle.len()] == needle
 }
@@ -70,32 +62,28 @@ pub fn detect_non_archive_header(bytes: &[u8]) -> bool {
     if bytes.is_empty() {
         return false;
     }
-    if matches_prefix(bytes, MAGIC_JPEG) {
-        return true;
+    // Replace handwritten ordinary-file magic with the mature `infer` crate.
+    // `infer` is used only for ordinary non-archive classification; archive
+    // detection remains via SmartZip’s own `detect_archive_header` / volume
+    // probes. Embedded scanning stays independent.
+    let Some(kind) = infer::get(bytes) else {
+        return false;
+    };
+    let ext = kind.extension();
+    // Archive-like extensions are not ordinary files; they must not block
+    // volume discovery. This prevents a disguised `.jpg` that actually
+    // contains `PK`/`7z`/`Rar!` bytes from being treated as ordinary.
+    // `infer` itself may report archive types for such bytes – in that
+    // case we return false so the caller can proceed to archive probing.
+    const ARCHIVE_EXTS: &[&str] = &[
+        "zip", "rar", "7z", "tar", "gz", "tgz", "bz2", "xz", "zst", "zstd", "lz4", "lzma", "cab", "iso", "dmg",
+    ];
+    if ARCHIVE_EXTS.contains(&ext) {
+        return false;
     }
-    if matches_prefix(bytes, MAGIC_PNG) {
-        return true;
-    }
-    if matches_prefix(bytes, MAGIC_PDF) {
-        return true;
-    }
-    if matches_prefix(bytes, MAGIC_ELF) {
-        return true;
-    }
-    if matches_prefix(bytes, MAGIC_RIFF) {
-        return true;
-    }
-    if matches_prefix(bytes, MAGIC_EXE) {
-        return true;
-    }
-    if bytes.len() >= 12
-        && matches_prefix(bytes, MAGIC_MP4)
-        && bytes[4..8] != *b"\x00\x00\x00\x00"
-        && bytes[8..12] != *b"\x00\x00\x00\x00"
-    {
-        return true;
-    }
-    false
+    // Any other `infer` hit (jpeg, png, pdf, mp4, elf, exe, riff, etc.) is
+    // strong negative evidence for cross-file volume discovery.
+    true
 }
 
 pub fn classify_by_header(
@@ -236,14 +224,20 @@ mod tests {
 
     #[test]
     fn detects_elf() {
-        let data = b"\x7fELFrest";
-        assert!(detect_non_archive_header(data));
+        // infer's ELF matcher requires >52 bytes
+        let mut data = vec![0u8; 64];
+        data[0..4].copy_from_slice(b"\x7fELF");
+        data[1..4].copy_from_slice(b"ELF");
+        assert!(detect_non_archive_header(&data));
     }
 
     #[test]
     fn detects_riff() {
-        let data = b"RIFF\x00\x00rest";
-        assert!(detect_non_archive_header(data));
+        // infer detects WAV (RIFF/WAVE) not generic RIFF
+        let mut data = vec![0u8; 16];
+        data[0..4].copy_from_slice(b"RIFF");
+        data[8..12].copy_from_slice(b"WAVE");
+        assert!(detect_non_archive_header(&data));
     }
 
     #[test]
