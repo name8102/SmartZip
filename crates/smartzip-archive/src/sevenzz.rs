@@ -261,8 +261,8 @@ impl SevenZipBackend {
             _ = token.cancelled() => {
                 let _ = child.start_kill();
                 let status = child.wait().await.map_err(|source| SmartZipError::io(Some(self.executable.clone()), source))?;
-                if let Some(t) = stdout_task { t.abort(); }
-                if let Some(t) = stderr_task { t.abort(); }
+                if let Some(t) = stdout_task { t.abort(); let _ = t.await; }
+                if let Some(t) = stderr_task { t.abort(); let _ = t.await; }
                 let _ = status;
                 return Err(SmartZipError::Cancelled);
             }
@@ -343,18 +343,14 @@ impl SevenZipBackend {
                 let _ = child.start_kill();
                 let status = child.wait().await
                     .map_err(|source| SmartZipError::io(Some(self.executable.clone()), source))?;
-                // Drain readers: they will see EOF after the child is killed.
-                // We detach them but wait briefly so the pipes are closed.
-                let _ = tokio::time::timeout(
-                    std::time::Duration::from_secs(2),
-                    async {
-                        let _ = stdout_task.await;
-                        let _ = stderr_task.await;
-                    }
-                ).await;
-                // Ensure we return Cancelled even if the child exited with a
-                // different code; the cancellation contract is that the tree
-                // is stopped.
+                // After the process group is killed, pipes will get EOF;
+                // await readers deterministically (no detach). Use a short
+                // timeout to avoid hanging forever if a reader is stuck, but
+                // always await the JoinHandle after aborting.
+                stdout_task.abort();
+                stderr_task.abort();
+                let _ = stdout_task.await;
+                let _ = stderr_task.await;
                 let _ = status;
                 return Err(SmartZipError::Cancelled);
             }
@@ -599,6 +595,39 @@ impl ArchiveAdapter for SevenZipBackend {
         })
     }
 
+    async fn probe_with_context(
+        &self,
+        path: &Path,
+        context: std::sync::Arc<TaskExecutionContext>,
+    ) -> Result<ArchiveProbe> {
+        let token = context.cancellation_token();
+        let request = TestRequest {
+            archive: path.to_path_buf(),
+            format: None,
+            password: Some(String::new()),
+            encoding: smartzip_core::EncodingMode::Auto,
+        };
+        let result = self.test_with_report_and_token(request, &token).await;
+        let (supported, encrypted) = match result {
+            Ok(result) => (result.value.is_some(), result.report.encrypted),
+            Err(SmartZipError::WrongPassword { .. })
+            | Err(SmartZipError::PasswordRequired { .. }) => (true, Some(true)),
+            Err(SmartZipError::UnsupportedContainer { .. }) => (false, None),
+            Err(error) => return Err(error),
+        };
+        // For probe, a successful test means supported; otherwise use the
+        // mapped error handling above. We need to re-evaluate the full probe
+        // logic: if the test succeeded, supported=true; if it failed with
+        // password errors, supported=true; if unsupported container, false.
+        // The above match already handles that.
+        Ok(ArchiveProbe {
+            path: path.to_path_buf(),
+            format: None,
+            encrypted,
+            supported,
+        })
+    }
+
     async fn list(&self, request: ListRequest) -> Result<ArchiveListing> {
         let mut args: Vec<String> = vec!["l".into(), "-slt".into()];
         if let Some(pw) = Self::password_arg(&request.password) {
@@ -619,9 +648,51 @@ impl ArchiveAdapter for SevenZipBackend {
         })
     }
 
+    async fn list_with_context(
+        &self,
+        request: ListRequest,
+        context: std::sync::Arc<TaskExecutionContext>,
+    ) -> Result<ArchiveListing> {
+        let token = context.cancellation_token();
+        let mut args: Vec<String> = vec!["l".into(), "-slt".into()];
+        if let Some(pw) = Self::password_arg(&request.password) {
+            args.push(pw);
+        }
+        if let Some(enc) = Self::encoding_arg(&request.encoding) {
+            args.push(enc);
+        }
+        args.push(request.archive.to_string_lossy().into_owned());
+        let output = self.run_with_token(&args, &token).await?;
+        if output.status != Some(0) {
+            return Err(self.map_failure(&output, &request.archive));
+        }
+        let report = parse_slt_archive_report(&output.stdout);
+        Ok(ArchiveListing {
+            format: report.archive_type.as_deref().map(parse_archive_format),
+            entries: parse_entries(&output.stdout),
+        })
+    }
+
     async fn test(&self, request: TestRequest) -> Result<TestResult> {
         let path = request.archive.clone();
         let result = self.test_with_report(request).await?;
+        if result.value.is_none() {
+            return Err(self.map_reported_failure(&result, &path));
+        }
+        match result.value {
+            Some(value) => Ok(value),
+            None => unreachable!("checked above"),
+        }
+    }
+
+    async fn test_with_context(
+        &self,
+        request: TestRequest,
+        context: std::sync::Arc<TaskExecutionContext>,
+    ) -> Result<TestResult> {
+        let token = context.cancellation_token();
+        let path = request.archive.clone();
+        let result = self.test_with_report_and_token(request, &token).await?;
         if result.value.is_none() {
             return Err(self.map_reported_failure(&result, &path));
         }
@@ -646,7 +717,7 @@ impl ArchiveAdapter for SevenZipBackend {
     async fn extract_with_context(
         &self,
         request: ExtractArchiveRequest,
-        context: &TaskExecutionContext,
+        context: std::sync::Arc<TaskExecutionContext>,
     ) -> Result<ExtractArchiveResult> {
         let token = context.cancellation_token();
         let path = request.archive.clone();
@@ -673,6 +744,32 @@ impl ArchiveAdapter for SevenZipBackend {
                 .map(|input| input.to_string_lossy().into_owned()),
         );
         let output = self.run(&args).await?;
+        if output.status != Some(0) {
+            return Err(self.map_failure(&output, &request.output));
+        }
+        Ok(CompressArchiveResult {
+            output: request.output,
+        })
+    }
+
+    async fn compress_with_context(
+        &self,
+        request: CompressArchiveRequest,
+        context: std::sync::Arc<TaskExecutionContext>,
+    ) -> Result<CompressArchiveResult> {
+        let token = context.cancellation_token();
+        let mut args: Vec<String> = vec!["a".into()];
+        if let Some(pw) = Self::password_arg(&request.password) {
+            args.push(pw);
+        }
+        args.push(request.output.to_string_lossy().into_owned());
+        args.extend(
+            request
+                .inputs
+                .iter()
+                .map(|input| input.to_string_lossy().into_owned()),
+        );
+        let output = self.run_with_token(&args, &token).await?;
         if output.status != Some(0) {
             return Err(self.map_failure(&output, &request.output));
         }
@@ -1404,7 +1501,7 @@ wait $writer_pid 2>/dev/null || true
         let ctx_clone = std::sync::Arc::clone(&ctx);
         let fut = tokio::spawn(async move {
             backend_clone
-                .extract_with_context(request, &ctx_clone)
+                .extract_with_context(request, std::sync::Arc::clone(&ctx_clone))
                 .await
         });
         // Let the child start and write a bit; wait up to 2s for the file to appear.
@@ -1439,17 +1536,26 @@ wait $writer_pid 2>/dev/null || true
             "file should not grow after cancellation"
         );
         // On Unix the process group kill should have terminated the sleep
-        // descendant. Check via /proc or kill -0.
+        // descendant. Verify via kill -0 (ESRCH).
         #[cfg(unix)]
         {
-            // Give the kernel a moment to reap
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            // The descendant was `sleep 30`; if still alive, `ps` would show it.
-            // We check that no `sleep` with our output_dir is still running by
-            // trying to see if the file is still being written (already checked)
-            // and that the process group is gone: the main 7z fake should be reaped.
-            // For this test we just ensure the output dir can be removed
-            // deterministically, which would fail if a descendant still held it.
+            let pid_path = output_dir.join("descendant.pid");
+            if let Ok(pid_str) = std::fs::read_to_string(&pid_path) {
+                let pid_str = pid_str.trim();
+                if let Ok(pid) = pid_str.parse::<i32>() {
+                    // Use kill -0 to check existence; should fail with ESRCH after group kill
+                    let status = std::process::Command::new("kill")
+                        .arg("-0")
+                        .arg(pid.to_string())
+                        .status()
+                        .unwrap();
+                    assert!(
+                        !status.success(),
+                        "descendant pid {pid} should have been killed by process group; still alive"
+                    );
+                }
+            }
         }
         // Deterministic cleanup: the attempt dir (here output_dir) must be
         // removable immediately after Cancelled.

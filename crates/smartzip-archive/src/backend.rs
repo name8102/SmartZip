@@ -20,7 +20,7 @@ pub trait ArchiveExecutor: Send + Sync {
     async fn probe_with_context(
         &self,
         path: &Path,
-        _context: &TaskExecutionContext,
+        _context: Arc<TaskExecutionContext>,
     ) -> Result<ArchiveProbe> {
         self.probe(path).await
     }
@@ -28,7 +28,7 @@ pub trait ArchiveExecutor: Send + Sync {
     async fn list_with_context(
         &self,
         request: ListRequest,
-        _context: &TaskExecutionContext,
+        _context: Arc<TaskExecutionContext>,
     ) -> Result<ArchiveListing> {
         self.list(request).await
     }
@@ -36,7 +36,7 @@ pub trait ArchiveExecutor: Send + Sync {
     async fn test_with_context(
         &self,
         request: TestRequest,
-        _context: &TaskExecutionContext,
+        _context: Arc<TaskExecutionContext>,
     ) -> Result<TestResult> {
         self.test(request).await
     }
@@ -44,7 +44,7 @@ pub trait ArchiveExecutor: Send + Sync {
     async fn extract_with_context(
         &self,
         request: ExtractArchiveRequest,
-        _context: &TaskExecutionContext,
+        _context: Arc<TaskExecutionContext>,
     ) -> Result<ExtractArchiveResult> {
         self.extract(request).await
     }
@@ -59,7 +59,7 @@ pub trait ArchiveExecutor: Send + Sync {
         &self,
         request: ExtractArchiveRequest,
         facts: &ArchiveFacts,
-        _context: &TaskExecutionContext,
+        _context: Arc<TaskExecutionContext>,
     ) -> Result<ExtractArchiveResult> {
         self.extract_with_facts(request, facts).await
     }
@@ -67,7 +67,7 @@ pub trait ArchiveExecutor: Send + Sync {
     async fn compress_with_context(
         &self,
         request: CompressArchiveRequest,
-        _context: &TaskExecutionContext,
+        _context: Arc<TaskExecutionContext>,
     ) -> Result<CompressArchiveResult> {
         self.compress(request).await
     }
@@ -78,19 +78,47 @@ pub trait ArchiveExecutor: Send + Sync {
 pub trait ArchiveAdapter: Send + Sync {
     fn id(&self) -> &str;
     async fn probe(&self, path: &Path) -> Result<ArchiveProbe>;
+    async fn probe_with_context(
+        &self,
+        path: &Path,
+        _context: std::sync::Arc<TaskExecutionContext>,
+    ) -> Result<ArchiveProbe> {
+        self.probe(path).await
+    }
     async fn list(&self, request: ListRequest) -> Result<ArchiveListing>;
+    async fn list_with_context(
+        &self,
+        request: ListRequest,
+        _context: std::sync::Arc<TaskExecutionContext>,
+    ) -> Result<ArchiveListing> {
+        self.list(request).await
+    }
     async fn test(&self, request: TestRequest) -> Result<TestResult>;
+    async fn test_with_context(
+        &self,
+        request: TestRequest,
+        _context: std::sync::Arc<TaskExecutionContext>,
+    ) -> Result<TestResult> {
+        self.test(request).await
+    }
     async fn extract(&self, request: ExtractArchiveRequest) -> Result<ExtractArchiveResult>;
     /// Context-aware extract that can observe cancellation. Default impl
     /// delegates to `extract` for adapters that do not need cancellation.
     async fn extract_with_context(
         &self,
         request: ExtractArchiveRequest,
-        _context: &TaskExecutionContext,
+        _context: std::sync::Arc<TaskExecutionContext>,
     ) -> Result<ExtractArchiveResult> {
         self.extract(request).await
     }
     async fn compress(&self, request: CompressArchiveRequest) -> Result<CompressArchiveResult>;
+    async fn compress_with_context(
+        &self,
+        request: CompressArchiveRequest,
+        _context: std::sync::Arc<TaskExecutionContext>,
+    ) -> Result<CompressArchiveResult> {
+        self.compress(request).await
+    }
     /// Built-in capability profile; config layers are composed by the router.
     fn profile(&self) -> smartzip_core::BackendCapabilityProfile;
 }

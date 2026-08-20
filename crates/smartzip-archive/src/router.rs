@@ -416,7 +416,7 @@ impl BackendRouter {
 
     async fn route<T, F>(
         &self,
-        context: &TaskExecutionContext,
+        context: std::sync::Arc<TaskExecutionContext>,
         operation: ArchiveOperation,
         container: Option<ArchiveFormat>,
         requirements: ArchiveRequirements,
@@ -431,8 +431,12 @@ impl BackendRouter {
         if token.is_cancelled() {
             return Err(SmartZipError::Cancelled);
         }
-        let plan =
-            self.plan_with_context(operation, container.as_ref(), requirements, Some(context));
+        let plan = self.plan_with_context(
+            operation,
+            container.as_ref(),
+            requirements,
+            Some(context.as_ref()),
+        );
         let mut attempted = Vec::new();
         let mut last_error = None;
         for candidate in &plan.candidates {
@@ -444,7 +448,7 @@ impl BackendRouter {
                 .expect("planned adapter must remain registered");
             attempted.push(candidate.adapter_id.clone());
             self.emit(
-                context,
+                context.as_ref(),
                 RouteEvent::BackendAttemptStarted {
                     adapter_id: candidate.adapter_id.clone(),
                 },
@@ -459,7 +463,7 @@ impl BackendRouter {
             match result {
                 Ok(value) => {
                     self.emit(
-                        context,
+                        context.as_ref(),
                         RouteEvent::BackendSelected {
                             adapter_id: candidate.adapter_id.clone(),
                         },
@@ -468,7 +472,7 @@ impl BackendRouter {
                 }
                 Err(error) => {
                     self.emit(
-                        context,
+                        context.as_ref(),
                         RouteEvent::BackendAttemptFailed {
                             adapter_id: candidate.adapter_id.clone(),
                             class: error_class(&error).into(),
@@ -481,7 +485,7 @@ impl BackendRouter {
                         return Err(error);
                     }
                     self.remember_retryable(
-                        context,
+                        context.as_ref(),
                         &candidate.adapter_id,
                         operation,
                         container.clone(),
@@ -491,7 +495,7 @@ impl BackendRouter {
                 }
             }
         }
-        self.emit(context, RouteEvent::RouteExhausted { attempted });
+        self.emit(context.as_ref(), RouteEvent::RouteExhausted { attempted });
         Err(last_error.unwrap_or_else(|| no_compatible_backend(operation, &plan)))
     }
 
@@ -499,7 +503,7 @@ impl BackendRouter {
         &self,
         request: ExtractArchiveRequest,
         facts: &ArchiveFacts,
-        context: &TaskExecutionContext,
+        context: std::sync::Arc<TaskExecutionContext>,
     ) -> Result<ExtractArchiveResult> {
         let container = facts
             .container
@@ -515,14 +519,19 @@ impl BackendRouter {
         requirements
             .items
             .extend(ArchiveRequirements::from_facts(facts).items);
-        self.extract_isolated_planned(request, container, requirements, context)
-            .await
+        self.extract_isolated_planned(
+            request,
+            container,
+            requirements,
+            std::sync::Arc::clone(&context),
+        )
+        .await
     }
 
     async fn extract_isolated(
         &self,
         request: ExtractArchiveRequest,
-        context: &TaskExecutionContext,
+        context: std::sync::Arc<TaskExecutionContext>,
     ) -> Result<ExtractArchiveResult> {
         let container = infer_format(request.format.clone(), &request.archive);
         let requirements = request_requirements(
@@ -531,8 +540,13 @@ impl BackendRouter {
             request.password.as_deref(),
             Some(&request.encoding),
         );
-        self.extract_isolated_planned(request, container, requirements, context)
-            .await
+        self.extract_isolated_planned(
+            request,
+            container,
+            requirements,
+            std::sync::Arc::clone(&context),
+        )
+        .await
     }
 
     async fn extract_isolated_planned(
@@ -540,7 +554,7 @@ impl BackendRouter {
         request: ExtractArchiveRequest,
         container: Option<ArchiveFormat>,
         requirements: ArchiveRequirements,
-        context: &TaskExecutionContext,
+        context: std::sync::Arc<TaskExecutionContext>,
     ) -> Result<ExtractArchiveResult> {
         let token = context.cancellation_token();
         if token.is_cancelled() {
@@ -550,7 +564,7 @@ impl BackendRouter {
             ArchiveOperation::Extract,
             container.as_ref(),
             requirements,
-            Some(context),
+            Some(context.as_ref()),
         );
         let mut attempted = Vec::new();
         let mut last_error = None;
@@ -580,7 +594,7 @@ impl BackendRouter {
             let mut attempt_request = request.clone();
             attempt_request.output_dir = attempt_dir.clone();
             self.emit(
-                context,
+                context.as_ref(),
                 RouteEvent::BackendAttemptStarted {
                     adapter_id: candidate.adapter_id.clone(),
                 },
@@ -593,14 +607,14 @@ impl BackendRouter {
             // future prematurely.
             let result = registration
                 .adapter
-                .extract_with_context(attempt_request, context)
+                .extract_with_context(attempt_request, std::sync::Arc::clone(&context))
                 .await;
             match result {
                 Ok(_) => {
                     move_attempt_output(&attempt_dir, &request.output_dir)?;
                     close_attempt(attempt, &attempt_dir)?;
                     self.emit(
-                        context,
+                        context.as_ref(),
                         RouteEvent::BackendSelected {
                             adapter_id: candidate.adapter_id.clone(),
                         },
@@ -611,7 +625,7 @@ impl BackendRouter {
                 }
                 Err(error) => {
                     self.emit(
-                        context,
+                        context.as_ref(),
                         RouteEvent::BackendAttemptFailed {
                             adapter_id: candidate.adapter_id.clone(),
                             class: error_class(&error).into(),
@@ -620,17 +634,19 @@ impl BackendRouter {
                     // Backend contract: on Cancelled the process tree is
                     // already stopped and no longer writing to attempt_dir.
                     // Do deterministic cleanup and surface any cleanup error
-                    // instead of silently dropping the TempDir.
+                    // instead of silently dropping the TempDir. Only emit
+                    // BackendAttemptCleaned after the directory is actually
+                    // removed.
                     let cleanup_result = close_attempt(attempt, &attempt_dir);
+                    if let Err(cleanup_err) = cleanup_result {
+                        return Err(cleanup_err);
+                    }
                     self.emit(
-                        context,
+                        context.as_ref(),
                         RouteEvent::BackendAttemptCleaned {
                             adapter_id: candidate.adapter_id.clone(),
                         },
                     );
-                    if let Err(cleanup_err) = cleanup_result {
-                        return Err(cleanup_err);
-                    }
                     if matches!(error, SmartZipError::Cancelled) {
                         return Err(error);
                     }
@@ -638,7 +654,7 @@ impl BackendRouter {
                         return Err(error);
                     }
                     self.remember_retryable(
-                        context,
+                        context.as_ref(),
                         &candidate.adapter_id,
                         ArchiveOperation::Extract,
                         container.clone(),
@@ -648,7 +664,7 @@ impl BackendRouter {
                 }
             }
         }
-        self.emit(context, RouteEvent::RouteExhausted { attempted });
+        self.emit(context.as_ref(), RouteEvent::RouteExhausted { attempted });
         Err(last_error.unwrap_or_else(|| no_compatible_backend(ArchiveOperation::Extract, &plan)))
     }
 }
@@ -664,27 +680,28 @@ impl ArchiveExecutor for BackendRouter {
     }
 
     async fn probe(&self, path: &Path) -> Result<ArchiveProbe> {
-        let context = TaskExecutionContext::detached();
-        self.probe_with_context(path, &context).await
+        let context = std::sync::Arc::new(TaskExecutionContext::detached());
+        self.probe_with_context(path, context).await
     }
 
     async fn probe_with_context(
         &self,
         path: &Path,
-        context: &TaskExecutionContext,
+        context: std::sync::Arc<TaskExecutionContext>,
     ) -> Result<ArchiveProbe> {
         let container = format_from_extension(path);
         let requirements = base_requirements(ArchiveOperation::Probe, container.as_ref());
         let path = path.to_path_buf();
         self.route(
-            context,
+            std::sync::Arc::clone(&context),
             ArchiveOperation::Probe,
             container,
             requirements,
             |adapter| {
                 let path = path.clone();
+                let context = std::sync::Arc::clone(&context);
                 Box::pin(async move {
-                    let probe = adapter.probe(&path).await?;
+                    let probe = adapter.probe_with_context(&path, context).await?;
                     if probe.supported {
                         Ok(probe)
                     } else {
@@ -701,14 +718,14 @@ impl ArchiveExecutor for BackendRouter {
     }
 
     async fn list(&self, request: ListRequest) -> Result<ArchiveListing> {
-        let context = TaskExecutionContext::detached();
-        self.list_with_context(request, &context).await
+        let context = std::sync::Arc::new(TaskExecutionContext::detached());
+        self.list_with_context(request, context).await
     }
 
     async fn list_with_context(
         &self,
         request: ListRequest,
-        context: &TaskExecutionContext,
+        context: std::sync::Arc<TaskExecutionContext>,
     ) -> Result<ArchiveListing> {
         let container = infer_format(request.format.clone(), &request.archive);
         let requirements = request_requirements(
@@ -718,27 +735,28 @@ impl ArchiveExecutor for BackendRouter {
             Some(&request.encoding),
         );
         self.route(
-            context,
+            std::sync::Arc::clone(&context),
             ArchiveOperation::List,
             container,
             requirements,
             |adapter| {
                 let request = request.clone();
-                Box::pin(async move { adapter.list(request).await })
+                let context = std::sync::Arc::clone(&context);
+                Box::pin(async move { adapter.list_with_context(request, context).await })
             },
         )
         .await
     }
 
     async fn test(&self, request: TestRequest) -> Result<TestResult> {
-        let context = TaskExecutionContext::detached();
-        self.test_with_context(request, &context).await
+        let context = std::sync::Arc::new(TaskExecutionContext::detached());
+        self.test_with_context(request, context).await
     }
 
     async fn test_with_context(
         &self,
         request: TestRequest,
-        context: &TaskExecutionContext,
+        context: std::sync::Arc<TaskExecutionContext>,
     ) -> Result<TestResult> {
         let container = infer_format(request.format.clone(), &request.archive);
         let requirements = request_requirements(
@@ -748,27 +766,28 @@ impl ArchiveExecutor for BackendRouter {
             Some(&request.encoding),
         );
         self.route(
-            context,
+            std::sync::Arc::clone(&context),
             ArchiveOperation::Test,
             container,
             requirements,
             |adapter| {
                 let request = request.clone();
-                Box::pin(async move { adapter.test(request).await })
+                let context = std::sync::Arc::clone(&context);
+                Box::pin(async move { adapter.test_with_context(request, context).await })
             },
         )
         .await
     }
 
     async fn extract(&self, request: ExtractArchiveRequest) -> Result<ExtractArchiveResult> {
-        let context = TaskExecutionContext::detached();
-        self.extract_with_context(request, &context).await
+        let context = std::sync::Arc::new(TaskExecutionContext::detached());
+        self.extract_with_context(request, context).await
     }
 
     async fn extract_with_context(
         &self,
         request: ExtractArchiveRequest,
-        context: &TaskExecutionContext,
+        context: std::sync::Arc<TaskExecutionContext>,
     ) -> Result<ExtractArchiveResult> {
         self.extract_isolated(request, context).await
     }
@@ -778,8 +797,8 @@ impl ArchiveExecutor for BackendRouter {
         request: ExtractArchiveRequest,
         facts: &ArchiveFacts,
     ) -> Result<ExtractArchiveResult> {
-        let context = TaskExecutionContext::detached();
-        self.extract_with_facts_and_context(request, facts, &context)
+        let context = std::sync::Arc::new(TaskExecutionContext::detached());
+        self.extract_with_facts_and_context(request, facts, context)
             .await
     }
 
@@ -787,21 +806,21 @@ impl ArchiveExecutor for BackendRouter {
         &self,
         request: ExtractArchiveRequest,
         facts: &ArchiveFacts,
-        context: &TaskExecutionContext,
+        context: std::sync::Arc<TaskExecutionContext>,
     ) -> Result<ExtractArchiveResult> {
         self.extract_with_facts_in_context(request, facts, context)
             .await
     }
 
     async fn compress(&self, request: CompressArchiveRequest) -> Result<CompressArchiveResult> {
-        let context = TaskExecutionContext::detached();
-        self.compress_with_context(request, &context).await
+        let context = std::sync::Arc::new(TaskExecutionContext::detached());
+        self.compress_with_context(request, context).await
     }
 
     async fn compress_with_context(
         &self,
         request: CompressArchiveRequest,
-        context: &TaskExecutionContext,
+        context: std::sync::Arc<TaskExecutionContext>,
     ) -> Result<CompressArchiveResult> {
         let container = Some(request.format.clone());
         let requirements = request_requirements(
@@ -811,13 +830,14 @@ impl ArchiveExecutor for BackendRouter {
             None,
         );
         self.route(
-            context,
+            std::sync::Arc::clone(&context),
             ArchiveOperation::Compress,
             container,
             requirements,
             |adapter| {
                 let request = request.clone();
-                Box::pin(async move { adapter.compress(request).await })
+                let context = std::sync::Arc::clone(&context);
+                Box::pin(async move { adapter.compress_with_context(request, context).await })
             },
         )
         .await
@@ -1524,7 +1544,10 @@ mod tests {
         let context = router.begin_task(TaskId::new(), Arc::new(sink.clone()));
         let temp = tempfile::tempdir().unwrap();
         router
-            .extract_with_context(extract_request(temp.path().to_path_buf()), context.as_ref())
+            .extract_with_context(
+                extract_request(temp.path().to_path_buf()),
+                std::sync::Arc::clone(&context),
+            )
             .await
             .unwrap();
         assert!(!temp.path().join("partial.txt").exists());

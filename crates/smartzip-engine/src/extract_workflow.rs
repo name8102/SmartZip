@@ -827,7 +827,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
             ..ArchiveFacts::default()
         };
         if let Ok(probe) = backend
-            .probe_with_context(&archive_path, task_context.as_ref())
+            .probe_with_context(&archive_path, std::sync::Arc::clone(&task_context))
             .await
         {
             archive_facts.encrypted = probe.encrypted.map(|value| ArchiveFact {
@@ -876,7 +876,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                             password: pw_value.clone(),
                             encoding: candidate_encoding_mode.clone(),
                         },
-                        &task_context,
+                        std::sync::Arc::clone(&task_context),
                     ),
                 )
                 .await
@@ -966,7 +966,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                                                 encoding: extract_encoding,
                                             },
                                             &extract_facts,
-                                            extract_context.as_ref(),
+                                            std::sync::Arc::clone(&extract_context),
                                         ),
                                     )
                                     .await
@@ -1078,7 +1078,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                                         encoding: extract_encoding,
                                     },
                                     &extract_facts,
-                                    extract_context.as_ref(),
+                                    std::sync::Arc::clone(&extract_context),
                                 ),
                             )
                             .await
@@ -1167,7 +1167,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                                         password: Some(pw.clone()),
                                         encoding: candidate_encoding_mode.clone(),
                                     },
-                                    &task_context,
+                                    std::sync::Arc::clone(&task_context),
                                 ),
                             )
                             .await
@@ -1252,7 +1252,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                                                             encoding: extract_encoding,
                                                         },
                                                         &extract_facts,
-                                                        extract_context.as_ref(),
+                                                        std::sync::Arc::clone(&extract_context),
                                                     ),
                                                 )
                                                 .await
@@ -1385,7 +1385,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                                                     encoding: extract_encoding,
                                                 },
                                                 &extract_facts,
-                                                extract_context.as_ref(),
+                                                std::sync::Arc::clone(&extract_context),
                                             ),
                                         )
                                         .await

@@ -1117,7 +1117,7 @@ async fn preview_encodings(
         };
         let listing = if verbose_routing {
             let context = backend.begin_task(TaskId::new(), std::sync::Arc::new(RoutingPrintSink));
-            backend.list_with_context(request, context.as_ref()).await
+            backend.list_with_context(request, context).await
         } else {
             backend.list(request).await
         };

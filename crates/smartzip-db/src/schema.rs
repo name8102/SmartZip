@@ -185,25 +185,22 @@ pub fn migrate(conn: &mut Connection) -> crate::Result<()> {
 
     // Promote legacy `schema_migrations` version to `user_version` if needed.
     // This is a one-time bridge for DBs created with the old hand-rolled logic.
-    let has_legacy = conn
-        .query_row(
-            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='schema_migrations'",
-            [],
-            |row| row.get::<_, i64>(0),
-        )
-        .unwrap_or(0)
-        > 0;
+    // Fail-closed: any error while inspecting the legacy state is propagated
+    // instead of being silently interpreted as version 0, which would cause
+    // destructive re-execution of migrations (e.g. v3 DROP TABLE).
+    let has_legacy: i64 = conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='schema_migrations'",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    let has_legacy = has_legacy > 0;
     if has_legacy {
-        let legacy_version: i64 = conn
-            .query_row(
-                "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
-        let user_version: i64 = conn
-            .query_row("PRAGMA user_version", [], |row| row.get(0))
-            .unwrap_or(0);
+        let legacy_version: i64 = conn.query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+            [],
+            |row| row.get(0),
+        )?;
+        let user_version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         if user_version == 0 && legacy_version > 0 {
             conn.pragma_update(None, "user_version", legacy_version)?;
         }
@@ -227,20 +224,18 @@ pub fn migrate(conn: &mut Connection) -> crate::Result<()> {
 /// been promoted. This keeps `current_version` meaningful during the
 /// transition period.
 pub fn current_version(conn: &Connection) -> rusqlite::Result<u32> {
-    let user_version: i64 = conn
-        .query_row("PRAGMA user_version", [], |row| row.get(0))
-        .unwrap_or(0);
+    let user_version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if user_version != 0 {
         return Ok(user_version as u32);
     }
     // Fallback for legacy DBs that still use `schema_migrations`.
-    let legacy: i64 = conn
-        .query_row(
-            "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
+    // Fail-closed: propagate any error (e.g. missing version column) instead
+    // of silently returning 0.
+    let legacy: i64 = conn.query_row(
+        "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+        [],
+        |row| row.get(0),
+    )?;
     Ok(legacy as u32)
 }
 
@@ -564,5 +559,41 @@ mod tests {
             .unwrap();
         assert_eq!(before, after, "user_version must not advance on failure");
         assert_eq!(after, 3);
+    }
+    #[test]
+    fn legacy_missing_version_column_fails_closed() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        // Malformed legacy table: has schema_migrations but no version column
+        conn.execute_batch(
+            "CREATE TABLE schema_migrations (id INTEGER PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP); INSERT INTO schema_migrations(id, applied_at) VALUES (1, '2024-01-01');",
+        )
+        .unwrap();
+        assert!(table_exists(&conn, "schema_migrations"));
+        let before_uv: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(before_uv, 0);
+        let res = migrate(&mut conn);
+        assert!(
+            res.is_err(),
+            "migrate should fail closed when legacy schema is malformed, got {res:?}"
+        );
+        let after_uv: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            after_uv, 0,
+            "user_version must not advance when legacy bridge fails"
+        );
+        // No SmartZip tables should have been created (the failing bridge
+        // should have prevented any of the v1/v2/v3 migrations from running).
+        assert!(
+            !table_exists(&conn, "passwords"),
+            "passwords should not be created after a bridge failure"
+        );
+        assert!(
+            !table_exists(&conn, "tasks"),
+            "tasks should not be created after a bridge failure"
+        );
     }
 }

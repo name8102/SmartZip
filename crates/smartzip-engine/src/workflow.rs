@@ -144,7 +144,7 @@ pub(crate) async fn inspect_file_with_listener<B: ArchiveExecutor>(
             .as_ref()
             .and_then(|hit| hit.confirmed_encoding.clone());
         let probe = backend
-            .probe_with_context(&resolved.archive_path, &task_context)
+            .probe_with_context(&resolved.archive_path, std::sync::Arc::clone(&task_context))
             .await
             .map_err(|error| map_detect_error(error, &request.path))?;
         encrypted = probe.encrypted;
@@ -374,7 +374,7 @@ pub(crate) async fn list_archive_with_listener_interactive<B: ArchiveExecutor>(
     let mut batch_passwords = Vec::new();
     let outcome = access_archive_with_password(
         backend,
-        &task_context,
+        std::sync::Arc::clone(&task_context),
         passwords,
         &resolved,
         &password_candidates,

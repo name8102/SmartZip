@@ -225,7 +225,7 @@ pub(crate) async fn prepare_resolved_archive(
 
 pub(crate) async fn access_archive_with_password<B: ArchiveExecutor>(
     backend: &B,
-    task_context: &TaskExecutionContext,
+    task_context: std::sync::Arc<TaskExecutionContext>,
     passwords: &PasswordService<'_>,
     resolved: &ResolvedArchive,
     password_candidates: &[PasswordCandidate],
@@ -286,7 +286,7 @@ pub(crate) async fn access_archive_with_password<B: ArchiveExecutor>(
                     password: pw_value.clone(),
                     encoding: resolved.encoding_mode.clone(),
                 },
-                task_context,
+                std::sync::Arc::clone(&task_context),
             ),
         )
         .await
@@ -351,7 +351,7 @@ pub(crate) async fn access_archive_with_password<B: ArchiveExecutor>(
                                         password: Some(pw.clone()),
                                         encoding: resolved.encoding_mode.clone(),
                                     },
-                                    task_context,
+                                    std::sync::Arc::clone(&task_context),
                                 ),
                             )
                             .await
@@ -421,7 +421,7 @@ pub(crate) async fn access_archive_with_password<B: ArchiveExecutor>(
                         password: used_password.clone(),
                         encoding: encoding_mode.clone(),
                     },
-                    task_context,
+                    std::sync::Arc::clone(&task_context),
                 ),
             )
             .await?,

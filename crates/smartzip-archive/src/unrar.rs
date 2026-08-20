@@ -121,8 +121,8 @@ impl UnrarBackend {
             _ = token.cancelled() => {
                 let _ = child.start_kill();
                 let status = child.wait().await.map_err(|source| SmartZipError::io(Some(self.executable.clone()), source))?;
-                if let Some(t) = stdout_task { t.abort(); }
-                if let Some(t) = stderr_task { t.abort(); }
+                if let Some(t) = stdout_task { t.abort(); let _ = t.await; }
+                if let Some(t) = stderr_task { t.abort(); let _ = t.await; }
                 let _ = status;
                 return Err(SmartZipError::Cancelled);
             }
@@ -219,6 +219,37 @@ impl ArchiveAdapter for UnrarBackend {
         })
     }
 
+    async fn probe_with_context(
+        &self,
+        path: &Path,
+        context: std::sync::Arc<TaskExecutionContext>,
+    ) -> Result<ArchiveProbe> {
+        let result = self
+            .test_with_context(
+                TestRequest {
+                    archive: path.to_path_buf(),
+                    format: Some(ArchiveFormat::Rar),
+                    password: None,
+                    encoding: smartzip_core::EncodingMode::Auto,
+                },
+                context,
+            )
+            .await;
+        let (supported, encrypted) = match result {
+            Ok(result) => (result.ok, result.encrypted),
+            Err(SmartZipError::WrongPassword { .. })
+            | Err(SmartZipError::PasswordRequired { .. }) => (true, Some(true)),
+            Err(SmartZipError::UnsupportedContainer { .. }) => (false, None),
+            Err(error) => return Err(error),
+        };
+        Ok(ArchiveProbe {
+            path: path.to_path_buf(),
+            format: Some(ArchiveFormat::Rar),
+            encrypted,
+            supported,
+        })
+    }
+
     async fn list(&self, request: ListRequest) -> Result<ArchiveListing> {
         let args = vec![
             "lb".to_string(),
@@ -250,6 +281,40 @@ impl ArchiveAdapter for UnrarBackend {
         })
     }
 
+    async fn list_with_context(
+        &self,
+        request: ListRequest,
+        context: std::sync::Arc<TaskExecutionContext>,
+    ) -> Result<ArchiveListing> {
+        let token = context.cancellation_token();
+        let args = vec![
+            "lb".to_string(),
+            "-idq".to_string(),
+            Self::password_arg(&request.password),
+            request.archive.to_string_lossy().into_owned(),
+        ];
+        let output = self.run_with_token(&args, &token).await?;
+        if output.status != Some(0) {
+            return Err(self.map_failure(&output, &request.archive));
+        }
+        let entries = output
+            .stdout
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| ArchiveEntry {
+                path: PathBuf::from(line),
+                raw_name: Vec::new(),
+                compressed_size: None,
+                uncompressed_size: None,
+                is_dir: line.ends_with('/') || line.ends_with('\\'),
+            })
+            .collect();
+        Ok(ArchiveListing {
+            format: Some(ArchiveFormat::Rar),
+            entries,
+        })
+    }
+
     async fn test(&self, request: TestRequest) -> Result<TestResult> {
         let args = vec![
             "t".to_string(),
@@ -259,6 +324,29 @@ impl ArchiveAdapter for UnrarBackend {
             request.archive.to_string_lossy().into_owned(),
         ];
         let output = self.run(&args).await?;
+        if output.status != Some(0) {
+            return Err(self.map_failure(&output, &request.archive));
+        }
+        Ok(TestResult {
+            ok: true,
+            encrypted: None,
+        })
+    }
+
+    async fn test_with_context(
+        &self,
+        request: TestRequest,
+        context: std::sync::Arc<TaskExecutionContext>,
+    ) -> Result<TestResult> {
+        let token = context.cancellation_token();
+        let args = vec![
+            "t".to_string(),
+            "-y".to_string(),
+            "-idq".to_string(),
+            Self::password_arg(&request.password),
+            request.archive.to_string_lossy().into_owned(),
+        ];
+        let output = self.run_with_token(&args, &token).await?;
         if output.status != Some(0) {
             return Err(self.map_failure(&output, &request.archive));
         }
@@ -292,7 +380,7 @@ impl ArchiveAdapter for UnrarBackend {
     async fn extract_with_context(
         &self,
         request: ExtractArchiveRequest,
-        context: &TaskExecutionContext,
+        context: std::sync::Arc<TaskExecutionContext>,
     ) -> Result<ExtractArchiveResult> {
         std::fs::create_dir_all(&request.output_dir)
             .map_err(|source| SmartZipError::io(Some(request.output_dir.clone()), source))?;
@@ -320,6 +408,14 @@ impl ArchiveAdapter for UnrarBackend {
             path: request.output,
             format: Some(request.format.as_str().to_string()),
         })
+    }
+
+    async fn compress_with_context(
+        &self,
+        request: CompressArchiveRequest,
+        _context: std::sync::Arc<TaskExecutionContext>,
+    ) -> Result<CompressArchiveResult> {
+        self.compress(request).await
     }
 
     fn profile(&self) -> smartzip_core::BackendCapabilityProfile {
