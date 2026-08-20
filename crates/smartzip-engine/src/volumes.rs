@@ -421,10 +421,10 @@ fn resolve_hypothesis_inner(
     // Extend clipping to exclude leading/trailing foreign definite MultiVolume (e.g., RAR prefix before 7z start)
     let mut sorted_ordinals: Vec<u64> = slot_candidates.keys().cloned().collect();
     sorted_ordinals.sort();
-    // Check for foreign at edges and extend clipping
+    // Check for foreign at edges and extend clipping (only if entire slot is foreign)
     for &ord in &sorted_ordinals {
         let is_foreign = slot_candidates.get(&ord).map_or(false, |paths| {
-            paths.iter().any(|p| matches!(probe_volume_structure(p), VolumeProbeResult::MultiVolume(s) if s.format != format))
+            !paths.is_empty() && paths.iter().all(|p| matches!(probe_volume_structure(p), VolumeProbeResult::MultiVolume(s) if s.format != format))
         });
         if is_foreign {
             // If this foreign ordinal is at the current edge, extend clip
@@ -495,16 +495,25 @@ fn resolve_hypothesis_inner(
             }
         }
     }
-    // Foreign definite MultiVolume inside interval is strong contradiction (format isolation)
-    for paths in filtered_candidates.values() {
-        for p in paths {
-            if let VolumeProbeResult::MultiVolume(s) = probe_volume_structure(p) {
-                if s.format != format {
-                    return HypothesisOutcome::NotViable;
-                }
-            }
+    // Foreign definite MultiVolume inside interval: filter out foreign candidates per slot, keep valid ones
+    let mut to_remove: Vec<u64> = Vec::new();
+    for (ord, paths) in filtered_candidates.iter_mut() {
+        let orig_len = paths.len();
+        paths.retain(|p| !matches!(probe_volume_structure(p), VolumeProbeResult::MultiVolume(s) if s.format != format));
+        if paths.is_empty() {
+            // Entire slot was foreign -> slot becomes empty
+            to_remove.push(*ord);
+        } else if paths.len() < orig_len {
+            // Some foreign alternates removed, keep remaining (will be handled by elimination)
         }
     }
+    for ord in to_remove {
+        filtered_candidates.remove(&ord);
+    }
+    if filtered_candidates.is_empty() {
+        return HypothesisOutcome::NotViable;
+    }
+    // If any remaining slot still has no valid candidate after filtering, it was already handled via to_remove
     // For RAR, each ordinal must have at least one candidate with RAR evidence
     if format == ArchiveFormat::Rar && filtered_candidates.len() > 1 {
         for paths in filtered_candidates.values() {
@@ -1836,6 +1845,41 @@ mod tests {
                 assert!(!set.members.iter().any(|m| m.path == p1));
             }
             other => panic!("should resolve ZIP raw 02,03,04 despite RAR prefix, got {:?}", other),
+        }
+    }
+    #[test]
+    fn foreign_alternate_in_same_slot_is_filtered() {
+        // pack02 has two alternates: one valid ZIP continuation, one foreign RAR volume mapped to same slot via alias
+        let dir = TempDir::new().unwrap();
+        let p1 = dir.path().join("pack01.dat");
+        let p2 = dir.path().join("pack02.dat");
+        let p2_alt = dir.path().join("pack02 (1).dat");
+        let p3 = dir.path().join("pack03.dat");
+        // Create valid ZIP raw split for 01,02,03
+        let zip_data = {
+            let mut buf = Vec::new();
+            let mut w = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            let opts = zip::write::FileOptions::<()>::default().compression_method(zip::CompressionMethod::Stored);
+            w.start_file("hello.txt", opts).unwrap();
+            w.write_all(b"hello world").unwrap();
+            w.finish().unwrap();
+            buf
+        };
+        let part = zip_data.len() / 3;
+        std::fs::write(&p1, &zip_data[0..part]).unwrap();
+        std::fs::write(&p2, &zip_data[part..2*part]).unwrap();
+        std::fs::write(&p3, &zip_data[2*part..]).unwrap();
+        // Create foreign RAR for same slot 02
+        create_rar_volume(&p2_alt, Some(2));
+        let mut resolver = VolumeResolver::new();
+        let cand = make_candidate(p1.clone());
+        match resolver.resolve(&cand) {
+            VolumeResolution::Resolved(set) | VolumeResolution::ResolvedWithWarnings { set, .. } => {
+                assert_eq!(set.members.len(), 3);
+                assert!(set.members.iter().any(|m| m.path == p2));
+                assert!(!set.members.iter().any(|m| m.path == p2_alt));
+            }
+            other => panic!("foreign alternate should be filtered, got {:?}", other),
         }
     }
 }
