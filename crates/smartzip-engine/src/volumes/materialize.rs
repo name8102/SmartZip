@@ -48,17 +48,8 @@ pub fn materialize_volume_set(
     // Let's derive canonical stem as e.g., "archive" -> strip volume suffix? For now use "payload".
     let canonical_stem = "payload";
 
-    // Members are already sorted by filename_ordinal.
-    // For ZIP, distinguish spanned (z01/zip) vs raw split (zip.001) via source names.
-    let zip_is_raw_split = if set.format == ArchiveFormat::Zip {
-        set.members.iter().any(|m| {
-            m.path.file_name().and_then(|n| n.to_str()).map_or(false, |name| {
-                // raw split like archive.zip.001 -> contains ".zip." + digits
-                let lower = name.to_ascii_lowercase();
-                lower.contains(".zip.") && lower.rsplit('.').next().map_or(false, |ext| ext.chars().all(|c| c.is_ascii_digit()))
-            })
-        })
-    } else { false };
+    // For ZIP, use resolver-determined split mechanism (Spanned vs Raw) rather than re-guessing via filename.
+    let zip_is_raw_split = matches!(set.zip_kind, Some(crate::volumes::ZipSplitKind::Raw));
     let total = set.members.len();
     for (idx, member) in set.members.iter().enumerate() {
         let seq = idx + 1; // 1-based canonical order
