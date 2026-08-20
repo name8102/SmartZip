@@ -30,6 +30,7 @@ chinese-number.workspace = true
 blake3.workspace = true
 roman.workspace = true
 crc32fast.workspace = true
+libc.workspace = true
 
 [dev-dependencies]
 rstest.workspace = true
