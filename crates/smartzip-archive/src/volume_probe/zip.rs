@@ -61,15 +61,12 @@ pub fn probe_zip(path: &Path) -> Option<VolumeProbeResult> {
             // Additionally, if file has ZIP64 locator, not standalone.
             return Some(VolumeProbeResult::Standalone(ArchiveFormat::Zip));
         } else if this_disk != 0 || cd_start_disk != 0 {
-            // This file is not disk 0, or central dir starts elsewhere → multivolume
-            // Determine if last volume: if this_disk is last? Need total disks from EOCD? In non-ZIP64, total disks not stored in EOCD directly, but we can infer if this_disk > cd_start_disk etc.
-            // For split archives, EOCD in last disk contains valid CD.
-            // If this file's EOCD indicates this_disk > 0, it's not first, but we can still determine.
-            let is_last = Some(true); // EOCD presence indicates this is last disk
+            // For spanned ZIP, EOCD's this_disk is 0-based last disk number, so expected count = this_disk+1.
+            let is_last = Some(true);
             return Some(VolumeProbeResult::MultiVolume(VolumeStructure {
                 format: ArchiveFormat::Zip,
                 logical_volume_index: Some(this_disk),
-                expected_volume_count: None, // EOCD total disks is at offset? For non-ZIP64, total disks is not in EOCD? Actually EOCD has no total disks field beyond these. Use total_entries?
+                expected_volume_count: Some(this_disk + 1),
                 expected_logical_size: None,
                 is_last_volume: is_last,
             }));
@@ -141,15 +138,16 @@ fn probe_zip64(buf: &[u8], eocd_pos: usize, _file_len: u64) -> Option<VolumeProb
         return None;
     }
     let disk_with_eocd = u32::from_le_bytes([buf[locator + 4], buf[locator + 5], buf[locator + 6], buf[locator + 7]]);
-    // let zip64_eocd_offset = u64::from_le_bytes([buf[locator+8], buf[locator+9], buf[locator+10], buf[locator+11], buf[locator+12], buf[locator+13], buf[locator+14], buf[locator+15]]);
     let total_disks = u32::from_le_bytes([buf[locator + 16], buf[locator + 17], buf[locator + 18], buf[locator + 19]]);
-    // For standalone single-disk ZIP64, total_disks ==1 and disk_with_eocd ==0
+    // For ZIP64, the current file containing the locator/EOCD is the last disk, so its logical index is total_disks-1.
+    // disk_with_eocd is where ZIP64 EOCD starts, not necessarily the current disk's index.
+    let current_logical = total_disks.checked_sub(1);
     if total_disks == 1 && disk_with_eocd == 0 {
         return Some(VolumeProbeResult::Standalone(ArchiveFormat::Zip));
     } else if total_disks > 1 {
         return Some(VolumeProbeResult::MultiVolume(VolumeStructure {
             format: ArchiveFormat::Zip,
-            logical_volume_index: Some(disk_with_eocd),
+            logical_volume_index: current_logical,
             expected_volume_count: Some(total_disks),
             expected_logical_size: None,
             is_last_volume: Some(true),
@@ -157,7 +155,7 @@ fn probe_zip64(buf: &[u8], eocd_pos: usize, _file_len: u64) -> Option<VolumeProb
     } else {
         return Some(VolumeProbeResult::PossiblyMultiVolume(VolumeStructure {
             format: ArchiveFormat::Zip,
-            logical_volume_index: Some(disk_with_eocd),
+            logical_volume_index: current_logical,
             expected_volume_count: Some(total_disks),
             expected_logical_size: None,
             is_last_volume: None,

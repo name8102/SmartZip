@@ -33,8 +33,9 @@ pub struct VolumeMember {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ZipSplitKind {
-    Spanned, // .z01 + .zip
-    Raw,     // .zip.001 style (raw byte split)
+    Spanned, // .z01 + .zip (ZIP's own multi-disk)
+    Raw,     // .zip.001 style (raw byte split, e.g., 7z -v)
+    Unknown, // not proven
 }
 #[derive(Debug, Clone)]
 pub struct VolumeSet {
@@ -483,19 +484,41 @@ fn resolve_hypothesis(
         return HypothesisOutcome::Ambiguous(hypo);
     }
 
-    // After elimination, check for definite missing-volume evidence via static probe.
-    // Use seed probe structure: if expected_volume_count or expected_logical_size indicates missing, and we have fewer members than expected, then Incomplete.
-    // Also check per-format strong evidence: RAR multivolume flag with missing last, ZIP disk counts etc.
-    // For now, use generic check: if seed_probe is MultiVolume with expected count, compare.
-    let expected_count = match seed_probe {
-        VolumeProbeResult::MultiVolume(s) | VolumeProbeResult::PossiblyMultiVolume(s) => s.expected_volume_count,
-        _ => None,
-    };
-    if let Some(exp) = expected_count {
+    // Aggregate strong structural evidence from all resolved members, not just seed (seed may be any physical member).
+    let mut agg_expected_count: Option<u32> = None;
+    let mut agg_expected_logical: Option<u64> = None;
+    for m in &final_members {
+        if let VolumeProbeResult::MultiVolume(s) = probe_volume_structure(&m.path) {
+            if let Some(c) = s.expected_volume_count {
+                agg_expected_count = Some(agg_expected_count.map_or(c, |prev| prev.max(c)));
+            }
+            if let Some(sz) = s.expected_logical_size {
+                agg_expected_logical = Some(agg_expected_logical.map_or(sz, |prev| prev.max(sz)));
+            }
+        }
+    }
+    // Also consider seed's strong evidence if not already aggregated (seed may not be in final_members if clipped? but seed is in final)
+    if let VolumeProbeResult::MultiVolume(s) = seed_probe {
+        if let Some(c) = s.expected_volume_count {
+            agg_expected_count = Some(agg_expected_count.map_or(c, |prev| prev.max(c)));
+        }
+        if let Some(sz) = s.expected_logical_size {
+            agg_expected_logical = Some(agg_expected_logical.map_or(sz, |prev| prev.max(sz)));
+        }
+    }
+    if let Some(exp) = agg_expected_count {
         if (final_members.len() as u32) < exp {
             return HypothesisOutcome::Incomplete(VolumeProblem {
                 reason: format!("expected {} volumes, found {}", exp, final_members.len()),
                 format: Some(format.clone()),
+            });
+        }
+        if (final_members.len() as u32) > exp {
+            // More members than expected -> possible overfull, treat as ambiguous if not exact
+            return HypothesisOutcome::Ambiguous(VolumeSetHypothesis {
+                format: format.clone(),
+                members: final_members.clone(),
+                warnings: warnings.clone(),
             });
         }
     }
@@ -506,10 +529,7 @@ fn resolve_hypothesis(
     // For RAR: if multivolume but no last volume closure? Hard.
 
     // For 7z: if expected_logical_size exceeds sum of file sizes? Could check.
-    let expected_logical = match seed_probe {
-        VolumeProbeResult::MultiVolume(s) | VolumeProbeResult::PossiblyMultiVolume(s) => s.expected_logical_size,
-        _ => None,
-    };
+    let expected_logical = agg_expected_logical;
     if let Some(exp_size) = expected_logical {
         if format == ArchiveFormat::SevenZip {
             // For 7z, expected is 32 + NextHeaderOffset + NextHeaderSize = logical archive size.
@@ -576,7 +596,7 @@ fn resolve_hypothesis(
 
     // If we have members but not all slots filled (gaps), we already warned but not incomplete. So proceed to resolved.
 
-    // Authoritative ordering: if every member has a logical volume index (RAR/ZIP), use it; filename ordinal is only hypothesis.
+    // Authoritative ordering and gap proof via logical indices (RAR/ZIP)
     let has_all_logical = final_members.iter().all(|m| m.logical_index.is_some());
     if has_all_logical {
         let mut seen = HashSet::new();
@@ -589,27 +609,64 @@ fn resolve_hypothesis(
                 });
             }
         }
+        // Check 0-based continuity and min==0
+        let mut logical_sorted: Vec<u32> = final_members.iter().map(|m| m.logical_index.unwrap()).collect();
+        logical_sorted.sort_unstable();
+        if logical_sorted[0] != 0 {
+            return HypothesisOutcome::Incomplete(VolumeProblem {
+                reason: format!("logical volume gap: missing volume 0 (found min {})", logical_sorted[0]),
+                format: Some(format.clone()),
+            });
+        }
+        for w in logical_sorted.windows(2) {
+            if w[1] != w[0] + 1 {
+                return HypothesisOutcome::Incomplete(VolumeProblem {
+                    reason: format!("logical volume gap: missing {} between {} and {}", w[0] + 1, w[0], w[1]),
+                    format: Some(format.clone()),
+                });
+            }
+        }
         final_members.sort_by_key(|m| m.logical_index.unwrap());
     } else {
         final_members.sort_by_key(|m| m.filename_ordinal.unwrap_or(0));
     }
 
-    // Determine ZIP split mechanism via structural evidence, not filename guess.
+    // Determine ZIP split mechanism via structural evidence; not proven -> Unknown.
     let zip_kind = if format == ArchiveFormat::Zip {
-        let mut is_spanned = false;
+        let mut has_spanned = false;
+        let mut has_strong = false;
         for m in &final_members {
-            if let VolumeProbeResult::MultiVolume(s) = probe_volume_structure(&m.path) {
-                if s.expected_volume_count.map_or(false, |c| c > 1) || s.is_last_volume == Some(true) && s.logical_volume_index.map_or(false, |idx| idx > 0) {
-                    is_spanned = true;
-                    break;
+            match probe_volume_structure(&m.path) {
+                VolumeProbeResult::MultiVolume(s) => {
+                    has_strong = true;
+                    if s.expected_volume_count.map_or(false, |c| c > 1) {
+                        has_spanned = true;
+                    }
                 }
+                VolumeProbeResult::Standalone(_) => {
+                    has_strong = true;
+                }
+                _ => {}
             }
         }
-        // Also check Possibly with total_disks? For raw, EOCD will be single-disk, so is_spanned remains false.
-        Some(if is_spanned { ZipSplitKind::Spanned } else { ZipSplitKind::Raw })
+        if has_spanned {
+            Some(ZipSplitKind::Spanned)
+        } else if has_strong {
+            // Multiple physical files but EOCD says single disk -> raw byte split
+            Some(ZipSplitKind::Raw)
+        } else {
+            Some(ZipSplitKind::Unknown)
+        }
     } else {
         None
     };
+    if zip_kind == Some(ZipSplitKind::Unknown) && final_members.len() > 1 {
+        return HypothesisOutcome::Ambiguous(VolumeSetHypothesis {
+            format: format.clone(),
+            members: final_members.clone(),
+            warnings: warnings.clone(),
+        });
+    }
     // Determine entrypoint per format and split kind: ZIP spanned last is entry, ZIP raw first is entry, 7z/RAR first.
     let entrypoint = match (&format, &zip_kind) {
         (ArchiveFormat::Zip, Some(ZipSplitKind::Raw)) => final_members[0].path.clone(),
@@ -621,8 +678,8 @@ fn resolve_hypothesis(
         format,
         entrypoint,
         members: final_members,
-        expected_volume_count: expected_count,
-        expected_logical_size: expected_logical,
+        expected_volume_count: agg_expected_count,
+        expected_logical_size: agg_expected_logical,
         zip_kind,
     };
     if warnings.is_empty() {
@@ -720,7 +777,7 @@ fn compute_clip_indices(candidates: &BTreeMap<u64, Vec<PathBuf>>, format: &Archi
 
 fn probe_logical_index(path: &Path) -> Option<u32> {
     match probe_volume_structure(path) {
-        VolumeProbeResult::MultiVolume(s) | VolumeProbeResult::PossiblyMultiVolume(s) => s.logical_volume_index,
+        VolumeProbeResult::MultiVolume(s) => s.logical_volume_index,
         _ => None,
     }
 }
