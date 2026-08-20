@@ -343,10 +343,8 @@ impl SevenZipBackend {
                 let _ = child.start_kill();
                 let status = child.wait().await
                     .map_err(|source| SmartZipError::io(Some(self.executable.clone()), source))?;
-                // After the process group is killed, pipes will get EOF;
-                // await readers deterministically (no detach). Use a short
-                // timeout to avoid hanging forever if a reader is stuck, but
-                // always await the JoinHandle after aborting.
+                // Pipes will get EOF after the group is killed; await
+                // readers deterministically.
                 stdout_task.abort();
                 stderr_task.abort();
                 let _ = stdout_task.await;
@@ -609,17 +607,29 @@ impl ArchiveAdapter for SevenZipBackend {
         };
         let result = self.test_with_report_and_token(request, &token).await;
         let (supported, encrypted) = match result {
-            Ok(result) => (result.value.is_some(), result.report.encrypted),
+            Ok(seven_result) => {
+                if seven_result.value.is_some() {
+                    (true, seven_result.report.encrypted)
+                } else {
+                    // Mirror the error classification in `test()` ->
+                    // `map_reported_failure()`. A 7zz report with
+                    // `value == None` is not an `Err`; we must map it
+                    // explicitly to distinguish WrongPassword /
+                    // PasswordRequired (supported) from UnsupportedContainer.
+                    let mapped = self.map_reported_failure(&seven_result, path);
+                    match mapped {
+                        SmartZipError::WrongPassword { .. }
+                        | SmartZipError::PasswordRequired { .. } => (true, Some(true)),
+                        SmartZipError::UnsupportedContainer { .. } => (false, None),
+                        other => return Err(other),
+                    }
+                }
+            }
             Err(SmartZipError::WrongPassword { .. })
             | Err(SmartZipError::PasswordRequired { .. }) => (true, Some(true)),
             Err(SmartZipError::UnsupportedContainer { .. }) => (false, None),
             Err(error) => return Err(error),
         };
-        // For probe, a successful test means supported; otherwise use the
-        // mapped error handling above. We need to re-evaluate the full probe
-        // logic: if the test succeeded, supported=true; if it failed with
-        // password errors, supported=true; if unsupported container, false.
-        // The above match already handles that.
         Ok(ArchiveProbe {
             path: path.to_path_buf(),
             format: None,
@@ -1452,6 +1462,49 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[tokio::test]
+    async fn probe_with_context_encrypted_archive_is_supported() {
+        let root = std::env::temp_dir().join(format!("smartzip-probe-ctx-{}", std::process::id()));
+        let archive = root.join("secret2.7z");
+        let file = root.join("hello2.txt");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(&file, b"hello2").unwrap();
+        let status = std::process::Command::new("7z")
+            .arg("a")
+            .arg("-psecret2")
+            .arg(&archive)
+            .arg(&file)
+            .current_dir(&root)
+            .status()
+            .unwrap();
+        assert!(status.success(), "7z must be available");
+        let backend =
+            SevenZipBackend::locate(&SevenZipLocator::default()).expect("7z/7zz must be available");
+        let ctx = std::sync::Arc::new(smartzip_core::TaskExecutionContext::detached());
+        let probe = backend.probe_with_context(&archive, ctx).await.unwrap();
+        assert!(
+            probe.supported,
+            "probe_with_context should report supported for encrypted archive"
+        );
+        assert_eq!(probe.encrypted, Some(true));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn probe_with_context_invalid_archive_is_unsupported() {
+        let temp = tempfile::tempdir().unwrap();
+        let bogus = temp.path().join("bogus.7z");
+        std::fs::write(&bogus, b"not an archive at all").unwrap();
+        let backend = SevenZipBackend::new(std::path::PathBuf::from("7z"));
+        let ctx = std::sync::Arc::new(smartzip_core::TaskExecutionContext::detached());
+        let probe = backend.probe_with_context(&bogus, ctx).await.unwrap();
+        assert!(
+            !probe.supported,
+            "probe_with_context should report unsupported for invalid archive"
+        );
+        assert_eq!(probe.encrypted, None);
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn cancellation_kills_process_group_and_stops_writing() {
@@ -1536,26 +1589,25 @@ wait $writer_pid 2>/dev/null || true
             "file should not grow after cancellation"
         );
         // On Unix the process group kill should have terminated the sleep
-        // descendant. Verify via kill -0 (ESRCH).
+        // descendant. Verify via kill -0 -> ESRCH.
         #[cfg(unix)]
         {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            let pid_path = output_dir.join("descendant.pid");
-            if let Ok(pid_str) = std::fs::read_to_string(&pid_path) {
-                let pid_str = pid_str.trim();
-                if let Ok(pid) = pid_str.parse::<i32>() {
-                    // Use kill -0 to check existence; should fail with ESRCH after group kill
-                    let status = std::process::Command::new("kill")
-                        .arg("-0")
-                        .arg(pid.to_string())
-                        .status()
-                        .unwrap();
-                    assert!(
-                        !status.success(),
-                        "descendant pid {pid} should have been killed by process group; still alive"
-                    );
-                }
-            }
+            let pid_str = std::fs::read_to_string(output_dir.join("descendant.pid"))
+                .expect("descendant.pid should have been written by fake 7z");
+            let pid = pid_str
+                .trim()
+                .parse::<i32>()
+                .expect("descendant.pid should contain a valid pid");
+            let status = std::process::Command::new("kill")
+                .arg("-0")
+                .arg(pid.to_string())
+                .status()
+                .unwrap();
+            assert!(
+                !status.success(),
+                "descendant pid {pid} should have been killed by process group; still alive"
+            );
         }
         // Deterministic cleanup: the attempt dir (here output_dir) must be
         // removable immediately after Cancelled.

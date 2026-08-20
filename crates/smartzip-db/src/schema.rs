@@ -228,9 +228,17 @@ pub fn current_version(conn: &Connection) -> rusqlite::Result<u32> {
     if user_version != 0 {
         return Ok(user_version as u32);
     }
-    // Fallback for legacy DBs that still use `schema_migrations`.
-    // Fail-closed: propagate any error (e.g. missing version column) instead
-    // of silently returning 0.
+    // Fresh DB: schema_migrations does not exist -> Ok(0) per documented
+    // contract. Only when the table exists do we query it, and any error
+    // (e.g. missing version column) is propagated fail-closed.
+    let has_legacy: i64 = conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='schema_migrations'",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if has_legacy == 0 {
+        return Ok(0);
+    }
     let legacy: i64 = conn.query_row(
         "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
         [],
@@ -253,6 +261,12 @@ mod tests {
             )
             .unwrap();
         count > 0
+    }
+
+    #[test]
+    fn current_version_is_zero_for_fresh_database() {
+        let conn = Connection::open_in_memory().unwrap();
+        assert_eq!(current_version(&conn).unwrap(), 0);
     }
 
     #[test]
