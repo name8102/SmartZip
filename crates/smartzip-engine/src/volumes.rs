@@ -432,7 +432,7 @@ fn resolve_hypothesis(
     for (ord, cands) in filtered_candidates {
         if cands.len() == 1 {
             let path = cands.into_iter().next().unwrap();
-            let logical = probe_logical_index(&path);
+            let logical = probe_logical_index(&path, &format);
             final_members.push(VolumeMember {
                 path,
                 filename_ordinal: Some(ord),
@@ -442,7 +442,7 @@ fn resolve_hypothesis(
             // Multiple candidates for slot - apply elimination steps
             match eliminate_candidates(&cands, &format, ord) {
                 CandidateElimination::Single(path) => {
-                    let logical = probe_logical_index(&path);
+                    let logical = probe_logical_index(&path, &format);
                     final_members.push(VolumeMember {
                         path,
                         filename_ordinal: Some(ord),
@@ -450,10 +450,8 @@ fn resolve_hypothesis(
                     });
                 }
                 CandidateElimination::Duplicates(paths) => {
-                    // Fold as duplicates: pick first, treat others as same logical file duplicates
-                    // Use first
                     let path = paths.into_iter().next().unwrap();
-                    let logical = probe_logical_index(&path);
+                    let logical = probe_logical_index(&path, &format);
                     final_members.push(VolumeMember {
                         path,
                         filename_ordinal: Some(ord),
@@ -729,13 +727,19 @@ fn same_member_set(a: &VolumeSet, b: &VolumeSet) -> bool {
 fn compute_clip_indices(candidates: &BTreeMap<u64, Vec<PathBuf>>, format: &ArchiveFormat) -> Result<(Option<u64>, Option<u64>), HypothesisOutcome> {
     let mut start: Option<u64> = None;
     let mut end: Option<u64> = None;
-    let mut start_paths: Vec<PathBuf> = Vec::new();
-    let mut end_paths: Vec<PathBuf> = Vec::new();
     for (ord, paths) in candidates {
         for path in paths {
             let probe = probe_volume_structure(path);
             match &probe {
                 VolumeProbeResult::MultiVolume(s) => {
+                    if s.format != *format {
+                        // Strong contradiction: definite MultiVolume of different format inside hypothesis interval
+                        return Err(HypothesisOutcome::Ambiguous(VolumeSetHypothesis {
+                            format: format.clone(),
+                            members: Vec::new(),
+                            warnings: Vec::new(),
+                        }));
+                    }
                     if s.logical_volume_index == Some(0) {
                         if let Some(prev) = start {
                             if prev != *ord {
@@ -762,6 +766,9 @@ fn compute_clip_indices(candidates: &BTreeMap<u64, Vec<PathBuf>>, format: &Archi
                             end = Some(*ord);
                         }
                     }
+                }
+                VolumeProbeResult::PossiblyMultiVolume(s) if s.format != *format => {
+                    // Weak evidence of different format is not strong contradiction, just ignore for clipping
                 }
                 VolumeProbeResult::PossiblyMultiVolume(_) => {
                     // Weak evidence: do not use as strong start/end anchor
@@ -803,33 +810,53 @@ fn compute_clip_indices(candidates: &BTreeMap<u64, Vec<PathBuf>>, format: &Archi
     Ok((start, end))
 }
 
-fn probe_logical_index(path: &Path) -> Option<u32> {
+fn probe_logical_index(path: &Path, expected_format: &ArchiveFormat) -> Option<u32> {
     match probe_volume_structure(path) {
-        VolumeProbeResult::MultiVolume(s) => s.logical_volume_index,
+        VolumeProbeResult::MultiVolume(s) if s.format == *expected_format => s.logical_volume_index,
         _ => None,
     }
 }
+fn read_logical_tail(members: &[VolumeMember], tail_len: usize) -> Option<Vec<u8>> {
+    if members.is_empty() || tail_len == 0 { return None; }
+    let mut ordered = members.to_vec();
+    ordered.sort_by_key(|m| m.filename_ordinal.unwrap_or(0));
+    let total: u64 = ordered.iter().filter_map(|m| std::fs::metadata(&m.path).ok().map(|md| md.len())).sum();
+    if total == 0 { return None; }
+    let mut remaining = tail_len.min(total as usize);
+    let mut tail = Vec::with_capacity(remaining);
+    // Read backwards from last member
+    for m in ordered.iter().rev() {
+        if remaining == 0 { break; }
+        let mut file = std::fs::File::open(&m.path).ok()?;
+        let len = file.metadata().ok()?.len() as usize;
+        let take = std::cmp::min(len, remaining);
+        let mut buf = vec![0u8; take];
+        use std::io::{Read, Seek, SeekFrom};
+        file.seek(SeekFrom::Start((len - take) as u64)).ok()?;
+        file.read_exact(&mut buf).ok()?;
+        // Prepend
+        let mut new_tail = Vec::with_capacity(take + tail.len());
+        new_tail.extend_from_slice(&buf);
+        new_tail.extend_from_slice(&tail);
+        tail = new_tail;
+        remaining -= take;
+    }
+    Some(tail)
+}
 fn is_zip_raw_logical_closure(members: &[VolumeMember]) -> bool {
     if members.is_empty() { return false; }
-    // Order members by filename_ordinal for logical concatenation
     let mut ordered = members.to_vec();
     ordered.sort_by_key(|m| m.filename_ordinal.unwrap_or(0));
     let total: u64 = ordered.iter().filter_map(|m| std::fs::metadata(&m.path).ok().map(|md| md.len())).sum();
     if total < 22 { return false; }
-    // Read tail of last member to find EOCD
-    let last = &ordered[ordered.len() - 1];
-    let mut buf = vec![0u8; 8192.min(total as usize)];
-    // For raw split, EOCD is at logical end, which is at physical end of last member (since last member is tail)
-    // We can just search for EOCD near end of last file's content
-    let mut file = match std::fs::File::open(&last.path) { Ok(f) => f, Err(_) => return false };
-    let len = match file.metadata() { Ok(md) => md.len(), Err(_) => return false };
-    let search_len = std::cmp::min(len, 65557 + 22) as usize;
-    let start = len.saturating_sub(search_len as u64);
-    use std::io::{Read, Seek, SeekFrom};
-    if file.seek(SeekFrom::Start(start)).is_err() { return false; }
-    buf.truncate(search_len);
-    if file.read_exact(&mut buf).is_err() { return false; }
-    // Find EOCD
+    let tail_len = std::cmp::min(total as usize, 65557 + 22 + 20 + 56);
+    let logical_tail = match read_logical_tail(&ordered, tail_len) {
+        Some(b) => b,
+        None => return false,
+    };
+    // Also need logical EOCD position for verification, but we can search in logical_tail
+    let buf = logical_tail;
+    // Find classic EOCD in logical tail (handles cross-volume split via logical_tail)
     let mut eocd_pos: Option<usize> = None;
     for i in (0..=buf.len().saturating_sub(4)).rev() {
         if buf[i..i+4] == [0x50, 0x4b, 0x05, 0x06] {
@@ -842,21 +869,44 @@ fn is_zip_raw_logical_closure(members: &[VolumeMember]) -> bool {
             }
         }
     }
-    let eocd_pos = match eocd_pos { Some(p) => p, None => return false };
-    let eocd = &buf[eocd_pos..];
-    if eocd.len() < 22 { return false; }
-    let this_disk = u16::from_le_bytes([eocd[4], eocd[5]]) as u32;
-    let cd_start_disk = u16::from_le_bytes([eocd[6], eocd[7]]) as u32;
-    let cd_size = u32::from_le_bytes([eocd[12], eocd[13], eocd[14], eocd[15]]) as u64;
-    let cd_offset = u32::from_le_bytes([eocd[16], eocd[17], eocd[18], eocd[19]]) as u64;
-    // For raw split, EOCD should be single-disk semantics
-    if this_disk != 0 || cd_start_disk != 0 { return false; }
-    // Logical EOCD position = total - 22 - comment_len
-    let comment_len = u16::from_le_bytes([eocd[20], eocd[21]]) as u64;
-    let logical_eocd_pos = total.saturating_sub(22 + comment_len);
-    if cd_offset + cd_size != logical_eocd_pos { return false; }
-    // Optionally verify CD signature at logical cd_offset (would require reading across members, skip for cheap)
-    true
+    if let Some(pos) = eocd_pos {
+        let eocd = &buf[pos..];
+        if eocd.len() >= 22 {
+            let this_disk = u16::from_le_bytes([eocd[4], eocd[5]]) as u32;
+            let cd_start_disk = u16::from_le_bytes([eocd[6], eocd[7]]) as u32;
+            let cd_size = u32::from_le_bytes([eocd[12], eocd[13], eocd[14], eocd[15]]) as u64;
+            let cd_offset = u32::from_le_bytes([eocd[16], eocd[17], eocd[18], eocd[19]]) as u64;
+            let total_entries = u16::from_le_bytes([eocd[10], eocd[11]]) as u32;
+            let is_zip64_placeholder = total_entries == 0xFFFF || cd_size == 0xFFFFFFFF || cd_offset == 0xFFFFFFFF;
+            if !is_zip64_placeholder {
+                if this_disk != 0 || cd_start_disk != 0 { return false; }
+                let comment_len = u16::from_le_bytes([eocd[20], eocd[21]]) as u64;
+                let logical_eocd_pos = total.saturating_sub(22 + comment_len);
+                if cd_offset + cd_size == logical_eocd_pos { return true; }
+            } else {
+                // ZIP64 placeholder: look for ZIP64 EOCD locator and EOCD in logical tail
+                // Locator is 20 bytes before classic EOCD
+                if pos >= 20 && buf[pos - 20..pos - 16] == [0x50, 0x4b, 0x06, 0x07] {
+                    let locator = &buf[pos - 20..pos];
+                    let total_disks = u32::from_le_bytes([locator[16], locator[17], locator[18], locator[19]]);
+                    // For raw split, total_disks should be 1 (single disk logical)
+                    if total_disks != 1 { return false; }
+                    // For ZIP64, need to verify ZIP64 EOCD fields (omitted for cheap check, but at least ensure locator found)
+                    return true;
+                }
+            }
+        }
+    }
+    // Also try pure ZIP64 without classic placeholder (unlikely but handle)
+    for i in (0..=buf.len().saturating_sub(4)).rev() {
+        if buf[i..i+4] == [0x50, 0x4b, 0x06, 0x06] {
+            // ZIP64 EOCD found - check total disks etc. (simplified)
+            if buf.len() >= i + 56 {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn try_fallback_hypothesis(
@@ -1024,7 +1074,7 @@ fn zip_fallback_collect(
         .map(|(ord, path)| VolumeMember {
             path: path.clone(),
             filename_ordinal: Some(ord),
-            logical_index: probe_logical_index(&path),
+            logical_index: probe_logical_index(&path, &ArchiveFormat::Zip),
         })
         .collect();
     let entrypoint = volume_members.last().map(|m| m.path.clone()).unwrap_or_else(|| volume_members[0].path.clone());
@@ -1074,7 +1124,7 @@ fn rar_old_fallback_collect(
         .map(|(ord, path)| VolumeMember {
             path: path.clone(),
             filename_ordinal: Some(ord),
-            logical_index: probe_logical_index(&path),
+            logical_index: probe_logical_index(&path, &ArchiveFormat::Rar),
         })
         .collect();
     let entrypoint = volume_members[0].path.clone();
