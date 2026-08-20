@@ -260,7 +260,9 @@ pub(crate) async fn list_archive_with_listener_interactive<B: ArchiveExecutor>(
         recorder.start_task(&task_id, "list", None);
     }
 
-    let candidate = resolve_root_candidate(
+    // P1-4: list must handle raw continuation as seed (e.g., disguised 7z .002) where resolve_root_candidate returns None.
+    // Try volume resolver directly on raw file before giving up.
+    let mut candidate = match resolve_root_candidate(
         &request.path,
         &request.scanner,
         min_embedded_size_bytes,
@@ -269,11 +271,80 @@ pub(crate) async fn list_archive_with_listener_interactive<B: ArchiveExecutor>(
         None,
         None,
     )
-    .await?
-    .ok_or_else(|| smartzip_core::SmartZipError::UnsupportedFormat {
-        path: request.path.clone(),
-        format: None,
-    })?;
+    .await? {
+        Some(c) => c,
+        None => {
+            let synthetic = crate::types::ExtractionCandidate {
+                path: request.path.clone(),
+                relative_path: std::path::PathBuf::from(request.path.file_name().unwrap_or_default()),
+                depth: 0,
+                source: crate::types::CandidateSource::RootInput,
+                detected_format: None,
+                embedded_offset: None,
+                embedded_size: None,
+            };
+            let mut check = crate::volumes::VolumeResolver::new();
+            match check.resolve(&synthetic) {
+                crate::volumes::VolumeResolution::Resolved(_) | crate::volumes::VolumeResolution::ResolvedWithWarnings { .. } => synthetic,
+                crate::volumes::VolumeResolution::Incomplete(p) => {
+                    return Err(smartzip_core::SmartZipError::CorruptedArchive { path: request.path.clone(), detail: p.reason })
+                }
+                crate::volumes::VolumeResolution::GroupingAmbiguous { .. } => {
+                    return Err(smartzip_core::SmartZipError::CorruptedArchive { path: request.path.clone(), detail: "grouping ambiguous".into() })
+                }
+                _ => return Err(smartzip_core::SmartZipError::UnsupportedFormat { path: request.path.clone(), format: None }),
+            }
+        }
+    };
+
+    // Shared volume resolution (same semantics as extract) – list must not use filename-only heuristics.
+    let mut volume_resolver = crate::volumes::VolumeResolver::new();
+    let mut _volume_keep: Option<crate::volumes::materialize::MaterializedVolumeSet> = None;
+    match volume_resolver.resolve(&candidate) {
+        crate::volumes::VolumeResolution::Single => {}
+        crate::volumes::VolumeResolution::Resolved(set) => {
+            let mat = crate::volumes::materialize::materialize_volume_set(&set).map_err(|e| {
+                smartzip_core::SmartZipError::CorruptedArchive {
+                    path: candidate.path.clone(),
+                    detail: format!("volume materialization failed: {}", e),
+                }
+            })?;
+            candidate.path = mat.canonical_entrypoint.clone();
+            candidate.detected_format = Some(set.format.clone());
+            _volume_keep = Some(mat);
+        }
+        crate::volumes::VolumeResolution::ResolvedWithWarnings { set, warnings } => {
+            for w in &warnings {
+                events.push(TaskEvent {
+                    task_id: task_id.clone(),
+                    kind: TaskEventKind::Warning {
+                        message: format!("volume warning: {:?}", w),
+                    },
+                });
+            }
+            let mat = crate::volumes::materialize::materialize_volume_set(&set).map_err(|e| {
+                smartzip_core::SmartZipError::CorruptedArchive {
+                    path: candidate.path.clone(),
+                    detail: format!("volume materialization failed: {}", e),
+                }
+            })?;
+            candidate.path = mat.canonical_entrypoint.clone();
+            candidate.detected_format = Some(set.format.clone());
+            _volume_keep = Some(mat);
+        }
+        crate::volumes::VolumeResolution::Incomplete(problem) => {
+            return Err(smartzip_core::SmartZipError::CorruptedArchive {
+                path: candidate.path.clone(),
+                detail: problem.reason,
+            });
+        }
+        crate::volumes::VolumeResolution::GroupingAmbiguous { hypotheses } => {
+            return Err(smartzip_core::SmartZipError::CorruptedArchive {
+                path: candidate.path.clone(),
+                detail: format!("grouping ambiguous: {} hypotheses", hypotheses.len()),
+            });
+        }
+    }
 
     let resolved = prepare_resolved_archive(
         &candidate,
@@ -318,10 +389,13 @@ pub(crate) async fn list_archive_with_listener_interactive<B: ArchiveExecutor>(
             })?;
 
     if let Some(recorder) = history {
+        // For volume sets, candidate.path may have been rewritten to the canonical staging entrypoint.
+        // History must log the original user input path, not the temporary canonical path.
+        let history_input_path = &request.path;
         recorder.record_file_extraction(
             &task_id,
             crate::history::FileExtractionRow {
-                input_path: &candidate.path,
+                input_path: history_input_path,
                 sample_hash: resolved.sample_hash.as_deref(),
                 file_size: resolved.sample_size,
                 offset: candidate.embedded_offset.map(|o| o as i64),

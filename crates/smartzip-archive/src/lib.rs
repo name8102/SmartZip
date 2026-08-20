@@ -7,6 +7,7 @@ pub mod safety;
 pub mod sevenzz;
 pub mod types;
 pub mod unrar;
+pub mod volume_probe;
 
 pub use backend::{ArchiveAdapter, ArchiveExecutor};
 pub use native_zip::NativeZipBackend;

@@ -21,10 +21,11 @@ use crate::interactive::{
 use crate::materialize::{self, CommitPolicy, MaterializeRequest, OutputMaterializer};
 use crate::nested::{
     archive_output_name, archive_stem, candidate_key, candidate_output_relative_path,
-    discover_nested_candidates, is_first_volume, make_collision_resolver,
-    materialize_archive_input, output_dir_for_candidate, output_relative_path_for, record_skip,
+    discover_nested_candidates, make_collision_resolver, materialize_archive_input,
+    output_dir_for_candidate, output_relative_path_for, record_skip,
     recyclable_nested_archive_path, recycle_archive, root_embedded_candidates,
 };
+use crate::volumes::{VolumeResolution, VolumeResolver};
 use crate::password_order::{
     order_password_candidates, password_attempt_index, password_source_label, password_value,
     remember_batch_password,
@@ -87,9 +88,6 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
 
     for input in &request.inputs {
         let relative_path = archive_output_name(input);
-        // Header-first: leave detected_format empty here. The main loop
-        // resolves format from file header, embedded findings, and finally
-        // the extension as a hint.
         queue.push_back(ExtractionCandidate {
             detected_format: None,
             path: input.clone(),
@@ -99,6 +97,31 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
             embedded_offset: None,
             embedded_size: None,
         });
+    }
+    // P1-5: coalesce multiple explicit roots that resolve to the same logical VolumeSet before queueing (
+    // avoid marking coalesced duplicates as skipped -> Partial). Use a temporary resolver for pre-queue.
+    {
+        let mut tmp_resolver = VolumeResolver::new();
+        let mut seen_volume_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut filtered: VecDeque<ExtractionCandidate> = VecDeque::new();
+        for cand in queue.into_iter() {
+            if cand.source == CandidateSource::RootInput {
+                match tmp_resolver.resolve(&cand) {
+                    VolumeResolution::Resolved(set) | VolumeResolution::ResolvedWithWarnings { set, .. } => {
+                        let key = volume_set_key(&set);
+                        if seen_volume_keys.contains(&key) {
+                            continue;
+                        }
+                        seen_volume_keys.insert(key);
+                        filtered.push_back(cand);
+                    }
+                    _ => filtered.push_back(cand),
+                }
+            } else {
+                filtered.push_back(cand);
+            }
+        }
+        queue = filtered;
     }
 
     // C6: Cache password candidates once before the extraction loop.
@@ -133,6 +156,8 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
         smartzip_db::timestamp::format_utc_seconds(now - 30 * 24 * 3600)
     };
     let mut hist_saw_failure = false;
+    let mut volume_resolver = VolumeResolver::new();
+    let mut processed_volume_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     loop {
         let Some(mut candidate) = queue.pop_front() else {
@@ -153,10 +178,170 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
             skipped.push(candidate);
             continue;
         }
-        if !is_first_volume(&candidate.path) {
-            record_skip(history, &task_id, &candidate, "not_first_volume");
-            skipped.push(candidate);
-            continue;
+        // Robust split-volume resolution (replaces filename-only is_first_volume)
+        // Embedded findings at non-zero offset bypass volume discovery.
+        let mut volume_materialized: Option<crate::volumes::materialize::MaterializedVolumeSet> =
+            None;
+        let mut volume_set_for_candidate: Option<crate::volumes::VolumeSet> = None;
+        match volume_resolver.resolve(&candidate) {
+            VolumeResolution::Single => {}
+            VolumeResolution::Resolved(set) => {
+                let key = volume_set_key(&set);
+                if processed_volume_keys.contains(&key) {
+                    // Already processed this logical VolumeSet (e.g., another physical member or nested duplicate) – coalesce without marking as skipped for Partial status.
+                    continue;
+                }
+                processed_volume_keys.insert(key);
+                match crate::volumes::materialize::materialize_volume_set(&set) {
+                    Ok(mat) => {
+                        candidate.detected_format = Some(set.format.clone());
+                        volume_set_for_candidate = Some(set);
+                        volume_materialized = Some(mat);
+                    }
+                    Err(e) => {
+                        hist_saw_failure = true;
+                        events.push(TaskEvent {
+                            task_id: task_id.clone(),
+                            kind: TaskEventKind::Failed {
+                                error: format!("volume materialization failed for {}: {}", candidate.path.display(), e),
+                            },
+                        });
+                        if let Some(recorder) = history {
+                            recorder.record_file_extraction(
+                                &task_id,
+                                crate::history::FileExtractionRow {
+                                    input_path: &candidate.path,
+                                    sample_hash: None,
+                                    file_size: None,
+                                    offset: candidate.embedded_offset.map(|o| o as i64),
+                                    output_path: None,
+                                    has_password: false,
+                                    password_id: None,
+                                    status: "failed",
+                                    reason: Some("materialize_failed"),
+                                    encoding: None,
+                                    encoding_corrected: false,
+                                    damaged_volumes_json: None,
+                                },
+                            );
+                        }
+                        skipped.push(candidate);
+                        continue;
+                    }
+                }
+            }
+            VolumeResolution::ResolvedWithWarnings { set, warnings } => {
+                for w in &warnings {
+                    events.push(TaskEvent {
+                        task_id: task_id.clone(),
+                        kind: TaskEventKind::Warning {
+                            message: format!("volume warning for {}: {:?}", candidate.path.display(), w),
+                        },
+                    });
+                }
+                let key = volume_set_key(&set);
+                if processed_volume_keys.contains(&key) {
+                    continue;
+                }
+                processed_volume_keys.insert(key);
+                match crate::volumes::materialize::materialize_volume_set(&set) {
+                    Ok(mat) => {
+                        candidate.detected_format = Some(set.format.clone());
+                        volume_set_for_candidate = Some(set);
+                        volume_materialized = Some(mat);
+                    }
+                    Err(e) => {
+                        hist_saw_failure = true;
+                        events.push(TaskEvent {
+                            task_id: task_id.clone(),
+                            kind: TaskEventKind::Failed {
+                                error: format!("volume materialization failed for {}: {}", candidate.path.display(), e),
+                            },
+                        });
+                        if let Some(recorder) = history {
+                            recorder.record_file_extraction(
+                                &task_id,
+                                crate::history::FileExtractionRow {
+                                    input_path: &candidate.path,
+                                    sample_hash: None,
+                                    file_size: None,
+                                    offset: candidate.embedded_offset.map(|o| o as i64),
+                                    output_path: None,
+                                    has_password: false,
+                                    password_id: None,
+                                    status: "failed",
+                                    reason: Some("materialize_failed"),
+                                    encoding: None,
+                                    encoding_corrected: false,
+                                    damaged_volumes_json: None,
+                                },
+                            );
+                        }
+                        skipped.push(candidate);
+                        continue;
+                    }
+                }
+            }
+            VolumeResolution::Incomplete(problem) => {
+                hist_saw_failure = true;
+                events.push(TaskEvent {
+                    task_id: task_id.clone(),
+                    kind: TaskEventKind::Failed {
+                        error: format!("incomplete volume set for {}: {}", candidate.path.display(), problem.reason),
+                    },
+                });
+                if let Some(recorder) = history {
+                    recorder.record_file_extraction(
+                        &task_id,
+                        crate::history::FileExtractionRow {
+                            input_path: &candidate.path,
+                            sample_hash: None,
+                            file_size: None,
+                            offset: candidate.embedded_offset.map(|o| o as i64),
+                            output_path: None,
+                            has_password: false,
+                            password_id: None,
+                            status: "failed",
+                            reason: Some("incomplete_volume"),
+                            encoding: None,
+                            encoding_corrected: false,
+                            damaged_volumes_json: None,
+                        },
+                    );
+                }
+                skipped.push(candidate);
+                continue;
+            }
+            VolumeResolution::GroupingAmbiguous { hypotheses } => {
+                hist_saw_failure = true;
+                events.push(TaskEvent {
+                    task_id: task_id.clone(),
+                    kind: TaskEventKind::Failed {
+                        error: format!("grouping ambiguous for {}: {} hypotheses", candidate.path.display(), hypotheses.len()),
+                    },
+                });
+                if let Some(recorder) = history {
+                    recorder.record_file_extraction(
+                        &task_id,
+                        crate::history::FileExtractionRow {
+                            input_path: &candidate.path,
+                            sample_hash: None,
+                            file_size: None,
+                            offset: candidate.embedded_offset.map(|o| o as i64),
+                            output_path: None,
+                            has_password: false,
+                            password_id: None,
+                            status: "failed",
+                            reason: Some("grouping_ambiguous"),
+                            encoding: None,
+                            encoding_corrected: false,
+                            damaged_volumes_json: None,
+                        },
+                    );
+                }
+                skipped.push(candidate);
+                continue;
+            }
         }
 
         // Header-based detection first, then scanner confirmation
@@ -444,8 +629,22 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
             }
         }
 
-        let archive_input = materialize_archive_input(&candidate)?;
-        let archive_path = archive_input.path.clone();
+        // For volume sets, the canonical staging already provides the entrypoint; for single files use the usual carve/materialize.
+        let (archive_path, _archive_temp, _volume_materialized_keep) =
+            if let Some(mat) = volume_materialized {
+                let p = mat.canonical_entrypoint.clone();
+                // Keep the staging alive for the duration of this candidate's backend calls.
+                // We move the mat into a holder that lives until the end of the loop iteration.
+                // To avoid dropping before extraction, we keep it in a variable that outlives backend calls.
+                // Here we return the path and keep the handle.
+                (p, None, Some(mat))
+            } else {
+                let inp = materialize_archive_input(&candidate)?;
+                let p = inp.path.clone();
+                (p, inp._temp, None)
+            };
+        // Shadow the earlier volume_materialized binding with the kept handle so it lives through the rest of the iteration.
+        let _volume_keep = _volume_materialized_keep;
 
         // File-grain history: identify this physical file by content
         // sampling so we can dedup, reuse a confirmed encoding, and reuse a
@@ -1408,7 +1607,34 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
             queue.push_back(nested);
         }
 
-        if let Some(path) = recyclable_nested_archive_path(&candidate, &request.output_dir) {
+        // For volume sets, recycle all members that are inside the managed output root; for singles, recycle the single candidate.
+        if let Some(set) = volume_set_for_candidate {
+            for member in set.members {
+                let synthetic = ExtractionCandidate {
+                    path: member.path.clone(),
+                    relative_path: member.path.clone(),
+                    depth: candidate.depth,
+                    source: CandidateSource::ExtractedFile,
+                    detected_format: Some(set.format.clone()),
+                    embedded_offset: None,
+                    embedded_size: None,
+                };
+                if let Some(path) = recyclable_nested_archive_path(&synthetic, &request.output_dir) {
+                    if let Err(error) = recycle_archive(archive_recycler.clone(), path.clone()).await {
+                        events.push(TaskEvent {
+                            task_id: task_id.clone(),
+                            kind: TaskEventKind::Warning {
+                                message: format!(
+                                    "failed to move processed nested archive {} to trash: {}",
+                                    path.display(),
+                                    error
+                                ),
+                            },
+                        });
+                    }
+                }
+            }
+        } else if let Some(path) = recyclable_nested_archive_path(&candidate, &request.output_dir) {
             if let Err(error) = recycle_archive(archive_recycler.clone(), path.clone()).await {
                 events.push(TaskEvent {
                     task_id: task_id.clone(),
@@ -1462,4 +1688,10 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
         enqueued,
         events: snapshot,
     })
+}
+
+fn volume_set_key(set: &crate::volumes::VolumeSet) -> String {
+    let mut paths: Vec<String> = set.members.iter().map(|m| m.path.display().to_string()).collect();
+    paths.sort();
+    format!("{}:{}", set.format.as_str(), paths.join("|"))
 }
