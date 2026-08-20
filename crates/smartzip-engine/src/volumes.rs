@@ -307,14 +307,15 @@ fn collect_candidate_formats(hyp: &SequenceHypothesis, index: &DirectoryVolumeIn
         if seen.insert(fmt.clone()) { formats.push(fmt); }
     };
     match seed_probe {
-        VolumeProbeResult::MultiVolume(s) => add(s.format.clone()),
+        VolumeProbeResult::MultiVolume(s) | VolumeProbeResult::PossiblyMultiVolume(s) => add(s.format.clone()),
         VolumeProbeResult::Standalone(f) => add(f.clone()),
         _ => {}
     }
     for files in hyp.groups.values() {
         for f in files {
-            if let VolumeProbeResult::MultiVolume(s) = probe_volume_structure(&f.path) {
-                add(s.format.clone());
+            match probe_volume_structure(&f.path) {
+                VolumeProbeResult::MultiVolume(s) | VolumeProbeResult::PossiblyMultiVolume(s) => add(s.format.clone()),
+                _ => {}
             }
         }
     }
@@ -413,12 +414,35 @@ fn resolve_hypothesis_inner(
 
     // Now we have slot candidates map (ordinal -> 0..N paths)
     // Apply interval clipping using strong structural evidence before/after.
-    let (clip_prefix, clip_suffix) = match compute_clip_indices(&slot_candidates, &format) {
+    let (mut clip_prefix, mut clip_suffix) = match compute_clip_indices(&slot_candidates, &format) {
         Ok(v) => v,
         Err(e) => return e,
     };
+    // Extend clipping to exclude leading/trailing foreign definite MultiVolume (e.g., RAR prefix before 7z start)
     let mut sorted_ordinals: Vec<u64> = slot_candidates.keys().cloned().collect();
     sorted_ordinals.sort();
+    // Check for foreign at edges and extend clipping
+    for &ord in &sorted_ordinals {
+        let is_foreign = slot_candidates.get(&ord).map_or(false, |paths| {
+            paths.iter().any(|p| matches!(probe_volume_structure(p), VolumeProbeResult::MultiVolume(s) if s.format != format))
+        });
+        if is_foreign {
+            // If this foreign ordinal is at the current edge, extend clip
+            if Some(ord) == sorted_ordinals.first().copied() || Some(ord) == clip_prefix {
+                clip_prefix = Some(sorted_ordinals.iter().find(|&&o| o > ord).copied().unwrap_or(ord + 1));
+            }
+            // Also check trailing
+            if Some(ord) == sorted_ordinals.last().copied() || Some(ord) == clip_suffix {
+                clip_suffix = Some(sorted_ordinals.iter().rev().find(|&&o| o < ord).copied().unwrap_or(ord - 1));
+            }
+        } else {
+            // First non-foreign from start defines start, similarly for end
+            if clip_prefix.is_none() {
+                // No strong start, but we can at least not include leading foreign
+                // Already handled above by extending clip_prefix when foreign at start
+            }
+        }
+    }
     let mut clipped_ordinals = sorted_ordinals.clone();
     if clip_prefix.is_some() || clip_suffix.is_some() {
         let start = clip_prefix.unwrap_or(*sorted_ordinals.first().unwrap());
@@ -478,6 +502,15 @@ fn resolve_hypothesis_inner(
                 if s.format != format {
                     return HypothesisOutcome::NotViable;
                 }
+            }
+        }
+    }
+    // For RAR, each ordinal must have at least one candidate with RAR evidence
+    if format == ArchiveFormat::Rar && filtered_candidates.len() > 1 {
+        for paths in filtered_candidates.values() {
+            let has_valid = paths.iter().any(|p| matches!(probe_volume_structure(p), VolumeProbeResult::MultiVolume(s) | VolumeProbeResult::PossiblyMultiVolume(s) if s.format == ArchiveFormat::Rar));
+            if !has_valid {
+                return HypothesisOutcome::NotViable;
             }
         }
     }
@@ -1344,8 +1377,26 @@ mod tests {
         // RAR5 magic + minimal header that probe will treat as PossiblyMultiVolume
         let mut f = fs::File::create(path).unwrap();
         f.write_all(b"Rar!\x1a\x07\x01\x00").unwrap();
-        // Pad to 64 bytes so probe reads header
         f.write_all(&vec![0u8; 64]).unwrap();
+    }
+    fn create_rar_volume(path: &Path, vol_num: Option<u32>) {
+        let mut f = std::fs::File::create(path).unwrap();
+        f.write_all(b"Rar!\x1a\x07\x01\x00").unwrap();
+        let mut hdr = Vec::new();
+        hdr.extend_from_slice(&[0,0,0,0]); // CRC placeholder
+        hdr.push(0x07); // hSize
+        hdr.push(0x01); // type=1
+        hdr.push(0x01); // hdrFlags extra
+        hdr.push(0x00); // extraSize 0
+        let arc_flags: u64 = if let Some(n) = vol_num { if n==0 {0x01} else {0x03} } else {0x00};
+        // encode arcFlags as vint
+        let mut v = arc_flags;
+        loop { let mut b = (v & 0x7F) as u8; v >>=7; if v!=0 { b|=0x80; hdr.push(b); } else { hdr.push(b); break; } }
+        if let Some(n) = vol_num { if n!=0 { let mut v=n as u64; loop { let mut b=(v&0x7F) as u8; v>>=7; if v!=0 {b|=0x80; hdr.push(b);} else {hdr.push(b); break;} } } }
+        let crc = crc32fast::hash(&hdr[4..]);
+        hdr[0..4].copy_from_slice(&crc.to_le_bytes());
+        f.write_all(&hdr).unwrap();
+        f.write_all(&vec![0u8; 100]).unwrap();
     }
     fn create_fake_7z_start(path: &Path, next_offset: u64, next_size: u64) {
         let mut header = [0u8; 32];
@@ -1749,6 +1800,43 @@ mod tests {
         drop(mat);
         // TempDir should be deleted on drop, but we used tempdir_in which may still exist until drop? Our MaterializedVolumeSet holds TempDir, so after drop it should be gone.
         assert!(!staging.exists() || fs::read_dir(&staging).map(|mut d| d.next().is_none()).unwrap_or(true));
+    }
+    #[test]
+    fn foreign_prefix_with_raw_seed_resolves_zip() {
+        let dir = TempDir::new().unwrap();
+        let p1 = dir.path().join("pack01.dat");
+        create_rar_volume(&p1, Some(0));
+        // Create a minimal ZIP and split into 3 raw parts for 02,03,04
+        let zip_data = {
+            let mut buf = Vec::new();
+            let mut w = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            let opts = zip::write::FileOptions::<()>::default().compression_method(zip::CompressionMethod::Stored);
+            w.start_file("hello.txt", opts).unwrap();
+            w.write_all(b"hello world").unwrap();
+            w.finish().unwrap();
+            buf
+        };
+        let total = zip_data.len();
+        let part = total / 3;
+        let p2 = dir.path().join("pack02.dat");
+        let p3 = dir.path().join("pack03.dat");
+        let p4 = dir.path().join("pack04.dat");
+        std::fs::write(&p2, &zip_data[0..part]).unwrap();
+        std::fs::write(&p3, &zip_data[part..2*part]).unwrap();
+        std::fs::write(&p4, &zip_data[2*part..]).unwrap();
+        let mut resolver = VolumeResolver::new();
+        let cand = make_candidate(p3.clone()); // seed is raw continuation
+        match resolver.resolve(&cand) {
+            VolumeResolution::Resolved(set) | VolumeResolution::ResolvedWithWarnings { set, .. } => {
+                assert_eq!(set.format, ArchiveFormat::Zip);
+                assert_eq!(set.members.len(), 3);
+                assert!(set.members.iter().any(|m| m.path == p2));
+                assert!(set.members.iter().any(|m| m.path == p3));
+                assert!(set.members.iter().any(|m| m.path == p4));
+                assert!(!set.members.iter().any(|m| m.path == p1));
+            }
+            other => panic!("should resolve ZIP raw 02,03,04 despite RAR prefix, got {:?}", other),
+        }
     }
 }
 
