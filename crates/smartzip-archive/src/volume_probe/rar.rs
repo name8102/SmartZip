@@ -75,7 +75,11 @@ fn parse_rar5_main_flags(data: &[u8]) -> Option<(bool, Option<u32>)> {
     }
     let hdr_flags = read_vint(data, &mut pos)?;
     let has_extra = (hdr_flags & 0x01) != 0;
-    let extra_size = if has_extra { read_vint(data, &mut pos)? } else { 0 };
+    let extra_size = if has_extra {
+        read_vint(data, &mut pos)?
+    } else {
+        0
+    };
     if data.len() < pos + 1 {
         return None;
     }

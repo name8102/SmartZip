@@ -1,5 +1,5 @@
-use regex::Regex;
 use chinese_number::{ChineseCountMethod, ChineseToNumber};
+use regex::Regex;
 use std::sync::OnceLock;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,15 +77,19 @@ fn parse_chinese_tokens(normalized: &str, existing: &[OrdinalToken]) -> Vec<Ordi
     let mut run_chars = String::new();
     let mut run_byte_start = 0usize;
 
-    let flush = |run_chars: &str, byte_start: usize, byte_end: usize, out: &mut Vec<OrdinalToken>| {
+    let flush = |run_chars: &str,
+                 byte_start: usize,
+                 byte_end: usize,
+                 out: &mut Vec<OrdinalToken>| {
         if run_chars.is_empty() {
             return;
         }
         // Attempt to parse via chinese-number with TenThousand method (most common).
         // Also try naive if method fails? Try both.
-        let parsed = <&str as ChineseToNumber<u64>>::to_number(&run_chars, ChineseCountMethod::TenThousand)
-            .or_else(|_| <&str as ChineseToNumber<u64>>::to_number_naive(&run_chars))
-            .ok();
+        let parsed =
+            <&str as ChineseToNumber<u64>>::to_number(&run_chars, ChineseCountMethod::TenThousand)
+                .or_else(|_| <&str as ChineseToNumber<u64>>::to_number_naive(&run_chars))
+                .ok();
         if let Some(v) = parsed {
             // Filter out zero? Allow.
             // Avoid single char '十' ambiguous? But still value 10, treat as ordinal.
@@ -117,7 +121,9 @@ fn parse_chinese_tokens(normalized: &str, existing: &[OrdinalToken]) -> Vec<Ordi
             if let Some(_) = run_start {
                 let byte_end = byte_pos;
                 // Check overlap with existing digit tokens
-                let overlaps = existing.iter().any(|t| !(byte_end <= t.start || run_byte_start >= t.end));
+                let overlaps = existing
+                    .iter()
+                    .any(|t| !(byte_end <= t.start || run_byte_start >= t.end));
                 if !overlaps {
                     // Need to handle that chinese run may be part of larger word like "資源第...卷"? Our run already isolates consecutive CN chars, which may be "二十三". Good.
                     flush(&run_chars, run_byte_start, byte_end, &mut out);
@@ -139,7 +145,10 @@ fn parse_roman_tokens(normalized: &str, existing: &[OrdinalToken]) -> Vec<Ordina
     for m in re.find_iter(normalized) {
         let raw = m.as_str();
         // Skip if overlaps existing
-        if existing.iter().any(|t| !(m.end() <= t.start || m.start() >= t.end)) {
+        if existing
+            .iter()
+            .any(|t| !(m.end() <= t.start || m.start() >= t.end))
+        {
             continue;
         }
         // Also skip if already counted as roman inside chinese? no.
@@ -193,7 +202,10 @@ pub fn generate_single_token_hypotheses(
         let tok = &seed_file.filename_ordinals[token_idx];
         let prefix = seed_file.normalized_name[..tok.start].to_string();
         let suffix = seed_file.normalized_name[tok.end..].to_string();
-        let mut groups: std::collections::BTreeMap<u64, Vec<crate::volumes::directory::DirectoryFile>> = Default::default();
+        let mut groups: std::collections::BTreeMap<
+            u64,
+            Vec<crate::volumes::directory::DirectoryFile>,
+        > = Default::default();
         for file in &index.files {
             // Must have same number of tokens? Not necessarily, but other tokens must match fixed parts.
             // Simplistic: check if normalized_name starts with prefix and ends with suffix, and middle can be parsed as ordinal.
@@ -260,7 +272,9 @@ pub fn generate_single_token_hypotheses(
     hypotheses
 }
 
-fn check_gap(groups: &std::collections::BTreeMap<u64, Vec<crate::volumes::directory::DirectoryFile>>) -> bool {
+fn check_gap(
+    groups: &std::collections::BTreeMap<u64, Vec<crate::volumes::directory::DirectoryFile>>,
+) -> bool {
     if groups.is_empty() {
         return false;
     }

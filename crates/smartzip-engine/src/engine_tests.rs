@@ -1033,10 +1033,8 @@ async fn extract_via_real_seven_zip_with_smart_output() {
 
     let seven_zip = SevenZipBackend::locate(&smartzip_archive::SevenZipLocator::default())
         .expect("7z/7zz must be available");
-    let backend = BackendRouter::from_adapters(vec![
-        AdapterRegistration::from_adapter(NativeZipBackend::new(), -10),
-        AdapterRegistration::from_adapter(seven_zip, 10),
-    ]);
+    let backend =
+        BackendRouter::from_adapters(vec![AdapterRegistration::from_adapter(seven_zip, 10)]);
     let db = SmartZipDb::in_memory().unwrap();
     let service = PasswordService::new(PasswordRepository::new(db.connection()));
 

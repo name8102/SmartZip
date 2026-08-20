@@ -28,11 +28,12 @@ pub struct VolumeSetForMaterialize {
     pub members: Vec<super::VolumeMember>,
 }
 
-pub fn materialize_volume_set(
-    set: &super::VolumeSet,
-) -> io::Result<MaterializedVolumeSet> {
+pub fn materialize_volume_set(set: &super::VolumeSet) -> io::Result<MaterializedVolumeSet> {
     if set.members.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty volume set"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "empty volume set",
+        ));
     }
     let source_dir = set.members[0]
         .path
@@ -72,7 +73,11 @@ pub fn materialize_volume_set(
     // Entrypoint depends on format and split style: ZIP spanned last contains EOCD, ZIP raw split first is entry, 7z/RAR first.
     let entry_idx = match set.format {
         ArchiveFormat::Zip => {
-            if zip_is_raw_split { 0 } else { canonical_members.len().saturating_sub(1) }
+            if zip_is_raw_split {
+                0
+            } else {
+                canonical_members.len().saturating_sub(1)
+            }
         }
         _ => 0,
     };
@@ -102,7 +107,12 @@ fn create_staging_dir(source_dir: &Path) -> io::Result<tempfile::TempDir> {
     }
 }
 
-fn canonical_name_for(format: &ArchiveFormat, stem: &str, seq: usize, _logical_index: Option<u32>) -> String {
+fn canonical_name_for(
+    format: &ArchiveFormat,
+    stem: &str,
+    seq: usize,
+    _logical_index: Option<u32>,
+) -> String {
     match format {
         ArchiveFormat::SevenZip => format!("{stem}.7z.{:03}", seq),
         ArchiveFormat::Rar => format!("{stem}.part{:02}.rar", seq),
@@ -169,8 +179,10 @@ fn try_reflink_linux(src: &Path, dst: &Path) -> io::Result<()> {
 fn try_clonefile_macos(src: &Path, dst: &Path) -> io::Result<()> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
-    let src_c = CString::new(src.as_os_str().as_bytes()).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    let dst_c = CString::new(dst.as_os_str().as_bytes()).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    let src_c = CString::new(src.as_os_str().as_bytes())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    let dst_c = CString::new(dst.as_os_str().as_bytes())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     let ret = unsafe { libc::clonefile(src_c.as_ptr(), dst_c.as_ptr(), 0) };
     if ret == 0 {
         Ok(())

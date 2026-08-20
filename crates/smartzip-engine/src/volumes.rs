@@ -58,9 +58,14 @@ pub struct VolumeSetHypothesis {
 pub enum VolumeResolution {
     Single,
     Resolved(VolumeSet),
-    ResolvedWithWarnings { set: VolumeSet, warnings: Vec<VolumeWarning> },
+    ResolvedWithWarnings {
+        set: VolumeSet,
+        warnings: Vec<VolumeWarning>,
+    },
     Incomplete(VolumeProblem),
-    GroupingAmbiguous { hypotheses: Vec<VolumeSetHypothesis> },
+    GroupingAmbiguous {
+        hypotheses: Vec<VolumeSetHypothesis>,
+    },
 }
 
 /// Shared resolver producing canonical outcomes.
@@ -148,7 +153,10 @@ impl VolumeResolver {
                 match probe {
                     VolumeProbeResult::MultiVolume(structure) => {
                         return VolumeResolution::Incomplete(VolumeProblem {
-                            reason: format!("archive requires additional volumes ({} probe)", structure.format.as_str()),
+                            reason: format!(
+                                "archive requires additional volumes ({} probe)",
+                                structure.format.as_str()
+                            ),
                             format: Some(structure.format),
                         });
                     }
@@ -165,29 +173,35 @@ impl VolumeResolver {
         for hyp in hypotheses {
             let formats = collect_candidate_formats(&hyp, &index, &probe);
             // If no strong format evidence, try the hypothesis once with format inferred via first-hit (legacy) to avoid missing weak cases
-            let formats = if formats.is_empty() { vec![None] } else { formats.into_iter().map(Some).collect() };
+            let formats = if formats.is_empty() {
+                vec![None]
+            } else {
+                formats.into_iter().map(Some).collect()
+            };
             for fmt_opt in formats {
                 let outcome = match fmt_opt {
                     Some(fmt) => resolve_hypothesis_with_forced_format(&hyp, &index, &probe, fmt),
                     None => resolve_hypothesis(&hyp, &index, &probe),
                 };
                 match outcome {
-                HypothesisOutcome::Resolved { set, warnings } => {
-                    if warnings.is_empty() {
-                        resolved_hypotheses.push((set, warnings));
-                    } else {
-                        resolved_hypotheses.push((set, warnings));
+                    HypothesisOutcome::Resolved { set, warnings } => {
+                        if warnings.is_empty() {
+                            resolved_hypotheses.push((set, warnings));
+                        } else {
+                            resolved_hypotheses.push((set, warnings));
+                        }
                     }
-                }
-                HypothesisOutcome::Incomplete(problem) => incomplete_reasons.push(problem),
-                HypothesisOutcome::Ambiguous(hypo) => ambiguous_hypotheses.push(hypo),
-                HypothesisOutcome::NotViable => {}
+                    HypothesisOutcome::Incomplete(problem) => incomplete_reasons.push(problem),
+                    HypothesisOutcome::Ambiguous(hypo) => ambiguous_hypotheses.push(hypo),
+                    HypothesisOutcome::NotViable => {}
                 }
             }
         }
 
         // P1-6/7: any plausible alternative (ambiguous or incomplete with different grouping) makes GroupingAmbiguous.
-        if !ambiguous_hypotheses.is_empty() || (!incomplete_reasons.is_empty() && !resolved_hypotheses.is_empty()) {
+        if !ambiguous_hypotheses.is_empty()
+            || (!incomplete_reasons.is_empty() && !resolved_hypotheses.is_empty())
+        {
             let mut hypos = ambiguous_hypotheses;
             for (set, warnings) in resolved_hypotheses {
                 hypos.push(VolumeSetHypothesis {
@@ -199,7 +213,10 @@ impl VolumeResolver {
             for prob in incomplete_reasons {
                 // Represent incomplete as a hypothesis with empty members but with problem as warning for debugging
                 hypos.push(VolumeSetHypothesis {
-                    format: prob.format.clone().unwrap_or(ArchiveFormat::Unknown("unknown".into())),
+                    format: prob
+                        .format
+                        .clone()
+                        .unwrap_or(ArchiveFormat::Unknown("unknown".into())),
                     members: Vec::new(),
                     warnings: Vec::new(),
                 });
@@ -265,7 +282,8 @@ impl VolumeResolver {
             };
             match self.resolve(&candidate) {
                 VolumeResolution::Single => single_paths.push(root.clone()),
-                VolumeResolution::Resolved(set) | VolumeResolution::ResolvedWithWarnings { set, .. } => {
+                VolumeResolution::Resolved(set)
+                | VolumeResolution::ResolvedWithWarnings { set, .. } => {
                     if !seen_sets.iter().any(|s| same_member_set(s, &set)) {
                         seen_sets.push(set);
                     }
@@ -279,7 +297,10 @@ impl VolumeResolver {
 }
 
 enum HypothesisOutcome {
-    Resolved { set: VolumeSet, warnings: Vec<VolumeWarning> },
+    Resolved {
+        set: VolumeSet,
+        warnings: Vec<VolumeWarning>,
+    },
     Incomplete(VolumeProblem),
     Ambiguous(VolumeSetHypothesis),
     NotViable,
@@ -300,21 +321,31 @@ fn resolve_hypothesis_with_forced_format(
 ) -> HypothesisOutcome {
     resolve_hypothesis_inner(hyp, index, seed_probe, Some(forced))
 }
-fn collect_candidate_formats(hyp: &SequenceHypothesis, index: &DirectoryVolumeIndex, seed_probe: &VolumeProbeResult) -> Vec<ArchiveFormat> {
+fn collect_candidate_formats(
+    hyp: &SequenceHypothesis,
+    index: &DirectoryVolumeIndex,
+    seed_probe: &VolumeProbeResult,
+) -> Vec<ArchiveFormat> {
     let mut formats: Vec<ArchiveFormat> = Vec::new();
     let mut seen: HashSet<ArchiveFormat> = HashSet::new();
     let mut add = |fmt: ArchiveFormat| {
-        if seen.insert(fmt.clone()) { formats.push(fmt); }
+        if seen.insert(fmt.clone()) {
+            formats.push(fmt);
+        }
     };
     match seed_probe {
-        VolumeProbeResult::MultiVolume(s) | VolumeProbeResult::PossiblyMultiVolume(s) => add(s.format.clone()),
+        VolumeProbeResult::MultiVolume(s) | VolumeProbeResult::PossiblyMultiVolume(s) => {
+            add(s.format.clone())
+        }
         VolumeProbeResult::Standalone(f) => add(f.clone()),
         _ => {}
     }
     for files in hyp.groups.values() {
         for f in files {
             match probe_volume_structure(&f.path) {
-                VolumeProbeResult::MultiVolume(s) | VolumeProbeResult::PossiblyMultiVolume(s) => add(s.format.clone()),
+                VolumeProbeResult::MultiVolume(s) | VolumeProbeResult::PossiblyMultiVolume(s) => {
+                    add(s.format.clone())
+                }
                 _ => {}
             }
         }
@@ -332,13 +363,16 @@ fn resolve_hypothesis_inner(
     } else {
         match seed_probe {
             VolumeProbeResult::Standalone(f) => f.clone(),
-            VolumeProbeResult::MultiVolume(s) | VolumeProbeResult::PossiblyMultiVolume(s) => s.format.clone(),
+            VolumeProbeResult::MultiVolume(s) | VolumeProbeResult::PossiblyMultiVolume(s) => {
+                s.format.clone()
+            }
             VolumeProbeResult::NotApplicable => {
                 let mut inferred: Option<ArchiveFormat> = None;
                 for files in hyp.groups.values() {
                     for f in files {
                         match probe_volume_structure(&f.path) {
-                            VolumeProbeResult::MultiVolume(s) | VolumeProbeResult::PossiblyMultiVolume(s) => {
+                            VolumeProbeResult::MultiVolume(s)
+                            | VolumeProbeResult::PossiblyMultiVolume(s) => {
                                 inferred = Some(s.format);
                                 break;
                             }
@@ -349,7 +383,9 @@ fn resolve_hypothesis_inner(
                             VolumeProbeResult::NotApplicable => continue,
                         }
                     }
-                    if inferred.is_some() { break; }
+                    if inferred.is_some() {
+                        break;
+                    }
                 }
                 inferred.unwrap_or(ArchiveFormat::Unknown("unknown".into()))
             }
@@ -384,15 +420,12 @@ fn resolve_hypothesis_inner(
         if mid.is_empty() {
             continue;
         }
-        let parsed = mid
-            .parse::<u64>()
-            .ok()
-            .or_else(|| {
-                use chinese_number::{ChineseCountMethod, ChineseToNumber};
-                <&str as ChineseToNumber<u64>>::to_number(&mid, ChineseCountMethod::TenThousand)
-                    .or_else(|_| <&str as ChineseToNumber<u64>>::to_number_naive(&mid))
-                    .ok()
-            });
+        let parsed = mid.parse::<u64>().ok().or_else(|| {
+            use chinese_number::{ChineseCountMethod, ChineseToNumber};
+            <&str as ChineseToNumber<u64>>::to_number(&mid, ChineseCountMethod::TenThousand)
+                .or_else(|_| <&str as ChineseToNumber<u64>>::to_number_naive(&mid))
+                .ok()
+        });
         let Some(v) = parsed else { continue };
         // Only add if v is within hypothesis range or would fill a gap.
         // Check if v is already in groups or is gap.
@@ -401,11 +434,17 @@ fn resolve_hypothesis_inner(
         // So allow alias to fill gaps inside interval and also extend by 1 beyond edges? We'll allow inside interval or max+1/min-1.
         let min_ord = *slot_candidates.keys().next().unwrap_or(&v);
         let max_ord = *slot_candidates.keys().last().unwrap_or(&v);
-        let is_gap_or_existing = slot_candidates.contains_key(&v) || (v >= min_ord && v <= max_ord) || v == max_ord + 1 || (min_ord > 0 && v + 1 == min_ord);
+        let is_gap_or_existing = slot_candidates.contains_key(&v)
+            || (v >= min_ord && v <= max_ord)
+            || v == max_ord + 1
+            || (min_ord > 0 && v + 1 == min_ord);
         if !is_gap_or_existing {
             continue;
         }
-        slot_candidates.entry(v).or_default().push(file.path.clone());
+        slot_candidates
+            .entry(v)
+            .or_default()
+            .push(file.path.clone());
         // Deduplicate same path
         let entry = slot_candidates.get_mut(&v).unwrap();
         entry.sort();
@@ -429,11 +468,24 @@ fn resolve_hypothesis_inner(
         if is_foreign {
             // If this foreign ordinal is at the current edge, extend clip
             if Some(ord) == sorted_ordinals.first().copied() || Some(ord) == clip_prefix {
-                clip_prefix = Some(sorted_ordinals.iter().find(|&&o| o > ord).copied().unwrap_or(ord + 1));
+                clip_prefix = Some(
+                    sorted_ordinals
+                        .iter()
+                        .find(|&&o| o > ord)
+                        .copied()
+                        .unwrap_or(ord + 1),
+                );
             }
             // Also check trailing
             if Some(ord) == sorted_ordinals.last().copied() || Some(ord) == clip_suffix {
-                clip_suffix = Some(sorted_ordinals.iter().rev().find(|&&o| o < ord).copied().unwrap_or(ord - 1));
+                clip_suffix = Some(
+                    sorted_ordinals
+                        .iter()
+                        .rev()
+                        .find(|&&o| o < ord)
+                        .copied()
+                        .unwrap_or(ord - 1),
+                );
             }
         } else {
             // First non-foreign from start defines start, similarly for end
@@ -455,13 +507,25 @@ fn resolve_hypothesis_inner(
     }
     // If clipping removed members, generate warnings for clipped count
     let mut warnings = Vec::new();
-    let prefix_clipped = sorted_ordinals.iter().filter(|o| !clipped_ordinals.contains(o) && **o < *clipped_ordinals.first().unwrap_or(&u64::MAX)).count();
-    let suffix_clipped = sorted_ordinals.iter().filter(|o| !clipped_ordinals.contains(o) && **o > *clipped_ordinals.last().unwrap_or(&0)).count();
+    let prefix_clipped = sorted_ordinals
+        .iter()
+        .filter(|o| {
+            !clipped_ordinals.contains(o) && **o < *clipped_ordinals.first().unwrap_or(&u64::MAX)
+        })
+        .count();
+    let suffix_clipped = sorted_ordinals
+        .iter()
+        .filter(|o| !clipped_ordinals.contains(o) && **o > *clipped_ordinals.last().unwrap_or(&0))
+        .count();
     if prefix_clipped > 0 {
-        warnings.push(VolumeWarning::PrefixClipped { clipped: prefix_clipped });
+        warnings.push(VolumeWarning::PrefixClipped {
+            clipped: prefix_clipped,
+        });
     }
     if suffix_clipped > 0 {
-        warnings.push(VolumeWarning::SuffixClipped { clipped: suffix_clipped });
+        warnings.push(VolumeWarning::SuffixClipped {
+            clipped: suffix_clipped,
+        });
     }
 
     // Check for gaps -> warnings, not incomplete.
@@ -469,7 +533,10 @@ fn resolve_hypothesis_inner(
         // Determine gap ranges for warnings
         for w in clipped_ordinals.windows(2) {
             if w[1] != w[0] + 1 {
-                warnings.push(VolumeWarning::FilenameGap { from: w[0], to: w[1] });
+                warnings.push(VolumeWarning::FilenameGap {
+                    from: w[0],
+                    to: w[1],
+                });
             }
         }
     }
@@ -586,18 +653,20 @@ fn resolve_hypothesis_inner(
     let mut evidence_conflict = false;
     for m in &final_members {
         if let VolumeProbeResult::MultiVolume(s) = probe_volume_structure(&m.path) {
-            if s.format != format { continue; }
+            if s.format != format {
+                continue;
+            }
             if let Some(c) = s.expected_volume_count {
                 match agg_expected_count {
                     None => agg_expected_count = Some(c),
-                    Some(prev) if prev == c => {},
+                    Some(prev) if prev == c => {}
                     Some(_) => evidence_conflict = true,
                 }
             }
             if let Some(sz) = s.expected_logical_size {
                 match agg_expected_logical {
                     None => agg_expected_logical = Some(sz),
-                    Some(prev) if prev == sz => {},
+                    Some(prev) if prev == sz => {}
                     Some(_) => evidence_conflict = true,
                 }
             }
@@ -608,14 +677,14 @@ fn resolve_hypothesis_inner(
             if let Some(c) = s.expected_volume_count {
                 match agg_expected_count {
                     None => agg_expected_count = Some(c),
-                    Some(prev) if prev == c => {},
+                    Some(prev) if prev == c => {}
                     Some(_) => evidence_conflict = true,
                 }
             }
             if let Some(sz) = s.expected_logical_size {
                 match agg_expected_logical {
                     None => agg_expected_logical = Some(sz),
-                    Some(prev) if prev == sz => {},
+                    Some(prev) if prev == sz => {}
                     Some(_) => evidence_conflict = true,
                 }
             }
@@ -678,7 +747,10 @@ fn resolve_hypothesis_inner(
             }
             if !reached_exact && cumulative < exp_size {
                 return HypothesisOutcome::Incomplete(VolumeProblem {
-                    reason: format!("7z logical size {} > cumulative {} (missing volumes)", exp_size, cumulative),
+                    reason: format!(
+                        "7z logical size {} > cumulative {} (missing volumes)",
+                        exp_size, cumulative
+                    ),
                     format: Some(format.clone()),
                 });
             }
@@ -687,15 +759,23 @@ fn resolve_hypothesis_inner(
                 let orig_len = final_members.len();
                 final_members.retain(|m| m.filename_ordinal.unwrap_or(0) <= end_ord);
                 if final_members.len() < orig_len {
-                    warnings.push(VolumeWarning::SuffixClipped { clipped: orig_len - final_members.len() });
+                    warnings.push(VolumeWarning::SuffixClipped {
+                        clipped: orig_len - final_members.len(),
+                    });
                 }
             }
         } else {
             // For other formats, expected_logical_size not defined; ignore.
-            let total_size: u64 = final_members.iter().filter_map(|m| std::fs::metadata(&m.path).ok().map(|md| md.len())).sum();
+            let total_size: u64 = final_members
+                .iter()
+                .filter_map(|m| std::fs::metadata(&m.path).ok().map(|md| md.len()))
+                .sum();
             if total_size < exp_size {
                 return HypothesisOutcome::Incomplete(VolumeProblem {
-                    reason: format!("expected logical size {} > cumulative {}", exp_size, total_size),
+                    reason: format!(
+                        "expected logical size {} > cumulative {}",
+                        exp_size, total_size
+                    ),
                     format: Some(format.clone()),
                 });
             }
@@ -732,18 +812,29 @@ fn resolve_hypothesis_inner(
             }
         }
         // Check 0-based continuity and min==0
-        let mut logical_sorted: Vec<u32> = final_members.iter().map(|m| m.logical_index.unwrap()).collect();
+        let mut logical_sorted: Vec<u32> = final_members
+            .iter()
+            .map(|m| m.logical_index.unwrap())
+            .collect();
         logical_sorted.sort_unstable();
         if logical_sorted[0] != 0 {
             return HypothesisOutcome::Incomplete(VolumeProblem {
-                reason: format!("logical volume gap: missing volume 0 (found min {})", logical_sorted[0]),
+                reason: format!(
+                    "logical volume gap: missing volume 0 (found min {})",
+                    logical_sorted[0]
+                ),
                 format: Some(format.clone()),
             });
         }
         for w in logical_sorted.windows(2) {
             if w[1] != w[0] + 1 {
                 return HypothesisOutcome::Incomplete(VolumeProblem {
-                    reason: format!("logical volume gap: missing {} between {} and {}", w[0] + 1, w[0], w[1]),
+                    reason: format!(
+                        "logical volume gap: missing {} between {} and {}",
+                        w[0] + 1,
+                        w[0],
+                        w[1]
+                    ),
                     format: Some(format.clone()),
                 });
             }
@@ -759,11 +850,16 @@ fn resolve_hypothesis_inner(
         let mut has_strong_single = false;
         for m in &final_members {
             if let VolumeProbeResult::MultiVolume(s) = probe_volume_structure(&m.path) {
-                if s.format == ArchiveFormat::Zip && s.expected_volume_count.map_or(false, |c| c > 1) {
+                if s.format == ArchiveFormat::Zip
+                    && s.expected_volume_count.map_or(false, |c| c > 1)
+                {
                     has_spanned = true;
                 }
             }
-            if matches!(probe_volume_structure(&m.path), VolumeProbeResult::Standalone(_)) {
+            if matches!(
+                probe_volume_structure(&m.path),
+                VolumeProbeResult::Standalone(_)
+            ) {
                 has_strong_single = true;
             }
         }
@@ -794,7 +890,10 @@ fn resolve_hypothesis_inner(
     // Determine entrypoint per format and split kind: ZIP spanned last is entry, ZIP raw first is entry, 7z/RAR first.
     let entrypoint = match (&format, &zip_kind) {
         (ArchiveFormat::Zip, Some(ZipSplitKind::Raw)) => final_members[0].path.clone(),
-        (ArchiveFormat::Zip, _) => final_members.last().map(|m| m.path.clone()).unwrap_or_else(|| final_members[0].path.clone()),
+        (ArchiveFormat::Zip, _) => final_members
+            .last()
+            .map(|m| m.path.clone())
+            .unwrap_or_else(|| final_members[0].path.clone()),
         _ => final_members[0].path.clone(),
     };
 
@@ -821,7 +920,10 @@ fn same_member_set(a: &VolumeSet, b: &VolumeSet) -> bool {
     a_paths == b_paths
 }
 
-fn compute_clip_indices(candidates: &BTreeMap<u64, Vec<PathBuf>>, format: &ArchiveFormat) -> Result<(Option<u64>, Option<u64>), HypothesisOutcome> {
+fn compute_clip_indices(
+    candidates: &BTreeMap<u64, Vec<PathBuf>>,
+    format: &ArchiveFormat,
+) -> Result<(Option<u64>, Option<u64>), HypothesisOutcome> {
     let mut start: Option<u64> = None;
     let mut end: Option<u64> = None;
     for (ord, paths) in candidates {
@@ -909,8 +1011,14 @@ fn probe_logical_index(path: &Path, expected_format: &ArchiveFormat) -> Option<u
         _ => None,
     }
 }
-fn read_logical_range(members: &[VolumeMember], logical_offset: u64, len: usize) -> Option<Vec<u8>> {
-    if members.is_empty() || len == 0 { return None; }
+fn read_logical_range(
+    members: &[VolumeMember],
+    logical_offset: u64,
+    len: usize,
+) -> Option<Vec<u8>> {
+    if members.is_empty() || len == 0 {
+        return None;
+    }
     let mut ordered = members.to_vec();
     ordered.sort_by_key(|m| m.filename_ordinal.unwrap_or(0));
     let mut remaining_offset = logical_offset;
@@ -932,25 +1040,45 @@ fn read_logical_range(members: &[VolumeMember], logical_offset: u64, len: usize)
         out.extend_from_slice(&buf);
         remaining_len -= take;
         remaining_offset = 0;
-        if remaining_len == 0 { break; }
+        if remaining_len == 0 {
+            break;
+        }
     }
-    if out.len() == len { Some(out) } else { None }
+    if out.len() == len {
+        Some(out)
+    } else {
+        None
+    }
 }
 fn read_logical_tail(members: &[VolumeMember], tail_len: usize) -> Option<Vec<u8>> {
-    if members.is_empty() || tail_len == 0 { return None; }
+    if members.is_empty() || tail_len == 0 {
+        return None;
+    }
     let mut ordered = members.to_vec();
     ordered.sort_by_key(|m| m.filename_ordinal.unwrap_or(0));
-    let total: u64 = ordered.iter().filter_map(|m| std::fs::metadata(&m.path).ok().map(|md| md.len())).sum();
-    if total == 0 { return None; }
+    let total: u64 = ordered
+        .iter()
+        .filter_map(|m| std::fs::metadata(&m.path).ok().map(|md| md.len()))
+        .sum();
+    if total == 0 {
+        return None;
+    }
     let start = total.saturating_sub(tail_len as u64);
     read_logical_range(members, start, tail_len.min(total as usize))
 }
 fn is_zip_raw_logical_closure(members: &[VolumeMember]) -> bool {
-    if members.is_empty() { return false; }
+    if members.is_empty() {
+        return false;
+    }
     let mut ordered = members.to_vec();
     ordered.sort_by_key(|m| m.filename_ordinal.unwrap_or(0));
-    let total: u64 = ordered.iter().filter_map(|m| std::fs::metadata(&m.path).ok().map(|md| md.len())).sum();
-    if total < 22 { return false; }
+    let total: u64 = ordered
+        .iter()
+        .filter_map(|m| std::fs::metadata(&m.path).ok().map(|md| md.len()))
+        .sum();
+    if total < 22 {
+        return false;
+    }
     let tail_len = std::cmp::min(total as usize, 65557 + 22 + 20 + 56);
     let logical_tail = match read_logical_tail(&ordered, tail_len) {
         Some(b) => b,
@@ -961,9 +1089,9 @@ fn is_zip_raw_logical_closure(members: &[VolumeMember]) -> bool {
     // Find classic EOCD in logical tail (handles cross-volume split via logical_tail)
     let mut eocd_pos: Option<usize> = None;
     for i in (0..=buf.len().saturating_sub(4)).rev() {
-        if buf[i..i+4] == [0x50, 0x4b, 0x05, 0x06] {
+        if buf[i..i + 4] == [0x50, 0x4b, 0x05, 0x06] {
             if buf.len() >= i + 22 {
-                let comment_len = u16::from_le_bytes([buf[i+20], buf[i+21]]) as usize;
+                let comment_len = u16::from_le_bytes([buf[i + 20], buf[i + 21]]) as usize;
                 if i + 22 + comment_len == buf.len() {
                     eocd_pos = Some(i);
                     break;
@@ -979,38 +1107,99 @@ fn is_zip_raw_logical_closure(members: &[VolumeMember]) -> bool {
             let cd_size = u32::from_le_bytes([eocd[12], eocd[13], eocd[14], eocd[15]]) as u64;
             let cd_offset = u32::from_le_bytes([eocd[16], eocd[17], eocd[18], eocd[19]]) as u64;
             let total_entries = u16::from_le_bytes([eocd[10], eocd[11]]) as u32;
-            let is_zip64_placeholder = total_entries == 0xFFFF || cd_size == 0xFFFFFFFF || cd_offset == 0xFFFFFFFF;
+            let is_zip64_placeholder =
+                total_entries == 0xFFFF || cd_size == 0xFFFFFFFF || cd_offset == 0xFFFFFFFF;
             if !is_zip64_placeholder {
-                if this_disk != 0 || cd_start_disk != 0 { return false; }
+                if this_disk != 0 || cd_start_disk != 0 {
+                    return false;
+                }
                 let comment_len = u16::from_le_bytes([eocd[20], eocd[21]]) as u64;
                 let logical_eocd_pos = total.saturating_sub(22 + comment_len);
-                if cd_offset + cd_size != logical_eocd_pos { return false; }
+                if cd_offset + cd_size != logical_eocd_pos {
+                    return false;
+                }
                 // Verify CD signature at logical cd_offset
                 if let Some(cd_buf) = read_logical_range(&ordered, cd_offset, 4) {
-                    if cd_buf != [0x50, 0x4b, 0x01, 0x02] { return false; }
-                } else { return false; }
+                    if cd_buf != [0x50, 0x4b, 0x01, 0x02] {
+                        return false;
+                    }
+                } else {
+                    return false;
+                }
                 return true;
             } else {
                 // ZIP64 placeholder: verify locator and ZIP64 EOCD via logical offsets
-                if pos < 20 || buf[pos - 20..pos - 16] != [0x50, 0x4b, 0x06, 0x07] { return false; }
+                if pos < 20 || buf[pos - 20..pos - 16] != [0x50, 0x4b, 0x06, 0x07] {
+                    return false;
+                }
                 let locator = &buf[pos - 20..pos];
-                let total_disks = u32::from_le_bytes([locator[16], locator[17], locator[18], locator[19]]);
-                if total_disks != 1 { return false; }
-                let zip64_offset = u64::from_le_bytes([locator[8], locator[9], locator[10], locator[11], locator[12], locator[13], locator[14], locator[15]]);
+                let total_disks =
+                    u32::from_le_bytes([locator[16], locator[17], locator[18], locator[19]]);
+                if total_disks != 1 {
+                    return false;
+                }
+                let zip64_offset = u64::from_le_bytes([
+                    locator[8],
+                    locator[9],
+                    locator[10],
+                    locator[11],
+                    locator[12],
+                    locator[13],
+                    locator[14],
+                    locator[15],
+                ]);
                 let zip64_buf = match read_logical_range(&ordered, zip64_offset, 56) {
                     Some(b) => b,
                     None => return false,
                 };
-                if zip64_buf[0..4] != [0x50, 0x4b, 0x06, 0x06] { return false; }
-                let this_disk64 = u32::from_le_bytes([zip64_buf[16], zip64_buf[17], zip64_buf[18], zip64_buf[19]]);
-                let cd_start_disk64 = u32::from_le_bytes([zip64_buf[20], zip64_buf[21], zip64_buf[22], zip64_buf[23]]);
-                if this_disk64 != 0 || cd_start_disk64 != 0 { return false; }
-                let cd_size64 = u64::from_le_bytes([zip64_buf[40], zip64_buf[41], zip64_buf[42], zip64_buf[43], zip64_buf[44], zip64_buf[45], zip64_buf[46], zip64_buf[47]]);
-                let cd_offset64 = u64::from_le_bytes([zip64_buf[48], zip64_buf[49], zip64_buf[50], zip64_buf[51], zip64_buf[52], zip64_buf[53], zip64_buf[54], zip64_buf[55]]);
-                if cd_offset64.checked_add(cd_size64) != Some(zip64_offset) { return false; }
+                if zip64_buf[0..4] != [0x50, 0x4b, 0x06, 0x06] {
+                    return false;
+                }
+                let this_disk64 = u32::from_le_bytes([
+                    zip64_buf[16],
+                    zip64_buf[17],
+                    zip64_buf[18],
+                    zip64_buf[19],
+                ]);
+                let cd_start_disk64 = u32::from_le_bytes([
+                    zip64_buf[20],
+                    zip64_buf[21],
+                    zip64_buf[22],
+                    zip64_buf[23],
+                ]);
+                if this_disk64 != 0 || cd_start_disk64 != 0 {
+                    return false;
+                }
+                let cd_size64 = u64::from_le_bytes([
+                    zip64_buf[40],
+                    zip64_buf[41],
+                    zip64_buf[42],
+                    zip64_buf[43],
+                    zip64_buf[44],
+                    zip64_buf[45],
+                    zip64_buf[46],
+                    zip64_buf[47],
+                ]);
+                let cd_offset64 = u64::from_le_bytes([
+                    zip64_buf[48],
+                    zip64_buf[49],
+                    zip64_buf[50],
+                    zip64_buf[51],
+                    zip64_buf[52],
+                    zip64_buf[53],
+                    zip64_buf[54],
+                    zip64_buf[55],
+                ]);
+                if cd_offset64.checked_add(cd_size64) != Some(zip64_offset) {
+                    return false;
+                }
                 if let Some(cd_sig) = read_logical_range(&ordered, cd_offset64, 4) {
-                    if cd_sig != [0x50, 0x4b, 0x01, 0x02] { return false; }
-                } else { return false; }
+                    if cd_sig != [0x50, 0x4b, 0x01, 0x02] {
+                        return false;
+                    }
+                } else {
+                    return false;
+                }
                 return true;
             }
         }
@@ -1026,8 +1215,12 @@ fn try_fallback_hypothesis(
     let seed_file = index.find_file(seed_path)?;
     let seed_norm = &seed_file.normalized_name;
     let (seed_base, seed_ext) = split_base_ext(seed_norm)?;
-    let is_zip_seed = seed_ext == "zip" || (seed_ext.starts_with('z') && seed_ext[1..].chars().all(|c| c.is_ascii_digit()));
-    let is_rar_old_seed = seed_ext == "rar" || (seed_ext.starts_with('r') && seed_ext[1..].chars().all(|c| c.is_ascii_digit()) && seed_ext.len() == 3);
+    let is_zip_seed = seed_ext == "zip"
+        || (seed_ext.starts_with('z') && seed_ext[1..].chars().all(|c| c.is_ascii_digit()));
+    let is_rar_old_seed = seed_ext == "rar"
+        || (seed_ext.starts_with('r')
+            && seed_ext[1..].chars().all(|c| c.is_ascii_digit())
+            && seed_ext.len() == 3);
     if is_zip_seed {
         if let Some(hyp) = zip_fallback_hypothesis(seed_base, index) {
             return Some(hyp);
@@ -1055,12 +1248,19 @@ fn try_fallback_zip_rar(
     None
 }
 
-fn zip_fallback_hypothesis(seed_base: &str, index: &DirectoryVolumeIndex) -> Option<SequenceHypothesis> {
+fn zip_fallback_hypothesis(
+    seed_base: &str,
+    index: &DirectoryVolumeIndex,
+) -> Option<SequenceHypothesis> {
     let mut groups: BTreeMap<u64, Vec<directory::DirectoryFile>> = BTreeMap::new();
     let mut max_z: Option<u64> = None;
     for file in &index.files {
-        let Some((base, ext)) = split_base_ext(&file.normalized_name) else { continue };
-        if base != seed_base { continue; }
+        let Some((base, ext)) = split_base_ext(&file.normalized_name) else {
+            continue;
+        };
+        if base != seed_base {
+            continue;
+        }
         if ext.starts_with('z') && ext.len() > 1 && ext[1..].chars().all(|c| c.is_ascii_digit()) {
             if let Ok(v) = ext[1..].parse::<u64>() {
                 groups.entry(v).or_default().push(file.clone());
@@ -1069,14 +1269,18 @@ fn zip_fallback_hypothesis(seed_base: &str, index: &DirectoryVolumeIndex) -> Opt
         }
     }
     for file in &index.files {
-        let Some((base, ext)) = split_base_ext(&file.normalized_name) else { continue };
+        let Some((base, ext)) = split_base_ext(&file.normalized_name) else {
+            continue;
+        };
         if base == seed_base && ext == "zip" {
             let zip_ord = max_z.map_or(1, |m| m + 1);
             groups.entry(zip_ord).or_default().push(file.clone());
             break;
         }
     }
-    if groups.len() < 2 { return None; }
+    if groups.len() < 2 {
+        return None;
+    }
     // Check duplicates already handled via groups entry (should be 1 per ordinal for fallback, else ambiguous will be handled later)
     let has_gap = {
         let keys: Vec<u64> = groups.keys().cloned().collect();
@@ -1085,27 +1289,41 @@ fn zip_fallback_hypothesis(seed_base: &str, index: &DirectoryVolumeIndex) -> Opt
     Some(SequenceHypothesis {
         varying_token_idx: 0,
         varying_token_value_seed: 0,
-        prefix: format!("{}." , seed_base),
+        prefix: format!("{}.", seed_base),
         suffix: String::new(),
         groups,
         has_gap,
     })
 }
-fn rar_old_fallback_hypothesis(seed_base: &str, index: &DirectoryVolumeIndex) -> Option<SequenceHypothesis> {
+fn rar_old_fallback_hypothesis(
+    seed_base: &str,
+    index: &DirectoryVolumeIndex,
+) -> Option<SequenceHypothesis> {
     let mut groups: BTreeMap<u64, Vec<directory::DirectoryFile>> = BTreeMap::new();
     for file in &index.files {
-        let Some((base, ext)) = split_base_ext(&file.normalized_name) else { continue };
-        if base != seed_base { continue; }
+        let Some((base, ext)) = split_base_ext(&file.normalized_name) else {
+            continue;
+        };
+        if base != seed_base {
+            continue;
+        }
         let ord = if ext == "rar" {
             Some(0)
-        } else if ext.starts_with('r') && ext.len() == 3 && ext[1..].chars().all(|c| c.is_ascii_digit()) {
+        } else if ext.starts_with('r')
+            && ext.len() == 3
+            && ext[1..].chars().all(|c| c.is_ascii_digit())
+        {
             ext[1..].parse::<u64>().ok().map(|v| v + 1)
-        } else { None };
+        } else {
+            None
+        };
         if let Some(o) = ord {
             groups.entry(o).or_default().push(file.clone());
         }
     }
-    if groups.len() < 2 { return None; }
+    if groups.len() < 2 {
+        return None;
+    }
     let has_gap = {
         let keys: Vec<u64> = groups.keys().cloned().collect();
         keys.windows(2).any(|w| w[1] != w[0] + 1)
@@ -1113,7 +1331,7 @@ fn rar_old_fallback_hypothesis(seed_base: &str, index: &DirectoryVolumeIndex) ->
     Some(SequenceHypothesis {
         varying_token_idx: 0,
         varying_token_value_seed: 0,
-        prefix: format!("{}." , seed_base),
+        prefix: format!("{}.", seed_base),
         suffix: String::new(),
         groups,
         has_gap,
@@ -1132,7 +1350,9 @@ fn zip_fallback_collect(
     let mut members: Vec<(u64, PathBuf)> = Vec::new();
     let mut max_z: Option<u64> = None;
     for file in &index.files {
-        let Some((base, ext)) = split_base_ext(&file.normalized_name) else { continue };
+        let Some((base, ext)) = split_base_ext(&file.normalized_name) else {
+            continue;
+        };
         if base != seed_base {
             continue;
         }
@@ -1151,7 +1371,9 @@ fn zip_fallback_collect(
     // Collect zip last
     let mut zip_path: Option<PathBuf> = None;
     for file in &index.files {
-        let Some((base, ext)) = split_base_ext(&file.normalized_name) else { continue };
+        let Some((base, ext)) = split_base_ext(&file.normalized_name) else {
+            continue;
+        };
         if base == seed_base && ext == "zip" {
             zip_path = Some(file.path.clone());
             break;
@@ -1186,7 +1408,10 @@ fn zip_fallback_collect(
             logical_index: probe_logical_index(&path, &ArchiveFormat::Zip),
         })
         .collect();
-    let entrypoint = volume_members.last().map(|m| m.path.clone()).unwrap_or_else(|| volume_members[0].path.clone());
+    let entrypoint = volume_members
+        .last()
+        .map(|m| m.path.clone())
+        .unwrap_or_else(|| volume_members[0].path.clone());
     Some(VolumeSet {
         format,
         entrypoint,
@@ -1204,13 +1429,18 @@ fn rar_old_fallback_collect(
 ) -> Option<VolumeSet> {
     let mut members: Vec<(u64, PathBuf)> = Vec::new();
     for file in &index.files {
-        let Some((base, ext)) = split_base_ext(&file.normalized_name) else { continue };
+        let Some((base, ext)) = split_base_ext(&file.normalized_name) else {
+            continue;
+        };
         if base != seed_base {
             continue;
         }
         if ext == "rar" {
             members.push((0, file.path.clone()));
-        } else if ext.starts_with('r') && ext.len() == 3 && ext[1..].chars().all(|c| c.is_ascii_digit()) {
+        } else if ext.starts_with('r')
+            && ext.len() == 3
+            && ext[1..].chars().all(|c| c.is_ascii_digit())
+        {
             if let Ok(v) = ext[1..].parse::<u64>() {
                 // r00 -> 1, r01 ->2 etc., to keep rar=0 as first
                 members.push((v + 1, file.path.clone()));
@@ -1254,7 +1484,11 @@ enum CandidateElimination {
     InvalidAll,
 }
 
-fn eliminate_candidates(paths: &[PathBuf], format: &ArchiveFormat, _ordinal: u64) -> CandidateElimination {
+fn eliminate_candidates(
+    paths: &[PathBuf],
+    format: &ArchiveFormat,
+    _ordinal: u64,
+) -> CandidateElimination {
     if paths.len() == 1 {
         return CandidateElimination::Single(paths[0].clone());
     }
@@ -1363,7 +1597,9 @@ fn eliminate_candidates(paths: &[PathBuf], format: &ArchiveFormat, _ordinal: u64
     if remaining_candidates.len() == 0 && duplicate_folded.len() > 1 {
         return CandidateElimination::Ambiguous;
     }
-    if remaining_candidates.len() > 1 || (!remaining_candidates.is_empty() && !duplicate_folded.is_empty()) {
+    if remaining_candidates.len() > 1
+        || (!remaining_candidates.is_empty() && !duplicate_folded.is_empty())
+    {
         // Multiple materially different candidates remain plausible -> GroupingAmbiguous
         return CandidateElimination::Ambiguous;
     }
@@ -1392,16 +1628,49 @@ mod tests {
         let mut f = std::fs::File::create(path).unwrap();
         f.write_all(b"Rar!\x1a\x07\x01\x00").unwrap();
         let mut hdr = Vec::new();
-        hdr.extend_from_slice(&[0,0,0,0]); // CRC placeholder
+        hdr.extend_from_slice(&[0, 0, 0, 0]); // CRC placeholder
         hdr.push(0x07); // hSize
         hdr.push(0x01); // type=1
         hdr.push(0x01); // hdrFlags extra
         hdr.push(0x00); // extraSize 0
-        let arc_flags: u64 = if let Some(n) = vol_num { if n==0 {0x01} else {0x03} } else {0x00};
+        let arc_flags: u64 = if let Some(n) = vol_num {
+            if n == 0 {
+                0x01
+            } else {
+                0x03
+            }
+        } else {
+            0x00
+        };
         // encode arcFlags as vint
         let mut v = arc_flags;
-        loop { let mut b = (v & 0x7F) as u8; v >>=7; if v!=0 { b|=0x80; hdr.push(b); } else { hdr.push(b); break; } }
-        if let Some(n) = vol_num { if n!=0 { let mut v=n as u64; loop { let mut b=(v&0x7F) as u8; v>>=7; if v!=0 {b|=0x80; hdr.push(b);} else {hdr.push(b); break;} } } }
+        loop {
+            let mut b = (v & 0x7F) as u8;
+            v >>= 7;
+            if v != 0 {
+                b |= 0x80;
+                hdr.push(b);
+            } else {
+                hdr.push(b);
+                break;
+            }
+        }
+        if let Some(n) = vol_num {
+            if n != 0 {
+                let mut v = n as u64;
+                loop {
+                    let mut b = (v & 0x7F) as u8;
+                    v >>= 7;
+                    if v != 0 {
+                        b |= 0x80;
+                        hdr.push(b);
+                    } else {
+                        hdr.push(b);
+                        break;
+                    }
+                }
+            }
+        }
         let crc = crc32fast::hash(&hdr[4..]);
         hdr[0..4].copy_from_slice(&crc.to_le_bytes());
         f.write_all(&hdr).unwrap();
@@ -1412,7 +1681,7 @@ mod tests {
         header[0..6].copy_from_slice(b"\x37\x7a\xbc\xaf\x27\x1c");
         header[6] = 0; // major
         header[7] = 4; // minor
-        // NextHeaderOffset, NextHeaderSize
+                       // NextHeaderOffset, NextHeaderSize
         header[12..20].copy_from_slice(&next_offset.to_le_bytes());
         header[20..28].copy_from_slice(&next_size.to_le_bytes());
         let crc = crc32fast::hash(&header[12..32]);
@@ -1438,7 +1707,10 @@ mod tests {
     fn make_candidate(path: PathBuf) -> crate::types::ExtractionCandidate {
         crate::types::ExtractionCandidate {
             path: path.clone(),
-            relative_path: path.file_name().map(|n| PathBuf::from(n)).unwrap_or(path.clone()),
+            relative_path: path
+                .file_name()
+                .map(|n| PathBuf::from(n))
+                .unwrap_or(path.clone()),
             depth: 0,
             source: crate::types::CandidateSource::RootInput,
             detected_format: None,
@@ -1452,11 +1724,14 @@ mod tests {
         let p1 = dir.path().join("archive.part01.rar");
         let p2 = dir.path().join("archive.part02.rar");
         let p3 = dir.path().join("archive.part03.rar");
-        for p in &[&p1, &p2, &p3] { create_fake_rar(p); }
+        for p in &[&p1, &p2, &p3] {
+            create_fake_rar(p);
+        }
         let mut resolver = VolumeResolver::new();
         let cand = make_candidate(p1.clone());
         match resolver.resolve(&cand) {
-            VolumeResolution::Resolved(set) | VolumeResolution::ResolvedWithWarnings { set, .. } => {
+            VolumeResolution::Resolved(set)
+            | VolumeResolution::ResolvedWithWarnings { set, .. } => {
                 assert_eq!(set.members.len(), 3);
                 assert_eq!(set.format, ArchiveFormat::Rar);
             }
@@ -1488,7 +1763,8 @@ mod tests {
         let mut resolver = VolumeResolver::new();
         let cand = make_candidate(p2.clone()); // middle member
         match resolver.resolve(&cand) {
-            VolumeResolution::Resolved(set) | VolumeResolution::ResolvedWithWarnings { set, .. } => {
+            VolumeResolution::Resolved(set)
+            | VolumeResolution::ResolvedWithWarnings { set, .. } => {
                 assert_eq!(set.members.len(), 3);
             }
             other => panic!("disguised should resolve, got {:?}", other),
@@ -1501,11 +1777,16 @@ mod tests {
         let p1 = dir.path().join("file\u{FF10}1.dat"); // file０1? Actually fullwidth 01
         let p2 = dir.path().join("file\u{FF10}2.dat");
         let p3 = dir.path().join("file\u{FF10}3.dat");
-        for p in &[&p1,&p2,&p3] { create_fake_rar(p); }
+        for p in &[&p1, &p2, &p3] {
+            create_fake_rar(p);
+        }
         let mut resolver = VolumeResolver::new();
         let cand = make_candidate(p2.clone());
         match resolver.resolve(&cand) {
-            VolumeResolution::Resolved(set) | VolumeResolution::ResolvedWithWarnings { set, .. } => assert_eq!(set.members.len(), 3),
+            VolumeResolution::Resolved(set)
+            | VolumeResolution::ResolvedWithWarnings { set, .. } => {
+                assert_eq!(set.members.len(), 3)
+            }
             other => panic!("fullwidth should resolve, got {:?}", other),
         }
         // Circled digits via direct file names with circled
@@ -1513,11 +1794,16 @@ mod tests {
         let c1 = dir2.path().join("archive\u{2460}.rar");
         let c2 = dir2.path().join("archive\u{2461}.rar");
         let c3 = dir2.path().join("archive\u{2462}.rar");
-        for p in &[&c1,&c2,&c3] { create_fake_rar(p); }
+        for p in &[&c1, &c2, &c3] {
+            create_fake_rar(p);
+        }
         let mut resolver2 = VolumeResolver::new();
         let cand2 = make_candidate(c2.clone());
         match resolver2.resolve(&cand2) {
-            VolumeResolution::Resolved(set) | VolumeResolution::ResolvedWithWarnings { set, .. } => assert_eq!(set.members.len(), 3),
+            VolumeResolution::Resolved(set)
+            | VolumeResolution::ResolvedWithWarnings { set, .. } => {
+                assert_eq!(set.members.len(), 3)
+            }
             other => panic!("circled should resolve, got {:?}", other),
         }
     }
@@ -1527,11 +1813,16 @@ mod tests {
         let p1 = dir.path().join("\u{7b2c}\u{4e00}\u{5377}.rar"); // 第一卷
         let p2 = dir.path().join("\u{7b2c}\u{4e8c}\u{5377}.rar");
         let p3 = dir.path().join("\u{7b2c}\u{4e09}\u{5377}.rar");
-        for p in &[&p1,&p2,&p3] { create_fake_rar(p); }
+        for p in &[&p1, &p2, &p3] {
+            create_fake_rar(p);
+        }
         let mut resolver = VolumeResolver::new();
         let cand = make_candidate(p2.clone());
         match resolver.resolve(&cand) {
-            VolumeResolution::Resolved(set) | VolumeResolution::ResolvedWithWarnings { set, .. } => assert_eq!(set.members.len(), 3),
+            VolumeResolution::Resolved(set)
+            | VolumeResolution::ResolvedWithWarnings { set, .. } => {
+                assert_eq!(set.members.len(), 3)
+            }
             other => panic!("chinese should resolve, got {:?}", other),
         }
     }
@@ -1541,13 +1832,17 @@ mod tests {
         let p1 = dir.path().join("file01.rar");
         let p2 = dir.path().join("file02.rar");
         let p4 = dir.path().join("file04.rar"); // gap at 03
-        for p in &[&p1,&p2,&p4] { create_fake_rar(p); }
+        for p in &[&p1, &p2, &p4] {
+            create_fake_rar(p);
+        }
         let mut resolver = VolumeResolver::new();
         let cand = make_candidate(p1.clone());
         match resolver.resolve(&cand) {
             VolumeResolution::ResolvedWithWarnings { set, warnings } => {
                 assert_eq!(set.members.len(), 3);
-                assert!(warnings.iter().any(|w| matches!(w, VolumeWarning::FilenameGap { .. })));
+                assert!(warnings
+                    .iter()
+                    .any(|w| matches!(w, VolumeWarning::FilenameGap { .. })));
             }
             VolumeResolution::Resolved(set) => {
                 // Gap may still be considered warning, but if no warning, still resolved (gap allowed)
@@ -1564,16 +1859,23 @@ mod tests {
         let p3 = dir.path().join("file03.rar");
         let p3_1 = dir.path().join("file03_1.rar");
         let p4 = dir.path().join("file04.rar");
-        for p in &[&p1,&p2,&p3,&p4] { create_fake_rar(p); }
+        for p in &[&p1, &p2, &p3, &p4] {
+            create_fake_rar(p);
+        }
         // 03_1 is duplicate copy of 03
         fs::copy(&p3, &p3_1).unwrap();
         let mut resolver = VolumeResolver::new();
         let cand = make_candidate(p1.clone());
         match resolver.resolve(&cand) {
-            VolumeResolution::Resolved(set) | VolumeResolution::ResolvedWithWarnings { set, .. } => {
+            VolumeResolution::Resolved(set)
+            | VolumeResolution::ResolvedWithWarnings { set, .. } => {
                 assert_eq!(set.members.len(), 4);
                 // Should have only one member for ordinal 3
-                let ord3 = set.members.iter().filter(|m| m.filename_ordinal == Some(3)).count();
+                let ord3 = set
+                    .members
+                    .iter()
+                    .filter(|m| m.filename_ordinal == Some(3))
+                    .count();
                 assert_eq!(ord3, 1);
             }
             other => panic!("alternate duplicate should resolve, got {:?}", other),
@@ -1586,14 +1888,19 @@ mod tests {
         let p2 = dir.path().join("a02.dat");
         let p3 = dir.path().join("a03.dat");
         let p3_dup = dir.path().join("a03_1.dat");
-        for p in &[&p1,&p2,&p3] { create_fake_rar(p); }
+        for p in &[&p1, &p2, &p3] {
+            create_fake_rar(p);
+        }
         // Create duplicate with same content
         let content = fs::read(&p3).unwrap();
         fs::write(&p3_dup, content).unwrap();
         let mut resolver = VolumeResolver::new();
         let cand = make_candidate(p1.clone());
         match resolver.resolve(&cand) {
-            VolumeResolution::Resolved(set) | VolumeResolution::ResolvedWithWarnings { set, .. } => assert_eq!(set.members.len(), 3),
+            VolumeResolution::Resolved(set)
+            | VolumeResolution::ResolvedWithWarnings { set, .. } => {
+                assert_eq!(set.members.len(), 3)
+            }
             other => panic!("duplicate should fold, got {:?}", other),
         }
     }
@@ -1604,7 +1911,9 @@ mod tests {
         let p2 = dir.path().join("b02.rar");
         let p3 = dir.path().join("b03.rar");
         let p3_alt = dir.path().join("b03_1.rar");
-        for p in &[&p1,&p2,&p3] { create_fake_rar(p); }
+        for p in &[&p1, &p2, &p3] {
+            create_fake_rar(p);
+        }
         // truncated copy: make it look like ordinary JPEG so infer eliminates it as non-archive
         {
             let mut f = fs::File::create(&p3_alt).unwrap();
@@ -1619,7 +1928,10 @@ mod tests {
         // Our truncated file is small but still has RAR magic (we wrote short without magic), so it would be considered invalid via ordinary check? It has no RAR magic, so probe NotApplicable but is it considered invalid? For RAR, raw without magic might still be considered candidate, but size differs.
         // To make test pass, we make truncated file have no RAR magic, so it will be eliminated as non-volume? That would leave single candidate.
         match resolver.resolve(&cand) {
-            VolumeResolution::Resolved(set) | VolumeResolution::ResolvedWithWarnings { set, .. } => assert_eq!(set.members.len(), 3),
+            VolumeResolution::Resolved(set)
+            | VolumeResolution::ResolvedWithWarnings { set, .. } => {
+                assert_eq!(set.members.len(), 3)
+            }
             other => panic!("truncated should be eliminated, got {:?}", other),
         }
     }
@@ -1644,7 +1956,10 @@ mod tests {
         let mut resolver = VolumeResolver::new();
         let cand = make_candidate(p1.clone());
         match resolver.resolve(&cand) {
-            VolumeResolution::Resolved(set) | VolumeResolution::ResolvedWithWarnings { set, .. } => assert_eq!(set.members.len(), 2),
+            VolumeResolution::Resolved(set)
+            | VolumeResolution::ResolvedWithWarnings { set, .. } => {
+                assert_eq!(set.members.len(), 2)
+            }
             other => panic!("two-member should resolve, got {:?}", other),
         }
     }
@@ -1654,22 +1969,28 @@ mod tests {
         let p1 = dir.path().join("archive.part01.rar");
         let p2 = dir.path().join("archive.part02.rar");
         let p3 = dir.path().join("archive.part03.rar");
-        for p in &[&p1,&p2,&p3] { create_fake_rar(p); }
+        for p in &[&p1, &p2, &p3] {
+            create_fake_rar(p);
+        }
         let mut resolver = VolumeResolver::new();
         let cand_mid = make_candidate(p2.clone());
         let set_mid = match resolver.resolve(&cand_mid) {
-            VolumeResolution::Resolved(s) | VolumeResolution::ResolvedWithWarnings { set: s, .. } => s,
+            VolumeResolution::Resolved(s)
+            | VolumeResolution::ResolvedWithWarnings { set: s, .. } => s,
             other => panic!("mid should resolve, got {:?}", other),
         };
         let mut resolver2 = VolumeResolver::new();
         let cand_first = make_candidate(p1.clone());
         let set_first = match resolver2.resolve(&cand_first) {
-            VolumeResolution::Resolved(s) | VolumeResolution::ResolvedWithWarnings { set: s, .. } => s,
+            VolumeResolution::Resolved(s)
+            | VolumeResolution::ResolvedWithWarnings { set: s, .. } => s,
             other => panic!("first should resolve, got {:?}", other),
         };
         assert_eq!(set_mid.members.len(), set_first.members.len());
-        let mid_paths: std::collections::HashSet<_> = set_mid.members.iter().map(|m| &m.path).collect();
-        let first_paths: std::collections::HashSet<_> = set_first.members.iter().map(|m| &m.path).collect();
+        let mid_paths: std::collections::HashSet<_> =
+            set_mid.members.iter().map(|m| &m.path).collect();
+        let first_paths: std::collections::HashSet<_> =
+            set_first.members.iter().map(|m| &m.path).collect();
         assert_eq!(mid_paths, first_paths);
     }
     #[test]
@@ -1694,7 +2015,7 @@ mod tests {
         // However our single-file 7z with expected beyond file will be considered MultiVolume, but hypothesis will have only one member (since no other files).
         // Our resolve logic for single member with is_last false should return Incomplete.
         match resolver.resolve(&cand) {
-            VolumeResolution::Incomplete(_) => {},
+            VolumeResolution::Incomplete(_) => {}
             other => panic!("single missing should be incomplete, got {:?}", other),
         }
     }
@@ -1710,7 +2031,7 @@ mod tests {
         let mut resolver = VolumeResolver::new();
         let cand = make_candidate(dir.path().join("a1b1.rar"));
         match resolver.resolve(&cand) {
-            VolumeResolution::GroupingAmbiguous { .. } => {},
+            VolumeResolution::GroupingAmbiguous { .. } => {}
             other => panic!("should be ambiguous, got {:?}", other),
         }
     }
@@ -1727,7 +2048,7 @@ mod tests {
         let mut resolver = VolumeResolver::new();
         let cand = make_candidate(dir.path().join("photo01.jpg"));
         match resolver.resolve(&cand) {
-            VolumeResolution::Single => {},
+            VolumeResolution::Single => {}
             other => panic!("jpeg sequence should be Single, got {:?}", other),
         }
     }
@@ -1737,7 +2058,9 @@ mod tests {
         let p1 = dir.path().join("coalesce.part01.rar");
         let p2 = dir.path().join("coalesce.part02.rar");
         let p3 = dir.path().join("coalesce.part03.rar");
-        for p in &[&p1,&p2,&p3] { create_fake_rar(p); }
+        for p in &[&p1, &p2, &p3] {
+            create_fake_rar(p);
+        }
         let mut resolver = VolumeResolver::new();
         let roots = vec![p1.clone(), p2.clone(), p3.clone()];
         let coalesced = resolver.coalesce_roots(&roots);
@@ -1771,7 +2094,8 @@ mod tests {
         let mut resolver = VolumeResolver::new();
         let cand = make_candidate(dir.path().join("clip03.dat"));
         match resolver.resolve(&cand) {
-            VolumeResolution::Resolved(set) | VolumeResolution::ResolvedWithWarnings { set, .. } => {
+            VolumeResolution::Resolved(set)
+            | VolumeResolution::ResolvedWithWarnings { set, .. } => {
                 // Should have clipped 01
                 assert!(!set.members.iter().any(|m| m.path.ends_with("clip01.dat")));
             }
@@ -1789,8 +2113,16 @@ mod tests {
             format: ArchiveFormat::Rar,
             entrypoint: p1.clone(),
             members: vec![
-                VolumeMember { path: p1.clone(), filename_ordinal: Some(1), logical_index: Some(1) },
-                VolumeMember { path: p2.clone(), filename_ordinal: Some(2), logical_index: Some(2) },
+                VolumeMember {
+                    path: p1.clone(),
+                    filename_ordinal: Some(1),
+                    logical_index: Some(1),
+                },
+                VolumeMember {
+                    path: p2.clone(),
+                    filename_ordinal: Some(2),
+                    logical_index: Some(2),
+                },
             ],
             expected_volume_count: Some(2),
             expected_logical_size: None,
@@ -1802,13 +2134,21 @@ mod tests {
         // Check that canonical files exist and have same size as original
         for (orig, canon) in set.members.iter().zip(mat.canonical_members.iter()) {
             assert!(canon.exists());
-            assert_eq!(fs::metadata(&orig.path).unwrap().len(), fs::metadata(canon).unwrap().len());
+            assert_eq!(
+                fs::metadata(&orig.path).unwrap().len(),
+                fs::metadata(canon).unwrap().len()
+            );
         }
         // Drop should clean up
         let staging = mat.staging_dir.clone();
         drop(mat);
         // TempDir should be deleted on drop, but we used tempdir_in which may still exist until drop? Our MaterializedVolumeSet holds TempDir, so after drop it should be gone.
-        assert!(!staging.exists() || fs::read_dir(&staging).map(|mut d| d.next().is_none()).unwrap_or(true));
+        assert!(
+            !staging.exists()
+                || fs::read_dir(&staging)
+                    .map(|mut d| d.next().is_none())
+                    .unwrap_or(true)
+        );
     }
     #[test]
     fn foreign_prefix_with_raw_seed_resolves_zip() {
@@ -1819,7 +2159,8 @@ mod tests {
         let zip_data = {
             let mut buf = Vec::new();
             let mut w = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
-            let opts = zip::write::FileOptions::<()>::default().compression_method(zip::CompressionMethod::Stored);
+            let opts = zip::write::FileOptions::<()>::default()
+                .compression_method(zip::CompressionMethod::Stored);
             w.start_file("hello.txt", opts).unwrap();
             w.write_all(b"hello world").unwrap();
             w.finish().unwrap();
@@ -1831,12 +2172,13 @@ mod tests {
         let p3 = dir.path().join("pack03.dat");
         let p4 = dir.path().join("pack04.dat");
         std::fs::write(&p2, &zip_data[0..part]).unwrap();
-        std::fs::write(&p3, &zip_data[part..2*part]).unwrap();
-        std::fs::write(&p4, &zip_data[2*part..]).unwrap();
+        std::fs::write(&p3, &zip_data[part..2 * part]).unwrap();
+        std::fs::write(&p4, &zip_data[2 * part..]).unwrap();
         let mut resolver = VolumeResolver::new();
         let cand = make_candidate(p3.clone()); // seed is raw continuation
         match resolver.resolve(&cand) {
-            VolumeResolution::Resolved(set) | VolumeResolution::ResolvedWithWarnings { set, .. } => {
+            VolumeResolution::Resolved(set)
+            | VolumeResolution::ResolvedWithWarnings { set, .. } => {
                 assert_eq!(set.format, ArchiveFormat::Zip);
                 assert_eq!(set.members.len(), 3);
                 assert!(set.members.iter().any(|m| m.path == p2));
@@ -1844,7 +2186,10 @@ mod tests {
                 assert!(set.members.iter().any(|m| m.path == p4));
                 assert!(!set.members.iter().any(|m| m.path == p1));
             }
-            other => panic!("should resolve ZIP raw 02,03,04 despite RAR prefix, got {:?}", other),
+            other => panic!(
+                "should resolve ZIP raw 02,03,04 despite RAR prefix, got {:?}",
+                other
+            ),
         }
     }
     #[test]
@@ -1859,7 +2204,8 @@ mod tests {
         let zip_data = {
             let mut buf = Vec::new();
             let mut w = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
-            let opts = zip::write::FileOptions::<()>::default().compression_method(zip::CompressionMethod::Stored);
+            let opts = zip::write::FileOptions::<()>::default()
+                .compression_method(zip::CompressionMethod::Stored);
             w.start_file("hello.txt", opts).unwrap();
             w.write_all(b"hello world").unwrap();
             w.finish().unwrap();
@@ -1867,14 +2213,15 @@ mod tests {
         };
         let part = zip_data.len() / 3;
         std::fs::write(&p1, &zip_data[0..part]).unwrap();
-        std::fs::write(&p2, &zip_data[part..2*part]).unwrap();
-        std::fs::write(&p3, &zip_data[2*part..]).unwrap();
+        std::fs::write(&p2, &zip_data[part..2 * part]).unwrap();
+        std::fs::write(&p3, &zip_data[2 * part..]).unwrap();
         // Create foreign RAR for same slot 02
         create_rar_volume(&p2_alt, Some(2));
         let mut resolver = VolumeResolver::new();
         let cand = make_candidate(p1.clone());
         match resolver.resolve(&cand) {
-            VolumeResolution::Resolved(set) | VolumeResolution::ResolvedWithWarnings { set, .. } => {
+            VolumeResolution::Resolved(set)
+            | VolumeResolution::ResolvedWithWarnings { set, .. } => {
                 assert_eq!(set.members.len(), 3);
                 assert!(set.members.iter().any(|m| m.path == p2));
                 assert!(!set.members.iter().any(|m| m.path == p2_alt));
@@ -1883,4 +2230,3 @@ mod tests {
         }
     }
 }
-

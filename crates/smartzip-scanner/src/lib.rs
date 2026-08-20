@@ -128,60 +128,6 @@ impl EmbeddedScanner {
         Ok(self.scan_bytes(&data))
     }
 
-    /// Scan a file using memory-mapping for large files.
-    ///
-    /// For files exceeding 64 MiB, this uses `memmap2::Mmap` to map the file
-    /// into memory as a `&[u8]` without copying the entire scan window into
-    /// a `Vec<u8>`. This fixes the previous implementation which claimed to
-    /// `mmap` but actually read the whole range into a heap allocation via
-    /// chunked `read` + `extend_from_slice`.
-    ///
-    /// # Safety considerations
-    ///
-    /// `Mmap::map` is `unsafe` because the underlying file could be
-    /// concurrently modified, which would be undefined behaviour for the
-    /// mapped slice. This is acceptable here because:
-    /// - the file is a stable local archive chosen by the user,
-    /// - the mapping is read-only and dropped immediately after `scan_bytes`,
-    /// - we hold the file open for the duration of the scan.
-    pub fn scan_path_mmap(
-        &self,
-        path: impl AsRef<Path>,
-    ) -> std::io::Result<Vec<EmbeddedArchiveFinding>> {
-        let file = fs::File::open(path.as_ref())?;
-        let file_size = file.metadata()?.len();
-
-        let scan_size = if let Some(max) = self.config.max_scan_bytes {
-            std::cmp::min(file_size, max)
-        } else {
-            file_size
-        };
-
-        if scan_size == 0 {
-            return Ok(vec![]);
-        }
-
-        // For small files, ordinary bounded read is cheaper and avoids
-        // mmap overhead.
-        if scan_size <= 64 * 1024 * 1024 {
-            return self.scan_path(path);
-        }
-
-        let file = fs::File::open(path.as_ref())?;
-        // SAFETY: file is not modified concurrently during the scan; the
-        // mapping is read-only and short-lived.
-        let mmap = unsafe {
-            if scan_size == file_size {
-                memmap2::Mmap::map(&file)?
-            } else {
-                memmap2::MmapOptions::new()
-                    .len(scan_size as usize)
-                    .map(&file)?
-            }
-        };
-        Ok(self.scan_bytes(&mmap[..scan_size as usize]))
-    }
-
     /// Get file size without loading it.
     pub fn file_size(path: impl AsRef<Path>) -> std::io::Result<u64> {
         Ok(std::fs::metadata(path.as_ref())?.len())

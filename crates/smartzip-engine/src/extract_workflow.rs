@@ -1,8 +1,6 @@
 //! Recursive extraction workflow implementation.
 
-use smartzip_archive::{
-    ArchiveAdapter, ArchiveExecutor, ExtractArchiveRequest, NativeZipBackend, TestRequest,
-};
+use smartzip_archive::{ArchiveExecutor, ExtractArchiveRequest, NativeZipBackend, TestRequest};
 use smartzip_core::{
     ArchiveFact, ArchiveFacts, ArchiveFormat, EncodingMode, TaskEvent, TaskEventKind, TaskId,
 };
@@ -25,7 +23,6 @@ use crate::nested::{
     output_dir_for_candidate, output_relative_path_for, record_skip,
     recyclable_nested_archive_path, recycle_archive, root_embedded_candidates,
 };
-use crate::volumes::{VolumeResolution, VolumeResolver};
 use crate::password_order::{
     order_password_candidates, password_attempt_index, password_source_label, password_value,
     remember_batch_password,
@@ -38,6 +35,7 @@ use crate::types::{
     ArchiveRecycleHandler, CandidateSource, ExtractWorkflowRequest, ExtractWorkflowResult,
     ExtractionCandidate,
 };
+use crate::volumes::{VolumeResolution, VolumeResolver};
 
 /// Override how successfully processed nested archives are recycled.
 ///
@@ -102,12 +100,14 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
     // avoid marking coalesced duplicates as skipped -> Partial). Use a temporary resolver for pre-queue.
     {
         let mut tmp_resolver = VolumeResolver::new();
-        let mut seen_volume_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut seen_volume_keys: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         let mut filtered: VecDeque<ExtractionCandidate> = VecDeque::new();
         for cand in queue.into_iter() {
             if cand.source == CandidateSource::RootInput {
                 match tmp_resolver.resolve(&cand) {
-                    VolumeResolution::Resolved(set) | VolumeResolution::ResolvedWithWarnings { set, .. } => {
+                    VolumeResolution::Resolved(set)
+                    | VolumeResolution::ResolvedWithWarnings { set, .. } => {
                         let key = volume_set_key(&set);
                         if seen_volume_keys.contains(&key) {
                             continue;
@@ -157,7 +157,8 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
     };
     let mut hist_saw_failure = false;
     let mut volume_resolver = VolumeResolver::new();
-    let mut processed_volume_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut processed_volume_keys: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
 
     loop {
         let Some(mut candidate) = queue.pop_front() else {
@@ -203,7 +204,11 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                         events.push(TaskEvent {
                             task_id: task_id.clone(),
                             kind: TaskEventKind::Failed {
-                                error: format!("volume materialization failed for {}: {}", candidate.path.display(), e),
+                                error: format!(
+                                    "volume materialization failed for {}: {}",
+                                    candidate.path.display(),
+                                    e
+                                ),
                             },
                         });
                         if let Some(recorder) = history {
@@ -235,7 +240,11 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                     events.push(TaskEvent {
                         task_id: task_id.clone(),
                         kind: TaskEventKind::Warning {
-                            message: format!("volume warning for {}: {:?}", candidate.path.display(), w),
+                            message: format!(
+                                "volume warning for {}: {:?}",
+                                candidate.path.display(),
+                                w
+                            ),
                         },
                     });
                 }
@@ -255,7 +264,11 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                         events.push(TaskEvent {
                             task_id: task_id.clone(),
                             kind: TaskEventKind::Failed {
-                                error: format!("volume materialization failed for {}: {}", candidate.path.display(), e),
+                                error: format!(
+                                    "volume materialization failed for {}: {}",
+                                    candidate.path.display(),
+                                    e
+                                ),
                             },
                         });
                         if let Some(recorder) = history {
@@ -287,7 +300,11 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                 events.push(TaskEvent {
                     task_id: task_id.clone(),
                     kind: TaskEventKind::Failed {
-                        error: format!("incomplete volume set for {}: {}", candidate.path.display(), problem.reason),
+                        error: format!(
+                            "incomplete volume set for {}: {}",
+                            candidate.path.display(),
+                            problem.reason
+                        ),
                     },
                 });
                 if let Some(recorder) = history {
@@ -317,7 +334,11 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                 events.push(TaskEvent {
                     task_id: task_id.clone(),
                     kind: TaskEventKind::Failed {
-                        error: format!("grouping ambiguous for {}: {} hypotheses", candidate.path.display(), hypotheses.len()),
+                        error: format!(
+                            "grouping ambiguous for {}: {} hypotheses",
+                            candidate.path.display(),
+                            hypotheses.len()
+                        ),
                     },
                 });
                 if let Some(recorder) = history {
@@ -783,11 +804,10 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
         if candidate_encoding_mode == EncodingMode::Auto
             && candidate.detected_format == Some(ArchiveFormat::Zip)
         {
-            let native_zip = NativeZipBackend::new();
-            if let Ok(probe) = native_zip.probe(&archive_path).await {
-                if probe.encrypted == Some(false) {
-                    zip_encoding_assessment =
-                        assess_zip_encoding(&native_zip, &archive_path, None).await;
+            let reader = NativeZipBackend::new();
+            if let Ok(is_encrypted) = reader.has_encrypted_entries(&archive_path) {
+                if !is_encrypted {
+                    zip_encoding_assessment = assess_zip_encoding(&archive_path, None).await;
                 }
             }
         }
@@ -881,10 +901,8 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                             && candidate_encoding_mode == EncodingMode::Auto
                             && candidate.detected_format == Some(ArchiveFormat::Zip)
                         {
-                            let native_zip = NativeZipBackend::new();
                             zip_encoding_assessment =
-                                assess_zip_encoding(&native_zip, &archive_path, pw_value.clone())
-                                    .await;
+                                assess_zip_encoding(&archive_path, pw_value.clone()).await;
                             if let Some(assessment) = &zip_encoding_assessment {
                                 events.push(TaskEvent {
                                     task_id: task_id.clone(),
@@ -1168,13 +1186,9 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                                         && candidate_encoding_mode == EncodingMode::Auto
                                         && candidate.detected_format == Some(ArchiveFormat::Zip)
                                     {
-                                        let native_zip = NativeZipBackend::new();
-                                        zip_encoding_assessment = assess_zip_encoding(
-                                            &native_zip,
-                                            &archive_path,
-                                            Some(pw.clone()),
-                                        )
-                                        .await;
+                                        zip_encoding_assessment =
+                                            assess_zip_encoding(&archive_path, Some(pw.clone()))
+                                                .await;
                                         if let Some(assessment) = &zip_encoding_assessment {
                                             events.push(TaskEvent {
                                                 task_id: task_id.clone(),
@@ -1619,8 +1633,11 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                     embedded_offset: None,
                     embedded_size: None,
                 };
-                if let Some(path) = recyclable_nested_archive_path(&synthetic, &request.output_dir) {
-                    if let Err(error) = recycle_archive(archive_recycler.clone(), path.clone()).await {
+                if let Some(path) = recyclable_nested_archive_path(&synthetic, &request.output_dir)
+                {
+                    if let Err(error) =
+                        recycle_archive(archive_recycler.clone(), path.clone()).await
+                    {
                         events.push(TaskEvent {
                             task_id: task_id.clone(),
                             kind: TaskEventKind::Warning {
@@ -1691,7 +1708,11 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
 }
 
 fn volume_set_key(set: &crate::volumes::VolumeSet) -> String {
-    let mut paths: Vec<String> = set.members.iter().map(|m| m.path.display().to_string()).collect();
+    let mut paths: Vec<String> = set
+        .members
+        .iter()
+        .map(|m| m.path.display().to_string())
+        .collect();
     paths.sort();
     format!("{}:{}", set.format.as_str(), paths.join("|"))
 }

@@ -271,12 +271,15 @@ pub(crate) async fn list_archive_with_listener_interactive<B: ArchiveExecutor>(
         None,
         None,
     )
-    .await? {
+    .await?
+    {
         Some(c) => c,
         None => {
             let synthetic = crate::types::ExtractionCandidate {
                 path: request.path.clone(),
-                relative_path: std::path::PathBuf::from(request.path.file_name().unwrap_or_default()),
+                relative_path: std::path::PathBuf::from(
+                    request.path.file_name().unwrap_or_default(),
+                ),
                 depth: 0,
                 source: crate::types::CandidateSource::RootInput,
                 detected_format: None,
@@ -285,14 +288,26 @@ pub(crate) async fn list_archive_with_listener_interactive<B: ArchiveExecutor>(
             };
             let mut check = crate::volumes::VolumeResolver::new();
             match check.resolve(&synthetic) {
-                crate::volumes::VolumeResolution::Resolved(_) | crate::volumes::VolumeResolution::ResolvedWithWarnings { .. } => synthetic,
+                crate::volumes::VolumeResolution::Resolved(_)
+                | crate::volumes::VolumeResolution::ResolvedWithWarnings { .. } => synthetic,
                 crate::volumes::VolumeResolution::Incomplete(p) => {
-                    return Err(smartzip_core::SmartZipError::CorruptedArchive { path: request.path.clone(), detail: p.reason })
+                    return Err(smartzip_core::SmartZipError::CorruptedArchive {
+                        path: request.path.clone(),
+                        detail: p.reason,
+                    })
                 }
                 crate::volumes::VolumeResolution::GroupingAmbiguous { .. } => {
-                    return Err(smartzip_core::SmartZipError::CorruptedArchive { path: request.path.clone(), detail: "grouping ambiguous".into() })
+                    return Err(smartzip_core::SmartZipError::CorruptedArchive {
+                        path: request.path.clone(),
+                        detail: "grouping ambiguous".into(),
+                    })
                 }
-                _ => return Err(smartzip_core::SmartZipError::UnsupportedFormat { path: request.path.clone(), format: None }),
+                _ => {
+                    return Err(smartzip_core::SmartZipError::UnsupportedFormat {
+                        path: request.path.clone(),
+                        format: None,
+                    })
+                }
             }
         }
     };

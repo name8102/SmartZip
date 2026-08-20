@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use rstest::*;
 use smartzip_archive::{
     AdapterRegistration, ArchiveExecutor, BackendRouter, ExtractArchiveRequest, ListRequest,
-    NativeZipBackend, SevenZipBackend, SevenZipLocator, TestRequest,
+    SevenZipBackend, SevenZipLocator, TestRequest,
 };
 use smartzip_core::{ArchiveFormat, EncodingMode};
 use smartzip_db::{password::PasswordRepository, SmartZipDb};
@@ -46,10 +46,7 @@ fn fixture_path(name: &str) -> PathBuf {
 fn backend() -> BackendRouter {
     let seven_zip = SevenZipBackend::locate(&SevenZipLocator::default())
         .expect("7z/7zz must be available in PATH to run integration tests");
-    BackendRouter::from_adapters(vec![
-        AdapterRegistration::from_adapter(NativeZipBackend::new(), -10),
-        AdapterRegistration::from_adapter(seven_zip, 10),
-    ])
+    BackendRouter::from_adapters(vec![AdapterRegistration::from_adapter(seven_zip, 10)])
 }
 
 fn engine_with_test_recycler() -> (SmartZipEngine, Arc<Mutex<Vec<PathBuf>>>) {

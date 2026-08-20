@@ -81,6 +81,15 @@ pub trait ArchiveAdapter: Send + Sync {
     async fn list(&self, request: ListRequest) -> Result<ArchiveListing>;
     async fn test(&self, request: TestRequest) -> Result<TestResult>;
     async fn extract(&self, request: ExtractArchiveRequest) -> Result<ExtractArchiveResult>;
+    /// Context-aware extract that can observe cancellation. Default impl
+    /// delegates to `extract` for adapters that do not need cancellation.
+    async fn extract_with_context(
+        &self,
+        request: ExtractArchiveRequest,
+        _context: &TaskExecutionContext,
+    ) -> Result<ExtractArchiveResult> {
+        self.extract(request).await
+    }
     async fn compress(&self, request: CompressArchiveRequest) -> Result<CompressArchiveResult>;
     /// Built-in capability profile; config layers are composed by the router.
     fn profile(&self) -> smartzip_core::BackendCapabilityProfile;

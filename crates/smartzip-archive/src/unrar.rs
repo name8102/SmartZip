@@ -1,14 +1,15 @@
 use crate::backend::ArchiveAdapter;
 use crate::types::*;
 use async_trait::async_trait;
-use process_wrap::tokio::{CommandWrap, KillOnDrop};
-#[cfg(unix)]
-use process_wrap::tokio::ProcessGroup;
 #[cfg(windows)]
 use process_wrap::tokio::JobObject;
-use smartzip_core::{ArchiveFormat, Result, SmartZipError};
+#[cfg(unix)]
+use process_wrap::tokio::ProcessGroup;
+use process_wrap::tokio::{CommandWrap, KillOnDrop};
+use smartzip_core::{ArchiveFormat, Result, SmartZipError, TaskExecutionContext};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone)]
 pub struct UnrarLocator {
@@ -69,6 +70,14 @@ impl UnrarBackend {
     }
 
     async fn run(&self, args: &[String]) -> Result<BackendCommandOutput> {
+        self.run_with_token(args, &CancellationToken::new()).await
+    }
+
+    async fn run_with_token(
+        &self,
+        args: &[String],
+        token: &CancellationToken,
+    ) -> Result<BackendCommandOutput> {
         let mut wrap = CommandWrap::with_new(&self.executable, |command| {
             command.args(args);
             command.stdin(Stdio::null());
@@ -81,25 +90,57 @@ impl UnrarBackend {
         wrap.wrap(JobObject);
         wrap.wrap(KillOnDrop);
 
-        let child = wrap
-            .spawn()
-            .map_err(|source| {
-                if source.kind() == std::io::ErrorKind::NotFound {
-                    SmartZipError::BackendUnavailable {
-                        backend: self.id.clone(),
-                    }
-                } else {
-                    SmartZipError::io(Some(self.executable.clone()), source)
+        let mut child = wrap.spawn().map_err(|source| {
+            if source.kind() == std::io::ErrorKind::NotFound {
+                SmartZipError::BackendUnavailable {
+                    backend: self.id.clone(),
                 }
-            })?;
-        let output = Box::into_pin(child.wait_with_output())
-            .await
-            .map_err(|source| SmartZipError::io(Some(self.executable.clone()), source))?;
-
+            } else {
+                SmartZipError::io(Some(self.executable.clone()), source)
+            }
+        })?;
+        // Keep pipes for reading; on cancel we kill the whole group and wait.
+        let stdout = child.stdout().take();
+        let stderr = child.stderr().take();
+        let stdout_task = stdout.map(|mut s| {
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let _ = tokio::io::AsyncReadExt::read_to_end(&mut s, &mut buf).await;
+                buf
+            })
+        });
+        let stderr_task = stderr.map(|mut s| {
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let _ = tokio::io::AsyncReadExt::read_to_end(&mut s, &mut buf).await;
+                buf
+            })
+        });
+        let status = tokio::select! {
+            res = child.wait() => res.map_err(|source| SmartZipError::io(Some(self.executable.clone()), source))?,
+            _ = token.cancelled() => {
+                let _ = child.start_kill();
+                let status = child.wait().await.map_err(|source| SmartZipError::io(Some(self.executable.clone()), source))?;
+                if let Some(t) = stdout_task { t.abort(); }
+                if let Some(t) = stderr_task { t.abort(); }
+                let _ = status;
+                return Err(SmartZipError::Cancelled);
+            }
+        };
+        let stdout = if let Some(t) = stdout_task {
+            t.await.unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let stderr = if let Some(t) = stderr_task {
+            t.await.unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         Ok(BackendCommandOutput {
-            status: output.status.code(),
-            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            status: status.code(),
+            stdout: String::from_utf8_lossy(&stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&stderr).into_owned(),
         })
     }
 
@@ -248,6 +289,32 @@ impl ArchiveAdapter for UnrarBackend {
         })
     }
 
+    async fn extract_with_context(
+        &self,
+        request: ExtractArchiveRequest,
+        context: &TaskExecutionContext,
+    ) -> Result<ExtractArchiveResult> {
+        std::fs::create_dir_all(&request.output_dir)
+            .map_err(|source| SmartZipError::io(Some(request.output_dir.clone()), source))?;
+        let args = vec![
+            "x".to_string(),
+            "-y".to_string(),
+            "-o+".to_string(),
+            "-idq".to_string(),
+            Self::password_arg(&request.password),
+            request.archive.to_string_lossy().into_owned(),
+            request.output_dir.to_string_lossy().into_owned(),
+        ];
+        let token = context.cancellation_token();
+        let output = self.run_with_token(&args, &token).await?;
+        if output.status != Some(0) {
+            return Err(self.map_failure(&output, &request.archive));
+        }
+        Ok(ExtractArchiveResult {
+            output_dir: request.output_dir,
+        })
+    }
+
     async fn compress(&self, request: CompressArchiveRequest) -> Result<CompressArchiveResult> {
         Err(SmartZipError::UnsupportedFormat {
             path: request.output,
@@ -256,8 +323,14 @@ impl ArchiveAdapter for UnrarBackend {
     }
 
     fn profile(&self) -> smartzip_core::BackendCapabilityProfile {
-        let mut profile =
-            crate::router::builtin_profile(&[ArchiveFormat::Rar], &[], true, true, true);
+        let mut profile = crate::router::builtin_profile(
+            &[ArchiveFormat::Rar], // probe
+            &[ArchiveFormat::Rar], // list
+            &[ArchiveFormat::Rar], // test
+            &[ArchiveFormat::Rar], // extract
+            &[],                   // compress
+            true,
+        );
         crate::router::restrict_profile_to_containers(&mut profile, &[ArchiveFormat::Rar]);
         profile
     }

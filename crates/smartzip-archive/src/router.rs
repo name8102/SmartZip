@@ -1,5 +1,4 @@
 use crate::backend::{ArchiveAdapter, ArchiveExecutor};
-use crate::native_zip::NativeZipBackend;
 use crate::sevenzz::{SevenZipBackend, SevenZipLocator};
 use crate::types::*;
 use crate::unrar::{UnrarBackend, UnrarLocator};
@@ -88,21 +87,29 @@ impl BackendRouter {
             .map(|entry| resolve_executable(&entry.executable))
             .collect();
         let mut registered_paths = HashSet::new();
-        let mut has_native_zip = false;
         let mut warnings = Vec::new();
 
         for installation in config.installations.iter().filter(|entry| entry.enabled) {
-            let executable = resolve_executable(&installation.executable);
-            if !matches!(installation.family, AdapterFamily::NativeZip) {
-                if !registered_paths.insert(executable.clone()) {
-                    warnings.push(format!(
-                        "backend {} duplicates an earlier configured executable and was ignored",
-                        installation.id
-                    ));
-                    continue;
-                }
-                check_declared_version(installation, &mut warnings);
+            // NativeZip no longer participates as a generic archive backend;
+            // its only remaining role is ZIP raw filename reading for encoding
+            // detection via a dedicated helper. Ignore any NativeZip
+            // installations in config but warn so users know they are ignored.
+            if matches!(installation.family, AdapterFamily::NativeZip) {
+                warnings.push(format!(
+                    "backend {} family native-zip is deprecated and ignored; ZIP handling is now via SevenZip",
+                    installation.id
+                ));
+                continue;
             }
+            let executable = resolve_executable(&installation.executable);
+            if !registered_paths.insert(executable.clone()) {
+                warnings.push(format!(
+                    "backend {} duplicates an earlier configured executable and was ignored",
+                    installation.id
+                ));
+                continue;
+            }
+            check_declared_version(installation, &mut warnings);
             let configured_profile = config.profile_for(installation).map_err(|detail| {
                 SmartZipError::BackendProtocolError {
                     backend: installation.id.clone(),
@@ -110,21 +117,6 @@ impl BackendRouter {
                 }
             })?;
             let registration = match &installation.family {
-                AdapterFamily::NativeZip if has_native_zip => {
-                    warnings.push(format!(
-                        "backend {} duplicates the configured native ZIP adapter and was ignored",
-                        installation.id
-                    ));
-                    continue;
-                }
-                AdapterFamily::NativeZip => {
-                    has_native_zip = true;
-                    configured_registration(
-                        NativeZipBackend::new().with_id(installation.id.clone()),
-                        installation,
-                        &configured_profile,
-                    )?
-                }
                 AdapterFamily::SevenZipCli => configured_registration(
                     SevenZipBackend::new(executable).with_id(installation.id.clone()),
                     installation,
@@ -135,6 +127,7 @@ impl BackendRouter {
                     installation,
                     &configured_profile,
                 )?,
+                AdapterFamily::NativeZip => unreachable!("handled above"),
                 AdapterFamily::Custom(family) => {
                     warnings.push(format!(
                         "backend {} uses unavailable adapter family {family}",
@@ -144,13 +137,6 @@ impl BackendRouter {
                 }
             };
             adapters.push(registration);
-        }
-
-        if !has_native_zip {
-            adapters.push(AdapterRegistration::from_adapter(
-                NativeZipBackend::new(),
-                -10,
-            ));
         }
         if config.auto_discover {
             if let Some(executable) = UnrarLocator::default().locate() {
@@ -463,20 +449,13 @@ impl BackendRouter {
                     adapter_id: candidate.adapter_id.clone(),
                 },
             );
-            // `CancellationToken` + `process-wrap` give correct lifecycle:
-            // - `token` is cloned into each attempt so GUI Cancel can
-            //   drop the in-flight `invoke` future;
-            // - the backend's `CommandWrap` is configured with
-            //   `ProcessGroup`/`JobObject` + `KillOnDrop`, so dropping the
-            //   future kills the whole descendant tree, not just the wrapper.
-            let result = {
-                let fut = invoke(registration.adapter.as_ref());
-                tokio::select! {
-                    biased;
-                    _ = token.cancelled() => Err(SmartZipError::Cancelled),
-                    res = fut => res,
-                }
-            };
+            // Cancellation is now handled inside the backend runner
+            // (SevenZip/Unrar select on token, kill the process group,
+            // wait, then return Cancelled). The router only does fast-path
+            // checks before starting an attempt; it does not drop the
+            // in-flight future, otherwise it would bypass the backend's
+            // kill+wait contract.
+            let result = invoke(registration.adapter.as_ref()).await;
             match result {
                 Ok(value) => {
                     self.emit(
@@ -607,16 +586,15 @@ impl BackendRouter {
                 },
             );
 
-            // Ensure the attempt directory is cleaned up if we are cancelled
-            // while the adapter is still writing. The adapter's CommandWrap
-            // uses `KillOnDrop` + `ProcessGroup`/`JobObject`, so dropping
-            // the future kills the entire descendant tree.
-            let extract_fut = registration.adapter.extract(attempt_request);
-            let result = tokio::select! {
-                biased;
-                _ = token.cancelled() => Err(SmartZipError::Cancelled),
-                res = extract_fut => res,
-            };
+            // Cancellation is handled inside the backend: it kills the
+            // process group / job object, waits for the child and its
+            // descendants, drains readers, then returns Cancelled. The
+            // router only waits for that result; it does not drop the
+            // future prematurely.
+            let result = registration
+                .adapter
+                .extract_with_context(attempt_request, context)
+                .await;
             match result {
                 Ok(_) => {
                     move_attempt_output(&attempt_dir, &request.output_dir)?;
@@ -639,21 +617,23 @@ impl BackendRouter {
                             class: error_class(&error).into(),
                         },
                     );
-                    // On cancellation the `TempDir` is dropped here; its
-                    // Drop impl removes the attempt directory.  `close_attempt`
-                    // would otherwise try to `close()` an already-removed dir,
-                    // so we handle Cancelled specially.
-                    if matches!(error, SmartZipError::Cancelled) {
-                        // `attempt` is dropped (cleaned) on return.
-                        return Err(error);
-                    }
-                    close_attempt(attempt, &attempt_dir)?;
+                    // Backend contract: on Cancelled the process tree is
+                    // already stopped and no longer writing to attempt_dir.
+                    // Do deterministic cleanup and surface any cleanup error
+                    // instead of silently dropping the TempDir.
+                    let cleanup_result = close_attempt(attempt, &attempt_dir);
                     self.emit(
                         context,
                         RouteEvent::BackendAttemptCleaned {
                             adapter_id: candidate.adapter_id.clone(),
                         },
                     );
+                    if let Err(cleanup_err) = cleanup_result {
+                        return Err(cleanup_err);
+                    }
+                    if matches!(error, SmartZipError::Cancelled) {
+                        return Err(error);
+                    }
                     if !is_retryable(&error) || self.forced_adapter.is_some() {
                         return Err(error);
                     }
@@ -1035,37 +1015,38 @@ fn request_requirements(
 }
 
 pub(crate) fn builtin_profile(
-    can_extract: &[ArchiveFormat],
-    can_compress: &[ArchiveFormat],
+    probe: &[ArchiveFormat],
+    list: &[ArchiveFormat],
+    test: &[ArchiveFormat],
+    extract: &[ArchiveFormat],
+    compress: &[ArchiveFormat],
     supports_passwords: bool,
-    supports_listing: bool,
-    supports_test: bool,
 ) -> BackendCapabilityProfile {
     let mut rules = Vec::new();
     rules.push(global_rule(
         capability_id("operation", "probe"),
         ArchiveOperation::Probe,
-        !can_extract.is_empty(),
+        !probe.is_empty(),
     ));
     rules.push(global_rule(
         capability_id("operation", "list"),
         ArchiveOperation::List,
-        supports_listing,
+        !list.is_empty(),
     ));
     rules.push(global_rule(
         capability_id("operation", "test"),
         ArchiveOperation::Test,
-        supports_test,
+        !test.is_empty(),
     ));
     rules.push(global_rule(
         capability_id("operation", "extract"),
         ArchiveOperation::Extract,
-        !can_extract.is_empty(),
+        !extract.is_empty(),
     ));
     rules.push(global_rule(
         capability_id("operation", "compress"),
         ArchiveOperation::Compress,
-        !can_compress.is_empty(),
+        !compress.is_empty(),
     ));
     for operation in [
         ArchiveOperation::List,
@@ -1078,13 +1059,19 @@ pub(crate) fn builtin_profile(
             supports_passwords,
         ));
     }
-    for format in can_extract {
+    for format in probe {
         rules.push(container_rule(format.clone(), ArchiveOperation::Probe));
+    }
+    for format in list {
         rules.push(container_rule(format.clone(), ArchiveOperation::List));
+    }
+    for format in test {
         rules.push(container_rule(format.clone(), ArchiveOperation::Test));
+    }
+    for format in extract {
         rules.push(container_rule(format.clone(), ArchiveOperation::Extract));
     }
-    for format in can_compress {
+    for format in compress {
         rules.push(container_rule(format.clone(), ArchiveOperation::Compress));
     }
     BackendCapabilityProfile { rules }
@@ -1433,10 +1420,11 @@ mod tests {
 
         fn profile(&self) -> smartzip_core::BackendCapabilityProfile {
             crate::router::builtin_profile(
-                &[ArchiveFormat::SevenZip],
-                &[ArchiveFormat::SevenZip],
-                true,
-                true,
+                &[ArchiveFormat::SevenZip], // probe
+                &[ArchiveFormat::SevenZip], // list
+                &[ArchiveFormat::SevenZip], // test
+                &[ArchiveFormat::SevenZip], // extract
+                &[ArchiveFormat::SevenZip], // compress
                 true,
             )
         }
@@ -1764,7 +1752,12 @@ mod tests {
             version_profiles: Default::default(),
         };
         let router = BackendRouter::from_config(&config).unwrap();
-        assert!(router.adapter_ids().contains(&"configured-native"));
+        // NativeZip is now deprecated and ignored; only SevenZip remains.
+        assert!(!router.adapter_ids().contains(&"configured-native"));
+        assert!(router
+            .warnings()
+            .iter()
+            .any(|w| w.contains("native-zip is deprecated")));
         assert!(router.adapter_ids().contains(&"first-7z"));
         assert!(!router.adapter_ids().contains(&"duplicate-7z"));
     }
@@ -1785,7 +1778,6 @@ mod tests {
         let router = BackendRouter::from_adapters(vec![
             AdapterRegistration::from_adapter(UnrarBackend::new(PathBuf::from("unrar")), 20),
             AdapterRegistration::from_adapter(SevenZipBackend::new(PathBuf::from("7z")), 10),
-            AdapterRegistration::from_adapter(NativeZipBackend::new(), -10),
         ]);
 
         let zstd_plan = router.plan(

@@ -90,7 +90,8 @@ pub fn alias_stripped_name(path: &Path) -> Option<(String, AliasKind)> {
     // Also handle "foo(副本)"? Rare.
     if lower_stem.ends_with("副本") {
         let base_stem = &stem[..stem.len() - "副本".len()];
-        let base_stem = base_stem.trim_end_matches(|c| c == ' ' || c == '-' || c == '_' || c == '(' || c == ')');
+        let base_stem = base_stem
+            .trim_end_matches(|c| c == ' ' || c == '-' || c == '_' || c == '(' || c == ')');
         let base = if ext.is_empty() {
             base_stem.to_string()
         } else {
@@ -116,7 +117,9 @@ pub fn collect_alias_candidates(
             if normalized_stripped.len() < hypothesis_prefix.len() + hypothesis_suffix.len() {
                 continue;
             }
-            if !normalized_stripped.starts_with(hypothesis_prefix) || !normalized_stripped.ends_with(hypothesis_suffix) {
+            if !normalized_stripped.starts_with(hypothesis_prefix)
+                || !normalized_stripped.ends_with(hypothesis_suffix)
+            {
                 continue;
             }
             // If stripped matches pattern, then this file's alias view can be candidate.

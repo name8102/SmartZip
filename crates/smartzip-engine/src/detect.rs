@@ -76,7 +76,8 @@ pub fn detect_non_archive_header(bytes: &[u8]) -> bool {
     // `infer` itself may report archive types for such bytes – in that
     // case we return false so the caller can proceed to archive probing.
     const ARCHIVE_EXTS: &[&str] = &[
-        "zip", "rar", "7z", "tar", "gz", "tgz", "bz2", "xz", "zst", "zstd", "lz4", "lzma", "cab", "iso", "dmg",
+        "zip", "rar", "7z", "tar", "gz", "tgz", "bz2", "xz", "zst", "zstd", "lz4", "lzma", "cab",
+        "iso", "dmg",
     ];
     if ARCHIVE_EXTS.contains(&ext) {
         return false;

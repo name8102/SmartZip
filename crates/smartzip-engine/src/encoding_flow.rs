@@ -1,7 +1,8 @@
 //! Encoding mode resolve, zip assessment, mojibake heuristics.
 
-use smartzip_archive::{ArchiveAdapter, ArchiveListing, ListRequest, NativeZipBackend};
-use smartzip_core::{ArchiveFormat, EncodingMode};
+use smartzip_archive::native_zip::NativeZipBackend;
+use smartzip_archive::{ArchiveEntry, ArchiveListing};
+use smartzip_core::EncodingMode;
 use std::path::Path;
 
 use crate::interactive::{
@@ -64,21 +65,45 @@ pub(crate) struct ZipEncodingAssessment {
 }
 
 pub(crate) async fn assess_zip_encoding(
-    native_zip: &NativeZipBackend,
     archive_path: &Path,
-    password: Option<String>,
+    _password: Option<String>,
 ) -> Option<ZipEncodingAssessment> {
-    let listing = native_zip
-        .list(ListRequest {
-            archive: archive_path.to_path_buf(),
-            format: Some(ArchiveFormat::Zip),
-            password,
-            encoding: EncodingMode::Auto,
+    // ZIP raw filename reading is now via the narrowed NativeZip helper, not
+    // via the generic ArchiveAdapter/list path. This keeps raw bytes intact
+    // for detector and avoids routing through the backend router.
+    let reader = NativeZipBackend::new();
+    let entries = reader.raw_entries(archive_path).ok()?;
+    // Filter out empty names and directory entries that have no filename bytes.
+    let raw_entries: Vec<Vec<u8>> = entries
+        .into_iter()
+        .filter_map(|e| {
+            if e.raw_name.is_empty() {
+                None
+            } else {
+                Some(e.raw_name)
+            }
         })
-        .await
-        .ok()?;
-
-    build_zip_encoding_assessment(listing)
+        .collect();
+    if raw_entries.is_empty() {
+        return None;
+    }
+    // Reuse existing build logic by faking an ArchiveListing with raw_name.
+    // We construct a minimal listing that only carries raw_name; the builder
+    // only uses raw_name.
+    let fake_listing = smartzip_archive::ArchiveListing {
+        format: Some(smartzip_core::ArchiveFormat::Zip),
+        entries: raw_entries
+            .into_iter()
+            .map(|raw| smartzip_archive::ArchiveEntry {
+                path: std::path::PathBuf::new(),
+                raw_name: raw,
+                compressed_size: None,
+                uncompressed_size: None,
+                is_dir: false,
+            })
+            .collect(),
+    };
+    build_zip_encoding_assessment(fake_listing)
 }
 
 pub(crate) fn build_zip_encoding_assessment(

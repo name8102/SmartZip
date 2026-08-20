@@ -1,6 +1,6 @@
 //! Root resolve, prepare archive, password access loop.
 
-use smartzip_archive::{ArchiveAdapter, ArchiveExecutor, ListRequest, NativeZipBackend};
+use smartzip_archive::{ArchiveExecutor, ListRequest, NativeZipBackend};
 use smartzip_core::{
     ArchiveFormat, EncodingMode, TaskEvent, TaskEventKind, TaskExecutionContext, TaskId,
 };
@@ -196,11 +196,10 @@ pub(crate) async fn prepare_resolved_archive(
     let mut zip_encoding_assessment = None;
     if encoding_mode == EncodingMode::Auto && candidate.detected_format == Some(ArchiveFormat::Zip)
     {
-        let native_zip = NativeZipBackend::new();
-        if let Ok(probe) = native_zip.probe(&archive_path).await {
-            if probe.encrypted == Some(false) {
-                zip_encoding_assessment =
-                    assess_zip_encoding(&native_zip, &archive_path, None).await;
+        let reader = NativeZipBackend::new();
+        if let Ok(is_encrypted) = reader.has_encrypted_entries(&archive_path) {
+            if !is_encrypted {
+                zip_encoding_assessment = assess_zip_encoding(&archive_path, None).await;
             }
         }
     }
@@ -301,10 +300,8 @@ pub(crate) async fn access_archive_with_password<B: ArchiveExecutor>(
                     && resolved.encoding_mode == EncodingMode::Auto
                     && resolved.candidate.detected_format == Some(ArchiveFormat::Zip)
                 {
-                    let native_zip = NativeZipBackend::new();
                     assessment =
-                        assess_zip_encoding(&native_zip, &resolved.archive_path, pw_value.clone())
-                            .await;
+                        assess_zip_encoding(&resolved.archive_path, pw_value.clone()).await;
                 }
                 break;
             }
@@ -380,10 +377,7 @@ pub(crate) async fn access_archive_with_password<B: ArchiveExecutor>(
                         && resolved.encoding_mode == EncodingMode::Auto
                         && resolved.candidate.detected_format == Some(ArchiveFormat::Zip)
                     {
-                        let native_zip = NativeZipBackend::new();
-                        assessment =
-                            assess_zip_encoding(&native_zip, &resolved.archive_path, Some(pw))
-                                .await;
+                        assessment = assess_zip_encoding(&resolved.archive_path, Some(pw)).await;
                     }
                 }
             }

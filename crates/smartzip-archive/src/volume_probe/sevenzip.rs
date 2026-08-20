@@ -41,14 +41,18 @@ pub fn probe_7z(path: &Path) -> Option<VolumeProbeResult> {
         }));
     }
     let next_header_offset = u64::from_le_bytes([
-        header[12], header[13], header[14], header[15], header[16], header[17], header[18], header[19],
+        header[12], header[13], header[14], header[15], header[16], header[17], header[18],
+        header[19],
     ]);
     let next_header_size = u64::from_le_bytes([
-        header[20], header[21], header[22], header[23], header[24], header[25], header[26], header[27],
+        header[20], header[21], header[22], header[23], header[24], header[25], header[26],
+        header[27],
     ]);
     let _next_header_crc = u32::from_le_bytes([header[28], header[29], header[30], header[31]]);
 
-    let expected_logical_size = 32u64.saturating_add(next_header_offset).saturating_add(next_header_size);
+    let expected_logical_size = 32u64
+        .saturating_add(next_header_offset)
+        .saturating_add(next_header_size);
 
     // If logical extent closes inside current physical file with valid structure, treat as standalone.
     // If extent points beyond file, that proves current file is not complete standalone 7z.

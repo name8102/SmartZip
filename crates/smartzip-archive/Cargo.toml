@@ -8,10 +8,8 @@ rust-version.workspace = true
 
 [dependencies]
 async-trait.workspace = true
-cap-std.workspace = true
 process-wrap.workspace = true
 serde.workspace = true
-walkdir.workspace = true
 smartzip-config.workspace = true
 smartzip-core.workspace = true
 smartzip-encoding.workspace = true

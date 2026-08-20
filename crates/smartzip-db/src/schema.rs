@@ -1,11 +1,10 @@
 use rusqlite::Connection;
-use rusqlite_migration::{M, Migrations};
+use rusqlite_migration::{Migrations, M};
 
 /// Latest schema version this build knows how to produce.
 pub const LATEST_VERSION: u32 = 3;
 
 const MIGRATIONS_SLICE: &[M<'static>] = &[
-
     M::up(
         r#"
         CREATE TABLE IF NOT EXISTS passwords (
@@ -178,7 +177,7 @@ static MIGRATIONS: Migrations<'static> = Migrations::from_slice(MIGRATIONS_SLICE
 /// detected and its highest `version` is promoted to `PRAGMA user_version`
 /// before invoking `to_latest`. This ensures a legacy v1/v2 database does
 /// not re-apply migrations and wipe data (notably v3's `DROP TABLE tasks`).
-pub fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
+pub fn migrate(conn: &mut Connection) -> crate::Result<()> {
     // Keep foreign-keys enforcement consistent with the previous implementation.
     // rusqlite_migration docs discourage `PRAGMA foreign_keys` inside the
     // migration SQL itself (transactions), so set it outside.
@@ -210,20 +209,12 @@ pub fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
         }
     }
 
-    MIGRATIONS
-        .to_latest(conn)
-        .map_err(|err| match err {
-            rusqlite_migration::Error::RusqliteError { query: _, err } => err,
-            other => rusqlite::Error::InvalidParameterName(other.to_string()),
-        })?;
+    MIGRATIONS.to_latest(conn)?;
 
     // After successful migration, the legacy table is no longer needed.
-    // Keeping it does not hurt, but removing it avoids confusion between the
-    // two versioning schemes. The v3 migration itself drops it on fresh DBs;
-    // for upgraded DBs we drop it here after promotion.
+    // Propagate any error instead of silently swallowing it.
     if has_legacy {
-        // `IF EXISTS` is safe even if the table was already removed.
-        let _ = conn.execute_batch("DROP TABLE IF EXISTS schema_migrations;");
+        conn.execute_batch("DROP TABLE IF EXISTS schema_migrations;")?;
     }
 
     Ok(())
@@ -385,5 +376,193 @@ mod tests {
         assert!(!table_exists(&conn, "password_matches"));
         // Legacy promotion should have removed the old table.
         assert!(!table_exists(&conn, "schema_migrations"));
+    }
+
+    #[test]
+    fn upgrades_v2_database_to_latest() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE schema_migrations (
+                version INTEGER PRIMARY KEY,
+                applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE passwords (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                value TEXT NOT NULL UNIQUE,
+                source TEXT NOT NULL,
+                pinned INTEGER NOT NULL DEFAULT 0,
+                disabled INTEGER NOT NULL DEFAULT 0,
+                success_count INTEGER NOT NULL DEFAULT 0,
+                failure_count INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                last_success_at TEXT,
+                last_failure_at TEXT
+            );
+            CREATE TABLE tasks (
+                id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                status TEXT NOT NULL,
+                input_summary TEXT NOT NULL,
+                output_path TEXT,
+                started_at TEXT NOT NULL,
+                finished_at TEXT,
+                error_code TEXT,
+                error_message TEXT,
+                password_attempts INTEGER NOT NULL DEFAULT 0,
+                encoding_selected TEXT,
+                embedded_found INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE task_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+                level TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                message TEXT NOT NULL,
+                data_json TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE encoding_detections (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                archive_path_hash TEXT NOT NULL,
+                archive_format TEXT,
+                selected_encoding TEXT NOT NULL,
+                confidence REAL NOT NULL,
+                user_corrected INTEGER NOT NULL DEFAULT 0,
+                candidates_json TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE embedded_archive_detections (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_path_hash TEXT NOT NULL,
+                format TEXT NOT NULL,
+                offset INTEGER NOT NULL,
+                confidence REAL NOT NULL,
+                size_hint INTEGER,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE password_matches (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                password_id INTEGER NOT NULL REFERENCES passwords(id) ON DELETE CASCADE,
+                archive_format TEXT,
+                path_pattern TEXT,
+                filename_pattern TEXT,
+                success_count INTEGER NOT NULL DEFAULT 0,
+                failure_count INTEGER NOT NULL DEFAULT 0,
+                last_success_at TEXT,
+                last_failure_at TEXT
+            );
+            INSERT INTO schema_migrations(version) VALUES (2);
+            "#,
+        )
+        .unwrap();
+        assert_eq!(current_version(&conn).unwrap(), 2);
+        migrate(&mut conn).unwrap();
+        assert_eq!(current_version(&conn).unwrap(), LATEST_VERSION);
+        assert!(table_exists(&conn, "file_extractions"));
+        assert!(table_exists(&conn, "known_files"));
+        assert!(!table_exists(&conn, "encoding_detections"));
+        assert!(!table_exists(&conn, "password_matches"));
+        // v3 should have slimmed tasks
+        let cols: Vec<String> = conn
+            .prepare("PRAGMA table_info(tasks)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(
+            cols,
+            vec![
+                "id",
+                "kind",
+                "status",
+                "output_path",
+                "started_at",
+                "finished_at"
+            ]
+        );
+    }
+
+    #[test]
+    fn legacy_v3_promotes_to_user_version() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        // Simulate a DB that already went through the old hand-rolled v3
+        // (has file_extractions/known_files and schema_migrations=3).
+        conn.execute_batch(
+            r#"
+            CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+            CREATE TABLE passwords (id INTEGER PRIMARY KEY AUTOINCREMENT, value TEXT NOT NULL UNIQUE, source TEXT NOT NULL);
+            CREATE TABLE tasks (id TEXT PRIMARY KEY, kind TEXT NOT NULL, status TEXT NOT NULL, output_path TEXT, started_at TEXT NOT NULL, finished_at TEXT);
+            CREATE TABLE task_events (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, level TEXT NOT NULL, event_type TEXT NOT NULL, message TEXT NOT NULL);
+            CREATE TABLE file_extractions (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, input_path TEXT NOT NULL, status TEXT NOT NULL);
+            CREATE TABLE known_files (sample_hash TEXT NOT NULL, size INTEGER NOT NULL, PRIMARY KEY (sample_hash, size));
+            INSERT INTO schema_migrations(version) VALUES (3);
+            "#,
+        )
+        .unwrap();
+        // user_version is still 0 before migrate
+        let uv: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(uv, 0);
+        migrate(&mut conn).unwrap();
+        let uv2: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(uv2, 3);
+        assert_eq!(current_version(&conn).unwrap(), 3);
+        assert!(!table_exists(&conn, "schema_migrations"));
+    }
+
+    #[test]
+    fn password_rows_survive_migration() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+            CREATE TABLE passwords (id INTEGER PRIMARY KEY AUTOINCREMENT, value TEXT NOT NULL UNIQUE, source TEXT NOT NULL, pinned INTEGER NOT NULL DEFAULT 0, disabled INTEGER NOT NULL DEFAULT 0, success_count INTEGER NOT NULL DEFAULT 0, failure_count INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, last_success_at TEXT, last_failure_at TEXT);
+            INSERT INTO passwords(value, source) VALUES ('secret123', 'manual');
+            INSERT INTO schema_migrations(version) VALUES (1);
+            "#,
+        )
+        .unwrap();
+        migrate(&mut conn).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM passwords WHERE value='secret123'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(current_version(&conn).unwrap(), LATEST_VERSION);
+    }
+
+    #[test]
+    fn migration_failure_does_not_advance_version() {
+        use rusqlite_migration::{Migrations, M};
+        let mut conn = Connection::open_in_memory().unwrap();
+        // First bring to v1 normally
+        migrate(&mut conn).unwrap();
+        let before: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        // Now try a failing migration on a fresh Migrations set that would be v4
+        let failing = Migrations::new(vec![
+            M::up("CREATE TABLE t1 (id INTEGER PRIMARY KEY);"),
+            M::up("CREATE TABLE t2 (id INTEGER PRIMARY KEY);"),
+            M::up("CREATE TABLE t3 (id INTEGER PRIMARY KEY);"),
+            M::up("THIS IS NOT VALID SQL"),
+        ]);
+        // The DB is at version 3, so the next migration (v4) will fail.
+        let res = failing.to_latest(&mut conn);
+        assert!(res.is_err(), "failing migration should error");
+        let after: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(before, after, "user_version must not advance on failure");
+        assert_eq!(after, 3);
     }
 }

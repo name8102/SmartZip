@@ -34,7 +34,10 @@ pub fn probe_zip(path: &Path) -> Option<VolumeProbeResult> {
         let cd_size = u32::from_le_bytes([eocd[12], eocd[13], eocd[14], eocd[15]]) as u64;
         let cd_offset = u32::from_le_bytes([eocd[16], eocd[17], eocd[18], eocd[19]]) as u64;
         let comment_len = u16::from_le_bytes([eocd[20], eocd[21]]) as usize;
-        let is_zip64_placeholder = total_entries == 0xFFFF || entries_this_disk == 0xFFFF || cd_size == 0xFFFFFFFF || cd_offset == 0xFFFFFFFF;
+        let is_zip64_placeholder = total_entries == 0xFFFF
+            || entries_this_disk == 0xFFFF
+            || cd_size == 0xFFFFFFFF
+            || cd_offset == 0xFFFFFFFF;
         if is_zip64_placeholder {
             if let Some(z64) = probe_zip64(&buf, eocd_pos, file_len) {
                 return Some(z64);
@@ -55,7 +58,8 @@ pub fn probe_zip(path: &Path) -> Option<VolumeProbeResult> {
         let expected_eocd_start = cd_end;
         // If this is single disk, this_disk==0, cd_start_disk==0, and CD fits before EOCD with correct adjacency (allowing comment)
         let is_single_disk = this_disk == 0 && cd_start_disk == 0;
-        let standalone = is_single_disk && cd_end <= eocd_file_offset && (eocd_file_offset - cd_end) < 65536;
+        let standalone =
+            is_single_disk && cd_end <= eocd_file_offset && (eocd_file_offset - cd_end) < 65536;
         // Also total entries consistency
         if standalone {
             // Additionally, if file has ZIP64 locator, not standalone.
@@ -108,7 +112,10 @@ fn find_eocd(buf: &[u8]) -> Option<usize> {
             // Validate comment len matches remaining bytes
             if buf.len() >= i + 22 {
                 let comment_len = u16::from_le_bytes([buf[i + 20], buf[i + 21]]) as usize;
-                if i + 22 + comment_len == buf.len() || i + 22 + comment_len <= buf.len() && buf.len() - (i + 22 + comment_len) < 1024 {
+                if i + 22 + comment_len == buf.len()
+                    || i + 22 + comment_len <= buf.len()
+                        && buf.len() - (i + 22 + comment_len) < 1024
+                {
                     // Accept
                     return Some(i);
                 }
@@ -137,8 +144,18 @@ fn probe_zip64(buf: &[u8], eocd_pos: usize, _file_len: u64) -> Option<VolumeProb
     if locator + 20 > buf.len() {
         return None;
     }
-    let disk_with_eocd = u32::from_le_bytes([buf[locator + 4], buf[locator + 5], buf[locator + 6], buf[locator + 7]]);
-    let total_disks = u32::from_le_bytes([buf[locator + 16], buf[locator + 17], buf[locator + 18], buf[locator + 19]]);
+    let disk_with_eocd = u32::from_le_bytes([
+        buf[locator + 4],
+        buf[locator + 5],
+        buf[locator + 6],
+        buf[locator + 7],
+    ]);
+    let total_disks = u32::from_le_bytes([
+        buf[locator + 16],
+        buf[locator + 17],
+        buf[locator + 18],
+        buf[locator + 19],
+    ]);
     // For ZIP64, the current file containing the locator/EOCD is the last disk, so its logical index is total_disks-1.
     // disk_with_eocd is where ZIP64 EOCD starts, not necessarily the current disk's index.
     let current_logical = total_disks.checked_sub(1);

@@ -19,6 +19,8 @@ pub enum DbError {
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
     #[error(transparent)]
+    Migration(#[from] rusqlite_migration::Error),
+    #[error(transparent)]
     Json(#[from] serde_json::Error),
 }
 
