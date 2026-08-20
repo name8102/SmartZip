@@ -31,6 +31,11 @@ pub struct VolumeMember {
     pub logical_index: Option<u32>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ZipSplitKind {
+    Spanned, // .z01 + .zip
+    Raw,     // .zip.001 style (raw byte split)
+}
 #[derive(Debug, Clone)]
 pub struct VolumeSet {
     pub format: ArchiveFormat,
@@ -38,6 +43,7 @@ pub struct VolumeSet {
     pub members: Vec<VolumeMember>,
     pub expected_volume_count: Option<u32>,
     pub expected_logical_size: Option<u64>,
+    pub zip_kind: Option<ZipSplitKind>,
 }
 
 #[derive(Debug, Clone)]
@@ -132,26 +138,21 @@ impl VolumeResolver {
 
         // If probe was Standalone we already returned. For NotApplicable without sequence evidence, return Single.
         // Generate primary single-token hypotheses.
-        let hypotheses = generate_single_token_hypotheses(path, &index);
+        let mut hypotheses = generate_single_token_hypotheses(path, &index);
         if hypotheses.is_empty() {
-            // No filename ordering evidence via single-token hypothesis.
-            // Try format-specific fallback for ZIP/RAR split where extensions differ (e.g., split.zip + split.z01, archive.rar + archive.r00).
-            if let Some(fallback_set) = try_fallback_zip_rar(path, &index, &probe) {
-                // Validate fallback via candidate elimination (reuse same elimination as hypothesis path)
-                // For now, if fallback found >=1 members and probe indicates multivolume, treat as resolved if not ambiguous.
-                // Check for grouping ambiguity in fallback: if multiple distinct candidates for same slot via alias, would be ambiguous – but fallback currently has unique per slot.
-                return VolumeResolution::Resolved(fallback_set);
-            }
-            // No filename ordering evidence.
-            // If probe definitively says multivolume (MultiVolume), then single visible member proves incomplete.
-            match probe {
-                VolumeProbeResult::MultiVolume(structure) => {
-                    return VolumeResolution::Incomplete(VolumeProblem {
-                        reason: format!("archive requires additional volumes ({} probe)", structure.format.as_str()),
-                        format: Some(structure.format),
-                    });
+            // Try format-specific fallback for ZIP/RAR split where extensions differ, but still validate via same structural path.
+            if let Some(fallback_hyp) = try_fallback_hypothesis(path, &index, &probe) {
+                hypotheses = vec![fallback_hyp];
+            } else {
+                match probe {
+                    VolumeProbeResult::MultiVolume(structure) => {
+                        return VolumeResolution::Incomplete(VolumeProblem {
+                            reason: format!("archive requires additional volumes ({} probe)", structure.format.as_str()),
+                            format: Some(structure.format),
+                        });
+                    }
+                    _ => return VolumeResolution::Single,
                 }
-                _ => return VolumeResolution::Single,
             }
         }
 
@@ -175,8 +176,8 @@ impl VolumeResolver {
             }
         }
 
-        // Decision per spec (P1-7): any remaining plausible alternative makes GroupingAmbiguous, even if one path resolves uniquely.
-        if !ambiguous_hypotheses.is_empty() {
+        // P1-6/7: any plausible alternative (ambiguous or incomplete with different grouping) makes GroupingAmbiguous.
+        if !ambiguous_hypotheses.is_empty() || (!incomplete_reasons.is_empty() && !resolved_hypotheses.is_empty()) {
             let mut hypos = ambiguous_hypotheses;
             for (set, warnings) in resolved_hypotheses {
                 hypos.push(VolumeSetHypothesis {
@@ -185,11 +186,17 @@ impl VolumeResolver {
                     warnings,
                 });
             }
-            // Also include incomplete hypotheses as ambiguous alternatives if they were plausible membership?
-            // Prioritize ambiguous over incomplete when both exist.
+            for prob in incomplete_reasons {
+                // Represent incomplete as a hypothesis with empty members but with problem as warning for debugging
+                hypos.push(VolumeSetHypothesis {
+                    format: prob.format.clone().unwrap_or(ArchiveFormat::Unknown("unknown".into())),
+                    members: Vec::new(),
+                    warnings: Vec::new(),
+                });
+            }
             return VolumeResolution::GroupingAmbiguous { hypotheses: hypos };
         }
-        if !incomplete_reasons.is_empty() && resolved_hypotheses.is_empty() {
+        if !incomplete_reasons.is_empty() {
             return VolumeResolution::Incomplete(incomplete_reasons.into_iter().next().unwrap());
         }
         if resolved_hypotheses.len() == 1 {
@@ -313,18 +320,6 @@ fn resolve_hypothesis(
         let paths: Vec<PathBuf> = files.iter().map(|f| f.path.clone()).collect();
         slot_candidates.insert(*ord, paths);
     }
-    // P1-6: standalone archive among multiple members is strong counter-evidence for multivolume hypothesis.
-    // If any candidate is Standalone and we have >1 distinct ordinals, the hypothesis is not viable.
-    if slot_candidates.len() > 1 {
-        for paths in slot_candidates.values() {
-            for p in paths {
-                if matches!(probe_volume_structure(p), VolumeProbeResult::Standalone(_)) {
-                    return HypothesisOutcome::NotViable;
-                }
-            }
-        }
-    }
-
     // Alias handling: for each file that has alias_stripped_name matching hypothesis pattern, compute its stripped ordinal value, and add as alternate candidate to that slot.
     // Alias views may not independently prove set, but can fill gap.
     // We only add alias candidate if its stripped ordinal corresponds to existing hypothesis ordinal range or gap implied?
@@ -371,10 +366,10 @@ fn resolve_hypothesis(
 
     // Now we have slot candidates map (ordinal -> 0..N paths)
     // Apply interval clipping using strong structural evidence before/after.
-    // Determine logical start ordinal and end ordinal via archive probes.
-    // For 7z: find member with probe Standalone? Actually 7z start has signature, others raw. So find file with 7z signature.
-    // For RAR/ZIP: check logical_volume_index.
-    let (clip_prefix, clip_suffix) = compute_clip_indices(&slot_candidates, &format);
+    let (clip_prefix, clip_suffix) = match compute_clip_indices(&slot_candidates, &format) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
     let mut sorted_ordinals: Vec<u64> = slot_candidates.keys().cloned().collect();
     sorted_ordinals.sort();
     let mut clipped_ordinals = sorted_ordinals.clone();
@@ -418,6 +413,16 @@ fn resolve_hypothesis(
     // If after clipping we have 0, not viable
     if filtered_candidates.is_empty() {
         return HypothesisOutcome::NotViable;
+    }
+    // P1-6: standalone inside clipped interval is strong counter-evidence for multivolume hypothesis
+    if filtered_candidates.len() > 1 {
+        for paths in filtered_candidates.values() {
+            for p in paths {
+                if matches!(probe_volume_structure(p), VolumeProbeResult::Standalone(_)) {
+                    return HypothesisOutcome::NotViable;
+                }
+            }
+        }
     }
 
     // Candidate elimination per slot
@@ -522,9 +527,11 @@ fn resolve_hypothesis(
                     reached_exact = true;
                     break;
                 } else if cumulative > exp_size {
-                    // Overshoot: do not guess, treat as ambiguous if we have not yet proven completeness
-                    // For now, break and let normal clipping handle; the set is not incomplete but may be overfull.
-                    break;
+                    return HypothesisOutcome::Ambiguous(VolumeSetHypothesis {
+                        format: format.clone(),
+                        members: final_members.clone(),
+                        warnings: warnings.clone(),
+                    });
                 }
             }
             if !reached_exact && cumulative < exp_size {
@@ -572,9 +579,22 @@ fn resolve_hypothesis(
     // Sort members by filename_ordinal (already in order due to iteration)
     final_members.sort_by_key(|m| m.filename_ordinal.unwrap_or(0));
 
-    // Determine entrypoint per format: for ZIP last is entry, else first.
-    let entrypoint = match format {
-        ArchiveFormat::Zip => final_members.last().map(|m| m.path.clone()).unwrap_or_else(|| final_members[0].path.clone()),
+    // Determine ZIP split mechanism for materializer (do not guess via filename alone; use members' probe and naming as structural evidence already validated)
+    let zip_kind = if format == ArchiveFormat::Zip {
+        let is_raw = final_members.iter().any(|m| {
+            m.path.file_name().and_then(|n| n.to_str()).map_or(false, |name| {
+                let lower = name.to_ascii_lowercase();
+                lower.contains(".zip.") && lower.rsplit('.').next().map_or(false, |ext| ext.chars().all(|c| c.is_ascii_digit()))
+            })
+        });
+        Some(if is_raw { ZipSplitKind::Raw } else { ZipSplitKind::Spanned })
+    } else {
+        None
+    };
+    // Determine entrypoint per format and split kind: ZIP spanned last is entry, ZIP raw first is entry, 7z/RAR first.
+    let entrypoint = match (&format, &zip_kind) {
+        (ArchiveFormat::Zip, Some(ZipSplitKind::Raw)) => final_members[0].path.clone(),
+        (ArchiveFormat::Zip, _) => final_members.last().map(|m| m.path.clone()).unwrap_or_else(|| final_members[0].path.clone()),
         _ => final_members[0].path.clone(),
     };
 
@@ -584,6 +604,7 @@ fn resolve_hypothesis(
         members: final_members,
         expected_volume_count: expected_count,
         expected_logical_size: expected_logical,
+        zip_kind,
     };
     if warnings.is_empty() {
         HypothesisOutcome::Resolved { set, warnings }
@@ -601,46 +622,79 @@ fn same_member_set(a: &VolumeSet, b: &VolumeSet) -> bool {
     a_paths == b_paths
 }
 
-fn compute_clip_indices(candidates: &BTreeMap<u64, Vec<PathBuf>>, format: &ArchiveFormat) -> (Option<u64>, Option<u64>) {
-    // Find strong start and end via probing.
-    // For 7z: file with 7z signature is start. For ZIP: file with EOCD is last. For RAR: logical index?
+fn compute_clip_indices(candidates: &BTreeMap<u64, Vec<PathBuf>>, format: &ArchiveFormat) -> Result<(Option<u64>, Option<u64>), HypothesisOutcome> {
     let mut start: Option<u64> = None;
     let mut end: Option<u64> = None;
-    // Collect ord -> probe results
+    let mut start_paths: Vec<PathBuf> = Vec::new();
+    let mut end_paths: Vec<PathBuf> = Vec::new();
     for (ord, paths) in candidates {
         for path in paths {
             let probe = probe_volume_structure(path);
             match &probe {
                 VolumeProbeResult::MultiVolume(s) | VolumeProbeResult::PossiblyMultiVolume(s) => {
-                    // If logical index indicates start (0), then this ord is start.
                     if s.logical_volume_index == Some(0) {
-                        start = Some(*ord);
+                        if let Some(prev) = start {
+                            if prev != *ord {
+                                // Multiple distinct start anchors -> ambiguous grouping
+                                return Err(HypothesisOutcome::Ambiguous(VolumeSetHypothesis {
+                                    format: format.clone(),
+                                    members: Vec::new(),
+                                    warnings: Vec::new(),
+                                }));
+                            }
+                        } else {
+                            start = Some(*ord);
+                        }
                     }
                     if s.is_last_volume == Some(true) {
-                        end = Some(*ord);
+                        if let Some(prev) = end {
+                            if prev != *ord {
+                                return Err(HypothesisOutcome::Ambiguous(VolumeSetHypothesis {
+                                    format: format.clone(),
+                                    members: Vec::new(),
+                                    warnings: Vec::new(),
+                                }));
+                            }
+                        } else {
+                            end = Some(*ord);
+                        }
                     }
                 }
                 VolumeProbeResult::Standalone(_) => {
-                    // Standalone file should not be in multivolume set, but if we have hypothesis that includes it, maybe it's last?
-                    // For ZIP, standalone indicates single disk; if hypothesis includes it plus others, perhaps it's last?
                     if format == &ArchiveFormat::Zip {
-                        end = Some(*ord);
+                        if let Some(prev) = end {
+                            if prev != *ord {
+                                return Err(HypothesisOutcome::Ambiguous(VolumeSetHypothesis {
+                                    format: format.clone(),
+                                    members: Vec::new(),
+                                    warnings: Vec::new(),
+                                }));
+                            }
+                        } else {
+                            end = Some(*ord);
+                        }
                     }
                 }
                 _ => {}
             }
-            // For 7z, direct signature detection
             if format == &ArchiveFormat::SevenZip {
-                // Probe_7z returns MultiVolume for start, NotApplicable for continuation chunks
                 if let VolumeProbeResult::MultiVolume(_) = probe {
-                    start = Some(*ord);
+                    if let Some(prev) = start {
+                        if prev != *ord {
+                            return Err(HypothesisOutcome::Ambiguous(VolumeSetHypothesis {
+                                format: format.clone(),
+                                members: Vec::new(),
+                                warnings: Vec::new(),
+                            }));
+                        }
+                    } else {
+                        start = Some(*ord);
+                    }
                 }
             }
         }
     }
-    // If multiple start candidates, ambiguous? But per spec strong evidence may clip prefix: if we found a start at ord, clip before.
-    // Similarly end.
-    (start, end)
+    Ok((start, end))
 }
 
 fn probe_logical_index(path: &Path) -> Option<u32> {
@@ -650,38 +704,107 @@ fn probe_logical_index(path: &Path) -> Option<u32> {
     }
 }
 
-fn try_fallback_zip_rar(
+fn try_fallback_hypothesis(
     seed_path: &Path,
     index: &DirectoryVolumeIndex,
-    probe: &VolumeProbeResult,
-) -> Option<VolumeSet> {
-    // Only attempt fallback when primary single-token hypothesis failed.
-    // This handles ZIP/RAR old split where extensions differ (e.g., split.zip + split.z01, archive.rar + archive.r00).
+    _probe: &VolumeProbeResult,
+) -> Option<SequenceHypothesis> {
     let seed_file = index.find_file(seed_path)?;
     let seed_norm = &seed_file.normalized_name;
-    // Determine seed base and ext via split at last '.'
     let (seed_base, seed_ext) = split_base_ext(seed_norm)?;
-    // Determine expected format for fallback: use probe format if known, otherwise infer from seed ext.
     let is_zip_seed = seed_ext == "zip" || (seed_ext.starts_with('z') && seed_ext[1..].chars().all(|c| c.is_ascii_digit()));
     let is_rar_old_seed = seed_ext == "rar" || (seed_ext.starts_with('r') && seed_ext[1..].chars().all(|c| c.is_ascii_digit()) && seed_ext.len() == 3);
-    // Try ZIP fallback
     if is_zip_seed {
-        if let Some(set) = zip_fallback_collect(seed_base, index, probe) {
-            if set.members.len() >= 2 {
-                return Some(set);
-            }
+        if let Some(hyp) = zip_fallback_hypothesis(seed_base, index) {
+            return Some(hyp);
         }
     }
     if is_rar_old_seed {
-        if let Some(set) = rar_old_fallback_collect(seed_base, index, probe) {
-            if set.members.len() >= 2 {
-                return Some(set);
-            }
+        if let Some(hyp) = rar_old_fallback_hypothesis(seed_base, index) {
+            return Some(hyp);
         }
     }
     None
 }
 
+fn try_fallback_zip_rar(
+    seed_path: &Path,
+    index: &DirectoryVolumeIndex,
+    probe: &VolumeProbeResult,
+) -> Option<VolumeSet> {
+    // Legacy entry kept for tests; now delegates to hypothesis path for validation.
+    let hyp = try_fallback_hypothesis(seed_path, index, probe)?;
+    // This legacy path is no longer used for direct Resolved return; kept for compatibility.
+    // Convert hypothesis to VolumeSet via same logic as resolve_hypothesis would, but without probe-dependent clipping.
+    // For now, return None to force hypothesis path.
+    let _ = hyp;
+    None
+}
+
+fn zip_fallback_hypothesis(seed_base: &str, index: &DirectoryVolumeIndex) -> Option<SequenceHypothesis> {
+    let mut groups: BTreeMap<u64, Vec<directory::DirectoryFile>> = BTreeMap::new();
+    let mut max_z: Option<u64> = None;
+    for file in &index.files {
+        let Some((base, ext)) = split_base_ext(&file.normalized_name) else { continue };
+        if base != seed_base { continue; }
+        if ext.starts_with('z') && ext.len() > 1 && ext[1..].chars().all(|c| c.is_ascii_digit()) {
+            if let Ok(v) = ext[1..].parse::<u64>() {
+                groups.entry(v).or_default().push(file.clone());
+                max_z = Some(max_z.map_or(v, |m| m.max(v)));
+            }
+        }
+    }
+    for file in &index.files {
+        let Some((base, ext)) = split_base_ext(&file.normalized_name) else { continue };
+        if base == seed_base && ext == "zip" {
+            let zip_ord = max_z.map_or(1, |m| m + 1);
+            groups.entry(zip_ord).or_default().push(file.clone());
+            break;
+        }
+    }
+    if groups.len() < 2 { return None; }
+    // Check duplicates already handled via groups entry (should be 1 per ordinal for fallback, else ambiguous will be handled later)
+    let has_gap = {
+        let keys: Vec<u64> = groups.keys().cloned().collect();
+        keys.windows(2).any(|w| w[1] != w[0] + 1)
+    };
+    Some(SequenceHypothesis {
+        varying_token_idx: 0,
+        varying_token_value_seed: 0,
+        prefix: format!("{}." , seed_base),
+        suffix: String::new(),
+        groups,
+        has_gap,
+    })
+}
+fn rar_old_fallback_hypothesis(seed_base: &str, index: &DirectoryVolumeIndex) -> Option<SequenceHypothesis> {
+    let mut groups: BTreeMap<u64, Vec<directory::DirectoryFile>> = BTreeMap::new();
+    for file in &index.files {
+        let Some((base, ext)) = split_base_ext(&file.normalized_name) else { continue };
+        if base != seed_base { continue; }
+        let ord = if ext == "rar" {
+            Some(0)
+        } else if ext.starts_with('r') && ext.len() == 3 && ext[1..].chars().all(|c| c.is_ascii_digit()) {
+            ext[1..].parse::<u64>().ok().map(|v| v + 1)
+        } else { None };
+        if let Some(o) = ord {
+            groups.entry(o).or_default().push(file.clone());
+        }
+    }
+    if groups.len() < 2 { return None; }
+    let has_gap = {
+        let keys: Vec<u64> = groups.keys().cloned().collect();
+        keys.windows(2).any(|w| w[1] != w[0] + 1)
+    };
+    Some(SequenceHypothesis {
+        varying_token_idx: 0,
+        varying_token_value_seed: 0,
+        prefix: format!("{}." , seed_base),
+        suffix: String::new(),
+        groups,
+        has_gap,
+    })
+}
 fn split_base_ext(normalized: &str) -> Option<(&str, &str)> {
     let pos = normalized.rfind('.')?;
     Some((&normalized[..pos], &normalized[pos + 1..]))
@@ -756,6 +879,7 @@ fn zip_fallback_collect(
         members: volume_members,
         expected_volume_count: None,
         expected_logical_size: None,
+        zip_kind: Some(ZipSplitKind::Spanned),
     })
 }
 
@@ -805,6 +929,7 @@ fn rar_old_fallback_collect(
         members: volume_members,
         expected_volume_count: None,
         expected_logical_size: None,
+        zip_kind: None,
     })
 }
 
@@ -1337,6 +1462,7 @@ mod tests {
             ],
             expected_volume_count: Some(2),
             expected_logical_size: None,
+            zip_kind: None,
         };
         let mat = crate::volumes::materialize::materialize_volume_set(&set).unwrap();
         assert!(mat.canonical_entrypoint.exists());

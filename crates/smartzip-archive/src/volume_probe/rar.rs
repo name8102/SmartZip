@@ -43,12 +43,13 @@ fn probe_rar5(header: &[u8], _path: &Path, _file: &mut File) -> VolumeProbeResul
     match parse_rar5_main_flags(&header[8..]) {
         Some((is_volume, volume_number)) => {
             if is_volume {
+                // Volume flag alone does not imply not-last; last volume also has it. End-of-archive header determines last.
                 VolumeProbeResult::MultiVolume(VolumeStructure {
                     format: ArchiveFormat::Rar,
                     logical_volume_index: volume_number,
                     expected_volume_count: None,
                     expected_logical_size: None,
-                    is_last_volume: Some(false),
+                    is_last_volume: None,
                 })
             } else {
                 VolumeProbeResult::Standalone(ArchiveFormat::Rar)
@@ -74,29 +75,25 @@ fn parse_rar5_main_flags(data: &[u8]) -> Option<(bool, Option<u32>)> {
     }
     let hdr_flags = read_vint(data, &mut pos)?;
     let has_extra = (hdr_flags & 0x01) != 0;
-    let has_data = (hdr_flags & 0x02) != 0;
     let extra_size = if has_extra { read_vint(data, &mut pos)? } else { 0 };
-    let data_size = if has_data { read_vint(data, &mut pos)? } else { 0 };
-    // Validate we have enough bytes for extra+data
-    if data.len() < pos + extra_size as usize + data_size as usize {
+    // For RAR5 main header, Archive flags follow immediately after Extra area size, not in Data area.
+    // Layout: Header flags, [Extra area size], Archive flags, [Volume number], [Extra area]
+    // Archive flags 0x0001 = Volume, 0x0002 = Volume number present.
+    if data.len() < pos + 1 {
         return None;
     }
-    // Data area for main header contains archive flags (and optional volume number)
-    if data_size == 0 {
-        // No data means no archive flags -> treat as not volume (standalone without extra)
-        return Some((false, None));
-    }
-    let data_start = pos + extra_size as usize;
-    let data_slice = &data[data_start..data_start + data_size as usize];
-    let mut dpos = 0usize;
-    let arc_flags = read_vint(data_slice, &mut dpos)?;
+    let arc_flags = read_vint(data, &mut pos)?;
     let is_volume = (arc_flags & 0x01) != 0;
     let has_vol_number = (arc_flags & 0x02) != 0;
     let vol_number = if has_vol_number {
-        Some(read_vint(data_slice, &mut dpos)? as u32)
+        Some(read_vint(data, &mut pos)? as u32)
     } else {
         None
     };
+    // Validate extra area fits (if present, it follows after archive flags/volume number)
+    if has_extra && data.len() < pos + extra_size as usize {
+        return None;
+    }
     Some((is_volume, vol_number))
 }
 
