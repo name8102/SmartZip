@@ -157,13 +157,21 @@ impl VolumeResolver {
             }
         }
 
-        // For each hypothesis, try to resolve to a VolumeSet using structural evidence and alias handling.
+        // For each filename hypothesis, try each candidate archive format separately (format is part of hypothesis, not global first-hit)
         let mut resolved_hypotheses = Vec::new();
         let mut incomplete_reasons = Vec::new();
         let mut ambiguous_hypotheses = Vec::new();
 
         for hyp in hypotheses {
-            match resolve_hypothesis(&hyp, &index, &probe) {
+            let formats = collect_candidate_formats(&hyp, &index, &probe);
+            // If no strong format evidence, try the hypothesis once with format inferred via first-hit (legacy) to avoid missing weak cases
+            let formats = if formats.is_empty() { vec![None] } else { formats.into_iter().map(Some).collect() };
+            for fmt_opt in formats {
+                let outcome = match fmt_opt {
+                    Some(fmt) => resolve_hypothesis_with_forced_format(&hyp, &index, &probe, fmt),
+                    None => resolve_hypothesis(&hyp, &index, &probe),
+                };
+                match outcome {
                 HypothesisOutcome::Resolved { set, warnings } => {
                     if warnings.is_empty() {
                         resolved_hypotheses.push((set, warnings));
@@ -174,6 +182,7 @@ impl VolumeResolver {
                 HypothesisOutcome::Incomplete(problem) => incomplete_reasons.push(problem),
                 HypothesisOutcome::Ambiguous(hypo) => ambiguous_hypotheses.push(hypo),
                 HypothesisOutcome::NotViable => {}
+                }
             }
         }
 
@@ -281,31 +290,68 @@ fn resolve_hypothesis(
     index: &DirectoryVolumeIndex,
     seed_probe: &VolumeProbeResult,
 ) -> HypothesisOutcome {
-    // Determine format: use seed probe format if available, else infer from member probes (scan all groups for any known format).
-    let format = match seed_probe {
-        VolumeProbeResult::Standalone(f) => f.clone(),
-        VolumeProbeResult::MultiVolume(s) | VolumeProbeResult::PossiblyMultiVolume(s) => s.format.clone(),
-        VolumeProbeResult::NotApplicable => {
-            let mut inferred: Option<ArchiveFormat> = None;
-            for files in hyp.groups.values() {
-                for f in files {
-                    match probe_volume_structure(&f.path) {
-                        VolumeProbeResult::MultiVolume(s) | VolumeProbeResult::PossiblyMultiVolume(s) => {
-                            inferred = Some(s.format);
-                            break;
-                        }
-                        VolumeProbeResult::Standalone(fmt) => {
-                            inferred = Some(fmt);
-                            break;
-                        }
-                        VolumeProbeResult::NotApplicable => continue,
-                    }
-                }
-                if inferred.is_some() {
-                    break;
-                }
+    resolve_hypothesis_inner(hyp, index, seed_probe, None)
+}
+fn resolve_hypothesis_with_forced_format(
+    hyp: &SequenceHypothesis,
+    index: &DirectoryVolumeIndex,
+    seed_probe: &VolumeProbeResult,
+    forced: ArchiveFormat,
+) -> HypothesisOutcome {
+    resolve_hypothesis_inner(hyp, index, seed_probe, Some(forced))
+}
+fn collect_candidate_formats(hyp: &SequenceHypothesis, index: &DirectoryVolumeIndex, seed_probe: &VolumeProbeResult) -> Vec<ArchiveFormat> {
+    let mut formats: Vec<ArchiveFormat> = Vec::new();
+    let mut seen: HashSet<ArchiveFormat> = HashSet::new();
+    let mut add = |fmt: ArchiveFormat| {
+        if seen.insert(fmt.clone()) { formats.push(fmt); }
+    };
+    match seed_probe {
+        VolumeProbeResult::MultiVolume(s) => add(s.format.clone()),
+        VolumeProbeResult::Standalone(f) => add(f.clone()),
+        _ => {}
+    }
+    for files in hyp.groups.values() {
+        for f in files {
+            if let VolumeProbeResult::MultiVolume(s) = probe_volume_structure(&f.path) {
+                add(s.format.clone());
             }
-            inferred.unwrap_or(ArchiveFormat::Unknown("unknown".into()))
+        }
+    }
+    formats
+}
+fn resolve_hypothesis_inner(
+    hyp: &SequenceHypothesis,
+    index: &DirectoryVolumeIndex,
+    seed_probe: &VolumeProbeResult,
+    forced_format: Option<ArchiveFormat>,
+) -> HypothesisOutcome {
+    let format = if let Some(forced) = forced_format.clone() {
+        forced
+    } else {
+        match seed_probe {
+            VolumeProbeResult::Standalone(f) => f.clone(),
+            VolumeProbeResult::MultiVolume(s) | VolumeProbeResult::PossiblyMultiVolume(s) => s.format.clone(),
+            VolumeProbeResult::NotApplicable => {
+                let mut inferred: Option<ArchiveFormat> = None;
+                for files in hyp.groups.values() {
+                    for f in files {
+                        match probe_volume_structure(&f.path) {
+                            VolumeProbeResult::MultiVolume(s) | VolumeProbeResult::PossiblyMultiVolume(s) => {
+                                inferred = Some(s.format);
+                                break;
+                            }
+                            VolumeProbeResult::Standalone(fmt) => {
+                                inferred = Some(fmt);
+                                break;
+                            }
+                            VolumeProbeResult::NotApplicable => continue,
+                        }
+                    }
+                    if inferred.is_some() { break; }
+                }
+                inferred.unwrap_or(ArchiveFormat::Unknown("unknown".into()))
+            }
         }
     };
     if matches!(format, ArchiveFormat::Unknown(_)) {
@@ -724,7 +770,6 @@ fn resolve_hypothesis(
         HypothesisOutcome::Resolved { set, warnings }
     }
 }
-
 fn same_member_set(a: &VolumeSet, b: &VolumeSet) -> bool {
     if a.members.len() != b.members.len() {
         return false;
@@ -910,28 +955,20 @@ fn is_zip_raw_logical_closure(members: &[VolumeMember]) -> bool {
                 let total_disks = u32::from_le_bytes([locator[16], locator[17], locator[18], locator[19]]);
                 if total_disks != 1 { return false; }
                 let zip64_offset = u64::from_le_bytes([locator[8], locator[9], locator[10], locator[11], locator[12], locator[13], locator[14], locator[15]]);
-                // Read ZIP64 EOCD at logical offset
                 let zip64_buf = match read_logical_range(&ordered, zip64_offset, 56) {
                     Some(b) => b,
                     None => return false,
                 };
                 if zip64_buf[0..4] != [0x50, 0x4b, 0x06, 0x06] { return false; }
+                let this_disk64 = u32::from_le_bytes([zip64_buf[16], zip64_buf[17], zip64_buf[18], zip64_buf[19]]);
+                let cd_start_disk64 = u32::from_le_bytes([zip64_buf[20], zip64_buf[21], zip64_buf[22], zip64_buf[23]]);
+                if this_disk64 != 0 || cd_start_disk64 != 0 { return false; }
                 let cd_size64 = u64::from_le_bytes([zip64_buf[40], zip64_buf[41], zip64_buf[42], zip64_buf[43], zip64_buf[44], zip64_buf[45], zip64_buf[46], zip64_buf[47]]);
                 let cd_offset64 = u64::from_le_bytes([zip64_buf[48], zip64_buf[49], zip64_buf[50], zip64_buf[51], zip64_buf[52], zip64_buf[53], zip64_buf[54], zip64_buf[55]]);
-                // For raw split, ZIP64 EOCD should also be single-disk and cd_offset+cd_size should be logical ZIP64 EOCD pos
-                // Simplified check: cd_offset + cd_size == zip64_offset (since ZIP64 EOCD follows CD)
-                // Instead, verify that cd_offset + cd_size == logical position of ZIP64 EOCD (which is locator's offset)
-                // For raw, the ZIP64 EOCD's cd fields should be consistent with total
-                let _ = (cd_size64, cd_offset64);
-                return true;
-            }
-        }
-    }
-    // Also try pure ZIP64 without classic placeholder (unlikely but handle)
-    for i in (0..=buf.len().saturating_sub(4)).rev() {
-        if buf[i..i+4] == [0x50, 0x4b, 0x06, 0x06] {
-            // ZIP64 EOCD found - check total disks etc. (simplified)
-            if buf.len() >= i + 56 {
+                if cd_offset64.checked_add(cd_size64) != Some(zip64_offset) { return false; }
+                if let Some(cd_sig) = read_logical_range(&ordered, cd_offset64, 4) {
+                    if cd_sig != [0x50, 0x4b, 0x01, 0x02] { return false; }
+                } else { return false; }
                 return true;
             }
         }
