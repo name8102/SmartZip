@@ -309,25 +309,20 @@ pub(crate) fn discover_nested_candidates(
         return candidates;
     }
 
-    let Ok(entries) = std::fs::read_dir(root) else {
-        return candidates;
-    };
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            let mut next_prefix = prefix.to_path_buf();
-            next_prefix.push(entry.file_name());
-            candidates.extend(discover_nested_candidates(
-                scanner,
-                &path,
-                depth,
-                &next_prefix,
-                policy,
-                nested_embedded_enabled,
-            ));
+    // Use `walkdir` for robust recursion: handles symlink loops, FD limits,
+    // and does not follow symlinks by default (unlike `Path::is_dir()`).
+    for entry in walkdir::WalkDir::new(root)
+        .follow_links(false)
+        .min_depth(1)
+        .into_iter()
+        .filter_map(|entry| entry.ok())
+    {
+        // Only process regular files; directories are traversed by WalkDir itself.
+        // Symlinks are not followed and not treated as archives (safer for untrusted output).
+        if !entry.file_type().is_file() {
             continue;
         }
+        let path = entry.path().to_path_buf();
 
         let detected_format = format_from_extension(&path);
         let mut relative_path = prefix.to_path_buf();

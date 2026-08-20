@@ -8,5 +8,6 @@ rust-version.workspace = true
 
 [dependencies]
 binwalk.workspace = true
+memmap2.workspace = true
 serde.workspace = true
 smartzip-core = { path = "../smartzip-core" }

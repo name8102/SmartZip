@@ -29,8 +29,8 @@ pub struct SmartZipDb {
 
 impl SmartZipDb {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let conn = Connection::open(path.as_ref())?;
-        schema::migrate(&conn)?;
+        let mut conn = Connection::open(path.as_ref())?;
+        schema::migrate(&mut conn)?;
         Ok(Self {
             conn,
             path: Some(path.as_ref().to_path_buf()),
@@ -38,8 +38,8 @@ impl SmartZipDb {
     }
 
     pub fn in_memory() -> Result<Self> {
-        let conn = Connection::open_in_memory()?;
-        schema::migrate(&conn)?;
+        let mut conn = Connection::open_in_memory()?;
+        schema::migrate(&mut conn)?;
         Ok(Self { conn, path: None })
     }
 

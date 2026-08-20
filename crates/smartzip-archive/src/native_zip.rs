@@ -197,23 +197,33 @@ impl ArchiveAdapter for NativeZipBackend {
 }
 
 fn collect_files(input: &Path) -> Result<Vec<PathBuf>> {
-    if input.is_file() {
+    // Use walkdir for cross-platform, symlink-safe traversal. It handles
+    // - not following symlinks by default,
+    // - file-descriptor limits,
+    // - depth & loop detection,
+    // - path-contextual errors.
+    // This replaces the previous hand-rolled `read_dir` stack which used
+    // `Path::is_dir()` (follows symlinks) and had divergent symlink semantics.
+    let meta = std::fs::symlink_metadata(input)
+        .map_err(|source| SmartZipError::io(Some(input.to_path_buf()), source))?;
+    if meta.is_file() {
         return Ok(vec![input.to_path_buf()]);
+    }
+    if !meta.is_dir() {
+        return Ok(vec![]);
     }
 
     let mut files = Vec::new();
-    let mut stack = vec![input.to_path_buf()];
-    while let Some(path) = stack.pop() {
-        let entries = std::fs::read_dir(&path)
-            .map_err(|source| SmartZipError::io(Some(path.clone()), source))?;
-        for entry in entries {
-            let entry = entry.map_err(|source| SmartZipError::io(Some(path.clone()), source))?;
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-            } else if path.is_file() {
-                files.push(path);
-            }
+    for entry in walkdir::WalkDir::new(input)
+        .follow_links(false)
+        .into_iter()
+    {
+        let entry = entry.map_err(|err| {
+            let path = err.path().map(Path::to_path_buf).unwrap_or_else(|| input.to_path_buf());
+            SmartZipError::io(Some(path), std::io::Error::new(std::io::ErrorKind::Other, err.to_string()))
+        })?;
+        if entry.file_type().is_file() {
+            files.push(entry.into_path());
         }
     }
     files.sort();
@@ -248,8 +258,17 @@ fn extract_sync(
     request: &ExtractArchiveRequest,
 ) -> Result<ExtractArchiveResult> {
     let mut archive = NativeZipBackend::open_archive_read(archive_path)?;
+    // Ensure the staging directory exists, then bind it as a capability.
+    // All subsequent mkdir/create operations are relative to this `Dir`,
+    // so even if a validated `relative_path` were somehow malicious, the
+    // OS capability prevents escaping the extraction root.
     std::fs::create_dir_all(&request.output_dir)
         .map_err(|source| SmartZipError::io(Some(request.output_dir.clone()), source))?;
+    let dir = cap_std::fs::Dir::open_ambient_dir(
+        &request.output_dir,
+        cap_std::ambient_authority(),
+    )
+    .map_err(|source| SmartZipError::io(Some(request.output_dir.clone()), source))?;
 
     let limits = ExtractionLimits::default();
     let mut total_written: u64 = 0;
@@ -307,28 +326,34 @@ fn extract_sync(
 
         let raw_name = entry.name_raw();
         let decoded_name = decode_entry_name(raw_name, &request.encoding);
+        // Lexical validation: keep SmartZip's policy of which entry names are legal.
         let relative_path = crate::safety::safe_entry_path(decoded_name.as_bytes()).ok_or(
             SmartZipError::UnsafeArchivePath {
-                entry: decoded_name,
+                entry: decoded_name.clone(),
             },
         )?;
-        let output_path = request.output_dir.join(relative_path);
 
         if entry.is_dir() {
-            std::fs::create_dir_all(&output_path)
-                .map_err(|source| SmartZipError::io(Some(output_path.clone()), source))?;
+            dir.create_dir_all(&relative_path).map_err(|source| {
+                SmartZipError::io(Some(request.output_dir.join(&relative_path)), source)
+            })?;
             continue;
         }
 
-        if let Some(parent) = output_path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|source| SmartZipError::io(Some(parent.to_path_buf()), source))?;
+        if let Some(parent) = relative_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                dir.create_dir_all(parent).map_err(|source| {
+                    SmartZipError::io(Some(request.output_dir.join(parent)), source)
+                })?;
+            }
         }
 
-        let mut outfile = File::create(&output_path)
-            .map_err(|source| SmartZipError::io(Some(output_path.clone()), source))?;
-        let written = std::io::copy(&mut entry, &mut outfile)
-            .map_err(|source| SmartZipError::io(Some(output_path), source))?;
+        let mut outfile = dir.create(&relative_path).map_err(|source| {
+            SmartZipError::io(Some(request.output_dir.join(&relative_path)), source)
+        })?;
+        let written = std::io::copy(&mut entry, &mut outfile).map_err(|source| {
+            SmartZipError::io(Some(request.output_dir.join(&relative_path)), source)
+        })?;
         total_written += written;
 
         if total_written > limits.max_total_output_bytes {

@@ -441,11 +441,18 @@ impl BackendRouter {
             &'a dyn ArchiveAdapter,
         ) -> Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>,
     {
+        let token = context.cancellation_token();
+        if token.is_cancelled() {
+            return Err(SmartZipError::Cancelled);
+        }
         let plan =
             self.plan_with_context(operation, container.as_ref(), requirements, Some(context));
         let mut attempted = Vec::new();
         let mut last_error = None;
         for candidate in &plan.candidates {
+            if token.is_cancelled() {
+                return Err(SmartZipError::Cancelled);
+            }
             let registration = self
                 .registration(&candidate.adapter_id)
                 .expect("planned adapter must remain registered");
@@ -456,7 +463,21 @@ impl BackendRouter {
                     adapter_id: candidate.adapter_id.clone(),
                 },
             );
-            match invoke(registration.adapter.as_ref()).await {
+            // `CancellationToken` + `process-wrap` give correct lifecycle:
+            // - `token` is cloned into each attempt so GUI Cancel can
+            //   drop the in-flight `invoke` future;
+            // - the backend's `CommandWrap` is configured with
+            //   `ProcessGroup`/`JobObject` + `KillOnDrop`, so dropping the
+            //   future kills the whole descendant tree, not just the wrapper.
+            let result = {
+                let fut = invoke(registration.adapter.as_ref());
+                tokio::select! {
+                    biased;
+                    _ = token.cancelled() => Err(SmartZipError::Cancelled),
+                    res = fut => res,
+                }
+            };
+            match result {
                 Ok(value) => {
                     self.emit(
                         context,
@@ -474,6 +495,9 @@ impl BackendRouter {
                             class: error_class(&error).into(),
                         },
                     );
+                    if matches!(error, SmartZipError::Cancelled) {
+                        return Err(error);
+                    }
                     if !is_retryable(&error) || self.forced_adapter.is_some() {
                         return Err(error);
                     }
@@ -539,6 +563,10 @@ impl BackendRouter {
         requirements: ArchiveRequirements,
         context: &TaskExecutionContext,
     ) -> Result<ExtractArchiveResult> {
+        let token = context.cancellation_token();
+        if token.is_cancelled() {
+            return Err(SmartZipError::Cancelled);
+        }
         let plan = self.plan_with_context(
             ArchiveOperation::Extract,
             container.as_ref(),
@@ -558,6 +586,9 @@ impl BackendRouter {
             .unwrap_or_else(|| PathBuf::from("."));
 
         for candidate in &plan.candidates {
+            if token.is_cancelled() {
+                return Err(SmartZipError::Cancelled);
+            }
             let registration = self
                 .registration(&candidate.adapter_id)
                 .expect("planned adapter must remain registered");
@@ -576,7 +607,17 @@ impl BackendRouter {
                 },
             );
 
-            match registration.adapter.extract(attempt_request).await {
+            // Ensure the attempt directory is cleaned up if we are cancelled
+            // while the adapter is still writing. The adapter's CommandWrap
+            // uses `KillOnDrop` + `ProcessGroup`/`JobObject`, so dropping
+            // the future kills the entire descendant tree.
+            let extract_fut = registration.adapter.extract(attempt_request);
+            let result = tokio::select! {
+                biased;
+                _ = token.cancelled() => Err(SmartZipError::Cancelled),
+                res = extract_fut => res,
+            };
+            match result {
                 Ok(_) => {
                     move_attempt_output(&attempt_dir, &request.output_dir)?;
                     close_attempt(attempt, &attempt_dir)?;
@@ -598,6 +639,14 @@ impl BackendRouter {
                             class: error_class(&error).into(),
                         },
                     );
+                    // On cancellation the `TempDir` is dropped here; its
+                    // Drop impl removes the attempt directory.  `close_attempt`
+                    // would otherwise try to `close()` an already-removed dir,
+                    // so we handle Cancelled specially.
+                    if matches!(error, SmartZipError::Cancelled) {
+                        // `attempt` is dropped (cleaned) on return.
+                        return Err(error);
+                    }
                     close_attempt(attempt, &attempt_dir)?;
                     self.emit(
                         context,
@@ -883,13 +932,8 @@ fn identify_version(executable: &Path, family_key: &str) -> std::io::Result<Stri
 
 fn resolve_executable(path: &Path) -> PathBuf {
     if path.components().count() == 1 {
-        if let Some(search_path) = std::env::var_os("PATH") {
-            if let Some(found) = std::env::split_paths(&search_path)
-                .map(|directory| directory.join(path))
-                .find(|candidate| candidate.exists())
-            {
-                return std::fs::canonicalize(&found).unwrap_or(found);
-            }
+        if let Ok(found) = which::which(path) {
+            return std::fs::canonicalize(&found).unwrap_or(found);
         }
     }
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())

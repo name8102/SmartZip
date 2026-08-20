@@ -28,7 +28,15 @@ chardetng = "0.1"
 clap = { version = "4.5", features = ["derive"] }
 directories = "6"
 gpui = { version = "0.2", features = ["macos-blade"] }
-rusqlite = { version = "0.33", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite_migration = "2.6"
+cap-std = "4.0"
+process-wrap = { version = "9.1", features = ["tokio1"] }
+which = "8.0"
+walkdir = "2.5"
+atomic-write-file = "0.3"
+memmap2 = "0.9"
+tokio-util = "0.7"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 smartzip-archive = { path = "crates/smartzip-archive" }

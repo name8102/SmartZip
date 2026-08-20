@@ -291,6 +291,7 @@ pub struct TaskExecutionContext {
     task_id: TaskId,
     sink: Arc<dyn TaskEventSink>,
     route: Mutex<TaskRouteContext>,
+    cancellation: tokio_util::sync::CancellationToken,
 }
 
 struct DiscardingTaskEventSink;
@@ -309,7 +310,20 @@ impl TaskExecutionContext {
             task_id,
             sink,
             route: Mutex::new(TaskRouteContext::default()),
+            cancellation: tokio_util::sync::CancellationToken::new(),
         }
+    }
+
+    pub fn cancellation_token(&self) -> tokio_util::sync::CancellationToken {
+        self.cancellation.clone()
+    }
+
+    pub fn cancel(&self) {
+        self.cancellation.cancel();
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancellation.is_cancelled()
     }
 
     pub fn record_rejection(&self, key: NegativeCapabilityKey, reason: impl Into<String>) {

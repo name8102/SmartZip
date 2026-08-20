@@ -1,57 +1,13 @@
-use rusqlite::{params, Connection};
+use rusqlite::Connection;
+use rusqlite_migration::{M, Migrations};
 
 /// Latest schema version this build knows how to produce.
 pub const LATEST_VERSION: u32 = 3;
 
-/// Apply any pending schema migrations to `conn`.
-///
-/// Migrations are versioned and idempotent: `schema_migrations` records which
-/// versions have been applied, and only the missing steps run. Each step is
-/// wrapped in a transaction so an interrupted upgrade leaves the database on
-/// the previous version rather than in a half-applied state.
-pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
-    conn.execute_batch(
+const MIGRATIONS_SLICE: &[M<'static>] = &[
+
+    M::up(
         r#"
-        PRAGMA foreign_keys = ON;
-
-        CREATE TABLE IF NOT EXISTS schema_migrations (
-            version INTEGER PRIMARY KEY,
-            applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-        );
-        "#,
-    )?;
-
-    let current = current_version(conn)?;
-    for step in MIGRATIONS {
-        if step.version <= current {
-            continue;
-        }
-        apply_step(conn, step)?;
-    }
-    Ok(())
-}
-
-/// Return the highest applied schema version, or 0 for a fresh database.
-pub fn current_version(conn: &Connection) -> rusqlite::Result<u32> {
-    let version: Option<i64> = conn
-        .query_row(
-            "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
-            [],
-            |row| row.get(0),
-        )
-        .ok();
-    Ok(version.unwrap_or(0) as u32)
-}
-
-struct MigrationStep {
-    version: u32,
-    sql: &'static str,
-}
-
-const MIGRATIONS: &[MigrationStep] = &[
-    MigrationStep {
-        version: 1,
-        sql: r#"
         CREATE TABLE IF NOT EXISTS passwords (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             value TEXT NOT NULL UNIQUE,
@@ -88,10 +44,9 @@ const MIGRATIONS: &[MigrationStep] = &[
         CREATE INDEX IF NOT EXISTS idx_password_matches_path
             ON password_matches(path_pattern);
         "#,
-    },
-    MigrationStep {
-        version: 2,
-        sql: r#"
+    ),
+    M::up(
+        r#"
         CREATE TABLE IF NOT EXISTS tasks (
             id TEXT PRIMARY KEY,
             kind TEXT NOT NULL,
@@ -150,10 +105,9 @@ const MIGRATIONS: &[MigrationStep] = &[
         CREATE INDEX IF NOT EXISTS idx_embedded_file_hash
             ON embedded_archive_detections(file_path_hash);
         "#,
-    },
-    MigrationStep {
-        version: 3,
-        sql: r#"
+    ),
+    M::up(
+        r#"
         -- v3: file-grain history. The v2 detection/match tables never held
         -- decision-driving data, so drop them outright rather than migrate.
         DROP TABLE IF EXISTS encoding_detections;
@@ -207,34 +161,102 @@ const MIGRATIONS: &[MigrationStep] = &[
             PRIMARY KEY (sample_hash, size)
         );
         "#,
-    },
+    ),
 ];
 
-fn apply_step(conn: &Connection, step: &MigrationStep) -> rusqlite::Result<()> {
-    conn.execute_batch("BEGIN")?;
-    let result = (|| -> rusqlite::Result<()> {
-        conn.execute_batch(step.sql)?;
-        conn.execute(
-            "INSERT OR IGNORE INTO schema_migrations(version) VALUES (?1)",
-            params![step.version as i64],
-        )?;
-        Ok(())
-    })();
-    match result {
-        Ok(()) => {
-            conn.execute_batch("COMMIT")?;
-            Ok(())
-        }
-        Err(error) => {
-            let _ = conn.execute_batch("ROLLBACK");
-            Err(error)
+static MIGRATIONS: Migrations<'static> = Migrations::from_slice(MIGRATIONS_SLICE);
+
+/// Apply any pending schema migrations to `conn`.
+///
+/// Uses `rusqlite_migration` with `user_version` as the version tracker,
+/// replacing the previous hand-rolled `schema_migrations` table, `BEGIN`/`COMMIT`
+/// plumbing, and manual `MigrationStep` dispatch. This removes a non-product
+/// persistence framework in favour of a maintained crate.
+///
+/// For backwards compatibility with databases created before the migration
+/// to `rusqlite_migration`, any existing `schema_migrations` table is
+/// detected and its highest `version` is promoted to `PRAGMA user_version`
+/// before invoking `to_latest`. This ensures a legacy v1/v2 database does
+/// not re-apply migrations and wipe data (notably v3's `DROP TABLE tasks`).
+pub fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
+    // Keep foreign-keys enforcement consistent with the previous implementation.
+    // rusqlite_migration docs discourage `PRAGMA foreign_keys` inside the
+    // migration SQL itself (transactions), so set it outside.
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+
+    // Promote legacy `schema_migrations` version to `user_version` if needed.
+    // This is a one-time bridge for DBs created with the old hand-rolled logic.
+    let has_legacy = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='schema_migrations'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+        > 0;
+    if has_legacy {
+        let legacy_version: i64 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        let user_version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap_or(0);
+        if user_version == 0 && legacy_version > 0 {
+            conn.pragma_update(None, "user_version", legacy_version)?;
         }
     }
+
+    MIGRATIONS
+        .to_latest(conn)
+        .map_err(|err| match err {
+            rusqlite_migration::Error::RusqliteError { query: _, err } => err,
+            other => rusqlite::Error::InvalidParameterName(other.to_string()),
+        })?;
+
+    // After successful migration, the legacy table is no longer needed.
+    // Keeping it does not hurt, but removing it avoids confusion between the
+    // two versioning schemes. The v3 migration itself drops it on fresh DBs;
+    // for upgraded DBs we drop it here after promotion.
+    if has_legacy {
+        // `IF EXISTS` is safe even if the table was already removed.
+        let _ = conn.execute_batch("DROP TABLE IF EXISTS schema_migrations;");
+    }
+
+    Ok(())
+}
+
+/// Return the highest applied schema version, or 0 for a fresh database.
+///
+/// Reads `PRAGMA user_version` (the `rusqlite_migration` tracker) and falls
+/// back to the legacy `schema_migrations` table for DBs that have not yet
+/// been promoted. This keeps `current_version` meaningful during the
+/// transition period.
+pub fn current_version(conn: &Connection) -> rusqlite::Result<u32> {
+    let user_version: i64 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap_or(0);
+    if user_version != 0 {
+        return Ok(user_version as u32);
+    }
+    // Fallback for legacy DBs that still use `schema_migrations`.
+    let legacy: i64 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    Ok(legacy as u32)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::params;
 
     fn table_exists(conn: &Connection, name: &str) -> bool {
         let count: i64 = conn
@@ -249,15 +271,15 @@ mod tests {
 
     #[test]
     fn migration_creates_passwords_table() {
-        let conn = Connection::open_in_memory().unwrap();
-        migrate(&conn).unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
+        migrate(&mut conn).unwrap();
         assert!(table_exists(&conn, "passwords"));
     }
 
     #[test]
     fn migration_creates_all_v3_tables() {
-        let conn = Connection::open_in_memory().unwrap();
-        migrate(&conn).unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
+        migrate(&mut conn).unwrap();
         for name in [
             "passwords",
             "tasks",
@@ -272,8 +294,8 @@ mod tests {
 
     #[test]
     fn v3_drops_superseded_v2_tables() {
-        let conn = Connection::open_in_memory().unwrap();
-        migrate(&conn).unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
+        migrate(&mut conn).unwrap();
         for name in [
             "password_matches",
             "encoding_detections",
@@ -285,8 +307,8 @@ mod tests {
 
     #[test]
     fn v3_tasks_table_is_slim() {
-        let conn = Connection::open_in_memory().unwrap();
-        migrate(&conn).unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
+        migrate(&mut conn).unwrap();
         let columns: Vec<String> = {
             let mut stmt = conn.prepare("PRAGMA table_info(tasks)").unwrap();
             let rows = stmt
@@ -311,20 +333,18 @@ mod tests {
 
     #[test]
     fn migration_is_idempotent() {
-        let conn = Connection::open_in_memory().unwrap();
-        migrate(&conn).unwrap();
-        migrate(&conn).unwrap();
-        let applied: i64 = conn
-            .query_row("SELECT count(*) FROM schema_migrations", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        assert_eq!(applied, LATEST_VERSION as i64);
+        let mut conn = Connection::open_in_memory().unwrap();
+        migrate(&mut conn).unwrap();
+        migrate(&mut conn).unwrap();
+        // `rusqlite_migration` tracks via `user_version`, not `schema_migrations`.
+        assert_eq!(current_version(&conn).unwrap(), LATEST_VERSION);
+        // Legacy table should have been cleaned up.
+        assert!(!table_exists(&conn, "schema_migrations"));
     }
 
     #[test]
     fn upgrades_v1_database_to_latest() {
-        let conn = Connection::open_in_memory().unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
         // Simulate an older database that only has v1 applied.
         conn.execute_batch(
             r#"
@@ -352,7 +372,7 @@ mod tests {
         assert_eq!(current_version(&conn).unwrap(), 1);
         assert!(!table_exists(&conn, "tasks"));
 
-        migrate(&conn).unwrap();
+        migrate(&mut conn).unwrap();
         assert_eq!(current_version(&conn).unwrap(), LATEST_VERSION);
         // v3 end state: slim tasks + file-grain tables present, the v2
         // detection/match tables dropped along the way.
@@ -363,5 +383,7 @@ mod tests {
         assert!(!table_exists(&conn, "encoding_detections"));
         assert!(!table_exists(&conn, "embedded_archive_detections"));
         assert!(!table_exists(&conn, "password_matches"));
+        // Legacy promotion should have removed the old table.
+        assert!(!table_exists(&conn, "schema_migrations"));
     }
 }

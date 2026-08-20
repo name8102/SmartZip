@@ -1,12 +1,16 @@
 use crate::backend::ArchiveAdapter;
 use crate::types::*;
 use async_trait::async_trait;
+use process_wrap::tokio::{CommandWrap, KillOnDrop};
+#[cfg(unix)]
+use process_wrap::tokio::ProcessGroup;
+#[cfg(windows)]
+use process_wrap::tokio::JobObject;
 use smartzip_core::{ArchiveFormat, Result, SmartZipError};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
-use tokio::process::Command;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SevenZipOperation {
@@ -112,6 +116,10 @@ impl SevenZipLocator {
     }
 
     /// Find every independent installation, normalized and deduplicated by path.
+    ///
+    /// Uses the `which` crate for cross-platform executable lookup (checks
+    /// `PATH`, `PATHEXT` on Windows, and executable permission) instead of a
+    /// manual `split_paths` + `exists` traversal.
     pub fn locate_all(&self) -> Vec<PathBuf> {
         let mut paths = Vec::new();
         if let Some(path) = &self.bundled {
@@ -119,16 +127,12 @@ impl SevenZipLocator {
                 paths.push(normalize_executable_path(path));
             }
         }
-        if let Some(search_path) = std::env::var_os("PATH") {
-            for candidate in &self.candidates {
-                for directory in std::env::split_paths(&search_path) {
-                    let path = directory.join(candidate);
-                    if path.exists() {
-                        let path = normalize_executable_path(&path);
-                        if !paths.contains(&path) {
-                            paths.push(path);
-                        }
-                        break;
+        for candidate in &self.candidates {
+            if let Ok(iter) = which::which_all(candidate) {
+                for found in iter {
+                    let found = normalize_executable_path(&found);
+                    if !paths.contains(&found) {
+                        paths.push(found);
                     }
                 }
             }
@@ -206,12 +210,28 @@ impl SevenZipBackend {
     }
 
     async fn run(&self, args: &[String]) -> Result<BackendCommandOutput> {
-        let output = Command::new(&self.executable)
-            .args(args)
-            .stdin(Stdio::null())
-            .output()
-            .await
+        // Use `process-wrap` so the 7zz child and any descendants are
+        // killed as a process group (Unix) or job object (Windows) when
+        // the handle is dropped. `KillOnDrop` ensures the OS resources
+        // are reaped even if the future is cancelled.
+        let mut wrap = CommandWrap::with_new(&self.executable, |command| {
+            command.args(args);
+            command.stdin(Stdio::null());
+            command.stdout(Stdio::piped());
+            command.stderr(Stdio::piped());
+        });
+        #[cfg(unix)]
+        wrap.wrap(ProcessGroup::leader());
+        #[cfg(windows)]
+        wrap.wrap(JobObject);
+        wrap.wrap(KillOnDrop);
+
+        let child = wrap
+            .spawn()
             .map_err(|source| self.map_start_error(source))?;
+        let output = Box::into_pin(child.wait_with_output())
+            .await
+            .map_err(|source| SmartZipError::io(Some(self.executable.clone()), source))?;
 
         Ok(BackendCommandOutput {
             status: output.status.code(),
@@ -225,25 +245,37 @@ impl SevenZipBackend {
         args: &[String],
         operation: SevenZipOperation,
     ) -> Result<BackendCommandOutput> {
-        let mut child = Command::new(&self.executable)
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|source| self.map_start_error(source))?;
-        let stdout = child.stdout.take().ok_or_else(|| {
-            SmartZipError::io(
-                Some(self.executable.clone()),
-                std::io::Error::other("7z child stdout pipe was unavailable"),
-            )
-        })?;
-        let stderr = child.stderr.take().ok_or_else(|| {
-            SmartZipError::io(
-                Some(self.executable.clone()),
-                std::io::Error::other("7z child stderr pipe was unavailable"),
-            )
-        })?;
+        let mut wrap = CommandWrap::with_new(&self.executable, |command| {
+            command.args(args);
+            command.stdin(Stdio::null());
+            command.stdout(Stdio::piped());
+            command.stderr(Stdio::piped());
+        });
+        #[cfg(unix)]
+        wrap.wrap(ProcessGroup::leader());
+        #[cfg(windows)]
+        wrap.wrap(JobObject);
+        wrap.wrap(KillOnDrop);
+
+        let mut child = wrap.spawn().map_err(|source| self.map_start_error(source))?;
+        let stdout = child
+            .stdout()
+            .take()
+            .ok_or_else(|| {
+                SmartZipError::io(
+                    Some(self.executable.clone()),
+                    std::io::Error::other("7z child stdout pipe was unavailable"),
+                )
+            })?;
+        let stderr = child
+            .stderr()
+            .take()
+            .ok_or_else(|| {
+                SmartZipError::io(
+                    Some(self.executable.clone()),
+                    std::io::Error::other("7z child stderr pipe was unavailable"),
+                )
+            })?;
         let observer = self.observer.clone();
         let stdout_task = tokio::spawn(read_stream(stdout, observer.clone(), Some(operation)));
         let stderr_task = tokio::spawn(read_stream(stderr, observer, None));

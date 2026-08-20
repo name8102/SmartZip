@@ -203,7 +203,14 @@ impl SmartZipConfig {
         if let Some(parent) = path.as_ref().parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(path, content)
+        // Use atomic-write-file to avoid truncated config on crash/power loss:
+        // write to a temp file in the same directory and atomically rename,
+        // guaranteeing the result is either the old file or the new file.
+        let mut file = atomic_write_file::AtomicWriteFile::open(path.as_ref())?;
+        use std::io::Write as _;
+        file.write_all(content.as_bytes())?;
+        file.commit()?;
+        Ok(())
     }
 }
 

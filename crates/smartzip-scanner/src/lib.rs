@@ -128,8 +128,22 @@ impl EmbeddedScanner {
         Ok(self.scan_bytes(&data))
     }
 
-    /// Scan a file using chunked reading for large files. Avoids loading the
-    /// entire file into a single Vec<u8> when it exceeds 64MB.
+    /// Scan a file using memory-mapping for large files.
+    ///
+    /// For files exceeding 64 MiB, this uses `memmap2::Mmap` to map the file
+    /// into memory as a `&[u8]` without copying the entire scan window into
+    /// a `Vec<u8>`. This fixes the previous implementation which claimed to
+    /// `mmap` but actually read the whole range into a heap allocation via
+    /// chunked `read` + `extend_from_slice`.
+    ///
+    /// # Safety considerations
+    ///
+    /// `Mmap::map` is `unsafe` because the underlying file could be
+    /// concurrently modified, which would be undefined behaviour for the
+    /// mapped slice. This is acceptable here because:
+    /// - the file is a stable local archive chosen by the user,
+    /// - the mapping is read-only and dropped immediately after `scan_bytes`,
+    /// - we hold the file open for the duration of the scan.
     pub fn scan_path_mmap(
         &self,
         path: impl AsRef<Path>,
@@ -147,25 +161,25 @@ impl EmbeddedScanner {
             return Ok(vec![]);
         }
 
-        // For small files, fall back to read
+        // For small files, ordinary bounded read is cheaper and avoids
+        // mmap overhead.
         if scan_size <= 64 * 1024 * 1024 {
             return self.scan_path(path);
         }
 
-        let mut file = fs::File::open(path.as_ref())?;
-        let mut data = Vec::with_capacity(scan_size as usize);
-        let mut buf = [0u8; 64 * 1024];
-        let mut remaining = scan_size;
-        while remaining > 0 {
-            let to_read = std::cmp::min(remaining, buf.len() as u64) as usize;
-            let n = file.read(&mut buf[..to_read])?;
-            if n == 0 {
-                break;
+        let file = fs::File::open(path.as_ref())?;
+        // SAFETY: file is not modified concurrently during the scan; the
+        // mapping is read-only and short-lived.
+        let mmap = unsafe {
+            if scan_size == file_size {
+                memmap2::Mmap::map(&file)?
+            } else {
+                memmap2::MmapOptions::new()
+                    .len(scan_size as usize)
+                    .map(&file)?
             }
-            data.extend_from_slice(&buf[..n]);
-            remaining -= n as u64;
-        }
-        Ok(self.scan_bytes(&data))
+        };
+        Ok(self.scan_bytes(&mmap[..scan_size as usize]))
     }
 
     /// Get file size without loading it.

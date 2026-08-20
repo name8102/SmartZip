@@ -501,15 +501,30 @@ fn find_non_colliding_name(parent: &Path, name: &std::ffi::OsStr) -> PathBuf {
 }
 
 fn recursive_move_contents(from: &Path, to: &Path) -> std::io::Result<()> {
-    for entry in std::fs::read_dir(from)? {
+    // Replace hand-rolled `read_dir` recursion with `walkdir`:
+    // - `follow_links(false)` avoids symlink-following divergence from `Path::is_dir()`,
+    // - handles symlink loops and FD limits,
+    // - reports the failing path in the error.
+    // Walk `from` and materialize each entry relative to `to`.
+    for entry in walkdir::WalkDir::new(from)
+        .min_depth(1)
+        .follow_links(false)
+        .into_iter()
+    {
         let entry = entry?;
-        let source = entry.path();
-        let dest = to.join(entry.file_name());
-        if source.is_dir() {
+        let rel = entry
+            .path()
+            .strip_prefix(from)
+            .expect("walkdir entry must be under `from`");
+        let dest = to.join(rel);
+        let file_type = entry.file_type();
+        if file_type.is_dir() {
             std::fs::create_dir_all(&dest)?;
-            recursive_move_contents(&source, &dest)?;
         } else {
-            std::fs::rename(&source, &dest)?;
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::rename(entry.path(), &dest)?;
         }
     }
     Ok(())

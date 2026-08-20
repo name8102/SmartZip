@@ -1,10 +1,14 @@
 use crate::backend::ArchiveAdapter;
 use crate::types::*;
 use async_trait::async_trait;
+use process_wrap::tokio::{CommandWrap, KillOnDrop};
+#[cfg(unix)]
+use process_wrap::tokio::ProcessGroup;
+#[cfg(windows)]
+use process_wrap::tokio::JobObject;
 use smartzip_core::{ArchiveFormat, Result, SmartZipError};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use tokio::process::Command;
 
 #[derive(Debug, Clone)]
 pub struct UnrarLocator {
@@ -65,11 +69,20 @@ impl UnrarBackend {
     }
 
     async fn run(&self, args: &[String]) -> Result<BackendCommandOutput> {
-        let output = Command::new(&self.executable)
-            .args(args)
-            .stdin(Stdio::null())
-            .output()
-            .await
+        let mut wrap = CommandWrap::with_new(&self.executable, |command| {
+            command.args(args);
+            command.stdin(Stdio::null());
+            command.stdout(Stdio::piped());
+            command.stderr(Stdio::piped());
+        });
+        #[cfg(unix)]
+        wrap.wrap(ProcessGroup::leader());
+        #[cfg(windows)]
+        wrap.wrap(JobObject);
+        wrap.wrap(KillOnDrop);
+
+        let child = wrap
+            .spawn()
             .map_err(|source| {
                 if source.kind() == std::io::ErrorKind::NotFound {
                     SmartZipError::BackendUnavailable {
@@ -79,6 +92,9 @@ impl UnrarBackend {
                     SmartZipError::io(Some(self.executable.clone()), source)
                 }
             })?;
+        let output = Box::into_pin(child.wait_with_output())
+            .await
+            .map_err(|source| SmartZipError::io(Some(self.executable.clone()), source))?;
 
         Ok(BackendCommandOutput {
             status: output.status.code(),
@@ -250,15 +266,14 @@ impl ArchiveAdapter for UnrarBackend {
 fn locate_executable(bundled: Option<&PathBuf>, candidates: &[String]) -> Option<PathBuf> {
     if let Some(path) = bundled {
         if path.exists() {
-            return Some(path.clone());
+            return Some(std::fs::canonicalize(path).unwrap_or_else(|_| path.clone()));
         }
     }
 
-    candidates.iter().find_map(|candidate| {
-        std::env::var_os("PATH").and_then(|paths| {
-            std::env::split_paths(&paths)
-                .map(|dir| dir.join(candidate))
-                .find(|path| path.exists())
-        })
-    })
+    for candidate in candidates {
+        if let Ok(found) = which::which(candidate) {
+            return Some(std::fs::canonicalize(&found).unwrap_or(found));
+        }
+    }
+    None
 }
