@@ -484,27 +484,53 @@ fn resolve_hypothesis(
         return HypothesisOutcome::Ambiguous(hypo);
     }
 
-    // Aggregate strong structural evidence from all resolved members, not just seed (seed may be any physical member).
+    // Aggregate strong structural evidence isolated by hypothesis format (seed may be any member).
     let mut agg_expected_count: Option<u32> = None;
     let mut agg_expected_logical: Option<u64> = None;
+    let mut evidence_conflict = false;
     for m in &final_members {
         if let VolumeProbeResult::MultiVolume(s) = probe_volume_structure(&m.path) {
+            if s.format != format { continue; }
             if let Some(c) = s.expected_volume_count {
-                agg_expected_count = Some(agg_expected_count.map_or(c, |prev| prev.max(c)));
+                match agg_expected_count {
+                    None => agg_expected_count = Some(c),
+                    Some(prev) if prev == c => {},
+                    Some(_) => evidence_conflict = true,
+                }
             }
             if let Some(sz) = s.expected_logical_size {
-                agg_expected_logical = Some(agg_expected_logical.map_or(sz, |prev| prev.max(sz)));
+                match agg_expected_logical {
+                    None => agg_expected_logical = Some(sz),
+                    Some(prev) if prev == sz => {},
+                    Some(_) => evidence_conflict = true,
+                }
             }
         }
     }
-    // Also consider seed's strong evidence if not already aggregated (seed may not be in final_members if clipped? but seed is in final)
     if let VolumeProbeResult::MultiVolume(s) = seed_probe {
-        if let Some(c) = s.expected_volume_count {
-            agg_expected_count = Some(agg_expected_count.map_or(c, |prev| prev.max(c)));
+        if s.format == format {
+            if let Some(c) = s.expected_volume_count {
+                match agg_expected_count {
+                    None => agg_expected_count = Some(c),
+                    Some(prev) if prev == c => {},
+                    Some(_) => evidence_conflict = true,
+                }
+            }
+            if let Some(sz) = s.expected_logical_size {
+                match agg_expected_logical {
+                    None => agg_expected_logical = Some(sz),
+                    Some(prev) if prev == sz => {},
+                    Some(_) => evidence_conflict = true,
+                }
+            }
         }
-        if let Some(sz) = s.expected_logical_size {
-            agg_expected_logical = Some(agg_expected_logical.map_or(sz, |prev| prev.max(sz)));
-        }
+    }
+    if evidence_conflict {
+        return HypothesisOutcome::Ambiguous(VolumeSetHypothesis {
+            format: format.clone(),
+            members: final_members.clone(),
+            warnings: warnings.clone(),
+        });
     }
     if let Some(exp) = agg_expected_count {
         if (final_members.len() as u32) < exp {
@@ -631,28 +657,30 @@ fn resolve_hypothesis(
         final_members.sort_by_key(|m| m.filename_ordinal.unwrap_or(0));
     }
 
-    // Determine ZIP split mechanism via structural evidence; not proven -> Unknown.
+    // Determine ZIP split mechanism via structural evidence; raw requires cross-member logical closure.
     let zip_kind = if format == ArchiveFormat::Zip {
         let mut has_spanned = false;
-        let mut has_strong = false;
+        let mut has_strong_single = false;
         for m in &final_members {
-            match probe_volume_structure(&m.path) {
-                VolumeProbeResult::MultiVolume(s) => {
-                    has_strong = true;
-                    if s.expected_volume_count.map_or(false, |c| c > 1) {
-                        has_spanned = true;
-                    }
+            if let VolumeProbeResult::MultiVolume(s) = probe_volume_structure(&m.path) {
+                if s.format == ArchiveFormat::Zip && s.expected_volume_count.map_or(false, |c| c > 1) {
+                    has_spanned = true;
                 }
-                VolumeProbeResult::Standalone(_) => {
-                    has_strong = true;
-                }
-                _ => {}
+            }
+            if matches!(probe_volume_structure(&m.path), VolumeProbeResult::Standalone(_)) {
+                has_strong_single = true;
             }
         }
         if has_spanned {
             Some(ZipSplitKind::Spanned)
-        } else if has_strong {
-            // Multiple physical files but EOCD says single disk -> raw byte split
+        } else if has_strong_single && final_members.len() > 1 {
+            // Single-disk EOCD but multiple physical files -> possible raw split, need cross-member verification
+            if is_zip_raw_logical_closure(&final_members) {
+                Some(ZipSplitKind::Raw)
+            } else {
+                Some(ZipSplitKind::Unknown)
+            }
+        } else if is_zip_raw_logical_closure(&final_members) {
             Some(ZipSplitKind::Raw)
         } else {
             Some(ZipSplitKind::Unknown)
@@ -780,6 +808,55 @@ fn probe_logical_index(path: &Path) -> Option<u32> {
         VolumeProbeResult::MultiVolume(s) => s.logical_volume_index,
         _ => None,
     }
+}
+fn is_zip_raw_logical_closure(members: &[VolumeMember]) -> bool {
+    if members.is_empty() { return false; }
+    // Order members by filename_ordinal for logical concatenation
+    let mut ordered = members.to_vec();
+    ordered.sort_by_key(|m| m.filename_ordinal.unwrap_or(0));
+    let total: u64 = ordered.iter().filter_map(|m| std::fs::metadata(&m.path).ok().map(|md| md.len())).sum();
+    if total < 22 { return false; }
+    // Read tail of last member to find EOCD
+    let last = &ordered[ordered.len() - 1];
+    let mut buf = vec![0u8; 8192.min(total as usize)];
+    // For raw split, EOCD is at logical end, which is at physical end of last member (since last member is tail)
+    // We can just search for EOCD near end of last file's content
+    let mut file = match std::fs::File::open(&last.path) { Ok(f) => f, Err(_) => return false };
+    let len = match file.metadata() { Ok(md) => md.len(), Err(_) => return false };
+    let search_len = std::cmp::min(len, 65557 + 22) as usize;
+    let start = len.saturating_sub(search_len as u64);
+    use std::io::{Read, Seek, SeekFrom};
+    if file.seek(SeekFrom::Start(start)).is_err() { return false; }
+    buf.truncate(search_len);
+    if file.read_exact(&mut buf).is_err() { return false; }
+    // Find EOCD
+    let mut eocd_pos: Option<usize> = None;
+    for i in (0..=buf.len().saturating_sub(4)).rev() {
+        if buf[i..i+4] == [0x50, 0x4b, 0x05, 0x06] {
+            if buf.len() >= i + 22 {
+                let comment_len = u16::from_le_bytes([buf[i+20], buf[i+21]]) as usize;
+                if i + 22 + comment_len == buf.len() {
+                    eocd_pos = Some(i);
+                    break;
+                }
+            }
+        }
+    }
+    let eocd_pos = match eocd_pos { Some(p) => p, None => return false };
+    let eocd = &buf[eocd_pos..];
+    if eocd.len() < 22 { return false; }
+    let this_disk = u16::from_le_bytes([eocd[4], eocd[5]]) as u32;
+    let cd_start_disk = u16::from_le_bytes([eocd[6], eocd[7]]) as u32;
+    let cd_size = u32::from_le_bytes([eocd[12], eocd[13], eocd[14], eocd[15]]) as u64;
+    let cd_offset = u32::from_le_bytes([eocd[16], eocd[17], eocd[18], eocd[19]]) as u64;
+    // For raw split, EOCD should be single-disk semantics
+    if this_disk != 0 || cd_start_disk != 0 { return false; }
+    // Logical EOCD position = total - 22 - comment_len
+    let comment_len = u16::from_le_bytes([eocd[20], eocd[21]]) as u64;
+    let logical_eocd_pos = total.saturating_sub(22 + comment_len);
+    if cd_offset + cd_size != logical_eocd_pos { return false; }
+    // Optionally verify CD signature at logical cd_offset (would require reading across members, skip for cheap)
+    true
 }
 
 fn try_fallback_hypothesis(
