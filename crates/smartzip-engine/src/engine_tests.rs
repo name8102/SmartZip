@@ -225,16 +225,6 @@ fn cbz_extension_is_not_a_business_container() {
 }
 
 #[test]
-fn recognizes_first_volume_rules() {
-    assert!(is_first_volume("archive.part1.rar"));
-    assert!(is_first_volume("archive.part01.rar"));
-    assert!(!is_first_volume("archive.part2.rar"));
-    assert!(is_first_volume("archive.001"));
-    assert!(!is_first_volume("archive.002"));
-    assert!(is_first_volume("archive.zip"));
-}
-
-#[test]
 fn nested_candidate_output_uses_archive_parent_as_global_output_root() {
     let managed_output = PathBuf::from("/managed-output");
     let root = ExtractionCandidate {
@@ -341,22 +331,6 @@ fn maps_common_extensions() {
 #[case("A.7Z", Some(ArchiveFormat::SevenZip))]
 fn format_from_extension_parametrized(#[case] path: &str, #[case] expected: Option<ArchiveFormat>) {
     assert_eq!(format_from_extension(path), expected);
-}
-
-#[rstest]
-#[case("archive.part1.rar", true)]
-#[case("archive.part01.rar", true)]
-#[case("archive.part2.rar", false)]
-#[case("archive.part5.rar", false)]
-#[case("archive.rar", true)]
-#[case("archive.001", true)]
-#[case("archive.002", false)]
-#[case("archive.010", false)]
-#[case("archive.zip", true)]
-#[case("archive.7z", true)]
-#[case("data.tar.gz", true)]
-fn is_first_volume_parametrized(#[case] path: &str, #[case] expected: bool) {
-    assert_eq!(is_first_volume(path), expected);
 }
 
 #[test]

@@ -430,43 +430,6 @@ pub(crate) fn discover_nested_candidates(
     candidates
 }
 
-pub fn is_first_volume(path: impl AsRef<std::path::Path>) -> bool {
-    let path = path.as_ref();
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-
-    if let Some(volume_index) = rar_part_volume_index(&file_name) {
-        return volume_index == 1;
-    }
-
-    if let Some(volume_index) = numeric_volume_index(path) {
-        return volume_index == 1;
-    }
-
-    true
-}
-
-pub(crate) fn rar_part_volume_index(file_name: &str) -> Option<u64> {
-    let stem = file_name.strip_suffix(".rar")?;
-    let part_index = stem.rfind(".part")?;
-    let suffix = &stem[part_index + ".part".len()..];
-    if suffix.is_empty() || !suffix.chars().all(|ch| ch.is_ascii_digit()) {
-        return None;
-    }
-    suffix.parse().ok()
-}
-
-pub(crate) fn numeric_volume_index(path: &Path) -> Option<u64> {
-    let extension = path.extension()?.to_str()?;
-    if extension.is_empty() || !extension.chars().all(|ch| ch.is_ascii_digit()) {
-        return None;
-    }
-    extension.parse().ok()
-}
-
 pub fn format_from_extension(path: impl AsRef<std::path::Path>) -> Option<ArchiveFormat> {
     let extension = path
         .as_ref()

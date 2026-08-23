@@ -431,11 +431,9 @@ pub(crate) async fn access_archive_with_password<B: ArchiveExecutor>(
     Ok(ArchiveAccessOutcome {
         password_id: accepted_password_id,
         has_password,
-        used_password,
         encoding_mode,
         listing,
         encrypted,
         events: Vec::new(),
-        password_prompt_cancelled,
     })
 }

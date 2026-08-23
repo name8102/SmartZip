@@ -68,6 +68,42 @@ pub enum VolumeResolution {
     },
 }
 
+/// One canonical volume-preparation result for list and extract callers.
+/// The materialized handle keeps canonical members alive until backend use ends.
+pub enum VolumePreparation {
+    Single(crate::types::ExtractionCandidate),
+    Resolved {
+        candidate: crate::types::ExtractionCandidate,
+        set: VolumeSet,
+        warnings: Vec<VolumeWarning>,
+        materialized: materialize::MaterializedVolumeSet,
+    },
+    Incomplete {
+        candidate: crate::types::ExtractionCandidate,
+        problem: VolumeProblem,
+    },
+    GroupingAmbiguous {
+        candidate: crate::types::ExtractionCandidate,
+        hypotheses: Vec<VolumeSetHypothesis>,
+    },
+    MaterializationFailed {
+        candidate: crate::types::ExtractionCandidate,
+        error: std::io::Error,
+    },
+}
+
+impl VolumePreparation {
+    pub fn candidate(&self) -> &crate::types::ExtractionCandidate {
+        match self {
+            Self::Single(candidate)
+            | Self::Incomplete { candidate, .. }
+            | Self::GroupingAmbiguous { candidate, .. }
+            | Self::MaterializationFailed { candidate, .. }
+            | Self::Resolved { candidate, .. } => candidate,
+        }
+    }
+}
+
 /// Shared resolver producing canonical outcomes.
 /// This is the single resolution layer for list/extract and nested candidates.
 /// Directory enumeration is cached within a task via DirectoryIndexCache.
@@ -266,33 +302,59 @@ impl VolumeResolver {
         VolumeResolution::Single
     }
 
-    /// Coalesce multiple explicit roots that resolve to same logical VolumeSet.
-    pub fn coalesce_roots(&mut self, roots: &[PathBuf]) -> Vec<VolumeSet> {
-        let mut seen_sets: Vec<VolumeSet> = Vec::new();
-        let mut single_paths = Vec::new();
-        for root in roots {
-            let candidate = crate::types::ExtractionCandidate {
-                path: root.clone(),
-                relative_path: root.clone(),
-                depth: 0,
-                source: crate::types::CandidateSource::RootInput,
-                detected_format: crate::nested::format_from_extension(root),
-                embedded_offset: None,
-                embedded_size: None,
-            };
-            match self.resolve(&candidate) {
-                VolumeResolution::Single => single_paths.push(root.clone()),
-                VolumeResolution::Resolved(set)
-                | VolumeResolution::ResolvedWithWarnings { set, .. } => {
-                    if !seen_sets.iter().any(|s| same_member_set(s, &set)) {
-                        seen_sets.push(set);
-                    }
+    /// Resolve and materialize one candidate through the shared integration path.
+    pub fn prepare(&mut self, candidate: crate::types::ExtractionCandidate) -> VolumePreparation {
+        let resolution = self.resolve(&candidate);
+        self.prepare_resolution(candidate, resolution)
+    }
+
+    /// Materialize a resolution already produced by this resolver. Root
+    /// coalescing uses this to avoid resolving the same explicit volume member
+    /// twice before the workflow loop.
+    pub fn prepare_resolution(
+        &mut self,
+        mut candidate: crate::types::ExtractionCandidate,
+        resolution: VolumeResolution,
+    ) -> VolumePreparation {
+        match resolution {
+            VolumeResolution::Single => VolumePreparation::Single(candidate),
+            VolumeResolution::Resolved(set) => prepare_resolved(&mut candidate, set, Vec::new()),
+            VolumeResolution::ResolvedWithWarnings { set, warnings } => {
+                prepare_resolved(&mut candidate, set, warnings)
+            }
+            VolumeResolution::Incomplete(problem) => {
+                VolumePreparation::Incomplete { candidate, problem }
+            }
+            VolumeResolution::GroupingAmbiguous { hypotheses } => {
+                VolumePreparation::GroupingAmbiguous {
+                    candidate,
+                    hypotheses,
                 }
-                _ => {}
             }
         }
-        // Return coalesced sets plus singles as single-member sets? For now just return volume sets.
-        seen_sets
+    }
+}
+
+fn prepare_resolved(
+    candidate: &mut crate::types::ExtractionCandidate,
+    set: VolumeSet,
+    warnings: Vec<VolumeWarning>,
+) -> VolumePreparation {
+    match materialize::materialize_volume_set(&set) {
+        Ok(materialized) => {
+            candidate.path = materialized.canonical_entrypoint.clone();
+            candidate.detected_format = Some(set.format.clone());
+            VolumePreparation::Resolved {
+                candidate: candidate.clone(),
+                set,
+                warnings,
+                materialized,
+            }
+        }
+        Err(error) => VolumePreparation::MaterializationFailed {
+            candidate: candidate.clone(),
+            error,
+        },
     }
 }
 
@@ -1234,20 +1296,6 @@ fn try_fallback_hypothesis(
     None
 }
 
-fn try_fallback_zip_rar(
-    seed_path: &Path,
-    index: &DirectoryVolumeIndex,
-    probe: &VolumeProbeResult,
-) -> Option<VolumeSet> {
-    // Legacy entry kept for tests; now delegates to hypothesis path for validation.
-    let hyp = try_fallback_hypothesis(seed_path, index, probe)?;
-    // This legacy path is no longer used for direct Resolved return; kept for compatibility.
-    // Convert hypothesis to VolumeSet via same logic as resolve_hypothesis would, but without probe-dependent clipping.
-    // For now, return None to force hypothesis path.
-    let _ = hyp;
-    None
-}
-
 fn zip_fallback_hypothesis(
     seed_base: &str,
     index: &DirectoryVolumeIndex,
@@ -1340,141 +1388,6 @@ fn rar_old_fallback_hypothesis(
 fn split_base_ext(normalized: &str) -> Option<(&str, &str)> {
     let pos = normalized.rfind('.')?;
     Some((&normalized[..pos], &normalized[pos + 1..]))
-}
-
-fn zip_fallback_collect(
-    seed_base: &str,
-    index: &DirectoryVolumeIndex,
-    _probe: &VolumeProbeResult,
-) -> Option<VolumeSet> {
-    let mut members: Vec<(u64, PathBuf)> = Vec::new();
-    let mut max_z: Option<u64> = None;
-    for file in &index.files {
-        let Some((base, ext)) = split_base_ext(&file.normalized_name) else {
-            continue;
-        };
-        if base != seed_base {
-            continue;
-        }
-        if ext == "zip" {
-            // defer ordinal assignment until we know max_z
-            continue;
-        }
-        if ext.starts_with('z') && ext.len() > 1 && ext[1..].chars().all(|c| c.is_ascii_digit()) {
-            if let Ok(v) = ext[1..].parse::<u64>() {
-                // z01 -> 1, etc. Keep as is, but avoid 0? zip's z01 is 1, consistent.
-                members.push((v, file.path.clone()));
-                max_z = Some(max_z.map_or(v, |m| m.max(v)));
-            }
-        }
-    }
-    // Collect zip last
-    let mut zip_path: Option<PathBuf> = None;
-    for file in &index.files {
-        let Some((base, ext)) = split_base_ext(&file.normalized_name) else {
-            continue;
-        };
-        if base == seed_base && ext == "zip" {
-            zip_path = Some(file.path.clone());
-            break;
-        }
-    }
-    // If we have at least one z* and a zip, we have a split set.
-    // Edge: if only zip and no z*, but probe says multivolume, we would have returned Incomplete earlier; fallback not needed.
-    // For 2-member zip split (z01 + zip), members currently has 1 (z01), add zip as max+1
-    if let Some(zip) = zip_path {
-        let zip_ord = max_z.map_or(1, |m| m + 1);
-        members.push((zip_ord, zip));
-    } else if members.is_empty() {
-        return None;
-    }
-    if members.len() < 2 {
-        return None;
-    }
-    members.sort_by_key(|(ord, _)| *ord);
-    // Check for duplicate ordinals -> would be grouping ambiguous, but fallback currently assumes unique.
-    let mut seen = std::collections::HashSet::new();
-    for (ord, _) in &members {
-        if !seen.insert(*ord) {
-            return None;
-        }
-    }
-    let format = ArchiveFormat::Zip;
-    let volume_members: Vec<VolumeMember> = members
-        .into_iter()
-        .map(|(ord, path)| VolumeMember {
-            path: path.clone(),
-            filename_ordinal: Some(ord),
-            logical_index: probe_logical_index(&path, &ArchiveFormat::Zip),
-        })
-        .collect();
-    let entrypoint = volume_members
-        .last()
-        .map(|m| m.path.clone())
-        .unwrap_or_else(|| volume_members[0].path.clone());
-    Some(VolumeSet {
-        format,
-        entrypoint,
-        members: volume_members,
-        expected_volume_count: None,
-        expected_logical_size: None,
-        zip_kind: Some(ZipSplitKind::Spanned),
-    })
-}
-
-fn rar_old_fallback_collect(
-    seed_base: &str,
-    index: &DirectoryVolumeIndex,
-    _probe: &VolumeProbeResult,
-) -> Option<VolumeSet> {
-    let mut members: Vec<(u64, PathBuf)> = Vec::new();
-    for file in &index.files {
-        let Some((base, ext)) = split_base_ext(&file.normalized_name) else {
-            continue;
-        };
-        if base != seed_base {
-            continue;
-        }
-        if ext == "rar" {
-            members.push((0, file.path.clone()));
-        } else if ext.starts_with('r')
-            && ext.len() == 3
-            && ext[1..].chars().all(|c| c.is_ascii_digit())
-        {
-            if let Ok(v) = ext[1..].parse::<u64>() {
-                // r00 -> 1, r01 ->2 etc., to keep rar=0 as first
-                members.push((v + 1, file.path.clone()));
-            }
-        }
-    }
-    if members.len() < 2 {
-        return None;
-    }
-    members.sort_by_key(|(ord, _)| *ord);
-    let mut seen = std::collections::HashSet::new();
-    for (ord, _) in &members {
-        if !seen.insert(*ord) {
-            return None;
-        }
-    }
-    let format = ArchiveFormat::Rar;
-    let volume_members: Vec<VolumeMember> = members
-        .into_iter()
-        .map(|(ord, path)| VolumeMember {
-            path: path.clone(),
-            filename_ordinal: Some(ord),
-            logical_index: probe_logical_index(&path, &ArchiveFormat::Rar),
-        })
-        .collect();
-    let entrypoint = volume_members[0].path.clone();
-    Some(VolumeSet {
-        format,
-        entrypoint,
-        members: volume_members,
-        expected_volume_count: None,
-        expected_logical_size: None,
-        zip_kind: None,
-    })
 }
 
 enum CandidateElimination {
@@ -2051,21 +1964,6 @@ mod tests {
             VolumeResolution::Single => {}
             other => panic!("jpeg sequence should be Single, got {:?}", other),
         }
-    }
-    #[test]
-    fn root_coalescing_same_set() {
-        let dir = TempDir::new().unwrap();
-        let p1 = dir.path().join("coalesce.part01.rar");
-        let p2 = dir.path().join("coalesce.part02.rar");
-        let p3 = dir.path().join("coalesce.part03.rar");
-        for p in &[&p1, &p2, &p3] {
-            create_fake_rar(p);
-        }
-        let mut resolver = VolumeResolver::new();
-        let roots = vec![p1.clone(), p2.clone(), p3.clone()];
-        let coalesced = resolver.coalesce_roots(&roots);
-        assert_eq!(coalesced.len(), 1);
-        assert_eq!(coalesced[0].members.len(), 3);
     }
     #[test]
     fn prefix_suffix_clipping_via_strong_evidence() {

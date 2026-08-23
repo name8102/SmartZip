@@ -5,10 +5,9 @@ use crate::unrar::{UnrarBackend, UnrarLocator};
 use async_trait::async_trait;
 use smartzip_config::{AdapterFamily, BackendConfig, BackendInstallation};
 use smartzip_core::{
-    ArchiveFacts, ArchiveFormat, ArchiveOperation, ArchiveRequirement, ArchiveRequirements,
-    BackendCapabilityProfile, CapabilityId, CapabilityRule, NegativeCapabilityKey, RejectedAdapter,
-    RequirementClass, Result, RouteCandidate, RouteEvent, RoutePlan, SmartZipError, SupportState,
-    TaskEventSink, TaskExecutionContext, TaskId,
+    AdapterCapabilities, ArchiveFacts, ArchiveFormat, ArchiveOperation, ArchiveRequirements,
+    NegativeCapabilityKey, RejectedAdapter, Result, RouteCandidate, RouteEvent, RoutePlan,
+    SmartZipError, TaskEventSink, TaskExecutionContext, TaskId,
 };
 use std::collections::HashSet;
 use std::future::Future;
@@ -19,7 +18,7 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub struct AdapterRegistration {
     pub adapter: Arc<dyn ArchiveAdapter>,
-    pub profile: BackendCapabilityProfile,
+    pub capabilities: AdapterCapabilities,
     pub priority: i32,
 }
 
@@ -28,7 +27,7 @@ impl std::fmt::Debug for AdapterRegistration {
         formatter
             .debug_struct("AdapterRegistration")
             .field("adapter_id", &self.adapter.id())
-            .field("profile", &self.profile)
+            .field("capabilities", &self.capabilities)
             .field("priority", &self.priority)
             .finish()
     }
@@ -37,19 +36,19 @@ impl std::fmt::Debug for AdapterRegistration {
 impl AdapterRegistration {
     pub fn new(
         adapter: impl ArchiveAdapter + 'static,
-        profile: BackendCapabilityProfile,
+        capabilities: AdapterCapabilities,
         priority: i32,
     ) -> Self {
         Self {
             adapter: Arc::new(adapter),
-            profile,
+            capabilities,
             priority,
         }
     }
 
     pub fn from_adapter(adapter: impl ArchiveAdapter + 'static, priority: i32) -> Self {
-        let profile = adapter.profile();
-        Self::new(adapter, profile, priority)
+        let capabilities = adapter.capabilities();
+        Self::new(adapter, capabilities, priority)
     }
 }
 
@@ -83,24 +82,12 @@ impl BackendRouter {
         let explicit_paths: HashSet<PathBuf> = config
             .installations
             .iter()
-            .filter(|entry| !matches!(entry.family, AdapterFamily::NativeZip))
             .map(|entry| resolve_executable(&entry.executable))
             .collect();
         let mut registered_paths = HashSet::new();
         let mut warnings = Vec::new();
 
         for installation in config.installations.iter().filter(|entry| entry.enabled) {
-            // NativeZip no longer participates as a generic archive backend;
-            // its only remaining role is ZIP raw filename reading for encoding
-            // detection via a dedicated helper. Ignore any NativeZip
-            // installations in config but warn so users know they are ignored.
-            if matches!(installation.family, AdapterFamily::NativeZip) {
-                warnings.push(format!(
-                    "backend {} family native-zip is deprecated and ignored; ZIP handling is now via SevenZip",
-                    installation.id
-                ));
-                continue;
-            }
             let executable = resolve_executable(&installation.executable);
             if !registered_paths.insert(executable.clone()) {
                 warnings.push(format!(
@@ -110,31 +97,17 @@ impl BackendRouter {
                 continue;
             }
             check_declared_version(installation, &mut warnings);
-            let configured_profile = config.profile_for(installation).map_err(|detail| {
-                SmartZipError::BackendProtocolError {
-                    backend: installation.id.clone(),
-                    detail,
-                }
-            })?;
             let registration = match &installation.family {
-                AdapterFamily::SevenZipCli => configured_registration(
+                AdapterFamily::SevenZipCli => AdapterRegistration::new(
                     SevenZipBackend::new(executable).with_id(installation.id.clone()),
-                    installation,
-                    &configured_profile,
-                )?,
-                AdapterFamily::UnrarCli => configured_registration(
+                    seven_zip_capabilities(),
+                    installation.priority,
+                ),
+                AdapterFamily::UnrarCli => AdapterRegistration::new(
                     UnrarBackend::new(executable).with_id(installation.id.clone()),
-                    installation,
-                    &configured_profile,
-                )?,
-                AdapterFamily::NativeZip => unreachable!("handled above"),
-                AdapterFamily::Custom(family) => {
-                    warnings.push(format!(
-                        "backend {} uses unavailable adapter family {family}",
-                        installation.id
-                    ));
-                    continue;
-                }
+                    unrar_capabilities(),
+                    installation.priority,
+                ),
             };
             adapters.push(registration);
         }
@@ -145,7 +118,6 @@ impl BackendRouter {
                         UnrarBackend::new(executable.clone()),
                         "unrar-cli",
                         &executable,
-                        config,
                         20,
                         &mut warnings,
                     ));
@@ -157,7 +129,6 @@ impl BackendRouter {
                         SevenZipBackend::new(executable.clone()),
                         "sevenzip-cli",
                         &executable,
-                        config,
                         10,
                         &mut warnings,
                     ));
@@ -191,14 +162,9 @@ impl BackendRouter {
         facts: &ArchiveFacts,
         mut intent: ArchiveRequirements,
     ) -> RoutePlan {
-        intent
-            .items
-            .extend(ArchiveRequirements::from_facts(facts).items);
-        self.plan(
-            operation,
-            facts.container.as_ref().map(|fact| &fact.value),
-            intent,
-        )
+        let facts_requirements = ArchiveRequirements::from_facts(facts);
+        intent.codecs.extend(facts_requirements.codecs);
+        self.plan(operation, facts.container.as_ref(), intent)
     }
 
     pub fn plan(
@@ -219,23 +185,18 @@ impl BackendRouter {
     ) -> RoutePlan {
         let mut candidates = Vec::new();
         let mut rejected = Vec::new();
+        let container_value = container.cloned();
 
         for registration in &self.adapters {
             let adapter_id = registration.adapter.id();
             let mut reasons = Vec::new();
             if let Some(forced) = self.forced_adapter.as_deref() {
                 if forced == adapter_id {
-                    candidates.push((
-                        RouteCandidate {
-                            adapter_id: adapter_id.to_owned(),
-                            priority: registration.priority,
-                            notes: vec![
-                                "forced for diagnostics; compatibility filters bypassed".into()
-                            ],
-                        },
-                        0,
-                        0,
-                    ));
+                    candidates.push(RouteCandidate {
+                        adapter_id: adapter_id.to_owned(),
+                        priority: registration.priority,
+                        notes: vec!["forced for diagnostics; compatibility filters bypassed".into()],
+                    });
                     continue;
                 }
                 reasons.push(format!("forced adapter is {forced}"));
@@ -244,95 +205,51 @@ impl BackendRouter {
             let negative = NegativeCapabilityKey {
                 adapter_id: adapter_id.to_owned(),
                 operation,
-                container: container.cloned(),
-                capability: None,
+                container: container_value.clone(),
+                codec: None,
             };
             if let Some(context) = context {
                 if let Some(reason) = context.rejection(&negative) {
                     reasons.push(format!("task-local incompatibility: {reason}"));
                 }
-                for requirement in &requirements.items {
-                    let feature_negative = NegativeCapabilityKey {
+                for codec in &requirements.codecs {
+                    let codec_negative = NegativeCapabilityKey {
                         adapter_id: adapter_id.to_owned(),
                         operation,
-                        container: container.cloned(),
-                        capability: Some(requirement.capability.clone()),
+                        container: container_value.clone(),
+                        codec: Some(codec.clone()),
                     };
-                    if let Some(reason) = context.rejection(&feature_negative) {
+                    if let Some(reason) = context.rejection(&codec_negative) {
                         reasons.push(format!(
-                            "task-local incompatibility for {}: {reason}",
-                            requirement.capability
+                            "task-local incompatibility for codec {codec}: {reason}"
                         ));
                     }
                 }
             }
 
-            let operation_capability = capability_id("operation", operation_name(operation));
-            reject_unsupported(
-                &registration.profile,
-                &operation_capability,
-                operation,
-                container,
-                "operation",
-                &mut reasons,
-            );
-            if let Some(container) = container {
-                let container_capability = capability_id("container", container.as_str());
-                reject_unsupported(
-                    &registration.profile,
-                    &container_capability,
-                    operation,
-                    Some(container),
-                    "container",
-                    &mut reasons,
-                );
+            if !registration.capabilities.supports(operation, container) {
+                reasons.push(match container {
+                    Some(container) => format!(
+                        "operation/container {operation:?}/{} is unsupported",
+                        container.as_str()
+                    ),
+                    None => format!("operation {operation:?} is unsupported"),
+                });
             }
-
-            let mut known_supported = 0;
-            let mut preferred = 0;
-            let mut notes = Vec::new();
-            for requirement in &requirements.items {
-                let support =
-                    registration
-                        .profile
-                        .support(&requirement.capability, operation, container);
-                match (&requirement.class, support) {
-                    (RequirementClass::Required, SupportState::Unsupported) => {
-                        reasons.push(format!(
-                            "{} is unsupported ({})",
-                            requirement.capability, requirement.reason
-                        ))
-                    }
-                    (RequirementClass::Required, SupportState::Conditional { conditions })
-                        if !conditions
-                            .iter()
-                            .all(|condition| requirement.conditions.contains(condition)) =>
-                    {
-                        reasons.push(format!(
-                            "{} requires conditions: {}",
-                            requirement.capability,
-                            conditions.join(", ")
-                        ));
-                    }
-                    (RequirementClass::Required, SupportState::Supported) => known_supported += 1,
-                    (RequirementClass::Preferred, SupportState::Supported) => preferred += 1,
-                    (RequirementClass::Required, SupportState::Unknown) => {
-                        notes.push(format!("{} support is unknown", requirement.capability))
-                    }
-                    _ => {}
-                }
+            if requirements.password && !registration.capabilities.supports_passwords {
+                reasons.push("password handling is unsupported".into());
+            }
+            if requirements.charset_override && !registration.capabilities.supports_charset_override
+            {
+                reasons.push("charset override is unsupported".into());
             }
 
             if reasons.is_empty() {
-                candidates.push((
-                    RouteCandidate {
-                        adapter_id: adapter_id.to_owned(),
-                        priority: registration.priority,
-                        notes,
-                    },
-                    known_supported,
-                    preferred,
-                ));
+                candidates.push(RouteCandidate {
+                    adapter_id: adapter_id.to_owned(),
+                    priority: registration.priority,
+                    notes: Vec::new(),
+                });
             } else {
                 rejected.push(RejectedAdapter {
                     adapter_id: adapter_id.to_owned(),
@@ -341,22 +258,17 @@ impl BackendRouter {
             }
         }
 
-        candidates.sort_by(
-            |(left, left_supported, left_preferred), (right, right_supported, right_preferred)| {
-                right_supported
-                    .cmp(left_supported)
-                    .then_with(|| right_preferred.cmp(left_preferred))
-                    .then_with(|| right.priority.cmp(&left.priority))
-                    .then_with(|| left.adapter_id.cmp(&right.adapter_id))
-            },
-        );
+        candidates.sort_by(|left, right| {
+            right
+                .priority
+                .cmp(&left.priority)
+                .then_with(|| left.adapter_id.cmp(&right.adapter_id))
+        });
         let plan = RoutePlan {
             operation,
+            container: container_value,
             requirements,
-            candidates: candidates
-                .into_iter()
-                .map(|(candidate, _, _)| candidate)
-                .collect(),
+            candidates,
             rejected,
             forced_adapter: self.forced_adapter.clone(),
         };
@@ -384,21 +296,11 @@ impl BackendRouter {
         container: Option<ArchiveFormat>,
         error: &SmartZipError,
     ) {
-        let (reason, capability) = match error {
+        let (reason, codec) = match error {
             SmartZipError::UnsupportedContainer { .. } => ("unsupported container", None),
             SmartZipError::UnsupportedCodec {
                 codec: Some(codec), ..
-            } => {
-                let identifier = if codec.contains(':') {
-                    CapabilityId::new(codec.clone())
-                } else {
-                    CapabilityId::new(format!("codec:{codec}"))
-                };
-                let Ok(identifier) = identifier else {
-                    return;
-                };
-                ("unsupported codec", Some(identifier))
-            }
+            } => ("unsupported codec", Some(codec.clone())),
             // A codec observation without an exact feature is not safe to cache.
             SmartZipError::UnsupportedCodec { codec: None, .. } => return,
             _ => return,
@@ -408,7 +310,7 @@ impl BackendRouter {
                 adapter_id: adapter_id.to_owned(),
                 operation,
                 container,
-                capability,
+                codec,
             },
             reason,
         );
@@ -507,8 +409,7 @@ impl BackendRouter {
     ) -> Result<ExtractArchiveResult> {
         let container = facts
             .container
-            .as_ref()
-            .map(|fact| fact.value.clone())
+            .clone()
             .or_else(|| infer_format(request.format.clone(), &request.archive));
         let mut requirements = request_requirements(
             ArchiveOperation::Extract,
@@ -516,9 +417,7 @@ impl BackendRouter {
             request.password.as_deref(),
             Some(&request.encoding),
         );
-        requirements
-            .items
-            .extend(ArchiveRequirements::from_facts(facts).items);
+        requirements.codecs.extend(facts.codecs.clone());
         self.extract_isolated_planned(
             request,
             container,
@@ -568,15 +467,10 @@ impl BackendRouter {
         );
         let mut attempted = Vec::new();
         let mut last_error = None;
-        // OutputMaterializer owns the caller directory. Each adapter receives
-        // an independent sibling attempt directory, never a nested temp root;
-        // only the selected tree is moved into the materializer's directory.
+        // The caller (normally OutputMaterializer) owns this staging directory.
+        // Adapters share it one at a time; failed attempts clear its contents
+        // before fallback, so the router owns no second temporary hierarchy.
         ensure_empty_output_dir(&request.output_dir)?;
-        let parent = request
-            .output_dir
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from("."));
 
         for candidate in &plan.candidates {
             if token.is_cancelled() {
@@ -586,13 +480,6 @@ impl BackendRouter {
                 .registration(&candidate.adapter_id)
                 .expect("planned adapter must remain registered");
             attempted.push(candidate.adapter_id.clone());
-            let attempt = tempfile::Builder::new()
-                .prefix(".smartzip-attempt-")
-                .tempdir_in(&parent)
-                .map_err(|source| SmartZipError::io(Some(parent.clone()), source))?;
-            let attempt_dir = attempt.path().to_path_buf();
-            let mut attempt_request = request.clone();
-            attempt_request.output_dir = attempt_dir.clone();
             self.emit(
                 context.as_ref(),
                 RouteEvent::BackendAttemptStarted {
@@ -607,12 +494,10 @@ impl BackendRouter {
             // future prematurely.
             let result = registration
                 .adapter
-                .extract_with_context(attempt_request, std::sync::Arc::clone(&context))
+                .extract_with_context(request.clone(), std::sync::Arc::clone(&context))
                 .await;
             match result {
                 Ok(_) => {
-                    move_attempt_output(&attempt_dir, &request.output_dir)?;
-                    close_attempt(attempt, &attempt_dir)?;
                     self.emit(
                         context.as_ref(),
                         RouteEvent::BackendSelected {
@@ -632,15 +517,9 @@ impl BackendRouter {
                         },
                     );
                     // Backend contract: on Cancelled the process tree is
-                    // already stopped and no longer writing to attempt_dir.
-                    // Do deterministic cleanup and surface any cleanup error
-                    // instead of silently dropping the TempDir. Only emit
-                    // BackendAttemptCleaned after the directory is actually
-                    // removed.
-                    let cleanup_result = close_attempt(attempt, &attempt_dir);
-                    if let Err(cleanup_err) = cleanup_result {
-                        return Err(cleanup_err);
-                    }
+                    // already stopped and no longer writing to output_dir.
+                    // Clear and verify before any retry.
+                    clear_attempt_output(&request.output_dir)?;
                     self.emit(
                         context.as_ref(),
                         RouteEvent::BackendAttemptCleaned {
@@ -844,62 +723,59 @@ impl ArchiveExecutor for BackendRouter {
     }
 }
 
-fn configured_registration<A: ArchiveAdapter + 'static>(
-    adapter: A,
-    installation: &BackendInstallation,
-    configured_profile: &BackendCapabilityProfile,
-) -> Result<AdapterRegistration> {
-    let mut profile = adapter.profile();
-    // `configured_profile` is already family -> version -> installation ordered.
-    // Appending preserves that layer precedence after the built-in family baseline.
-    profile
-        .rules
-        .extend(configured_profile.rules.iter().cloned().map(|mut rule| {
-            rule.precedence = rule.precedence.saturating_add(1);
-            rule
-        }));
-    Ok(AdapterRegistration::new(
-        adapter,
-        profile,
-        installation.priority,
-    ))
-}
-
 fn discovered_registration<A: ArchiveAdapter + 'static>(
     adapter: A,
     family_key: &str,
     executable: &Path,
-    config: &BackendConfig,
     priority: i32,
     warnings: &mut Vec<String>,
 ) -> AdapterRegistration {
-    let mut profile = adapter.profile();
-    if let Some(family) = config.family_profiles.get(family_key) {
-        profile
-            .rules
-            .extend(family.rules.iter().cloned().map(|mut rule| {
-                rule.precedence = 1;
-                rule
-            }));
-    }
-    match identify_version(executable, family_key) {
-        Ok(version) => {
-            let key = format!("{family_key}@{version}");
-            if let Some(version_profile) = config.version_profiles.get(&key) {
-                profile
-                    .rules
-                    .extend(version_profile.rules.iter().cloned().map(|mut rule| {
-                        rule.precedence = 2;
-                        rule
-                    }));
-            }
-        }
-        Err(error) => warnings.push(format!(
-            "auto-discovered backend {} version command failed ({error}); family profile remains active",
+    if let Err(error) = identify_version(executable, family_key) {
+        warnings.push(format!(
+            "auto-discovered backend {} version command failed ({error})",
             executable.display()
-        )),
+        ));
     }
-    AdapterRegistration::new(adapter, profile, priority)
+    AdapterRegistration::from_adapter(adapter, priority)
+}
+
+pub(crate) fn seven_zip_capabilities() -> AdapterCapabilities {
+    AdapterCapabilities {
+        operations: vec![
+            ArchiveOperation::Probe,
+            ArchiveOperation::List,
+            ArchiveOperation::Test,
+            ArchiveOperation::Extract,
+            ArchiveOperation::Compress,
+        ],
+        containers: vec![
+            ArchiveFormat::Zip,
+            ArchiveFormat::SevenZip,
+            ArchiveFormat::Rar,
+            ArchiveFormat::Tar,
+            ArchiveFormat::Gzip,
+            ArchiveFormat::Bzip2,
+            ArchiveFormat::Xz,
+            ArchiveFormat::Zstd,
+            ArchiveFormat::Cab,
+        ],
+        supports_passwords: true,
+        supports_charset_override: true,
+    }
+}
+
+pub(crate) fn unrar_capabilities() -> AdapterCapabilities {
+    AdapterCapabilities {
+        operations: vec![
+            ArchiveOperation::Probe,
+            ArchiveOperation::List,
+            ArchiveOperation::Test,
+            ArchiveOperation::Extract,
+        ],
+        containers: vec![ArchiveFormat::Rar],
+        supports_passwords: true,
+        supports_charset_override: false,
+    }
 }
 
 fn identify_version(executable: &Path, family_key: &str) -> std::io::Result<String> {
@@ -961,233 +837,33 @@ fn check_declared_version(installation: &BackendInstallation, warnings: &mut Vec
             }
         }
         Ok(_) => warnings.push(format!(
-            "backend {} version command failed; configured profile remains active",
+            "backend {} version command failed; configured adapter remains active",
             installation.id
         )),
         Err(error) => warnings.push(format!(
-            "backend {} version command failed ({error}); configured profile remains active",
+            "backend {} version command failed ({error}); configured adapter remains active",
             installation.id
         )),
-    }
-}
-
-fn reject_unsupported(
-    profile: &BackendCapabilityProfile,
-    capability: &CapabilityId,
-    operation: ArchiveOperation,
-    container: Option<&ArchiveFormat>,
-    kind: &str,
-    reasons: &mut Vec<String>,
-) {
-    if matches!(
-        profile.support(capability, operation, container),
-        SupportState::Unsupported
-    ) {
-        reasons.push(format!("{kind} {} is unsupported", capability));
     }
 }
 
 fn base_requirements(
-    operation: ArchiveOperation,
-    container: Option<&ArchiveFormat>,
+    _operation: ArchiveOperation,
+    _container: Option<&ArchiveFormat>,
 ) -> ArchiveRequirements {
-    let mut items = vec![ArchiveRequirement {
-        capability: capability_id("operation", operation_name(operation)),
-        class: RequirementClass::Required,
-        conditions: Vec::new(),
-        reason: "requested operation".into(),
-    }];
-    if let Some(container) = container {
-        items.push(ArchiveRequirement {
-            capability: capability_id("container", container.as_str()),
-            class: RequirementClass::Required,
-            conditions: Vec::new(),
-            reason: "archive container".into(),
-        });
-    }
-    ArchiveRequirements { items }
+    ArchiveRequirements::default()
 }
 
 fn request_requirements(
-    operation: ArchiveOperation,
-    container: Option<&ArchiveFormat>,
+    _operation: ArchiveOperation,
+    _container: Option<&ArchiveFormat>,
     password: Option<&str>,
     encoding: Option<&smartzip_core::EncodingMode>,
 ) -> ArchiveRequirements {
-    let mut requirements = base_requirements(operation, container);
-    if password.is_some_and(|password| !password.is_empty()) {
-        requirements.items.push(ArchiveRequirement {
-            capability: capability_id("password", "provided"),
-            class: RequirementClass::Required,
-            conditions: Vec::new(),
-            reason: "caller supplied a password".into(),
-        });
-    }
-    if matches!(encoding, Some(smartzip_core::EncodingMode::Override(_))) {
-        requirements.items.push(ArchiveRequirement {
-            capability: capability_id("metadata", "charset-override"),
-            class: RequirementClass::Required,
-            conditions: Vec::new(),
-            reason: "caller requested a filename charset override".into(),
-        });
-    }
-    requirements
-}
-
-pub(crate) fn builtin_profile(
-    probe: &[ArchiveFormat],
-    list: &[ArchiveFormat],
-    test: &[ArchiveFormat],
-    extract: &[ArchiveFormat],
-    compress: &[ArchiveFormat],
-    supports_passwords: bool,
-) -> BackendCapabilityProfile {
-    let mut rules = Vec::new();
-    rules.push(global_rule(
-        capability_id("operation", "probe"),
-        ArchiveOperation::Probe,
-        !probe.is_empty(),
-    ));
-    rules.push(global_rule(
-        capability_id("operation", "list"),
-        ArchiveOperation::List,
-        !list.is_empty(),
-    ));
-    rules.push(global_rule(
-        capability_id("operation", "test"),
-        ArchiveOperation::Test,
-        !test.is_empty(),
-    ));
-    rules.push(global_rule(
-        capability_id("operation", "extract"),
-        ArchiveOperation::Extract,
-        !extract.is_empty(),
-    ));
-    rules.push(global_rule(
-        capability_id("operation", "compress"),
-        ArchiveOperation::Compress,
-        !compress.is_empty(),
-    ));
-    for operation in [
-        ArchiveOperation::List,
-        ArchiveOperation::Test,
-        ArchiveOperation::Extract,
-    ] {
-        rules.push(global_rule(
-            capability_id("password", "provided"),
-            operation,
-            supports_passwords,
-        ));
-    }
-    for format in probe {
-        rules.push(container_rule(format.clone(), ArchiveOperation::Probe));
-    }
-    for format in list {
-        rules.push(container_rule(format.clone(), ArchiveOperation::List));
-    }
-    for format in test {
-        rules.push(container_rule(format.clone(), ArchiveOperation::Test));
-    }
-    for format in extract {
-        rules.push(container_rule(format.clone(), ArchiveOperation::Extract));
-    }
-    for format in compress {
-        rules.push(container_rule(format.clone(), ArchiveOperation::Compress));
-    }
-    BackendCapabilityProfile { rules }
-}
-
-/// Make a specialized built-in adapter explicitly reject known containers it
-/// does not implement. Without these rules, an omitted container claim is
-/// `Unknown` and remains routable, which can put a terminal adapter such as
-/// unrar after 7z for unrelated formats.
-pub(crate) fn restrict_profile_to_containers(
-    profile: &mut BackendCapabilityProfile,
-    supported: &[ArchiveFormat],
-) {
-    for format in [
-        ArchiveFormat::Zip,
-        ArchiveFormat::SevenZip,
-        ArchiveFormat::Rar,
-        ArchiveFormat::Tar,
-        ArchiveFormat::Gzip,
-        ArchiveFormat::Bzip2,
-        ArchiveFormat::Xz,
-        ArchiveFormat::Cab,
-        ArchiveFormat::Iso,
-        ArchiveFormat::Dmg,
-        ArchiveFormat::Zstd,
-        ArchiveFormat::Lz4,
-        ArchiveFormat::Lzma,
-    ] {
-        if supported.contains(&format) {
-            continue;
-        }
-        for operation in [
-            ArchiveOperation::Probe,
-            ArchiveOperation::List,
-            ArchiveOperation::Test,
-            ArchiveOperation::Extract,
-        ] {
-            profile.rules.push(container_rule_with_support(
-                format.clone(),
-                operation,
-                SupportState::Unsupported,
-            ));
-        }
-    }
-}
-
-fn global_rule(
-    capability: CapabilityId,
-    operation: ArchiveOperation,
-    supported: bool,
-) -> CapabilityRule {
-    CapabilityRule {
-        capability,
-        precedence: 0,
-        operations: vec![operation],
-        containers: Vec::new(),
-        support: if supported {
-            SupportState::Supported
-        } else {
-            SupportState::Unsupported
-        },
-        evidence: Some("adapter family baseline".into()),
-    }
-}
-
-fn container_rule(format: ArchiveFormat, operation: ArchiveOperation) -> CapabilityRule {
-    container_rule_with_support(format, operation, SupportState::Supported)
-}
-
-fn container_rule_with_support(
-    format: ArchiveFormat,
-    operation: ArchiveOperation,
-    support: SupportState,
-) -> CapabilityRule {
-    CapabilityRule {
-        capability: capability_id("container", format.as_str()),
-        precedence: 0,
-        operations: vec![operation],
-        containers: vec![format],
-        support,
-        evidence: Some("adapter family baseline".into()),
-    }
-}
-
-fn capability_id(namespace: &str, name: &str) -> CapabilityId {
-    CapabilityId::new(format!("{namespace}:{name}"))
-        .expect("built-in capability identifiers are valid")
-}
-
-fn operation_name(operation: ArchiveOperation) -> &'static str {
-    match operation {
-        ArchiveOperation::Probe => "probe",
-        ArchiveOperation::List => "list",
-        ArchiveOperation::Test => "test",
-        ArchiveOperation::Extract => "extract",
-        ArchiveOperation::Compress => "compress",
+    ArchiveRequirements {
+        password: password.is_some_and(|password| !password.is_empty()),
+        charset_override: matches!(encoding, Some(smartzip_core::EncodingMode::Override(_))),
+        ..ArchiveRequirements::default()
     }
 }
 
@@ -1218,13 +894,10 @@ fn error_class(error: &SmartZipError) -> &'static str {
 }
 
 fn no_compatible_backend(operation: ArchiveOperation, plan: &RoutePlan) -> SmartZipError {
-    let requirements = plan
-        .requirements
-        .items
-        .iter()
-        .map(|requirement| requirement.capability.as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
+    let requirements = format!(
+        "password={}, charset_override={}, codecs={:?}",
+        plan.requirements.password, plan.requirements.charset_override, plan.requirements.codecs
+    );
     let rejected = plan
         .rejected
         .iter()
@@ -1264,30 +937,30 @@ fn ensure_empty_output_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn close_attempt(attempt: tempfile::TempDir, path: &Path) -> Result<()> {
-    attempt
-        .close()
-        .map_err(|source| SmartZipError::io(Some(path.to_path_buf()), source))?;
-    if path.exists() {
+fn clear_attempt_output(path: &Path) -> Result<()> {
+    for entry in std::fs::read_dir(path)
+        .map_err(|source| SmartZipError::io(Some(path.to_path_buf()), source))?
+    {
+        let entry = entry.map_err(|source| SmartZipError::io(Some(path.to_path_buf()), source))?;
+        let entry_path = entry.path();
+        let result = if entry_path.is_dir() {
+            std::fs::remove_dir_all(&entry_path)
+        } else {
+            std::fs::remove_file(&entry_path)
+        };
+        result.map_err(|source| SmartZipError::io(Some(entry_path), source))?;
+    }
+    if std::fs::read_dir(path)
+        .map_err(|source| SmartZipError::io(Some(path.to_path_buf()), source))?
+        .next()
+        .transpose()
+        .map_err(|source| SmartZipError::io(Some(path.to_path_buf()), source))?
+        .is_some()
+    {
         return Err(SmartZipError::BackendProtocolError {
             backend: "archive-router-cleanup".into(),
-            detail: format!("temporary output still exists: {}", path.display()),
+            detail: format!("temporary output is not empty: {}", path.display()),
         });
-    }
-    Ok(())
-}
-
-fn move_attempt_output(attempt_dir: &Path, output_dir: &Path) -> Result<()> {
-    std::fs::create_dir_all(output_dir)
-        .map_err(|source| SmartZipError::io(Some(output_dir.to_path_buf()), source))?;
-    for entry in std::fs::read_dir(attempt_dir)
-        .map_err(|source| SmartZipError::io(Some(attempt_dir.to_path_buf()), source))?
-    {
-        let entry =
-            entry.map_err(|source| SmartZipError::io(Some(attempt_dir.to_path_buf()), source))?;
-        let target = output_dir.join(entry.file_name());
-        std::fs::rename(entry.path(), &target)
-            .map_err(|source| SmartZipError::io(Some(target), source))?;
     }
     Ok(())
 }
@@ -1315,7 +988,7 @@ pub fn format_from_extension(path: impl AsRef<Path>) -> Option<ArchiveFormat> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use smartzip_core::{CompressionLevel, EncodingMode, TaskEvent, TaskEventKind, TaskEventSink};
+    use smartzip_core::{EncodingMode, TaskEvent, TaskEventKind, TaskEventSink};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
@@ -1438,15 +1111,8 @@ mod tests {
             })
         }
 
-        fn profile(&self) -> smartzip_core::BackendCapabilityProfile {
-            crate::router::builtin_profile(
-                &[ArchiveFormat::SevenZip], // probe
-                &[ArchiveFormat::SevenZip], // list
-                &[ArchiveFormat::SevenZip], // test
-                &[ArchiveFormat::SevenZip], // extract
-                &[ArchiveFormat::SevenZip], // compress
-                true,
-            )
+        fn capabilities(&self) -> smartzip_core::AdapterCapabilities {
+            crate::router::seven_zip_capabilities()
         }
     }
 
@@ -1465,69 +1131,42 @@ mod tests {
     }
 
     #[test]
-    fn route_plan_is_stable_and_explains_rejections() {
-        let incapable = FakeAdapter::new("7zz", None);
-        let capable = FakeAdapter::new("7z", None);
-        let mut unsupported = incapable.profile();
-        unsupported.rules.push(CapabilityRule {
-            capability: capability_id("codec", "zstd"),
-            precedence: 0,
-            operations: vec![ArchiveOperation::Extract],
-            containers: vec![ArchiveFormat::SevenZip],
-            support: SupportState::Unsupported,
-            evidence: Some("configured".into()),
-        });
+    fn route_plan_orders_candidates_and_explains_container_rejections() {
         let router = BackendRouter::from_adapters(vec![
-            AdapterRegistration::new(incapable, unsupported, 20),
-            registration(capable, 10),
+            registration(FakeAdapter::new("7zz", None), 20),
+            registration(FakeAdapter::new("7z", None), 10),
         ]);
-        let facts = ArchiveFacts {
-            container: Some(smartzip_core::ArchiveFact {
-                value: ArchiveFormat::SevenZip,
-                source: "extension".into(),
-            }),
-            codecs: vec![smartzip_core::ArchiveFact {
-                value: capability_id("codec", "zstd"),
-                source: "archive header".into(),
-            }],
-            ..ArchiveFacts::default()
-        };
-        let plan = router.plan_for_facts(
+        let plan = router.plan(
             ArchiveOperation::Extract,
-            &facts,
+            Some(&ArchiveFormat::Rar),
             ArchiveRequirements::default(),
         );
-        assert_eq!(plan.candidates[0].adapter_id, "7z");
-        assert_eq!(plan.rejected[0].adapter_id, "7zz");
-        assert!(plan.rejected[0].reasons[0].contains("codec:zstd"));
+        assert_eq!(plan.candidates[0].adapter_id, "7zz");
+        assert!(plan.rejected.is_empty());
+
+        let rar_only =
+            AdapterRegistration::new(FakeAdapter::new("rar", None), unrar_capabilities(), 20);
+        let plan = BackendRouter::from_adapters(vec![rar_only]).plan(
+            ArchiveOperation::Extract,
+            Some(&ArchiveFormat::SevenZip),
+            ArchiveRequirements::default(),
+        );
+        assert!(plan.candidates.is_empty());
+        assert!(plan.rejected[0].reasons[0].contains("unsupported"));
     }
 
     #[test]
-    fn forced_adapter_bypasses_profile_rejection() {
-        let adapter = FakeAdapter::new("diagnostic", None);
-        let mut profile = adapter.profile();
-        profile.rules.push(CapabilityRule {
-            capability: capability_id("codec", "zstd"),
-            precedence: 1,
-            operations: vec![ArchiveOperation::Extract],
-            containers: vec![ArchiveFormat::SevenZip],
-            support: SupportState::Unsupported,
-            evidence: Some("configured".into()),
-        });
-        let router =
-            BackendRouter::from_adapters(vec![AdapterRegistration::new(adapter, profile, 0)])
-                .with_forced_adapter("diagnostic");
+    fn forced_adapter_bypasses_concrete_eligibility() {
+        let router = BackendRouter::from_adapters(vec![AdapterRegistration::new(
+            FakeAdapter::new("diagnostic", None),
+            unrar_capabilities(),
+            0,
+        )])
+        .with_forced_adapter("diagnostic");
         let plan = router.plan(
             ArchiveOperation::Extract,
             Some(&ArchiveFormat::SevenZip),
-            ArchiveRequirements {
-                items: vec![ArchiveRequirement {
-                    capability: capability_id("codec", "zstd"),
-                    class: RequirementClass::Required,
-                    conditions: Vec::new(),
-                    reason: "archive method".into(),
-                }],
-            },
+            ArchiveRequirements::default(),
         );
         assert_eq!(plan.candidates[0].adapter_id, "diagnostic");
         assert!(plan.rejected.is_empty());
@@ -1646,7 +1285,7 @@ mod tests {
     }
 
     #[test]
-    fn negative_cache_skips_adapter_only_for_matching_codec() {
+    fn negative_cache_is_scoped_to_observed_codec_and_task() {
         let router = BackendRouter::from_adapters(vec![
             registration(FakeAdapter::new("7zz", None), 20),
             registration(FakeAdapter::new("7z", None), 10),
@@ -1663,18 +1302,13 @@ mod tests {
                 codec: Some("zstd".into()),
             },
         );
-        let zstd = ArchiveRequirements {
-            items: vec![ArchiveRequirement {
-                capability: capability_id("codec", "zstd"),
-                class: RequirementClass::Required,
-                conditions: Vec::new(),
-                reason: "archive method".into(),
-            }],
-        };
         let plan = router.plan_with_context(
             ArchiveOperation::Extract,
             Some(&ArchiveFormat::SevenZip),
-            zstd.clone(),
+            ArchiveRequirements {
+                codecs: vec!["zstd".into()],
+                ..ArchiveRequirements::default()
+            },
             Some(&context),
         );
         assert!(plan
@@ -1682,32 +1316,31 @@ mod tests {
             .iter()
             .any(|adapter| adapter.adapter_id == "7zz"));
 
-        let reset_context = router.begin_task(TaskId::new(), Arc::new(RecordingSink::default()));
-        let reset_plan = router.plan_with_context(
+        let other_codec = router.plan_with_context(
             ArchiveOperation::Extract,
             Some(&ArchiveFormat::SevenZip),
-            zstd,
-            Some(reset_context.as_ref()),
+            ArchiveRequirements {
+                codecs: vec!["lzma".into()],
+                ..ArchiveRequirements::default()
+            },
+            Some(&context),
         );
-        assert!(reset_plan
+        assert!(other_codec
             .candidates
             .iter()
             .any(|adapter| adapter.adapter_id == "7zz"));
 
-        let lzma = ArchiveRequirements {
-            items: vec![ArchiveRequirement {
-                capability: capability_id("codec", "lzma"),
-                class: RequirementClass::Required,
-                conditions: Vec::new(),
-                reason: "archive method".into(),
-            }],
-        };
-        let plan = router.plan(
+        let reset_context = router.begin_task(TaskId::new(), Arc::new(RecordingSink::default()));
+        let reset_plan = router.plan_with_context(
             ArchiveOperation::Extract,
             Some(&ArchiveFormat::SevenZip),
-            lzma,
+            ArchiveRequirements {
+                codecs: vec!["zstd".into()],
+                ..ArchiveRequirements::default()
+            },
+            Some(reset_context.as_ref()),
         );
-        assert!(plan
+        assert!(reset_plan
             .candidates
             .iter()
             .any(|adapter| adapter.adapter_id == "7zz"));
@@ -1724,34 +1357,22 @@ mod tests {
                 declared_version: Some("24.09".into()),
                 enabled: true,
                 priority: 50,
-                profile: BackendCapabilityProfile::default(),
             }],
-            family_profiles: Default::default(),
-            version_profiles: Default::default(),
         };
         let router = BackendRouter::from_config(&config).unwrap();
         assert!(router.adapter_ids().contains(&"configured-7z"));
         assert!(router
             .warnings()
             .iter()
-            .any(|warning| warning.contains("configured profile remains active")));
+            .any(|warning| warning.contains("configured adapter remains active")));
     }
 
     #[test]
-    fn configured_paths_are_deduplicated_and_native_id_is_preserved() {
+    fn configured_paths_are_deduplicated() {
         let duplicate_path = PathBuf::from("/missing/shared-7z");
         let config = BackendConfig {
             auto_discover: false,
             installations: vec![
-                BackendInstallation {
-                    id: "configured-native".into(),
-                    family: AdapterFamily::NativeZip,
-                    executable: PathBuf::new(),
-                    declared_version: None,
-                    enabled: true,
-                    priority: 0,
-                    profile: BackendCapabilityProfile::default(),
-                },
                 BackendInstallation {
                     id: "first-7z".into(),
                     family: AdapterFamily::SevenZipCli,
@@ -1759,7 +1380,6 @@ mod tests {
                     declared_version: None,
                     enabled: true,
                     priority: 0,
-                    profile: BackendCapabilityProfile::default(),
                 },
                 BackendInstallation {
                     id: "duplicate-7z".into(),
@@ -1768,19 +1388,10 @@ mod tests {
                     declared_version: None,
                     enabled: true,
                     priority: 0,
-                    profile: BackendCapabilityProfile::default(),
                 },
             ],
-            family_profiles: Default::default(),
-            version_profiles: Default::default(),
         };
         let router = BackendRouter::from_config(&config).unwrap();
-        // NativeZip is now deprecated and ignored; only SevenZip remains.
-        assert!(!router.adapter_ids().contains(&"configured-native"));
-        assert!(router
-            .warnings()
-            .iter()
-            .any(|w| w.contains("native-zip is deprecated")));
         assert!(router.adapter_ids().contains(&"first-7z"));
         assert!(!router.adapter_ids().contains(&"duplicate-7z"));
     }
@@ -1819,16 +1430,5 @@ mod tests {
         assert_eq!(rar_plan.candidates.len(), 2);
         assert!(rar_plan.candidates[0].adapter_id.starts_with("unrar:"));
         assert!(rar_plan.candidates[1].adapter_id.starts_with("sevenzip:"));
-    }
-
-    #[allow(dead_code)]
-    fn compression_request() -> CompressArchiveRequest {
-        CompressArchiveRequest {
-            inputs: vec![PathBuf::from("input")],
-            output: PathBuf::from("archive.7z"),
-            format: ArchiveFormat::SevenZip,
-            level: CompressionLevel::Balanced,
-            password: None,
-        }
     }
 }

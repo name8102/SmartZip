@@ -87,18 +87,10 @@ pub(crate) struct ResolvedArchive {
 pub(crate) struct ArchiveAccessOutcome {
     pub(crate) password_id: Option<i64>,
     pub(crate) has_password: bool,
-    // Resolved plaintext password and cancellation flag are populated by the
-    // shared password flow but only consumed by the integrity-check backend,
-    // which is split into 07-03-test-command-backend-split. Kept here so that
-    // task can wire `test` in without reshaping this struct.
-    #[allow(dead_code)]
-    pub(crate) used_password: Option<String>,
     pub(crate) encoding_mode: EncodingMode,
     pub(crate) listing: Option<ArchiveListing>,
     pub(crate) encrypted: Option<bool>,
     pub(crate) events: Vec<TaskEvent>,
-    #[allow(dead_code)]
-    pub(crate) password_prompt_cancelled: bool,
 }
 
 pub struct SmartZipEngine {

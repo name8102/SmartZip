@@ -171,3 +171,10 @@ Before completion, verify:
 - retained config fields have named production consumers;
 - no new generic framework was introduced to replace deleted generic machinery;
 - net concept count and code volume are materially lower.
+
+## Implementation notes
+
+- Retained `ArchiveExecutor`, `ArchiveAdapter` identity, internal `test`/`compress` operations, deterministic routing diagnostics, retry taxonomy, and task-local unsupported-codec observations because production workflows or regression tests still consume them.
+- Replaced the unused generic capability/profile rule language with concrete adapter operation/container/password/charset capabilities; configuration now carries only backend routing settings.
+- `OutputMaterializer` remains the extraction staging owner: the router reuses its caller-provided directory and verifies failed-attempt cleanup instead of creating `.smartzip-attempt-*` siblings.
+- Added one `VolumeResolver::prepare` path shared by list and extract, with warnings and materialization keepalive in one result; removed the filename-only volume helper and unused root coalescing API.

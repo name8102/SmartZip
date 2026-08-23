@@ -418,17 +418,8 @@ impl ArchiveAdapter for UnrarBackend {
         self.compress(request).await
     }
 
-    fn profile(&self) -> smartzip_core::BackendCapabilityProfile {
-        let mut profile = crate::router::builtin_profile(
-            &[ArchiveFormat::Rar], // probe
-            &[ArchiveFormat::Rar], // list
-            &[ArchiveFormat::Rar], // test
-            &[ArchiveFormat::Rar], // extract
-            &[],                   // compress
-            true,
-        );
-        crate::router::restrict_profile_to_containers(&mut profile, &[ArchiveFormat::Rar]);
-        profile
+    fn capabilities(&self) -> smartzip_core::AdapterCapabilities {
+        crate::router::unrar_capabilities()
     }
 }
 

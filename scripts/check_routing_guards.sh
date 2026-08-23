@@ -7,13 +7,17 @@ cd "$root"
 patterns=(
 	'ArchiveBackend'
 	'BackendCapabilities'
+	'BackendCapabilityProfile'
+	'CapabilityRule'
+	'CapabilityId'
+	'SupportState'
 	'BackendRouter::locate'
 	'BackendRouter::new'
 	'route_events'
 	'clear_route_events'
 	'extract_with_progress'
 	'ExtractionProgressCallback'
-	'fn capabilities\\(&self\\) -> BackendCapabilities'
+	'fn profile\\(&self\\)'
 )
 
 for pattern in "${patterns[@]}"; do
