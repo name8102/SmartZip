@@ -1,9 +1,7 @@
 //! Recursive extraction workflow implementation.
 
 use smartzip_archive::{ArchiveExecutor, ExtractArchiveRequest, NativeZipBackend, TestRequest};
-use smartzip_core::{
-    ArchiveFact, ArchiveFacts, ArchiveFormat, EncodingMode, TaskEvent, TaskEventKind, TaskId,
-};
+use smartzip_core::{ArchiveFacts, ArchiveFormat, EncodingMode, TaskEvent, TaskEventKind, TaskId};
 use smartzip_passwords::{PasswordCandidate, PasswordService};
 use smartzip_scanner::{Confidence, EmbeddedArchiveFinding, EmbeddedScanner};
 use std::collections::{HashSet, VecDeque};
@@ -96,34 +94,6 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
             embedded_size: None,
         });
     }
-    // P1-5: coalesce multiple explicit roots that resolve to the same logical VolumeSet before queueing (
-    // avoid marking coalesced duplicates as skipped -> Partial). Use a temporary resolver for pre-queue.
-    {
-        let mut tmp_resolver = VolumeResolver::new();
-        let mut seen_volume_keys: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
-        let mut filtered: VecDeque<ExtractionCandidate> = VecDeque::new();
-        for cand in queue.into_iter() {
-            if cand.source == CandidateSource::RootInput {
-                match tmp_resolver.resolve(&cand) {
-                    VolumeResolution::Resolved(set)
-                    | VolumeResolution::ResolvedWithWarnings { set, .. } => {
-                        let key = volume_set_key(&set);
-                        if seen_volume_keys.contains(&key) {
-                            continue;
-                        }
-                        seen_volume_keys.insert(key);
-                        filtered.push_back(cand);
-                    }
-                    _ => filtered.push_back(cand),
-                }
-            } else {
-                filtered.push_back(cand);
-            }
-        }
-        queue = filtered;
-    }
-
     // C6: Cache password candidates once before the extraction loop.
     let password_candidates = passwords
         .ranked_candidates(request.password_candidates.clone())
@@ -164,6 +134,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
         let Some(mut candidate) = queue.pop_front() else {
             break;
         };
+        let original_input_path = candidate.path.clone();
         let key = candidate_key(&candidate);
         let is_new = seen.insert(key);
         // Split the merged skip so each reason lands its own file_extractions
@@ -179,130 +150,63 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
             skipped.push(candidate);
             continue;
         }
-        // Robust split-volume resolution (replaces filename-only is_first_volume)
-        // Embedded findings at non-zero offset bypass volume discovery.
+        // Resolve and materialize volumes once through the shared preparation path.
+        // Embedded findings at non-zero offset still bypass sibling discovery.
         let mut volume_materialized: Option<crate::volumes::materialize::MaterializedVolumeSet> =
             None;
+        let mut volume_archive_path: Option<std::path::PathBuf> = None;
         let mut volume_set_for_candidate: Option<crate::volumes::VolumeSet> = None;
-        match volume_resolver.resolve(&candidate) {
-            VolumeResolution::Single => {}
-            VolumeResolution::Resolved(set) => {
-                let key = volume_set_key(&set);
+        let preparation = if candidate.source == CandidateSource::RootInput {
+            let resolution = volume_resolver.resolve(&candidate);
+            if let VolumeResolution::Resolved(set)
+            | VolumeResolution::ResolvedWithWarnings { set, .. } = &resolution
+            {
+                let key = volume_set_key(set);
                 if processed_volume_keys.contains(&key) {
-                    // Already processed this logical VolumeSet (e.g., another physical member or nested duplicate) – coalesce without marking as skipped for Partial status.
                     continue;
                 }
                 processed_volume_keys.insert(key);
-                match crate::volumes::materialize::materialize_volume_set(&set) {
-                    Ok(mat) => {
-                        candidate.detected_format = Some(set.format.clone());
-                        volume_set_for_candidate = Some(set);
-                        volume_materialized = Some(mat);
-                    }
-                    Err(e) => {
-                        hist_saw_failure = true;
-                        events.push(TaskEvent {
-                            task_id: task_id.clone(),
-                            kind: TaskEventKind::Failed {
-                                error: format!(
-                                    "volume materialization failed for {}: {}",
-                                    candidate.path.display(),
-                                    e
-                                ),
-                            },
-                        });
-                        if let Some(recorder) = history {
-                            recorder.record_file_extraction(
-                                &task_id,
-                                crate::history::FileExtractionRow {
-                                    input_path: &candidate.path,
-                                    sample_hash: None,
-                                    file_size: None,
-                                    offset: candidate.embedded_offset.map(|o| o as i64),
-                                    output_path: None,
-                                    has_password: false,
-                                    password_id: None,
-                                    status: "failed",
-                                    reason: Some("materialize_failed"),
-                                    encoding: None,
-                                    encoding_corrected: false,
-                                    damaged_volumes_json: None,
-                                },
-                            );
-                        }
-                        skipped.push(candidate);
-                        continue;
-                    }
-                }
             }
-            VolumeResolution::ResolvedWithWarnings { set, warnings } => {
-                for w in &warnings {
+            volume_resolver.prepare_resolution(candidate, resolution)
+        } else {
+            volume_resolver.prepare(candidate)
+        };
+        match preparation {
+            crate::volumes::VolumePreparation::Single(prepared) => candidate = prepared,
+            crate::volumes::VolumePreparation::Resolved {
+                candidate: prepared,
+                archive_path,
+                set,
+                warnings,
+                materialized,
+            } => {
+                for warning in warnings {
                     events.push(TaskEvent {
                         task_id: task_id.clone(),
                         kind: TaskEventKind::Warning {
                             message: format!(
-                                "volume warning for {}: {:?}",
-                                candidate.path.display(),
-                                w
+                                "volume warning for {}: {warning:?}",
+                                prepared.path.display()
                             ),
                         },
                     });
                 }
-                let key = volume_set_key(&set);
-                if processed_volume_keys.contains(&key) {
-                    continue;
-                }
-                processed_volume_keys.insert(key);
-                match crate::volumes::materialize::materialize_volume_set(&set) {
-                    Ok(mat) => {
-                        candidate.detected_format = Some(set.format.clone());
-                        volume_set_for_candidate = Some(set);
-                        volume_materialized = Some(mat);
-                    }
-                    Err(e) => {
-                        hist_saw_failure = true;
-                        events.push(TaskEvent {
-                            task_id: task_id.clone(),
-                            kind: TaskEventKind::Failed {
-                                error: format!(
-                                    "volume materialization failed for {}: {}",
-                                    candidate.path.display(),
-                                    e
-                                ),
-                            },
-                        });
-                        if let Some(recorder) = history {
-                            recorder.record_file_extraction(
-                                &task_id,
-                                crate::history::FileExtractionRow {
-                                    input_path: &candidate.path,
-                                    sample_hash: None,
-                                    file_size: None,
-                                    offset: candidate.embedded_offset.map(|o| o as i64),
-                                    output_path: None,
-                                    has_password: false,
-                                    password_id: None,
-                                    status: "failed",
-                                    reason: Some("materialize_failed"),
-                                    encoding: None,
-                                    encoding_corrected: false,
-                                    damaged_volumes_json: None,
-                                },
-                            );
-                        }
-                        skipped.push(candidate);
-                        continue;
-                    }
-                }
+                candidate = prepared;
+                volume_archive_path = Some(archive_path);
+                volume_set_for_candidate = Some(set);
+                volume_materialized = Some(materialized);
             }
-            VolumeResolution::Incomplete(problem) => {
+            crate::volumes::VolumePreparation::Incomplete {
+                candidate: failed,
+                problem,
+            } => {
                 hist_saw_failure = true;
                 events.push(TaskEvent {
                     task_id: task_id.clone(),
                     kind: TaskEventKind::Failed {
                         error: format!(
                             "incomplete volume set for {}: {}",
-                            candidate.path.display(),
+                            failed.path.display(),
                             problem.reason
                         ),
                     },
@@ -311,10 +215,10 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                     recorder.record_file_extraction(
                         &task_id,
                         crate::history::FileExtractionRow {
-                            input_path: &candidate.path,
+                            input_path: &original_input_path,
                             sample_hash: None,
                             file_size: None,
-                            offset: candidate.embedded_offset.map(|o| o as i64),
+                            offset: failed.embedded_offset.map(|o| o as i64),
                             output_path: None,
                             has_password: false,
                             password_id: None,
@@ -326,17 +230,20 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                         },
                     );
                 }
-                skipped.push(candidate);
+                skipped.push(failed);
                 continue;
             }
-            VolumeResolution::GroupingAmbiguous { hypotheses } => {
+            crate::volumes::VolumePreparation::GroupingAmbiguous {
+                candidate: failed,
+                hypotheses,
+            } => {
                 hist_saw_failure = true;
                 events.push(TaskEvent {
                     task_id: task_id.clone(),
                     kind: TaskEventKind::Failed {
                         error: format!(
                             "grouping ambiguous for {}: {} hypotheses",
-                            candidate.path.display(),
+                            failed.path.display(),
                             hypotheses.len()
                         ),
                     },
@@ -345,10 +252,10 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                     recorder.record_file_extraction(
                         &task_id,
                         crate::history::FileExtractionRow {
-                            input_path: &candidate.path,
+                            input_path: &original_input_path,
                             sample_hash: None,
                             file_size: None,
-                            offset: candidate.embedded_offset.map(|o| o as i64),
+                            offset: failed.embedded_offset.map(|o| o as i64),
                             output_path: None,
                             has_password: false,
                             password_id: None,
@@ -360,7 +267,43 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                         },
                     );
                 }
-                skipped.push(candidate);
+                skipped.push(failed);
+                continue;
+            }
+            crate::volumes::VolumePreparation::MaterializationFailed {
+                candidate: failed,
+                error,
+            } => {
+                hist_saw_failure = true;
+                events.push(TaskEvent {
+                    task_id: task_id.clone(),
+                    kind: TaskEventKind::Failed {
+                        error: format!(
+                            "volume materialization failed for {}: {error}",
+                            failed.path.display()
+                        ),
+                    },
+                });
+                if let Some(recorder) = history {
+                    recorder.record_file_extraction(
+                        &task_id,
+                        crate::history::FileExtractionRow {
+                            input_path: &original_input_path,
+                            sample_hash: None,
+                            file_size: None,
+                            offset: failed.embedded_offset.map(|o| o as i64),
+                            output_path: None,
+                            has_password: false,
+                            password_id: None,
+                            status: "failed",
+                            reason: Some("materialize_failed"),
+                            encoding: None,
+                            encoding_corrected: false,
+                            damaged_volumes_json: None,
+                        },
+                    );
+                }
+                skipped.push(failed);
                 continue;
             }
         }
@@ -650,15 +593,11 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
             }
         }
 
-        // For volume sets, the canonical staging already provides the entrypoint; for single files use the usual carve/materialize.
+        // For volume sets, preparation already supplied the canonical backend
+        // entrypoint; candidate.path remains the logical input identity.
         let (archive_path, _archive_temp, _volume_materialized_keep) =
-            if let Some(mat) = volume_materialized {
-                let p = mat.canonical_entrypoint.clone();
-                // Keep the staging alive for the duration of this candidate's backend calls.
-                // We move the mat into a holder that lives until the end of the loop iteration.
-                // To avoid dropping before extraction, we keep it in a variable that outlives backend calls.
-                // Here we return the path and keep the handle.
-                (p, None, Some(mat))
+            if let Some(path) = volume_archive_path {
+                (path, None, volume_materialized)
             } else {
                 let inp = materialize_archive_input(&candidate)?;
                 let p = inp.path.clone();
@@ -712,7 +651,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                         recorder.record_file_extraction(
                             &task_id,
                             crate::history::FileExtractionRow {
-                                input_path: &candidate.path,
+                                input_path: &original_input_path,
                                 sample_hash: Some(hash),
                                 file_size: Some(size),
                                 offset: candidate.embedded_offset.map(|o| o as i64),
@@ -819,22 +758,10 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
         }
 
         let _key = candidate_key(&candidate);
-        let mut archive_facts = ArchiveFacts {
-            container: candidate.detected_format.clone().map(|value| ArchiveFact {
-                value,
-                source: "engine header detection".into(),
-            }),
+        let archive_facts = ArchiveFacts {
+            container: candidate.detected_format.clone(),
             ..ArchiveFacts::default()
         };
-        if let Ok(probe) = backend
-            .probe_with_context(&archive_path, std::sync::Arc::clone(&task_context))
-            .await
-        {
-            archive_facts.encrypted = probe.encrypted.map(|value| ArchiveFact {
-                value,
-                source: "executor probe".into(),
-            });
-        }
         let output_dir = output_dir_for_candidate(&request.output_dir, &candidate);
 
         let mut extracted = false;
@@ -1465,7 +1392,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                     recorder.record_file_extraction(
                         &task_id,
                         crate::history::FileExtractionRow {
-                            input_path: &candidate.path,
+                            input_path: &original_input_path,
                             sample_hash: sample_hash.as_deref(),
                             file_size: sample_size,
                             offset: candidate.embedded_offset.map(|o| o as i64),
@@ -1499,7 +1426,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                     recorder.record_file_extraction(
                         &task_id,
                         crate::history::FileExtractionRow {
-                            input_path: &candidate.path,
+                            input_path: &original_input_path,
                             sample_hash: sample_hash.as_deref(),
                             file_size: sample_size,
                             offset: candidate.embedded_offset.map(|o| o as i64),
@@ -1524,7 +1451,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                 recorder.record_file_extraction(
                     &task_id,
                     crate::history::FileExtractionRow {
-                        input_path: &candidate.path,
+                        input_path: &original_input_path,
                         sample_hash: sample_hash.as_deref(),
                         file_size: sample_size,
                         offset: candidate.embedded_offset.map(|o| o as i64),
@@ -1565,7 +1492,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
             recorder.record_file_extraction(
                 &task_id,
                 crate::history::FileExtractionRow {
-                    input_path: &candidate.path,
+                    input_path: &original_input_path,
                     sample_hash: sample_hash.as_deref(),
                     file_size: sample_size,
                     offset: candidate.embedded_offset.map(|o| o as i64),

@@ -284,16 +284,6 @@ impl SevenZipBackend {
         })
     }
 
-    #[allow(dead_code)]
-    async fn run_streaming(
-        &self,
-        args: &[String],
-        operation: SevenZipOperation,
-    ) -> Result<BackendCommandOutput> {
-        self.run_streaming_with_token(args, operation, &CancellationToken::new())
-            .await
-    }
-
     async fn run_streaming_with_token(
         &self,
         args: &[String],
@@ -788,26 +778,8 @@ impl ArchiveAdapter for SevenZipBackend {
         })
     }
 
-    fn profile(&self) -> smartzip_core::BackendCapabilityProfile {
-        let all = &[
-            ArchiveFormat::Zip,
-            ArchiveFormat::SevenZip,
-            ArchiveFormat::Rar,
-            ArchiveFormat::Tar,
-            ArchiveFormat::Gzip,
-            ArchiveFormat::Bzip2,
-            ArchiveFormat::Xz,
-            ArchiveFormat::Zstd,
-            ArchiveFormat::Cab,
-        ];
-        crate::router::builtin_profile(
-            all,                                            // probe
-            all,                                            // list
-            all,                                            // test
-            all,                                            // extract
-            &[ArchiveFormat::Zip, ArchiveFormat::SevenZip], // compress
-            true,
-        )
+    fn capabilities(&self) -> smartzip_core::AdapterCapabilities {
+        crate::router::seven_zip_capabilities()
     }
 }
 
@@ -1398,18 +1370,13 @@ mod tests {
     }
 
     #[test]
-    fn profile_declares_zstd_stream_support() {
+    fn capabilities_declare_zstd_extract_support() {
         let backend = SevenZipBackend::new(PathBuf::from("7z"));
-        let profile = backend.profile();
-        let capability = smartzip_core::CapabilityId::new("container:zstd").unwrap();
-        assert_eq!(
-            profile.support(
-                &capability,
-                smartzip_core::ArchiveOperation::Extract,
-                Some(&ArchiveFormat::Zstd),
-            ),
-            smartzip_core::SupportState::Supported
-        );
+        let capabilities = backend.capabilities();
+        assert!(capabilities.supports(
+            smartzip_core::ArchiveOperation::Extract,
+            Some(&ArchiveFormat::Zstd),
+        ));
     }
 
     #[test]

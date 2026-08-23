@@ -1,6 +1,5 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -35,15 +34,6 @@ impl fmt::Display for TaskId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
     }
-}
-
-/// Top-level operation types SmartZip can execute.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum TaskKind {
-    Extract,
-    Compress,
-    Detect,
-    Open,
 }
 
 /// Encoding policy used for archive entry names.
@@ -101,27 +91,6 @@ pub enum CompressionLevel {
     #[default]
     Balanced,
     Best,
-}
-
-/// Request to extract one or more archives.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ExtractRequest {
-    pub inputs: Vec<PathBuf>,
-    pub output_dir: Option<PathBuf>,
-    pub encoding: EncodingMode,
-    pub embedded_scan_policy: crate::embedded::EmbeddedScanPolicy,
-    pub delete_source_on_success: bool,
-    pub recursion_limit: u8,
-}
-
-/// Request to compress files or directories into one or more archives.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CompressRequest {
-    pub inputs: Vec<PathBuf>,
-    pub output: Option<PathBuf>,
-    pub format: ArchiveFormat,
-    pub level: CompressionLevel,
-    pub password: Option<String>,
 }
 
 #[cfg(test)]

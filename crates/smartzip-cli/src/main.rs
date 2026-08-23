@@ -93,10 +93,6 @@ enum Command {
         #[arg(short = 'p', long)]
         password: Vec<String>,
 
-        /// Read password from clipboard (platform-dependent placeholder).
-        #[arg(long)]
-        use_clipboard: bool,
-
         /// Skip empty password attempt.
         #[arg(long)]
         no_empty: bool,
@@ -108,39 +104,6 @@ enum Command {
         /// Print several candidate encodings, then prompt once for one to use.
         #[arg(long)]
         pick_encoding: bool,
-
-        #[arg(long)]
-        json: bool,
-
-        #[arg(long)]
-        deep: bool,
-
-        #[arg(long)]
-        max_scan_bytes: Option<u64>,
-
-        #[arg(long, value_enum, default_value_t = ConfidenceArg::Medium)]
-        min_confidence: ConfidenceArg,
-    },
-
-    /// Test archive integrity using shared password and encoding resolution.
-    Test {
-        path: PathBuf,
-
-        /// Password to try first. May be repeated.
-        #[arg(short = 'p', long)]
-        password: Vec<String>,
-
-        /// Read password from clipboard (platform-dependent placeholder).
-        #[arg(long)]
-        use_clipboard: bool,
-
-        /// Skip empty password attempt.
-        #[arg(long)]
-        no_empty: bool,
-
-        /// Encoding for entry names: "auto", "UTF-8", "GB18030", "GBK", "Big5", "Shift_JIS", "EUC-JP", "EUC-KR".
-        #[arg(long, default_value = "auto")]
-        encoding: String,
 
         #[arg(long)]
         json: bool,
@@ -170,10 +133,6 @@ enum Command {
         /// Password to try first. May be repeated.
         #[arg(short = 'p', long)]
         password: Vec<String>,
-
-        /// Read password from clipboard (platform-dependent placeholder).
-        #[arg(long)]
-        use_clipboard: bool,
 
         /// Skip empty password attempt.
         #[arg(long)]
@@ -236,9 +195,6 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-
-    /// Placeholder for future compression implementation.
-    Compress { paths: Vec<PathBuf> },
 
     /// Manage password database.
     #[command(subcommand)]
@@ -433,7 +389,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Command::List {
             path,
             password: manual_passwords,
-            use_clipboard: _use_clipboard,
             no_empty,
             encoding,
             pick_encoding,
@@ -459,24 +414,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             )
             .await
         }
-        Command::Test { .. } => {
-            // Interface is frozen, but the integrity-check backend (full-scan
-            // verification + reliable damaged-volume localization) is split
-            // into a dedicated task (07-03-test-command-backend-split). Until
-            // that lands, `test` must fail loudly rather than fabricate an
-            // intact/corrupt verdict or damaged-volume list.
-            eprintln!(
-                "error: `smartzip test` is not implemented yet; the integrity-check \
-                 backend is tracked separately and will not fake a result"
-            );
-            std::process::exit(1);
-        }
         Command::Extract {
             paths,
             output,
             recursion_limit,
             password: manual_passwords,
-            use_clipboard: _use_clipboard,
             no_empty,
             deep,
             encoding,
@@ -519,16 +461,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             password,
             json,
         } => preview_encodings(&backend, path, password, json, verbose_routing).await,
-        Command::Compress { paths } => {
-            // `compress` is a reserved top-level command with no backend yet.
-            // Per the frozen CLI spec it must fail loudly rather than print a
-            // "not implemented" notice and return success.
-            eprintln!(
-                "error: `smartzip compress` is not implemented yet (received {} path(s))",
-                paths.len()
-            );
-            std::process::exit(1);
-        }
         Command::Password(cmd) => {
             let db = open_db(cli.db)?;
             password(&db, cmd)

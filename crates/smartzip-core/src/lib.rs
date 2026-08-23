@@ -16,9 +16,8 @@ pub use progress::{
     TaskProgress,
 };
 pub use routing::{
-    ArchiveFact, ArchiveFacts, ArchiveOperation, ArchiveRequirement, ArchiveRequirements,
-    BackendCapabilityProfile, CapabilityId, CapabilityRule, NegativeCapabilityKey, RejectedAdapter,
-    RequirementClass, RouteCandidate, RouteEvent, RoutePlan, SupportState, TaskExecutionContext,
-    TaskRouteContext,
+    AdapterCapabilities, ArchiveFacts, ArchiveOperation, ArchiveRequirements,
+    NegativeCapabilityKey, RejectedAdapter, RouteCandidate, RouteEvent, RoutePlan,
+    TaskExecutionContext, TaskRouteContext,
 };
-pub use task::{ArchiveFormat, CompressionLevel, EncodingMode, TaskId, TaskKind};
+pub use task::{ArchiveFormat, CompressionLevel, EncodingMode, TaskId};

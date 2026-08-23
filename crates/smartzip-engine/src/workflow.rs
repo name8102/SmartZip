@@ -131,9 +131,15 @@ pub(crate) async fn inspect_file_with_listener<B: ArchiveExecutor>(
         reason = Some("business_container".to_string());
         detected_format = Some(ArchiveFormat::Zip);
     } else if let Some(candidate) = candidate {
-        let resolved =
-            prepare_resolved_archive(&candidate, EncodingMode::Auto, history, &events, &task_id)
-                .await?;
+        let resolved = prepare_resolved_archive(
+            &candidate,
+            None,
+            EncodingMode::Auto,
+            history,
+            &events,
+            &task_id,
+        )
+        .await?;
         known_password = resolved
             .known_hit
             .as_ref()
@@ -260,9 +266,8 @@ pub(crate) async fn list_archive_with_listener_interactive<B: ArchiveExecutor>(
         recorder.start_task(&task_id, "list", None);
     }
 
-    // P1-4: list must handle raw continuation as seed (e.g., disguised 7z .002) where resolve_root_candidate returns None.
-    // Try volume resolver directly on raw file before giving up.
-    let mut candidate = match resolve_root_candidate(
+    // List and extract share the same resolver/materialization entrypoint.
+    let candidate = resolve_root_candidate(
         &request.path,
         &request.scanner,
         min_embedded_size_bytes,
@@ -272,97 +277,63 @@ pub(crate) async fn list_archive_with_listener_interactive<B: ArchiveExecutor>(
         None,
     )
     .await?
-    {
-        Some(c) => c,
-        None => {
-            let synthetic = crate::types::ExtractionCandidate {
-                path: request.path.clone(),
-                relative_path: std::path::PathBuf::from(
-                    request.path.file_name().unwrap_or_default(),
-                ),
-                depth: 0,
-                source: crate::types::CandidateSource::RootInput,
-                detected_format: None,
-                embedded_offset: None,
-                embedded_size: None,
-            };
-            let mut check = crate::volumes::VolumeResolver::new();
-            match check.resolve(&synthetic) {
-                crate::volumes::VolumeResolution::Resolved(_)
-                | crate::volumes::VolumeResolution::ResolvedWithWarnings { .. } => synthetic,
-                crate::volumes::VolumeResolution::Incomplete(p) => {
-                    return Err(smartzip_core::SmartZipError::CorruptedArchive {
-                        path: request.path.clone(),
-                        detail: p.reason,
-                    })
-                }
-                crate::volumes::VolumeResolution::GroupingAmbiguous { .. } => {
-                    return Err(smartzip_core::SmartZipError::CorruptedArchive {
-                        path: request.path.clone(),
-                        detail: "grouping ambiguous".into(),
-                    })
-                }
-                _ => {
-                    return Err(smartzip_core::SmartZipError::UnsupportedFormat {
-                        path: request.path.clone(),
-                        format: None,
-                    })
-                }
-            }
-        }
-    };
+    .unwrap_or_else(|| crate::types::ExtractionCandidate {
+        path: request.path.clone(),
+        relative_path: std::path::PathBuf::from(request.path.file_name().unwrap_or_default()),
+        depth: 0,
+        source: crate::types::CandidateSource::RootInput,
+        detected_format: None,
+        embedded_offset: None,
+        embedded_size: None,
+    });
 
-    // Shared volume resolution (same semantics as extract) – list must not use filename-only heuristics.
     let mut volume_resolver = crate::volumes::VolumeResolver::new();
-    let mut _volume_keep: Option<crate::volumes::materialize::MaterializedVolumeSet> = None;
-    match volume_resolver.resolve(&candidate) {
-        crate::volumes::VolumeResolution::Single => {}
-        crate::volumes::VolumeResolution::Resolved(set) => {
-            let mat = crate::volumes::materialize::materialize_volume_set(&set).map_err(|e| {
-                smartzip_core::SmartZipError::CorruptedArchive {
-                    path: candidate.path.clone(),
-                    detail: format!("volume materialization failed: {}", e),
-                }
-            })?;
-            candidate.path = mat.canonical_entrypoint.clone();
-            candidate.detected_format = Some(set.format.clone());
-            _volume_keep = Some(mat);
-        }
-        crate::volumes::VolumeResolution::ResolvedWithWarnings { set, warnings } => {
-            for w in &warnings {
+    let (candidate, backend_path_override, _volume_keep) = match volume_resolver.prepare(candidate)
+    {
+        crate::volumes::VolumePreparation::Single(candidate) => (candidate, None, None),
+        crate::volumes::VolumePreparation::Resolved {
+            candidate,
+            archive_path,
+            warnings,
+            materialized,
+            ..
+        } => {
+            for warning in warnings {
                 events.push(TaskEvent {
                     task_id: task_id.clone(),
                     kind: TaskEventKind::Warning {
-                        message: format!("volume warning: {:?}", w),
+                        message: format!("volume warning: {warning:?}"),
                     },
                 });
             }
-            let mat = crate::volumes::materialize::materialize_volume_set(&set).map_err(|e| {
-                smartzip_core::SmartZipError::CorruptedArchive {
-                    path: candidate.path.clone(),
-                    detail: format!("volume materialization failed: {}", e),
-                }
-            })?;
-            candidate.path = mat.canonical_entrypoint.clone();
-            candidate.detected_format = Some(set.format.clone());
-            _volume_keep = Some(mat);
+            (candidate, Some(archive_path), Some(materialized))
         }
-        crate::volumes::VolumeResolution::Incomplete(problem) => {
+        crate::volumes::VolumePreparation::Incomplete { candidate, problem } => {
             return Err(smartzip_core::SmartZipError::CorruptedArchive {
-                path: candidate.path.clone(),
+                path: candidate.path,
                 detail: problem.reason,
             });
         }
-        crate::volumes::VolumeResolution::GroupingAmbiguous { hypotheses } => {
+        crate::volumes::VolumePreparation::GroupingAmbiguous {
+            candidate,
+            hypotheses,
+        } => {
             return Err(smartzip_core::SmartZipError::CorruptedArchive {
-                path: candidate.path.clone(),
+                path: candidate.path,
                 detail: format!("grouping ambiguous: {} hypotheses", hypotheses.len()),
             });
         }
-    }
+        crate::volumes::VolumePreparation::MaterializationFailed { candidate, error } => {
+            return Err(smartzip_core::SmartZipError::CorruptedArchive {
+                path: candidate.path,
+                detail: format!("volume materialization failed: {error}"),
+            });
+        }
+    };
 
     let resolved = prepare_resolved_archive(
         &candidate,
+        backend_path_override,
         request.encoding_mode.clone(),
         history,
         &events,
@@ -404,8 +375,8 @@ pub(crate) async fn list_archive_with_listener_interactive<B: ArchiveExecutor>(
             })?;
 
     if let Some(recorder) = history {
-        // For volume sets, candidate.path may have been rewritten to the canonical staging entrypoint.
-        // History must log the original user input path, not the temporary canonical path.
+        // History follows the logical candidate/request identity, never the
+        // temporary canonical staging path used by the backend.
         let history_input_path = &request.path;
         recorder.record_file_extraction(
             &task_id,

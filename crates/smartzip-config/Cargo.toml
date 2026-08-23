@@ -7,8 +7,5 @@ authors.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-atomic-write-file.workspace = true
 serde.workspace = true
-smartzip-core.workspace = true
-smartzip-scanner.workspace = true
 toml.workspace = true

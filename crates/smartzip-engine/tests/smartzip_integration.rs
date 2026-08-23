@@ -15,9 +15,8 @@ use smartzip_core::{ArchiveFormat, EncodingMode};
 use smartzip_db::{password::PasswordRepository, SmartZipDb};
 use smartzip_encoding::ArchiveEncodingDetector;
 use smartzip_engine::{
-    format_from_extension, is_first_volume, ArchiveRecycleHandler, EmbeddedSelectionChoice,
-    ExtractWorkflowRequest, InteractiveEmbeddedPrompter, InteractivePasswordPrompter,
-    SmartZipEngine,
+    format_from_extension, ArchiveRecycleHandler, EmbeddedSelectionChoice, ExtractWorkflowRequest,
+    InteractiveEmbeddedPrompter, InteractivePasswordPrompter, SmartZipEngine,
 };
 use smartzip_passwords::{PasswordCandidateRequest, PasswordService};
 use smartzip_scanner::{EmbeddedScanner, ScannerConfig};
@@ -1365,20 +1364,6 @@ async fn test_engine_preserves_nested_archive_paths() {
 #[case("archive", None)]
 fn test_format_from_extension(#[case] path: &str, #[case] expected: Option<ArchiveFormat>) {
     assert_eq!(format_from_extension(path), expected);
-}
-
-// ── Volume detection (rstest parametrized) ────────────────────────────────
-
-#[rstest]
-#[case("archive.part1.rar", true)]
-#[case("archive.part2.rar", false)]
-#[case("archive.part5.rar", false)]
-#[case("archive.001", true)]
-#[case("archive.002", false)]
-#[case("archive.zip", true)]
-#[case("archive.7z", true)]
-fn test_is_first_volume(#[case] path: &str, #[case] expected: bool) {
-    assert_eq!(is_first_volume(path), expected);
 }
 
 // ── Encoding detection via fixture archives ───────────────────────────────

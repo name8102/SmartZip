@@ -1,6 +1,8 @@
 use crate::types::*;
 use async_trait::async_trait;
-use smartzip_core::{ArchiveFacts, Result, TaskEventSink, TaskExecutionContext, TaskId};
+use smartzip_core::{
+    AdapterCapabilities, ArchiveFacts, Result, TaskEventSink, TaskExecutionContext, TaskId,
+};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -119,6 +121,6 @@ pub trait ArchiveAdapter: Send + Sync {
     ) -> Result<CompressArchiveResult> {
         self.compress(request).await
     }
-    /// Built-in capability profile; config layers are composed by the router.
-    fn profile(&self) -> smartzip_core::BackendCapabilityProfile;
+    /// Concrete capabilities consumed by the router.
+    fn capabilities(&self) -> AdapterCapabilities;
 }

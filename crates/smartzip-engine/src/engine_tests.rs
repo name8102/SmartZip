@@ -225,16 +225,6 @@ fn cbz_extension_is_not_a_business_container() {
 }
 
 #[test]
-fn recognizes_first_volume_rules() {
-    assert!(is_first_volume("archive.part1.rar"));
-    assert!(is_first_volume("archive.part01.rar"));
-    assert!(!is_first_volume("archive.part2.rar"));
-    assert!(is_first_volume("archive.001"));
-    assert!(!is_first_volume("archive.002"));
-    assert!(is_first_volume("archive.zip"));
-}
-
-#[test]
 fn nested_candidate_output_uses_archive_parent_as_global_output_root() {
     let managed_output = PathBuf::from("/managed-output");
     let root = ExtractionCandidate {
@@ -341,22 +331,6 @@ fn maps_common_extensions() {
 #[case("A.7Z", Some(ArchiveFormat::SevenZip))]
 fn format_from_extension_parametrized(#[case] path: &str, #[case] expected: Option<ArchiveFormat>) {
     assert_eq!(format_from_extension(path), expected);
-}
-
-#[rstest]
-#[case("archive.part1.rar", true)]
-#[case("archive.part01.rar", true)]
-#[case("archive.part2.rar", false)]
-#[case("archive.part5.rar", false)]
-#[case("archive.rar", true)]
-#[case("archive.001", true)]
-#[case("archive.002", false)]
-#[case("archive.010", false)]
-#[case("archive.zip", true)]
-#[case("archive.7z", true)]
-#[case("data.tar.gz", true)]
-fn is_first_volume_parametrized(#[case] path: &str, #[case] expected: bool) {
-    assert_eq!(is_first_volume(path), expected);
 }
 
 #[test]
@@ -1149,9 +1123,64 @@ async fn embedded_archive_is_carved_before_extraction_and_recurses() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+#[tokio::test]
+async fn list_embedded_archive_is_carved_before_backend() {
+    let root = std::env::temp_dir().join(format!("smartzip-list-embedded-{}", std::process::id()));
+    let archive = root.join("payload.zip");
+    let carrier = root.join("photo.jpg");
+    std::fs::create_dir_all(&root).unwrap();
+    let payload = root.join("payload.txt");
+    std::fs::write(&payload, b"payload").unwrap();
+    let status = std::process::Command::new("7z")
+        .arg("a")
+        .arg(&archive)
+        .arg(&payload)
+        .current_dir(&root)
+        .status()
+        .unwrap();
+    assert!(status.success(), "7z must be available in PATH");
+
+    let mut composite = Vec::from(&b"JPEG-HEADER"[..]);
+    composite.extend_from_slice(&std::fs::read(&archive).unwrap());
+    std::fs::write(&carrier, composite).unwrap();
+
+    let backend = EmbeddedAwareFakeBackend::default();
+    let db = SmartZipDb::in_memory().unwrap();
+    let service = PasswordService::new(PasswordRepository::new(db.connection()));
+    SmartZipEngine::default()
+        .with_min_embedded_size_bytes(0)
+        .list_archive_with_listener_interactive(
+            &backend,
+            &service,
+            ListArchiveRequest {
+                path: carrier.clone(),
+                scanner: ScannerConfig::default(),
+                encoding_mode: EncodingMode::Auto,
+                password_candidates: PasswordCandidateRequest::default(),
+            },
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let calls = backend.list_calls.lock().unwrap().clone();
+    assert!(!calls.is_empty());
+    assert!(
+        calls.iter().all(
+            |(path, starts_with_zip)| path != &carrier.display().to_string() && *starts_with_zip
+        ),
+        "list backend should receive only carved archives: {calls:?}"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
 #[derive(Default, Clone)]
 struct EmbeddedAwareFakeBackend {
     calls: Arc<Mutex<Vec<(String, bool)>>>,
+    list_calls: Arc<Mutex<Vec<(String, bool)>>>,
 }
 
 #[async_trait]
@@ -1165,7 +1194,14 @@ impl ArchiveExecutor for EmbeddedAwareFakeBackend {
         })
     }
 
-    async fn list(&self, _request: ListRequest) -> smartzip_core::Result<ArchiveListing> {
+    async fn list(&self, request: ListRequest) -> smartzip_core::Result<ArchiveListing> {
+        let starts_with_zip = std::fs::read(&request.archive)
+            .map(|bytes| bytes.starts_with(b"PK"))
+            .unwrap_or(false);
+        self.list_calls
+            .lock()
+            .unwrap()
+            .push((request.archive.display().to_string(), starts_with_zip));
         Ok(ArchiveListing {
             format: Some(ArchiveFormat::Zip),
             entries: Vec::new(),

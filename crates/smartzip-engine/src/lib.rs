@@ -40,9 +40,7 @@ pub use interactive::{
     InteractiveEmbeddedPrompter, InteractiveEncodingPrompter, InteractiveOutputPrompter,
     InteractivePasswordPrompter, OutputCollisionStrategy,
 };
-pub use nested::{format_from_extension, is_first_volume};
-// `is_first_volume` is retired in favor of the shared volume resolver and remains only for
-// integration test compatibility; new code must use `volumes::VolumeResolver`.
+pub use nested::format_from_extension;
 pub use types::{
     ArchiveRecycleHandler, CandidateSource, DetectRequest, DetectResult, ExtractWorkflowRequest,
     ExtractWorkflowResult, ExtractionCandidate, FileAwareDetectResult, InspectRequest,
