@@ -21,15 +21,20 @@ pub enum ArchiveOperation {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AdapterCapabilities {
     pub operations: Vec<ArchiveOperation>,
-    pub containers: Vec<ArchiveFormat>,
+    pub read_containers: Vec<ArchiveFormat>,
+    pub compress_containers: Vec<ArchiveFormat>,
     pub supports_passwords: bool,
     pub supports_charset_override: bool,
 }
 
 impl AdapterCapabilities {
     pub fn supports(&self, operation: ArchiveOperation, container: Option<&ArchiveFormat>) -> bool {
+        let containers = match operation {
+            ArchiveOperation::Compress => &self.compress_containers,
+            _ => &self.read_containers,
+        };
         self.operations.contains(&operation)
-            && container.is_none_or(|container| self.containers.contains(container))
+            && container.is_none_or(|container| containers.contains(container))
     }
 }
 
@@ -40,7 +45,6 @@ pub struct ArchiveFacts {
     pub container: Option<ArchiveFormat>,
     #[serde(default)]
     pub codecs: Vec<String>,
-    pub encrypted: Option<bool>,
 }
 
 /// Request requirements used by current list/test/extract callers.

@@ -74,6 +74,7 @@ pub enum VolumePreparation {
     Single(crate::types::ExtractionCandidate),
     Resolved {
         candidate: crate::types::ExtractionCandidate,
+        archive_path: PathBuf,
         set: VolumeSet,
         warnings: Vec<VolumeWarning>,
         materialized: materialize::MaterializedVolumeSet,
@@ -342,10 +343,11 @@ fn prepare_resolved(
 ) -> VolumePreparation {
     match materialize::materialize_volume_set(&set) {
         Ok(materialized) => {
-            candidate.path = materialized.canonical_entrypoint.clone();
+            let archive_path = materialized.canonical_entrypoint.clone();
             candidate.detected_format = Some(set.format.clone());
             VolumePreparation::Resolved {
                 candidate: candidate.clone(),
+                archive_path,
                 set,
                 warnings,
                 materialized,
@@ -1631,6 +1633,30 @@ mod tests {
             embedded_size: None,
         }
     }
+    #[test]
+    fn prepared_volume_keeps_candidate_identity() {
+        let dir = TempDir::new().unwrap();
+        let p1 = dir.path().join("inner.part01.rar");
+        let p2 = dir.path().join("inner.part02.rar");
+        for path in [&p1, &p2] {
+            create_fake_rar(path);
+        }
+        let mut resolver = VolumeResolver::new();
+        let preparation = resolver.prepare(make_candidate(p1.clone()));
+        match preparation {
+            VolumePreparation::Resolved {
+                candidate,
+                archive_path,
+                ..
+            } => {
+                assert_eq!(candidate.path, p1);
+                assert_ne!(archive_path, candidate.path);
+                assert!(archive_path.exists());
+            }
+            other => panic!("expected resolved volume, got {:?}", other.candidate()),
+        }
+    }
+
     #[test]
     fn standard_rar_part_naming_resolves() {
         let dir = TempDir::new().unwrap();

@@ -748,7 +748,7 @@ pub(crate) fn seven_zip_capabilities() -> AdapterCapabilities {
             ArchiveOperation::Extract,
             ArchiveOperation::Compress,
         ],
-        containers: vec![
+        read_containers: vec![
             ArchiveFormat::Zip,
             ArchiveFormat::SevenZip,
             ArchiveFormat::Rar,
@@ -759,6 +759,7 @@ pub(crate) fn seven_zip_capabilities() -> AdapterCapabilities {
             ArchiveFormat::Zstd,
             ArchiveFormat::Cab,
         ],
+        compress_containers: vec![ArchiveFormat::Zip, ArchiveFormat::SevenZip],
         supports_passwords: true,
         supports_charset_override: true,
     }
@@ -772,7 +773,8 @@ pub(crate) fn unrar_capabilities() -> AdapterCapabilities {
             ArchiveOperation::Test,
             ArchiveOperation::Extract,
         ],
-        containers: vec![ArchiveFormat::Rar],
+        read_containers: vec![ArchiveFormat::Rar],
+        compress_containers: Vec::new(),
         supports_passwords: true,
         supports_charset_override: false,
     }
@@ -1153,6 +1155,28 @@ mod tests {
         );
         assert!(plan.candidates.is_empty());
         assert!(plan.rejected[0].reasons[0].contains("unsupported"));
+    }
+
+    #[test]
+    fn compress_only_uses_compressible_containers() {
+        let router = BackendRouter::from_adapters(vec![AdapterRegistration::new(
+            FakeAdapter::new("7z", None),
+            seven_zip_capabilities(),
+            10,
+        )]);
+        let zip = router.plan(
+            ArchiveOperation::Compress,
+            Some(&ArchiveFormat::Zip),
+            ArchiveRequirements::default(),
+        );
+        assert_eq!(zip.candidates.len(), 1);
+
+        let rar = router.plan(
+            ArchiveOperation::Compress,
+            Some(&ArchiveFormat::Rar),
+            ArchiveRequirements::default(),
+        );
+        assert!(rar.candidates.is_empty());
     }
 
     #[test]

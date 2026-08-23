@@ -9,7 +9,7 @@
 | **ArchiveBackend** | 当前压缩后端抽象 trait。定义 `probe` / `list` / `test` / `extract` / `compress`。所有后端实现（Rust 原生 lib 或 7zz CLI）统一实现此 trait；在路由迁移完成前保留。 |
 | **ArchiveExecutor** | 目标中面向 `SmartZipEngine` 的归档执行 seam，定义 `probe` / `list` / `test` / `extract` / `compress`。`BackendRouter` 实现此 interface；engine 不接触 adapter 发现、能力 profile、排序或 fallback。 |
 | **ArchiveAdapter** | 面向 `BackendRouter` 的后端 adapter seam。每个 Rust 原生实现或外部程序实例（包括不同路径或版本的 `7z`、`7zz`）都是独立 adapter，并保留自己的身份和能力，不在进入路由前合并。 |
-| **AdapterCapabilities** | 路由实际消费的 adapter 元数据：支持的 operation/container，以及密码和字符集覆盖能力。运行时 UnsupportedCodec/UnsupportedContainer 仅进入任务级负面缓存，不持久化假设性的 profile 规则。 |
+| **AdapterCapabilities** | 路由实际消费的 adapter 元数据：支持的 operation、读取容器、压缩容器，以及密码和字符集覆盖能力。运行时 UnsupportedCodec/UnsupportedContainer 仅进入任务级负面缓存，不持久化假设性的 profile 规则。 |
 | **ArchiveFacts** | 路由需要的归档事实：容器、可选 codec 字符串和加密状态。事实不包含假设性的后端策略。 |
 | **ArchiveRequirements** | 当前调用方的具体路由要求：是否提供密码、是否覆盖文件名字符集，以及已观察的 codec 字符串。 |
 | **RoutePlan** | 针对单个归档和 operation 生成的可解释 adapter 顺序，记录容器、候选、排除原因与 fallback 规则。list/test/extract/compress 分别规划；同一任务复用 facts 和 extract 顺序。 |
@@ -78,7 +78,7 @@
 
 ### ADR-003: Capability-aware mixed backend routing
 
-**Decision**: 目标是将现有后端抽象拆为面向 engine 的 `ArchiveExecutor` seam 和面向 router 的 `ArchiveAdapter` seam。`BackendRouter` 保留所有 adapter 的身份和具体 `AdapterCapabilities`，按 operation/container/password/charset-override 过滤，再按优先级稳定排序，最后执行显式错误 fallback；`7z` 与 `7zz` 等不同程序或版本是独立 adapter。显式配置优先，自动发现补充；版本不一致只警告。明确的 UnsupportedContainer / UnsupportedCodec 会加入任务级负面缓存。
+**Decision**: 目标是将现有后端抽象拆为面向 engine 的 `ArchiveExecutor` seam 和面向 router 的 `ArchiveAdapter` seam。`BackendRouter` 保留所有 adapter 的身份和具体 `AdapterCapabilities`，按 operation、读取/压缩容器、password、charset-override 过滤，再按优先级稳定排序，最后执行显式错误 fallback；`7z` 与 `7zz` 等不同程序或版本是独立 adapter。显式配置优先，自动发现补充；版本不一致只警告。明确的 UnsupportedContainer / UnsupportedCodec 会加入任务级负面缓存。
 
 每个 `ExtractionCandidate` 独立管理临时输出。adapter 失败后立即清理当前候选的临时产物，确认清理成功后才交给下一个 adapter；清理失败终止当前候选，但不影响任务中的其他候选。只有 UnsupportedContainer、UnsupportedCodec、BackendUnavailable 和 BackendProtocolError 允许 fallback；密码错误、损坏、安全、资源、权限、磁盘和取消错误均终止当前 route。router 产生可解释 `RoutePlan` 和结构化 attempt/cleanup/selection 事件。迁移完成前，现有 `ArchiveBackend` stack 保持不变。
 

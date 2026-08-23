@@ -178,3 +178,4 @@ Before completion, verify:
 - Replaced the unused generic capability/profile rule language with concrete adapter operation/container/password/charset capabilities; configuration now carries only backend routing settings.
 - `OutputMaterializer` remains the extraction staging owner: the router reuses its caller-provided directory and verifies failed-attempt cleanup instead of creating `.smartzip-attempt-*` siblings.
 - Added one `VolumeResolver::prepare` path shared by list and extract, with warnings and materialization keepalive in one result; removed the filename-only volume helper and unused root coalescing API.
+- Follow-up review fix keeps candidate identity separate from the canonical backend staging path, restores SevenZip's ZIP/7z-only compression eligibility, and removes the unused extraction encryption probe/fact.

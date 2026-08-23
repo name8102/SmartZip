@@ -6,7 +6,7 @@ use smartzip_core::{
 };
 use smartzip_passwords::{PasswordCandidate, PasswordService};
 use smartzip_scanner::{EmbeddedArchiveFinding, EmbeddedScanner, ScannerConfig};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::backend_util::backend_call;
 use crate::encoding_flow::{assess_zip_encoding, resolve_encoding_mode};
@@ -152,13 +152,18 @@ pub(crate) async fn resolve_root_candidate(
 
 pub(crate) async fn prepare_resolved_archive(
     candidate: &ExtractionCandidate,
+    archive_path_override: Option<PathBuf>,
     requested_encoding: EncodingMode,
     history: Option<&dyn crate::history::TaskHistoryRecorder>,
     events: &EventSink,
     task_id: &TaskId,
 ) -> smartzip_core::Result<ResolvedArchive> {
-    let archive_input = materialize_archive_input(candidate)?;
-    let archive_path = archive_input.path.clone();
+    let (archive_path, archive_temp) = if let Some(path) = archive_path_override {
+        (path, None)
+    } else {
+        let archive_input = materialize_archive_input(candidate)?;
+        (archive_input.path, archive_input._temp)
+    };
     let (sample_hash, sample_size) = match candidate.embedded_offset {
         Some(offset) if offset > 0 => smartzip_db::sample_hash::sample_hash_segment(
             &candidate.path,
@@ -212,7 +217,7 @@ pub(crate) async fn prepare_resolved_archive(
     Ok(ResolvedArchive {
         candidate: candidate.clone(),
         archive_path,
-        _archive_temp: archive_input._temp,
+        _archive_temp: archive_temp,
         sample_hash,
         sample_size,
         known_hit,

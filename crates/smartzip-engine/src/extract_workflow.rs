@@ -154,6 +154,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
         // Embedded findings at non-zero offset still bypass sibling discovery.
         let mut volume_materialized: Option<crate::volumes::materialize::MaterializedVolumeSet> =
             None;
+        let mut volume_archive_path: Option<std::path::PathBuf> = None;
         let mut volume_set_for_candidate: Option<crate::volumes::VolumeSet> = None;
         let preparation = if candidate.source == CandidateSource::RootInput {
             let resolution = volume_resolver.resolve(&candidate);
@@ -174,6 +175,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
             crate::volumes::VolumePreparation::Single(prepared) => candidate = prepared,
             crate::volumes::VolumePreparation::Resolved {
                 candidate: prepared,
+                archive_path,
                 set,
                 warnings,
                 materialized,
@@ -190,6 +192,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                     });
                 }
                 candidate = prepared;
+                volume_archive_path = Some(archive_path);
                 volume_set_for_candidate = Some(set);
                 volume_materialized = Some(materialized);
             }
@@ -590,15 +593,11 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
             }
         }
 
-        // For volume sets, the canonical staging already provides the entrypoint; for single files use the usual carve/materialize.
+        // For volume sets, preparation already supplied the canonical backend
+        // entrypoint; candidate.path remains the logical input identity.
         let (archive_path, _archive_temp, _volume_materialized_keep) =
-            if let Some(mat) = volume_materialized {
-                let p = mat.canonical_entrypoint.clone();
-                // Keep the staging alive for the duration of this candidate's backend calls.
-                // We move the mat into a holder that lives until the end of the loop iteration.
-                // To avoid dropping before extraction, we keep it in a variable that outlives backend calls.
-                // Here we return the path and keep the handle.
-                (p, None, Some(mat))
+            if let Some(path) = volume_archive_path {
+                (path, None, volume_materialized)
             } else {
                 let inp = materialize_archive_input(&candidate)?;
                 let p = inp.path.clone();
@@ -759,16 +758,10 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
         }
 
         let _key = candidate_key(&candidate);
-        let mut archive_facts = ArchiveFacts {
+        let archive_facts = ArchiveFacts {
             container: candidate.detected_format.clone(),
             ..ArchiveFacts::default()
         };
-        if let Ok(probe) = backend
-            .probe_with_context(&archive_path, std::sync::Arc::clone(&task_context))
-            .await
-        {
-            archive_facts.encrypted = probe.encrypted;
-        }
         let output_dir = output_dir_for_candidate(&request.output_dir, &candidate);
 
         let mut extracted = false;

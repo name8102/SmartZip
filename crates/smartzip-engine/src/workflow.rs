@@ -131,9 +131,15 @@ pub(crate) async fn inspect_file_with_listener<B: ArchiveExecutor>(
         reason = Some("business_container".to_string());
         detected_format = Some(ArchiveFormat::Zip);
     } else if let Some(candidate) = candidate {
-        let resolved =
-            prepare_resolved_archive(&candidate, EncodingMode::Auto, history, &events, &task_id)
-                .await?;
+        let resolved = prepare_resolved_archive(
+            &candidate,
+            None,
+            EncodingMode::Auto,
+            history,
+            &events,
+            &task_id,
+        )
+        .await?;
         known_password = resolved
             .known_hit
             .as_ref()
@@ -282,10 +288,14 @@ pub(crate) async fn list_archive_with_listener_interactive<B: ArchiveExecutor>(
     });
 
     let mut volume_resolver = crate::volumes::VolumeResolver::new();
-    let (candidate, _volume_keep) = match volume_resolver.prepare(candidate) {
-        crate::volumes::VolumePreparation::Single(candidate) => (candidate, None),
+    let (candidate, backend_path, _volume_keep) = match volume_resolver.prepare(candidate) {
+        crate::volumes::VolumePreparation::Single(candidate) => {
+            let backend_path = candidate.path.clone();
+            (candidate, backend_path, None)
+        }
         crate::volumes::VolumePreparation::Resolved {
             candidate,
+            archive_path,
             warnings,
             materialized,
             ..
@@ -298,7 +308,7 @@ pub(crate) async fn list_archive_with_listener_interactive<B: ArchiveExecutor>(
                     },
                 });
             }
-            (candidate, Some(materialized))
+            (candidate, archive_path, Some(materialized))
         }
         crate::volumes::VolumePreparation::Incomplete { candidate, problem } => {
             return Err(smartzip_core::SmartZipError::CorruptedArchive {
@@ -325,6 +335,7 @@ pub(crate) async fn list_archive_with_listener_interactive<B: ArchiveExecutor>(
 
     let resolved = prepare_resolved_archive(
         &candidate,
+        Some(backend_path),
         request.encoding_mode.clone(),
         history,
         &events,
@@ -366,8 +377,8 @@ pub(crate) async fn list_archive_with_listener_interactive<B: ArchiveExecutor>(
             })?;
 
     if let Some(recorder) = history {
-        // For volume sets, candidate.path may have been rewritten to the canonical staging entrypoint.
-        // History must log the original user input path, not the temporary canonical path.
+        // History follows the logical candidate/request identity, never the
+        // temporary canonical staging path used by the backend.
         let history_input_path = &request.path;
         recorder.record_file_extraction(
             &task_id,
