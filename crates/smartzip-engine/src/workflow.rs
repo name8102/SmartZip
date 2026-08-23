@@ -288,11 +288,9 @@ pub(crate) async fn list_archive_with_listener_interactive<B: ArchiveExecutor>(
     });
 
     let mut volume_resolver = crate::volumes::VolumeResolver::new();
-    let (candidate, backend_path, _volume_keep) = match volume_resolver.prepare(candidate) {
-        crate::volumes::VolumePreparation::Single(candidate) => {
-            let backend_path = candidate.path.clone();
-            (candidate, backend_path, None)
-        }
+    let (candidate, backend_path_override, _volume_keep) = match volume_resolver.prepare(candidate)
+    {
+        crate::volumes::VolumePreparation::Single(candidate) => (candidate, None, None),
         crate::volumes::VolumePreparation::Resolved {
             candidate,
             archive_path,
@@ -308,7 +306,7 @@ pub(crate) async fn list_archive_with_listener_interactive<B: ArchiveExecutor>(
                     },
                 });
             }
-            (candidate, archive_path, Some(materialized))
+            (candidate, Some(archive_path), Some(materialized))
         }
         crate::volumes::VolumePreparation::Incomplete { candidate, problem } => {
             return Err(smartzip_core::SmartZipError::CorruptedArchive {
@@ -335,7 +333,7 @@ pub(crate) async fn list_archive_with_listener_interactive<B: ArchiveExecutor>(
 
     let resolved = prepare_resolved_archive(
         &candidate,
-        Some(backend_path),
+        backend_path_override,
         request.encoding_mode.clone(),
         history,
         &events,

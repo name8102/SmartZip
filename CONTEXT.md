@@ -10,7 +10,7 @@
 | **ArchiveExecutor** | 目标中面向 `SmartZipEngine` 的归档执行 seam，定义 `probe` / `list` / `test` / `extract` / `compress`。`BackendRouter` 实现此 interface；engine 不接触 adapter 发现、能力 profile、排序或 fallback。 |
 | **ArchiveAdapter** | 面向 `BackendRouter` 的后端 adapter seam。每个 Rust 原生实现或外部程序实例（包括不同路径或版本的 `7z`、`7zz`）都是独立 adapter，并保留自己的身份和能力，不在进入路由前合并。 |
 | **AdapterCapabilities** | 路由实际消费的 adapter 元数据：支持的 operation、读取容器、压缩容器，以及密码和字符集覆盖能力。运行时 UnsupportedCodec/UnsupportedContainer 仅进入任务级负面缓存，不持久化假设性的 profile 规则。 |
-| **ArchiveFacts** | 路由需要的归档事实：容器、可选 codec 字符串和加密状态。事实不包含假设性的后端策略。 |
+| **ArchiveFacts** | 路由需要的归档事实：容器和可选 codec 字符串。事实不包含假设性的后端策略。 |
 | **ArchiveRequirements** | 当前调用方的具体路由要求：是否提供密码、是否覆盖文件名字符集，以及已观察的 codec 字符串。 |
 | **RoutePlan** | 针对单个归档和 operation 生成的可解释 adapter 顺序，记录容器、候选、排除原因与 fallback 规则。list/test/extract/compress 分别规划；同一任务复用 facts 和 extract 顺序。 |
 | **NativeBackend** | 原生 adapter。`NativeZipBackend` 负责 ZIP ZipCrypto / AES、原始文件名字节、编码信息和路径安全；它作为需要这些特殊能力的显式路径使用，不是普通 ZIP 密码路径的默认后端。密码候选通过直接解压验证，`test` 仅用于显式完整性检查。复杂格式由 `BackendRouter` 交给其他 adapter。 |
