@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use unicode_normalization::UnicodeNormalization;
 
 /// Bounded set of common duplicate/copy suffix aliases as secondary candidate views.
@@ -13,7 +13,7 @@ pub enum AliasKind {
 }
 
 pub fn alias_stripped_name(path: &Path) -> Option<(String, AliasKind)> {
-    let file_name = path.file_name()?.to_str()?;
+    path.file_name()?.to_str()?;
     // Need to consider extension handling: alias suffix is before extension or after?
     // Examples: `03_1` with maybe no extension? For `03_1.jpg`, `_1` is before extension.
     // We'll handle stem and extension separately.

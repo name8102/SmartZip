@@ -5892,9 +5892,13 @@ dependencies = [
 name = "smartzip-scanner"
 version = "0.1.0"
 dependencies = [
+ "aho-corasick",
  "binwalk",
+ "crc32fast",
  "serde",
  "smartzip-core",
+ "tempfile",
+ "zip",
 ]
 
 [[package]]

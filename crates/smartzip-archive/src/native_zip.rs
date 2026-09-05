@@ -1,6 +1,6 @@
 use smartzip_core::{Result, SmartZipError};
 use std::fs::File;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use zip::ZipArchive;
 
 /// Raw ZIP entry as stored in central directory, without SmartZip decoding.
@@ -144,6 +144,7 @@ fn map_zip_error(source: zip::result::ZipError, path: &Path) -> SmartZipError {
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::path::PathBuf;
     use zip::write::SimpleFileOptions;
     use zip::ZipWriter;
 

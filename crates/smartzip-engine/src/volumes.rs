@@ -6,7 +6,7 @@ pub mod sequence;
 
 use directory::{DirectoryIndexCache, DirectoryVolumeIndex};
 use sequence::{generate_single_token_hypotheses, SequenceHypothesis};
-use smartzip_archive::volume_probe::{probe_volume_structure, VolumeProbeResult, VolumeStructure};
+use smartzip_archive::volume_probe::{probe_volume_structure, VolumeProbeResult};
 use smartzip_core::ArchiveFormat;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -122,7 +122,10 @@ impl VolumeResolver {
     /// Resolve a seed path (physical file selected by user or nested).
     /// Embedded findings at non-zero offset bypass sibling discovery.
     pub fn resolve(&mut self, candidate: &crate::types::ExtractionCandidate) -> VolumeResolution {
-        if candidate.embedded_offset.is_some_and(|off| off > 0) {
+        if candidate.embedded_offset.is_some_and(|off| off > 0)
+            || (candidate.source == crate::types::CandidateSource::EmbeddedFinding
+                && candidate.embedded_offset.is_some())
+        {
             return VolumeResolution::Single;
         }
         let path = &candidate.path;
@@ -131,8 +134,8 @@ impl VolumeResolver {
         };
 
         // Check if file exists and is regular file.
-        let metadata = match std::fs::symlink_metadata(path) {
-            Ok(m) if m.is_file() => m,
+        match std::fs::symlink_metadata(path) {
+            Ok(m) if m.is_file() => {}
             _ => return VolumeResolution::Single,
         };
         // Use infer + archive probe to decide if we need sibling discovery.
@@ -208,7 +211,7 @@ impl VolumeResolver {
         let mut ambiguous_hypotheses = Vec::new();
 
         for hyp in hypotheses {
-            let formats = collect_candidate_formats(&hyp, &index, &probe);
+            let formats = collect_candidate_formats(&hyp, &probe);
             // If no strong format evidence, try the hypothesis once with format inferred via first-hit (legacy) to avoid missing weak cases
             let formats = if formats.is_empty() {
                 vec![None]
@@ -387,7 +390,6 @@ fn resolve_hypothesis_with_forced_format(
 }
 fn collect_candidate_formats(
     hyp: &SequenceHypothesis,
-    index: &DirectoryVolumeIndex,
     seed_probe: &VolumeProbeResult,
 ) -> Vec<ArchiveFormat> {
     let mut formats: Vec<ArchiveFormat> = Vec::new();
@@ -979,7 +981,7 @@ fn same_member_set(a: &VolumeSet, b: &VolumeSet) -> bool {
     if a.members.len() != b.members.len() {
         return false;
     }
-    let mut a_paths: HashSet<PathBuf> = a.members.iter().map(|m| m.path.clone()).collect();
+    let a_paths: HashSet<PathBuf> = a.members.iter().map(|m| m.path.clone()).collect();
     let b_paths: HashSet<PathBuf> = b.members.iter().map(|m| m.path.clone()).collect();
     a_paths == b_paths
 }
@@ -1401,7 +1403,7 @@ enum CandidateElimination {
 
 fn eliminate_candidates(
     paths: &[PathBuf],
-    format: &ArchiveFormat,
+    _format: &ArchiveFormat,
     _ordinal: u64,
 ) -> CandidateElimination {
     if paths.len() == 1 {
@@ -1417,7 +1419,6 @@ fn eliminate_candidates(
     // For now, try to eliminate candidates that are definitively not valid volume (e.g., probe says NotApplicable but format demands multivolume? Or file is too small?)
     let mut valid: Vec<PathBuf> = Vec::new();
     for p in paths {
-        let probe = probe_volume_structure(p);
         // If probe indicates NotApplicable for a format that should be volume, maybe still valid as continuation chunk (raw) – so not invalid.
         // We'll consider probe Invalid only if file is ordinary (infer) – but that check already prevents volume candidates? Actually our candidate set only includes files that matched filename pattern, which may include ordinary files mis-grouped; those would be infer-ordinary and should be eliminated.
         // Check if file is infer ordinary
@@ -1454,7 +1455,6 @@ fn eliminate_candidates(
 
     // 4. Sampled BLAKE3 for duplicate detection
     // Group by fingerprint + size
-    let mut groups: HashMap<blake3::Hash, Vec<PathBuf>> = HashMap::new();
     let mut size_map: HashMap<PathBuf, u64> = HashMap::new();
     for p in &valid {
         let size = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
@@ -1469,7 +1469,7 @@ fn eliminate_candidates(
     // For each size group with >1, compute fingerprint
     let mut remaining_candidates: Vec<PathBuf> = Vec::new();
     let mut duplicate_folded = Vec::new();
-    for (size, group) in size_groups {
+    for group in size_groups.into_values() {
         if group.len() == 1 {
             remaining_candidates.push(group.into_iter().next().unwrap());
         } else {
@@ -1591,33 +1591,8 @@ mod tests {
         f.write_all(&hdr).unwrap();
         f.write_all(&vec![0u8; 100]).unwrap();
     }
-    fn create_fake_7z_start(path: &Path, next_offset: u64, next_size: u64) {
-        let mut header = [0u8; 32];
-        header[0..6].copy_from_slice(b"\x37\x7a\xbc\xaf\x27\x1c");
-        header[6] = 0; // major
-        header[7] = 4; // minor
-                       // NextHeaderOffset, NextHeaderSize
-        header[12..20].copy_from_slice(&next_offset.to_le_bytes());
-        header[20..28].copy_from_slice(&next_size.to_le_bytes());
-        let crc = crc32fast::hash(&header[12..32]);
-        header[8..12].copy_from_slice(&crc.to_le_bytes());
-        // Set NextHeaderCRC dummy
-        let mut f = fs::File::create(path).unwrap();
-        f.write_all(&header).unwrap();
-        // Pad to expected logical size or beyond
-        if next_offset + next_size + 32 > 32 {
-            let remaining = (next_offset + next_size) as usize;
-            f.write_all(&vec![0u8; remaining]).unwrap();
-        }
-    }
     fn create_raw_file(path: &Path, content: &[u8]) {
         fs::write(path, content).unwrap();
-    }
-    fn create_fake_zip_local(path: &Path) {
-        // ZIP local header + no EOCD -> probe will say MultiVolume
-        let mut f = fs::File::create(path).unwrap();
-        f.write_all(b"PK\x03\x04").unwrap();
-        f.write_all(&vec![0u8; 100]).unwrap();
     }
     fn make_candidate(path: PathBuf) -> crate::types::ExtractionCandidate {
         crate::types::ExtractionCandidate {

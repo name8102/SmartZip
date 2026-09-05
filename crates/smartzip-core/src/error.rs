@@ -36,6 +36,11 @@ pub enum SmartZipError {
     #[error("password required for {path}")]
     PasswordRequired { path: PathBuf },
 
+    #[error(
+        "wrong password or damaged encrypted data for {path}; test could not distinguish them"
+    )]
+    PasswordIndeterminate { path: PathBuf },
+
     #[error("wrong password for {path}")]
     WrongPassword { path: PathBuf },
 

@@ -32,22 +32,22 @@ def _minimal_zip(entries: list[tuple[str, bytes]]) -> bytes:
     for name, data in entries:
         offsets.append(len(buf))
         crc = zlib.crc32(data) & 0xFFFFFFFF
-        compressed = zlib.compress(data)
+        compressed = zlib.compress(data, wbits=-15)
         name_b = name.encode("utf-8")
         # local file header
         buf += b"PK\x03\x04"
         buf += struct.pack("<HHHHHIIIHH",
-            20, 0, 0, 0, 0, crc, len(compressed), len(data), len(name_b), 0)
+            20, 0, 8, 0, 0, crc, len(compressed), len(data), len(name_b), 0)
         buf += name_b
         buf += compressed
     cd_start = len(buf)
     for i, (name, data) in enumerate(entries):
         crc = zlib.crc32(data) & 0xFFFFFFFF
-        compressed = zlib.compress(data)
+        compressed = zlib.compress(data, wbits=-15)
         name_b = name.encode("utf-8")
         buf += b"PK\x01\x02"
         buf += struct.pack("<HHHHHHIIIHHHHHII",
-            20, 20, 0, 0, 0, 0, crc, len(compressed), len(data),
+            20, 20, 0, 8, 0, 0, crc, len(compressed), len(data),
             len(name_b), 0, 0, 0, 0, 0, offsets[i])
         buf += name_b
     cd_size = len(buf) - cd_start

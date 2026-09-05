@@ -158,6 +158,7 @@ enum Command {
         #[arg(long)]
         json: bool,
 
+        /// Nested scan byte limit (0 = unlimited); explicit root archives are parsed in full.
         #[arg(long)]
         max_scan_bytes: Option<u64>,
 
@@ -192,6 +193,7 @@ enum Command {
         #[arg(long)]
         deep: bool,
 
+        /// Nested scan byte limit (0 = unlimited); explicit root archives are parsed in full.
         #[arg(long)]
         max_scan_bytes: Option<u64>,
 
@@ -239,6 +241,7 @@ enum Command {
         #[arg(long)]
         deep: bool,
 
+        /// Nested scan byte limit (0 = unlimited); explicit root archives are parsed in full.
         #[arg(long)]
         max_scan_bytes: Option<u64>,
 
@@ -271,6 +274,7 @@ enum Command {
         #[arg(long)]
         deep: bool,
 
+        /// Nested scan byte limit (0 = unlimited); explicit root archives are parsed in full.
         #[arg(long)]
         max_scan_bytes: Option<u64>,
 
@@ -550,7 +554,7 @@ async fn run(mut cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let result = serde_json::json!({"schema_version": 1, "version": env!("CARGO_PKG_VERSION"), "database": db_path,
                 "backends": adapters, "warnings": backend.warnings(), "status": if healthy { "completed" } else { "failed" },
                 "exit_code": if healthy { 0 } else { 1 }, "extraction_limits": cli.safety.limits(), "scan_default_bytes": smartzip_scanner::DEFAULT_SCAN_BYTES,
-                "scan_hard_limit_bytes": smartzip_scanner::MAX_SCAN_BYTES});
+                "scan_hard_limit_bytes": null, "root_scan_strategy": "continue_from_archive_end_until_empty_window"});
             if json {
                 println!("{}", serde_json::to_string_pretty(&result)?);
             } else {

@@ -279,7 +279,6 @@ pub(crate) async fn run<B: ArchiveExecutor>(
                     Some(TestFailure::PasswordIndeterminate) => {
                         password_was_required = true;
                         report.password_status = PasswordStatus::Indeterminate;
-                        break;
                     }
                     _ => {
                         report.password_status =
@@ -507,6 +506,7 @@ fn executed_result(result: Result<TestResult>) -> TestResult {
                 SmartZipError::Cancelled => TestFailure::Cancelled,
                 SmartZipError::PasswordRequired { .. } => TestFailure::PasswordRequired,
                 SmartZipError::WrongPassword { .. } => TestFailure::PasswordRejected,
+                SmartZipError::PasswordIndeterminate { .. } => TestFailure::PasswordIndeterminate,
                 SmartZipError::CorruptedArchive { .. } => TestFailure::Corruption,
                 SmartZipError::Io { .. } => TestFailure::Io,
                 _ => TestFailure::Unknown,

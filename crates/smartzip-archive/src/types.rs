@@ -64,6 +64,9 @@ pub struct ExtractArchiveRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExtractArchiveResult {
     pub output_dir: PathBuf,
+    /// Encryption evidence from the extraction's existing metadata/preflight.
+    #[serde(default)]
+    pub encrypted: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

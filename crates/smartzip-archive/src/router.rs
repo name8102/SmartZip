@@ -509,16 +509,14 @@ impl BackendRouter {
                 .extract_with_context(request.clone(), std::sync::Arc::clone(&context))
                 .await;
             match result {
-                Ok(_) => {
+                Ok(result) => {
                     self.emit(
                         context.as_ref(),
                         RouteEvent::BackendSelected {
                             adapter_id: candidate.adapter_id.clone(),
                         },
                     );
-                    return Ok(ExtractArchiveResult {
-                        output_dir: request.output_dir,
-                    });
+                    return Ok(result);
                 }
                 Err(error) => {
                     self.emit(
@@ -1201,6 +1199,7 @@ mod tests {
             std::fs::write(request.output_dir.join("success.txt"), &self.id).unwrap();
             Ok(ExtractArchiveResult {
                 output_dir: request.output_dir,
+                encrypted: None,
             })
         }
 

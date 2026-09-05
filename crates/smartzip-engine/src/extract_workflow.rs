@@ -1,6 +1,6 @@
 //! Recursive extraction workflow implementation.
 
-use smartzip_archive::{ArchiveExecutor, ExtractArchiveRequest, NativeZipBackend, TestRequest};
+use smartzip_archive::{ArchiveExecutor, ExtractArchiveRequest, NativeZipBackend};
 use smartzip_core::{ArchiveFacts, ArchiveFormat, EncodingMode, TaskEvent, TaskEventKind, TaskId};
 use smartzip_passwords::{PasswordCandidate, PasswordService};
 use smartzip_scanner::{Confidence, EmbeddedArchiveFinding, EmbeddedScanner};
@@ -129,8 +129,8 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
     let mut was_cancelled = false;
     let mut committed_usage = crate::budget::Usage::default();
     let mut volume_resolver = VolumeResolver::new();
-    let mut processed_volume_keys: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
+    let mut processed_volume_keys = HashSet::new();
+    let mut consumed_volume_members = HashSet::new();
 
     loop {
         if cancellation.is_cancelled() {
@@ -159,13 +159,22 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
             skipped.push(candidate);
             continue;
         }
+        let absolute_input =
+            std::path::absolute(&candidate.path).unwrap_or_else(|_| candidate.path.clone());
+        if candidate.source != CandidateSource::EmbeddedFinding
+            && consumed_volume_members.contains(&absolute_input)
+        {
+            record_skip(history, &task_id, &candidate, "duplicate");
+            skipped.push(candidate);
+            continue;
+        }
         // Resolve and materialize volumes once through the shared preparation path.
-        // Embedded findings at non-zero offset still bypass sibling discovery.
+        // Carved findings bypass sibling discovery, including offset-zero payloads.
         let mut volume_materialized: Option<crate::volumes::materialize::MaterializedVolumeSet> =
             None;
         let mut volume_archive_path: Option<std::path::PathBuf> = None;
         let mut volume_set_for_candidate: Option<crate::volumes::VolumeSet> = None;
-        let preparation = if candidate.source == CandidateSource::RootInput {
+        let preparation = if candidate.source != CandidateSource::EmbeddedFinding {
             let resolution = volume_resolver.resolve(&candidate);
             if let VolumeResolution::Resolved(set)
             | VolumeResolution::ResolvedWithWarnings { set, .. } = &resolution
@@ -175,6 +184,11 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                     continue;
                 }
                 processed_volume_keys.insert(key);
+                for member in &set.members {
+                    consumed_volume_members.insert(
+                        std::path::absolute(&member.path).unwrap_or_else(|_| member.path.clone()),
+                    );
+                }
             }
             volume_resolver.prepare_resolution(candidate, resolution)
         } else {
@@ -341,10 +355,9 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
         // Confirm those candidates one at a time without rescanning the
         // carrier file.
         if candidate.source == CandidateSource::EmbeddedFinding
-            && matches!(
-                embedded_policy.mode,
-                smartzip_core::EmbeddedScanMode::Auto | smartzip_core::EmbeddedScanMode::Ask
-            )
+            && (embedded_policy.mode == smartzip_core::EmbeddedScanMode::Ask
+                || (embedded_policy.mode == smartzip_core::EmbeddedScanMode::Auto
+                    && candidate.depth > 0))
             && !embedded_extract_all
         {
             let finding = EmbeddedArchiveFinding {
@@ -411,7 +424,8 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                 embedded_policy.mode,
                 smartzip_core::EmbeddedScanMode::All | smartzip_core::EmbeddedScanMode::Aggressive
             );
-        let findings: Vec<_> = if (!header_archive || explicit_scan)
+        let findings: Vec<_> = if volume_set_for_candidate.is_none()
+            && (candidate.source == CandidateSource::RootInput || !header_archive || explicit_scan)
             && should_scan_candidate_for_embedded(
                 &candidate,
                 &embedded_policy,
@@ -420,13 +434,16 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                 &events,
                 &task_id,
             ) {
-            if std::fs::metadata(&candidate.path).is_ok_and(|m| m.len() > scan_with.scan_limit()) {
+            if let Some(limit) = scan_with
+                .scan_limit()
+                .filter(|limit| std::fs::metadata(&candidate.path).is_ok_and(|m| m.len() > *limit))
+            {
                 events.push(TaskEvent {
                     task_id: task_id.clone(),
                     kind: TaskEventKind::Warning {
                         message: format!(
                             "embedded scan limited to first {} bytes of {}",
-                            scan_with.scan_limit(),
+                            limit,
                             candidate.path.display()
                         ),
                     },
@@ -436,7 +453,10 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                 .scan_path(&candidate.path)
                 .unwrap_or_default()
                 .into_iter()
-                .filter(|finding| finding_meets_min_size(finding, &embedded_policy))
+                .filter(|finding| {
+                    candidate.source == CandidateSource::RootInput
+                        || finding_meets_min_size(finding, &embedded_policy)
+                })
                 .collect()
         } else {
             Vec::new()
@@ -605,14 +625,14 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
             continue;
         }
 
-        // Business container filter for root inputs: nested candidates are
-        // filtered in discover_nested_candidates, but root inputs (a .docx
-        // dropped straight in, or a plain .zip whose contents match docx
-        // structure) reach the main loop directly.
-        if candidate.detected_format == Some(ArchiveFormat::Zip) {
-            if let Some(kind) = ext_business_container_kind(&candidate.path)
-                .or_else(|| crate::container::classify_zip_path(&candidate.path))
-            {
+        // Business-container skips are an efficiency policy for nested files.
+        // Explicit root inputs still reach the archive backend.
+        if candidate.depth > 0 && candidate.detected_format == Some(ArchiveFormat::Zip) {
+            if let Some(kind) = ext_business_container_kind(&candidate.path).or_else(|| {
+                crate::container::classify_zip_path(
+                    volume_archive_path.as_deref().unwrap_or(&candidate.path),
+                )
+            }) {
                 events.push(TaskEvent {
                     task_id: task_id.clone(),
                     kind: TaskEventKind::BusinessContainerSkipped {
@@ -745,12 +765,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
         if candidate_encoding_mode == EncodingMode::Auto
             && candidate.detected_format == Some(ArchiveFormat::Zip)
         {
-            let reader = NativeZipBackend::new();
-            if let Ok(is_encrypted) = reader.has_encrypted_entries(&archive_path) {
-                if !is_encrypted {
-                    zip_encoding_assessment = assess_zip_encoding(&archive_path, None).await;
-                }
-            }
+            zip_encoding_assessment = assess_zip_encoding(&archive_path, None).await;
         }
         if let Some(assessment) = &zip_encoding_assessment {
             events.push(TaskEvent {
@@ -770,6 +785,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
         let mut terminal_skip = false;
         let mut last_error = None;
         let mut saw_wrong_password = false;
+        let mut saw_password_indeterminate = false;
         let mut password_prompt_cancelled = false;
         let mut actual_output_dir = output_dir.clone();
         // File-grain success state, recorded once after the try loop.
@@ -786,6 +802,8 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
             terminal_skip = true;
             skip_reason = "encoding_skipped";
         }
+        let total_attempts = candidate_passwords.len();
+        let mut attempt_index = 0;
         let mut attempts: VecDeque<_> = candidate_passwords.into_iter().collect();
         let mut prompted = false;
         let mut saw_password_required = false;
@@ -793,7 +811,10 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
             let password = if let Some(password) = attempts.pop_front() {
                 password
             } else if !prompted
-                && (saw_wrong_password || saw_password_required || last_error.is_none())
+                && (saw_wrong_password
+                    || saw_password_required
+                    || saw_password_indeterminate
+                    || last_error.is_none())
             {
                 prompted = true;
                 let input = if let Some(prompter) = password_prompter {
@@ -819,6 +840,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                 break;
             }
             let pw_value = password_value(&password);
+            attempt_index += 1;
             events.push(TaskEvent {
                 task_id: task_id.clone(),
                 kind: TaskEventKind::PasswordTried {
@@ -828,59 +850,19 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
             events.push(TaskEvent {
                 task_id: task_id.clone(),
                 kind: TaskEventKind::Progress(smartzip_core::TaskProgress::indeterminate(format!(
-                    "Testing password candidate ({}) for {}",
+                    "Trying password [{}/{}] ({}) by extraction for {}",
+                    attempt_index,
+                    total_attempts.max(attempt_index),
                     password_source_label(&password),
                     candidate.path.display()
                 ))),
             });
-            let test = backend_call(
-                "archive-backend",
-                "test",
-                &archive_path,
-                backend.test_with_context(
-                    TestRequest {
-                        archive: archive_path.clone(),
-                        format: candidate.detected_format.clone(),
-                        password: pw_value.clone(),
-                        encoding: candidate_encoding_mode.clone(),
-                    },
-                    task_context.clone(),
-                ),
-            )
-            .await
-            .and_then(|result| {
-                if result.ok {
-                    Ok(result)
-                } else {
-                    Err(crate::backend_util::failed_test_error(
-                        &result,
-                        &archive_path,
-                    ))
-                }
-            });
-            let test = match test {
-                Ok(test) => test,
-                Err(smartzip_core::SmartZipError::WrongPassword { .. }) => {
-                    saw_wrong_password = true;
-                    let _ = passwords.record_failure(&password);
-                    continue;
-                }
-                Err(smartzip_core::SmartZipError::PasswordRequired { .. })
-                    if pw_value.as_deref().is_none_or(str::is_empty) =>
-                {
-                    saw_password_required = true;
-                    continue;
-                }
-                Err(error) => {
-                    last_error = Some(error);
-                    break;
-                }
-            };
             let encoding = encoding_choice
                 .clone()
                 .expect("encoding skip exits before attempts");
             candidate_encoding_used = Some(encoding_mode_label(&encoding));
             let staged_usage = std::cell::Cell::new(committed_usage);
+            let extracted_encrypted = std::cell::Cell::new(None);
             let result = output_materializer
                 .materialize(
                     MaterializeRequest {
@@ -888,7 +870,18 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                         archive_path: candidate.path.clone(),
                         commit_policy: CommitPolicy::FailIfExists,
                         archive_stem: Some(
-                            archive_stem(&candidate.path).to_string_lossy().into_owned(),
+                            if candidate.source == CandidateSource::EmbeddedFinding
+                                && candidate.depth == 0
+                            {
+                                candidate
+                                    .relative_path
+                                    .file_name()
+                                    .unwrap_or_default()
+                                    .to_string_lossy()
+                                    .into_owned()
+                            } else {
+                                archive_stem(&candidate.path).to_string_lossy().into_owned()
+                            },
                         ),
                         layout_policy: request.layout_policy,
                         single_root_name_policy: request.single_root_name_policy,
@@ -901,8 +894,9 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                         let facts = &archive_facts;
                         let limits = &request.limits;
                         let staged_usage = &staged_usage;
+                        let extracted_encrypted = &extracted_encrypted;
                         async move {
-                            crate::budget::monitor(
+                            let extracted = crate::budget::monitor(
                                 &temp_output_dir,
                                 limits,
                                 committed_usage,
@@ -925,6 +919,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                                 ),
                             )
                             .await?;
+                            extracted_encrypted.set(extracted.encrypted);
                             staged_usage.set(crate::budget::inspect(
                                 &temp_output_dir,
                                 limits,
@@ -956,9 +951,10 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                     actual_output_dir = result.output_dir;
                     // Credential success needs evidence that encryption was used.
                     candidate_has_password = pw_value.as_deref().is_some_and(|p| !p.is_empty())
-                        && (test.encrypted == Some(true)
+                        && (extracted_encrypted.get() == Some(true)
                             || saw_password_required
                             || saw_wrong_password
+                            || saw_password_indeterminate
                             || (candidate.detected_format == Some(ArchiveFormat::Zip)
                                 && NativeZipBackend::new()
                                     .has_encrypted_entries(&archive_path)
@@ -987,15 +983,26 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                             },
                         });
                     }
-                    if failure.kind == materialize::MaterializeFailureKind::ExtractFailed
-                        && matches!(
-                            failure.error,
-                            smartzip_core::SmartZipError::WrongPassword { .. }
-                        )
-                    {
-                        saw_wrong_password = true;
-                        let _ = passwords.record_failure(&password);
-                        continue;
+                    if failure.kind == materialize::MaterializeFailureKind::ExtractFailed {
+                        match &failure.error {
+                            smartzip_core::SmartZipError::WrongPassword { .. } => {
+                                saw_wrong_password = true;
+                                let _ = passwords.record_failure(&password);
+                                continue;
+                            }
+                            smartzip_core::SmartZipError::PasswordRequired { .. }
+                                if pw_value.as_deref().is_none_or(str::is_empty) =>
+                            {
+                                saw_password_required = true;
+                                continue;
+                            }
+                            smartzip_core::SmartZipError::PasswordIndeterminate { .. } => {
+                                saw_password_indeterminate = true;
+                                last_error = Some(failure.error);
+                                continue;
+                            }
+                            _ => {}
+                        }
                     }
                     last_error = Some(failure.error);
                     break;
@@ -1015,7 +1022,11 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
             if password_prompt_cancelled {
                 if password_prompter.is_none() {
                     failed_count += 1;
-                    let error = if saw_wrong_password {
+                    let error = if saw_password_indeterminate {
+                        smartzip_core::SmartZipError::PasswordIndeterminate {
+                            path: candidate.path.clone(),
+                        }
+                    } else if saw_wrong_password {
                         smartzip_core::SmartZipError::WrongPassword {
                             path: candidate.path.clone(),
                         }
@@ -1042,7 +1053,9 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                             } else {
                                 "skipped"
                             },
-                            reason: Some(if saw_wrong_password {
+                            reason: Some(if saw_password_indeterminate {
+                                "password_indeterminate"
+                            } else if saw_wrong_password {
                                 "wrong_password"
                             } else {
                                 "password_required"
@@ -1064,10 +1077,14 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                 // File-grain failure: classify the reason from the error so
                 // `history files --reason` can filter later.
                 let reason = match &error {
+                    smartzip_core::SmartZipError::PasswordIndeterminate { .. } => {
+                        "password_indeterminate"
+                    }
                     smartzip_core::SmartZipError::WrongPassword { .. }
                     | smartzip_core::SmartZipError::PasswordRequired { .. } => "wrong_password",
                     smartzip_core::SmartZipError::Io { .. } => "not_found",
-                    _ => "corrupt",
+                    smartzip_core::SmartZipError::CorruptedArchive { .. } => "corrupt",
+                    _ => "backend_failed",
                 };
                 if let Some(recorder) = history {
                     recorder.record_file_extraction(

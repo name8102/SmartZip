@@ -6,7 +6,6 @@ use std::path::Path;
 
 const EOCD_SIG: [u8; 4] = [0x50, 0x4b, 0x05, 0x06];
 const ZIP64_EOCD_LOC_SIG: [u8; 4] = [0x50, 0x4b, 0x06, 0x07];
-const ZIP64_EOCD_SIG: [u8; 4] = [0x50, 0x4b, 0x06, 0x06];
 
 pub fn probe_zip(path: &Path) -> Option<VolumeProbeResult> {
     let mut file = File::open(path).ok()?;
@@ -33,7 +32,6 @@ pub fn probe_zip(path: &Path) -> Option<VolumeProbeResult> {
         let total_entries = u16::from_le_bytes([eocd[10], eocd[11]]) as u32;
         let cd_size = u32::from_le_bytes([eocd[12], eocd[13], eocd[14], eocd[15]]) as u64;
         let cd_offset = u32::from_le_bytes([eocd[16], eocd[17], eocd[18], eocd[19]]) as u64;
-        let comment_len = u16::from_le_bytes([eocd[20], eocd[21]]) as usize;
         let is_zip64_placeholder = total_entries == 0xFFFF
             || entries_this_disk == 0xFFFF
             || cd_size == 0xFFFFFFFF
@@ -55,7 +53,6 @@ pub fn probe_zip(path: &Path) -> Option<VolumeProbeResult> {
         let cd_end = cd_offset.saturating_add(cd_size);
         // EOCD position relative to start of file = start + eocd_pos
         let eocd_file_offset = start + eocd_pos as u64;
-        let expected_eocd_start = cd_end;
         // If this is single disk, this_disk==0, cd_start_disk==0, and CD fits before EOCD with correct adjacency (allowing comment)
         let is_single_disk = this_disk == 0 && cd_start_disk == 0;
         let standalone =

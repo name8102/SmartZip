@@ -94,6 +94,104 @@ pub(crate) async fn run(
     ))
 }
 
+/// Only diagnostic lines participate in classification, never displayed names.
+pub(crate) fn diagnostic_text(combined: &str, family: &str) -> String {
+    combined
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim().to_ascii_lowercase();
+            let message = line.strip_prefix("error: ").unwrap_or(&line);
+            let message = if family == "unrar" {
+                message.rsplit_once(" - ").map_or(message, |(_, tail)| tail)
+            } else {
+                message
+            };
+            const PREFIXES: &[&str] = &[
+                "missing volume",
+                "cannot find volume",
+                "cannot open next volume",
+                "cannot find the file specified",
+                "cannot open",
+                "can not open",
+                "wrong password",
+                "incorrect password",
+                "password is incorrect",
+                "password required",
+                "password is required",
+                "enter password",
+                "unsupported method",
+                "unknown method",
+                "unsupported archive",
+                "is not archive",
+                "no such file",
+                "the system cannot find",
+                "file not found",
+                "data error",
+                "crc failed",
+                "crc error",
+                "checksum error",
+                "headers error",
+                "unexpected end",
+                "corrupt",
+                "permission denied",
+                "access is denied",
+                "user break",
+                "break signaled",
+            ];
+            let is_diagnostic = |message: &str| {
+                PREFIXES.iter().any(|prefix| {
+                    message.strip_prefix(prefix).is_some_and(|rest| {
+                        rest.is_empty() || rest.starts_with([' ', '?', ':']) || rest == "."
+                    })
+                })
+            };
+            let first = message.split(" : ").next().unwrap_or(message);
+            if is_diagnostic(first) {
+                return Some(first.to_owned());
+            }
+            // 7z listing failures put the archive path before the diagnostic:
+            // ERROR: path : Can not open encrypted archive. Wrong password?
+            if line.starts_with("error: ") {
+                let last = message.rsplit(" : ").next().unwrap_or(message);
+                if is_diagnostic(last) {
+                    return Some(last.to_owned());
+                }
+            }
+            None
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+pub(crate) fn password_error(
+    output: &BackendCommandOutput,
+    family: &str,
+    password: Option<&str>,
+    path: &Path,
+) -> Option<SmartZipError> {
+    let failure = report(
+        "credential-attempt",
+        family,
+        output.clone(),
+        false,
+        password,
+    )
+    .diagnostics
+    .failure;
+    match failure {
+        Some(TestFailure::PasswordRequired) => {
+            Some(SmartZipError::PasswordRequired { path: path.into() })
+        }
+        Some(TestFailure::PasswordRejected) => {
+            Some(SmartZipError::WrongPassword { path: path.into() })
+        }
+        Some(TestFailure::PasswordIndeterminate) => {
+            Some(SmartZipError::PasswordIndeterminate { path: path.into() })
+        }
+        _ => None,
+    }
+}
+
 pub(crate) fn report(
     id: &str,
     family: &str,
@@ -102,7 +200,24 @@ pub(crate) fn report(
     password: Option<&str>,
 ) -> TestResult {
     let combined = format!("{}\n{}", output.stdout, output.stderr);
-    let lower = combined.to_ascii_lowercase();
+    let lower = diagnostic_text(&combined, family);
+    let password_failure = lower.lines().any(|message| {
+        [
+            "wrong password",
+            "incorrect password",
+            "password is incorrect",
+            "password required",
+            "password is required",
+            "enter password",
+            "cannot open encrypted archive",
+            "can not open encrypted archive",
+            "data error in encrypted file",
+            "crc failed in encrypted file",
+            "checksum error in the encrypted file",
+        ]
+        .iter()
+        .any(|prefix| message.starts_with(prefix))
+    });
     let ok = output.status == Some(0);
     // Listing text also contains attacker-controlled filenames. A successful
     // process with a supplied password does not prove that it used that password.
@@ -120,7 +235,7 @@ pub(crate) fn report(
         || lower.contains("cannot find the file specified")
     {
         Some(TestFailure::MissingVolume)
-    } else if lower.contains("password") {
+    } else if password_failure {
         if password.is_none_or(str::is_empty) {
             Some(TestFailure::PasswordRequired)
         } else if lower.contains("wrong password?")
@@ -200,6 +315,50 @@ pub(crate) fn report(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn archive_and_entry_names_do_not_change_failure_classification() {
+        for name in ["password.zip", "missing volume.zip", "corrupt.zip"] {
+            let result = report(
+                "7z",
+                "7z",
+                BackendCommandOutput {
+                    status: Some(2),
+                    stdout: format!("Testing archive: {name}\nPath = {name}\n"),
+                    stderr: format!("ERROR: CRC Failed : {name}\n"),
+                },
+                false,
+                None,
+            );
+            assert_eq!(result.diagnostics.failure, Some(TestFailure::Corruption));
+            assert_eq!(result.diagnostics.damaged_files, [name]);
+        }
+        let result = report(
+            "7z",
+            "7z",
+            BackendCommandOutput {
+                status: Some(2),
+                stdout: "Testing archive: /tmp/password/archive.jpg\n".into(),
+                stderr: "ERROR: /tmp/password/archive.jpg\nCannot open the file as archive\n"
+                    .into(),
+            },
+            false,
+            None,
+        );
+        assert_eq!(result.diagnostics.failure, Some(TestFailure::Unknown));
+        let io = report(
+            "7z",
+            "7z",
+            BackendCommandOutput {
+                status: Some(2),
+                stdout: String::new(),
+                stderr: "Cannot open /tmp/password/archive.jpg\nPermission denied\n".into(),
+            },
+            false,
+            None,
+        );
+        assert_eq!(io.diagnostics.failure, Some(TestFailure::Io));
+    }
 
     #[test]
     fn partial_output_keeps_failure_and_does_not_claim_a_volume() {

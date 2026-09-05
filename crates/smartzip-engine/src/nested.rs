@@ -63,7 +63,7 @@ pub(crate) fn root_embedded_candidates(
 ) -> Vec<ExtractionCandidate> {
     if root.source != CandidateSource::RootInput
         || root.embedded_offset.is_some()
-        || findings.iter().any(|finding| finding.offset == 0)
+        || (findings.len() == 1 && findings[0].offset == 0)
     {
         return Vec::new();
     }
@@ -77,11 +77,9 @@ pub(crate) fn root_embedded_candidates(
                 .file_name()
                 .unwrap_or_default()
                 .to_string_lossy();
-            relative_path.set_file_name(format!(
-                "{base_name}-embedded-{}-{:X}",
-                index + 1,
-                finding.offset
-            ));
+            if findings.len() > 1 {
+                relative_path.set_file_name(format!("{base_name}-{}", index + 1));
+            }
             ExtractionCandidate {
                 path: root.path.clone(),
                 relative_path,
@@ -152,7 +150,10 @@ pub(crate) struct ArchiveInput {
 pub(crate) fn materialize_archive_input(
     candidate: &ExtractionCandidate,
 ) -> smartzip_core::Result<ArchiveInput> {
-    if let Some(offset) = candidate.embedded_offset.filter(|offset| *offset > 0) {
+    if let Some(offset) = candidate
+        .embedded_offset
+        .filter(|offset| *offset > 0 || candidate.source == CandidateSource::EmbeddedFinding)
+    {
         let temp = carve_embedded_archive(
             &candidate.path,
             offset,

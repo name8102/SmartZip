@@ -1,6 +1,6 @@
 //! Root resolve, prepare archive, password access loop.
 
-use smartzip_archive::{ArchiveExecutor, ListRequest, NativeZipBackend};
+use smartzip_archive::{ArchiveExecutor, ListRequest};
 use smartzip_core::{
     ArchiveFormat, EncodingMode, TaskEvent, TaskEventKind, TaskExecutionContext, TaskId,
 };
@@ -11,45 +11,30 @@ use std::path::{Path, PathBuf};
 use crate::backend_util::backend_call;
 use crate::encoding_flow::{assess_zip_encoding, resolve_encoding_mode};
 use crate::events::EventSink;
-use crate::interactive::{
-    EmbeddedSelectionChoice, InteractiveEmbeddedPrompter, InteractiveEncodingPrompter,
-    InteractivePasswordPrompter,
-};
+use crate::interactive::{InteractiveEncodingPrompter, InteractivePasswordPrompter};
 use crate::nested::{archive_output_name, materialize_archive_input};
 use crate::password_order::{
     order_password_candidates, password_attempt_index, password_source_label, password_value,
     remember_batch_password,
 };
-use crate::policy::{
-    ext_business_container_kind, finding_meets_min_size, full_root_scanner_config,
-};
+use crate::policy::full_root_scanner_config;
 use crate::types::{ArchiveAccessOutcome, CandidateSource, ExtractionCandidate, ResolvedArchive};
 
 pub(crate) fn scan_embedded_findings(
     path: &Path,
     scanner: &ScannerConfig,
-    min_embedded_size_bytes: u64,
 ) -> Vec<EmbeddedArchiveFinding> {
-    let scanner = EmbeddedScanner::new(full_root_scanner_config(scanner));
-    let mut policy = smartzip_core::EmbeddedScanPolicy::default();
-    policy.min_finding_size_bytes = min_embedded_size_bytes;
-    scanner
+    EmbeddedScanner::new(full_root_scanner_config(scanner))
         .scan_path(path)
         .unwrap_or_default()
-        .into_iter()
-        .filter(|finding| finding_meets_min_size(finding, &policy))
-        .collect()
 }
 
-pub(crate) async fn resolve_root_candidate(
+pub(crate) fn resolve_root_candidate(
     path: &Path,
-    scanner: &ScannerConfig,
-    min_embedded_size_bytes: u64,
+    findings: &[EmbeddedArchiveFinding],
     events: &EventSink,
     task_id: &TaskId,
-    embedded_prompter: Option<&dyn InteractiveEmbeddedPrompter>,
-    embedded_extract_all: Option<&mut bool>,
-) -> smartzip_core::Result<Option<ExtractionCandidate>> {
+) -> Option<ExtractionCandidate> {
     let mut candidate = ExtractionCandidate {
         detected_format: None,
         path: path.to_path_buf(),
@@ -60,102 +45,46 @@ pub(crate) async fn resolve_root_candidate(
         embedded_size: None,
     };
 
-    let header_result = crate::detect::probe_file_header(&candidate.path);
-    let findings = if header_result
-        .as_ref()
-        .is_some_and(|(_, offset)| *offset == 0)
-        && scanner.mode != smartzip_scanner::ScanMode::Deep
-    {
-        Vec::new()
-    } else {
-        scan_embedded_findings(&candidate.path, scanner, min_embedded_size_bytes)
+    // Detect/list resolve one archive; an explicit root selects the largest
+    // finding regardless of the nested minimum size or carrier ratio.
+    let policy = smartzip_core::EmbeddedScanPolicy {
+        mode: smartzip_core::EmbeddedScanMode::Largest,
+        ..Default::default()
     };
-    if !findings.is_empty() {
-        let mut policy = smartzip_core::EmbeddedScanPolicy::default();
-        policy.min_finding_size_bytes = min_embedded_size_bytes;
-        let ext_is_archive = crate::nested::format_from_extension(&candidate.path).is_some();
-        let file_size = std::fs::metadata(&candidate.path)
-            .map(|m| m.len())
-            .unwrap_or(0);
-        let decision =
-            crate::embedded::select_embedded_action(file_size, &findings, &policy, ext_is_archive);
-        match decision.action {
-            smartzip_core::DetectionAction::ExtractDirect
-            | smartzip_core::DetectionAction::CarveAndExtract => {
-                if let Some(idx) = decision.selected_index {
-                    let finding = &findings[idx];
-                    candidate.detected_format = Some(finding.format.clone());
-                    candidate.embedded_offset = Some(finding.offset);
-                    candidate.embedded_size = finding.size;
-                    if matches!(
-                        decision.action,
-                        smartzip_core::DetectionAction::CarveAndExtract
-                    ) {
-                        events.push(TaskEvent {
-                            task_id: task_id.clone(),
-                            kind: TaskEventKind::EmbeddedArchiveSelected {
-                                offset: finding.offset,
-                                size: finding.size,
-                                format: finding.format.clone(),
-                                reason: decision.reason,
-                            },
-                        });
-                    }
-                }
-            }
-            smartzip_core::DetectionAction::AskUser => {
-                events.push(TaskEvent {
-                    task_id: task_id.clone(),
-                    kind: TaskEventKind::EmbeddedArchiveSelectionRequired {
-                        path: candidate.path.clone(),
-                        findings_count: findings.len(),
-                    },
-                });
-                let mut extract_all = false;
-                let selection = if let Some(prompter) = embedded_prompter {
-                    Some(prompter.prompt(&candidate.path, &decision).await)
-                } else {
-                    None
-                };
-                match selection {
-                    Some(EmbeddedSelectionChoice::Extract) => {}
-                    Some(EmbeddedSelectionChoice::ExtractAll) => extract_all = true,
-                    Some(EmbeddedSelectionChoice::Skip) | None => return Ok(None),
-                }
-                if let Some(flag) = embedded_extract_all {
-                    *flag = extract_all;
-                }
-                if let Some(idx) = decision.selected_index {
-                    let finding = &findings[idx];
-                    candidate.detected_format = Some(finding.format.clone());
-                    candidate.embedded_offset = Some(finding.offset);
-                    candidate.embedded_size = finding.size;
-                }
-            }
-            _ => return Ok(None),
+    let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let decision = crate::embedded::select_embedded_action(
+        file_size,
+        findings,
+        &policy,
+        crate::nested::format_from_extension(path).is_some(),
+    );
+    if let Some(finding) = decision
+        .selected_index
+        .and_then(|index| findings.get(index))
+    {
+        candidate.detected_format = Some(finding.format.clone());
+        candidate.embedded_offset = Some(finding.offset);
+        candidate.embedded_size = finding.size;
+        if finding.offset > 0 {
+            events.push(TaskEvent {
+                task_id: task_id.clone(),
+                kind: TaskEventKind::EmbeddedArchiveSelected {
+                    offset: finding.offset,
+                    size: finding.size,
+                    format: finding.format.clone(),
+                    reason: decision.reason,
+                },
+            });
         }
-    } else if candidate.detected_format.is_none() {
-        if let Some((fmt, offset)) = header_result {
-            candidate.detected_format = Some(fmt);
-            if offset > 0 {
-                candidate.embedded_offset = Some(offset);
-            }
-        } else {
-            candidate.detected_format = crate::nested::format_from_extension(&candidate.path);
-        }
+    } else if let Some((format, offset)) = crate::detect::probe_file_header(path) {
+        candidate.detected_format = Some(format);
+        candidate.embedded_offset = (offset > 0).then_some(offset);
+    } else {
+        candidate.detected_format = crate::nested::format_from_extension(path);
     }
 
-    if candidate.detected_format.is_none() {
-        return Ok(None);
-    }
-    if candidate.detected_format == Some(ArchiveFormat::Zip)
-        && ext_business_container_kind(&candidate.path)
-            .or_else(|| crate::container::classify_zip_path(&candidate.path))
-            .is_some()
-    {
-        return Ok(None);
-    }
-    Ok(Some(candidate))
+    candidate.detected_format.as_ref()?;
+    Some(candidate)
 }
 
 pub(crate) async fn prepare_resolved_archive(
@@ -209,12 +138,7 @@ pub(crate) async fn prepare_resolved_archive(
     let mut zip_encoding_assessment = None;
     if encoding_mode == EncodingMode::Auto && candidate.detected_format == Some(ArchiveFormat::Zip)
     {
-        let reader = NativeZipBackend::new();
-        if let Ok(is_encrypted) = reader.has_encrypted_entries(&archive_path) {
-            if !is_encrypted {
-                zip_encoding_assessment = assess_zip_encoding(&archive_path, None).await;
-            }
-        }
+        zip_encoding_assessment = assess_zip_encoding(&archive_path, None).await;
     }
     if let Some(assessment) = &zip_encoding_assessment {
         events.push(TaskEvent {
@@ -265,7 +189,6 @@ pub(crate) async fn access_archive_with_password<B: ArchiveExecutor>(
     let mut has_password = false;
     let mut listing = None;
     let encrypted = None;
-    let mut last_error = None;
     let mut saw_wrong_password = false;
     let mut password_prompt_cancelled = false;
     let mut assessment = resolved.zip_encoding_assessment.clone();
@@ -406,9 +329,6 @@ pub(crate) async fn access_archive_with_password<B: ArchiveExecutor>(
         });
     }
     if used_password.is_none() {
-        if let Some(error) = last_error {
-            return Err(error);
-        }
         if saw_wrong_password {
             return Err(smartzip_core::SmartZipError::WrongPassword {
                 path: resolved.candidate.path.clone(),

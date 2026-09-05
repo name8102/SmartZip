@@ -95,12 +95,13 @@ fn detects_empty_file_without_findings() {
 }
 
 #[test]
-fn root_scan_preserves_bounded_configuration() {
+fn explicit_root_scan_is_full_while_nested_defaults_stay_bounded() {
     let nested = ScannerConfig::default();
     let root = full_root_scanner_config(&nested);
 
-    assert_eq!(root.mode, ScanMode::Fast);
-    assert_eq!(root.max_scan_bytes, Some(64 * 1024 * 1024));
+    assert_eq!(root.mode, ScanMode::Deep);
+    assert_eq!(root.max_scan_bytes, None);
+    assert_eq!(root.max_findings, usize::MAX);
     assert_eq!(nested.mode, ScanMode::Fast);
     assert_eq!(nested.max_scan_bytes, Some(64 * 1024 * 1024));
 }
@@ -606,6 +607,7 @@ impl ArchiveExecutor for EncodingAwareBackend {
         })?;
         Ok(ExtractArchiveResult {
             output_dir: request.output_dir,
+            encrypted: None,
         })
     }
 
@@ -620,7 +622,7 @@ impl ArchiveExecutor for EncodingAwareBackend {
 }
 
 #[tokio::test]
-async fn explicit_encoding_override_is_preserved_for_test_and_extract() {
+async fn extraction_preserves_encoding_without_full_test_prepass() {
     let root =
         std::env::temp_dir().join(format!("smartzip-engine-encoding-{}", std::process::id()));
     let input = root.join("root.zip");
@@ -659,10 +661,7 @@ async fn explicit_encoding_override_is_preserved_for_test_and_extract() {
         .unwrap();
 
     assert_eq!(result.processed.len(), 1);
-    assert_eq!(
-        backend.seen_test_encodings.lock().unwrap().as_slice(),
-        &[EncodingMode::Override("gbk".into())]
-    );
+    assert!(backend.seen_test_encodings.lock().unwrap().is_empty());
     assert_eq!(
         backend.seen_extract_encodings.lock().unwrap().as_slice(),
         &[EncodingMode::Override("gbk".into())]
@@ -672,10 +671,10 @@ async fn explicit_encoding_override_is_preserved_for_test_and_extract() {
 }
 
 #[derive(Clone, Default)]
-struct FailingTestBackend;
+struct FailingExtractBackend;
 
 #[async_trait]
-impl ArchiveExecutor for FailingTestBackend {
+impl ArchiveExecutor for FailingExtractBackend {
     async fn probe(&self, path: &std::path::Path) -> smartzip_core::Result<ArchiveProbe> {
         Ok(ArchiveProbe {
             path: path.to_path_buf(),
@@ -704,8 +703,10 @@ impl ArchiveExecutor for FailingTestBackend {
         &self,
         request: ExtractArchiveRequest,
     ) -> smartzip_core::Result<ExtractArchiveResult> {
-        Ok(ExtractArchiveResult {
-            output_dir: request.output_dir,
+        Err(smartzip_core::SmartZipError::BackendFailed {
+            backend: "extract-backend".into(),
+            exit_code: Some(2),
+            stderr: format!("i/o failure while extracting {}", request.archive.display()),
         })
     }
 
@@ -730,7 +731,7 @@ async fn backend_failures_do_not_record_password_failures() {
     std::fs::create_dir_all(&root).unwrap();
     std::fs::write(&input, b"not really a zip").unwrap();
 
-    let backend = FailingTestBackend;
+    let backend = FailingExtractBackend;
     let db = SmartZipDb::in_memory().unwrap();
     let repo = PasswordRepository::new(db.connection());
     let password_id = repo
@@ -813,28 +814,28 @@ impl ArchiveExecutor for BatchPasswordBackend {
         })
     }
 
-    async fn test(&self, request: TestRequest) -> smartzip_core::Result<TestResult> {
-        self.attempted_passwords
-            .lock()
-            .unwrap()
-            .push(request.password.clone());
-        if request.password.as_deref() == Some("batch-secret") {
-            Ok(TestResult {
-                ok: true,
-                encrypted: Some(true),
-                ..TestResult::default()
-            })
-        } else {
-            Err(smartzip_core::SmartZipError::WrongPassword {
-                path: request.archive,
-            })
-        }
+    async fn test(&self, _request: TestRequest) -> smartzip_core::Result<TestResult> {
+        panic!("password attempts must extract directly, never run a full test");
     }
 
     async fn extract(
         &self,
         request: ExtractArchiveRequest,
     ) -> smartzip_core::Result<ExtractArchiveResult> {
+        self.attempted_passwords
+            .lock()
+            .unwrap()
+            .push(request.password.clone());
+        if request.password.as_deref() != Some("batch-secret") {
+            std::fs::write(
+                request.output_dir.join("wrong-partial.txt"),
+                b"discard this",
+            )
+            .unwrap();
+            return Err(smartzip_core::SmartZipError::PasswordIndeterminate {
+                path: request.archive,
+            });
+        }
         std::fs::create_dir_all(&request.output_dir).map_err(|source| {
             smartzip_core::SmartZipError::io(Some(request.output_dir.clone()), source)
         })?;
@@ -843,6 +844,7 @@ impl ArchiveExecutor for BatchPasswordBackend {
         })?;
         Ok(ExtractArchiveResult {
             output_dir: request.output_dir,
+            encrypted: Some(true),
         })
     }
 
@@ -983,6 +985,7 @@ impl ArchiveExecutor for FakeBackend {
         }
         Ok(ExtractArchiveResult {
             output_dir: request.output_dir,
+            encrypted: Some(true),
         })
     }
 
@@ -1252,6 +1255,7 @@ impl ArchiveExecutor for EmbeddedAwareFakeBackend {
         }
         Ok(ExtractArchiveResult {
             output_dir: request.output_dir,
+            encrypted: None,
         })
     }
 
