@@ -394,6 +394,7 @@ impl SevenZipBackend {
             value: (status == SevenZipExitStatus::Success).then_some(TestResult {
                 ok: true,
                 encrypted: report.encrypted,
+                ..TestResult::default()
             }),
             report,
             status,
@@ -447,6 +448,9 @@ impl ArchiveAdapter for SevenZipBackend {
     fn id(&self) -> &str {
         &self.id
     }
+    fn diagnostic_family(&self) -> Option<&'static str> {
+        Some("7z")
+    }
 
     async fn probe(&self, path: &Path) -> Result<ArchiveProbe> {
         let request = TestRequest {
@@ -457,6 +461,18 @@ impl ArchiveAdapter for SevenZipBackend {
         };
         let result = self.test(request).await;
         let (supported, encrypted) = match result {
+            Ok(result)
+                if matches!(
+                    result.diagnostics.failure,
+                    Some(
+                        crate::integrity::TestFailure::PasswordRequired
+                            | crate::integrity::TestFailure::PasswordRejected
+                            | crate::integrity::TestFailure::PasswordIndeterminate
+                    )
+                ) =>
+            {
+                (true, Some(true))
+            }
             Ok(result) => (result.ok, result.encrypted),
             Err(SmartZipError::WrongPassword { .. })
             | Err(SmartZipError::PasswordRequired { .. }) => (true, Some(true)),
@@ -492,15 +508,37 @@ impl ArchiveAdapter for SevenZipBackend {
     }
 
     async fn test(&self, request: TestRequest) -> Result<TestResult> {
-        let path = request.archive.clone();
-        let result = self.test_with_report(request).await?;
-        if result.value.is_none() {
-            return Err(self.map_reported_failure(&result, &path));
+        let mut args = vec!["t".into(), "-bd".into(), "-bb1".into(), "-sccUTF-8".into()];
+        // In test mode an explicit bare -p supplies an empty credential. With
+        // no switch 7z prompts on stdin and reports EOF as exit 255 (cancelled).
+        // Arguments go straight to the process; do not add shell quote bytes.
+        args.push(format!(
+            "-p{}",
+            request.password.as_deref().unwrap_or_default()
+        ));
+        if let Some(encoding) = Self::encoding_arg(&request.encoding) {
+            args.push(encoding);
         }
-        match result.value {
-            Some(value) => Ok(value),
-            None => unreachable!("checked above"),
+        args.push("--".into());
+        args.push(request.archive.to_string_lossy().into_owned());
+        let (output, truncated) =
+            crate::test_output::run(&self.executable, &self.id, &args).await?;
+        // Definitive unsupported-method errors retain normal router fallback.
+        // Integrity/password results remain executed reports, even on exit 2.
+        if output.status != Some(0)
+            && format!("{}\n{}", output.stdout, output.stderr)
+                .to_ascii_lowercase()
+                .contains("unsupported method")
+        {
+            return Err(self.map_failure(&output, &request.archive));
         }
+        Ok(crate::test_output::report(
+            &self.id,
+            "7z",
+            output,
+            truncated,
+            request.password.as_deref(),
+        ))
     }
 
     async fn extract(&self, request: ExtractArchiveRequest) -> Result<ExtractArchiveResult> {

@@ -31,6 +31,7 @@ pub struct NewFileExtraction<'a> {
     pub encoding: Option<&'a str>,
     pub encoding_corrected: bool,
     pub damaged_volumes_json: Option<&'a str>,
+    pub test_report_json: Option<&'a str>,
     pub created_at: &'a str,
 }
 
@@ -51,6 +52,7 @@ pub struct FileExtractionRecord {
     pub encoding: Option<String>,
     pub encoding_corrected: bool,
     pub damaged_volumes_json: Option<String>,
+    pub test_report_json: Option<String>,
     pub created_at: String,
 }
 
@@ -70,8 +72,8 @@ impl<'a> FileExtractionRepository<'a> {
             INSERT INTO file_extractions(
                 task_id, input_path, sample_hash, file_size, offset, output_path,
                 has_password, password_id, status, reason, encoding,
-                encoding_corrected, damaged_volumes_json, created_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                encoding_corrected, damaged_volumes_json, created_at, test_report_json
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
             "#,
             params![
                 row.task_id,
@@ -88,6 +90,7 @@ impl<'a> FileExtractionRepository<'a> {
                 row.encoding_corrected as i64,
                 row.damaged_volumes_json,
                 row.created_at,
+                row.test_report_json,
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
@@ -99,7 +102,7 @@ impl<'a> FileExtractionRepository<'a> {
             r#"
             SELECT id, task_id, input_path, sample_hash, file_size, offset,
                    output_path, has_password, password_id, status, reason,
-                   encoding, encoding_corrected, damaged_volumes_json, created_at
+                   encoding, encoding_corrected, damaged_volumes_json, created_at, test_report_json
             FROM file_extractions
             WHERE task_id = ?1
             ORDER BY id ASC
@@ -114,7 +117,7 @@ impl<'a> FileExtractionRepository<'a> {
             r#"
             SELECT id, task_id, input_path, sample_hash, file_size, offset,
                    output_path, has_password, password_id, status, reason,
-                   encoding, encoding_corrected, damaged_volumes_json, created_at
+                   encoding, encoding_corrected, damaged_volumes_json, created_at, test_report_json
             FROM file_extractions
             ORDER BY id DESC
             LIMIT ?1
@@ -129,7 +132,7 @@ impl<'a> FileExtractionRepository<'a> {
             r#"
             SELECT id, task_id, input_path, sample_hash, file_size, offset,
                    output_path, has_password, password_id, status, reason,
-                   encoding, encoding_corrected, damaged_volumes_json, created_at
+                   encoding, encoding_corrected, damaged_volumes_json, created_at, test_report_json
             FROM file_extractions
             WHERE status = ?1
             ORDER BY id DESC
@@ -145,7 +148,7 @@ impl<'a> FileExtractionRepository<'a> {
             r#"
             SELECT id, task_id, input_path, sample_hash, file_size, offset,
                    output_path, has_password, password_id, status, reason,
-                   encoding, encoding_corrected, damaged_volumes_json, created_at
+                   encoding, encoding_corrected, damaged_volumes_json, created_at, test_report_json
             FROM file_extractions
             WHERE reason = ?1
             ORDER BY id DESC
@@ -166,7 +169,7 @@ impl<'a> FileExtractionRepository<'a> {
             r#"
             SELECT id, task_id, input_path, sample_hash, file_size, offset,
                    output_path, has_password, password_id, status, reason,
-                   encoding, encoding_corrected, damaged_volumes_json, created_at
+                   encoding, encoding_corrected, damaged_volumes_json, created_at, test_report_json
             FROM file_extractions
             WHERE status = ?1 AND reason = ?2
             ORDER BY id DESC
@@ -200,6 +203,7 @@ fn map_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileExtractionRecord>
         encoding: row.get(11)?,
         encoding_corrected: row.get::<_, i64>(12)? != 0,
         damaged_volumes_json: row.get(13)?,
+        test_report_json: row.get(15)?,
         created_at: row.get(14)?,
     })
 }
@@ -236,6 +240,7 @@ mod tests {
             encoding: None,
             encoding_corrected: false,
             damaged_volumes_json: None,
+            test_report_json: None,
             created_at: "2026-07-02T00:00:01Z",
         }
     }

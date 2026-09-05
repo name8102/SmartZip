@@ -34,6 +34,7 @@ pub(crate) fn record_skip(
                 encoding: None,
                 encoding_corrected: false,
                 damaged_volumes_json: None,
+                test_report_json: None,
             },
         );
     }

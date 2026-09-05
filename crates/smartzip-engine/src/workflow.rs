@@ -176,6 +176,7 @@ pub(crate) async fn inspect_file_with_listener<B: ArchiveExecutor>(
                     encoding: encoding.as_deref(),
                     encoding_corrected: resolved.reused_confirmed_encoding,
                     damaged_volumes_json: None,
+                    test_report_json: None,
                 },
             );
         }
@@ -197,6 +198,7 @@ pub(crate) async fn inspect_file_with_listener<B: ArchiveExecutor>(
                     encoding: None,
                     encoding_corrected: false,
                     damaged_volumes_json: None,
+                    test_report_json: None,
                 },
             );
         }
@@ -334,6 +336,7 @@ pub(crate) async fn list_archive_with_listener_interactive<B: ArchiveExecutor>(
                 encoding_corrected: resolved.reused_confirmed_encoding
                     || matches!(request.encoding_mode, EncodingMode::Override(_)),
                 damaged_volumes_json: None,
+                test_report_json: None,
             },
         );
         if let (Some(hash), Some(size), EncodingMode::Override(encoding)) = (

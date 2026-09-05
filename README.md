@@ -7,16 +7,19 @@ SmartZip 是一个用 Rust 重写的跨平台压缩包辅助工具，目标是�
 ## 当前能力
 
 - **检测**：识别嵌入式压缩包和伪装成普通文件的压缩数据
+- **列出内容**：`list` 共享密码与编码处理；`enc` 可查看不同编码下的文件名
+- **校验**：`test` / `t` 完整校验归档，失败后自动诊断分卷，区分确认损坏、疑似组、缺失与未检查范围
 - **解压**：支持递归/嵌套解压，并可按需控制最大递归深度
 - **密码管理**：支持密码列表查看、添加、删除、导入、导出与清理
 - **编码处理**：支持自动识别与手动指定文件名编码
 - **工作区**：CLI、GUI、核心库、扫描、密码、平台适配等模块分层组织
 
-## 当前修复方向
+## 当前状态与下一步
 
-- ZIP 解压主路径正在调整为优先调用 `7z` / `7zz`，不再把现有原生 ZIP 后端视为复杂 ZIP 的默认实现。
-- ZIP 全自动编码检测已确认暂时不可靠，当前修复方向是先保留手动 `--encoding`，并补一个“多编码文件名预览”辅助命令。
-- 近期优先级仍是：恢复解压成功率、修正密码/分卷行为、消除误报成功与静默失败。
+- 能力路由整合已落地：后端按能力、配置与归档要求选择，CLI 与 engine 使用统一执行入口；文件级历史与密码/编码记忆保留。
+- `test` 已接通后端、自动诊断、JSON 和历史报告；[分卷定位说明](.trellis/tasks/2026-07/07-03-test-command-backend-split/design.md) 记录证据规则与格式边界。`compress` 仍是占位命令。
+- 下一轮优先完善 CLI 的密码输入、可靠验证与保存反馈，以及真实文件名编码对照选择。详见 [CLI 交互设计草案](.trellis/tasks/09-05-cli-interaction-design/design.md)；其中新增参数尚未实现。
+- 当前核对结果与已知缺口见 [实现进度](docs/implementation-progress.md)。
 
 ## 快速开始
 
@@ -30,10 +33,29 @@ cargo run -p smartzip-cli -- --help
 
 ```bash
 cargo run -p smartzip-cli -- detect <path>
+cargo run -p smartzip-cli -- list <path>
+cargo run -p smartzip-cli -- list <path> --encoding gb18030
+cargo run -p smartzip-cli -- enc <path>
 cargo run -p smartzip-cli -- extract <path>
+cargo run -p smartzip-cli -- test <任意一卷>
+cargo run -p smartzip-cli -- t movie.part03.rar other.zip --json
 cargo run -p smartzip-cli -- password list
 cargo run -p smartzip-cli -- password add <password>
 ```
+
+常用短别名：
+
+| 命令 | 短别名 |
+| --- | --- |
+| `extract` | `x` |
+| `list` | `l` |
+| `detect` | `d` |
+| `test` | `t` |
+| `compress`（尚未实现） | `c` |
+| `password` | `pw` |
+| `history` | `hist` |
+
+编码预览直接使用 `smartzip enc <path>`；旧名称 `encoding-preview` 保留兼容。短别名与完整命令使用相同参数，例如 `smartzip x archive.zip`、`smartzip pw list`、`smartzip hist files`。
 
 `extract` 支持常见参数，例如：
 
@@ -41,7 +63,18 @@ cargo run -p smartzip-cli -- password add <password>
 - `--deep`：启用深度扫描
 - `--encoding <name>`：指定文件名编码
 - `-p/--password <value>`：预置密码
-- `--db <path>`：指定密码数据库文件
+
+`test` 接受多个归档或任意分卷，同组输入只校验一次。默认 `--diagnose auto`，失败后追加只读校验和至多一次不同后端复核；`--diagnose off` 关闭追加诊断，`--diagnostic-timeout 30` 限制追加阶段为 30 秒，`--no-history` 不保存任务记录。JSON 模式不提示输入，可用 `-p` 提供密码。
+
+RAR5 的独立局部校验可以确认具体坏卷；跨卷 ZIP 数据、7z solid 依赖或无法解密的元数据通常只能给候选组或未知范围。疑似组不代表组内每卷都坏。退出码为 `0` 全部完整、`1` 无组完整、`2` 部分组完整、`130` 取消；参数错误仍使用 `2`。
+
+当前 `--db`、`--config`、`--backend`、`--verbose-routing` 是根层参数，必须放在子命令前。例如指定数据库：
+
+```bash
+cargo run -p smartzip-cli -- --db ./smartzip.db extract <path>
+```
+
+当前 `--use-clipboard` 尚未接线；`list --pick-encoding` 只显示编码名称。需要文件名对照时先使用 `enc`，再通过 `--encoding` 指定。
 
 ## 工作区结构
 
@@ -91,6 +124,7 @@ scripts/crap-scan.sh
 - `docs/design.md`
 - `docs/implementation-plan.md`
 - `docs/implementation-progress.md`
+- [CLI 交互设计草案](.trellis/tasks/09-05-cli-interaction-design/design.md)
 - `docs/agents/`
 - `docs/compose/plans/`
 - `docs/research/`

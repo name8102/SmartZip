@@ -86,6 +86,11 @@ pub enum TaskEventKind {
         path: PathBuf,
     },
     Route(RouteEvent),
+    TestPhase {
+        path: PathBuf,
+        pass_id: u32,
+        phase: String,
+    },
     Warning {
         message: String,
     },

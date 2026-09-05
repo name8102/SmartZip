@@ -81,6 +81,7 @@ pub struct FileExtractionRow<'a> {
     pub encoding: Option<&'a str>,
     pub encoding_corrected: bool,
     pub damaged_volumes_json: Option<&'a str>,
+    pub test_report_json: Option<&'a str>,
 }
 
 /// Reuse hints returned by [`TaskHistoryRecorder::lookup_known_file`].
@@ -259,6 +260,7 @@ impl<'a> TaskHistoryRecorder for DbTaskHistoryRecorder<'a> {
             encoding: row.encoding,
             encoding_corrected: row.encoding_corrected,
             damaged_volumes_json: row.damaged_volumes_json,
+            test_report_json: row.test_report_json,
             created_at: &created_at,
         }) {
             Self::warn("file_extraction insert", error);
@@ -357,6 +359,16 @@ fn describe_event(kind: &TaskEventKind) -> (TaskEventLevel, String, String, Opti
             "Route".into(),
             format!("{route:?}"),
             serde_json::to_string(route).ok(),
+        ),
+        TaskEventKind::TestPhase {
+            path,
+            pass_id,
+            phase,
+        } => (
+            TaskEventLevel::Info,
+            "test_phase".into(),
+            format!("test pass {pass_id}: {phase} {}", path.display()),
+            serde_json::to_string(kind).ok(),
         ),
         TaskEventKind::EncodingDetected(result) => {
             let name = match &result.selected {

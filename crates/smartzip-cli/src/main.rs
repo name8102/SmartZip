@@ -69,6 +69,7 @@ impl From<EmbeddedModeArg> for smartzip_core::EmbeddedScanMode {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Inspect archive format, encoding, embedded findings, and password requirements.
+    #[command(visible_alias = "d")]
     Detect {
         path: PathBuf,
 
@@ -86,6 +87,7 @@ enum Command {
     },
 
     /// List archive entries using shared password and encoding resolution.
+    #[command(visible_alias = "l")]
     List {
         path: PathBuf,
 
@@ -122,9 +124,23 @@ enum Command {
         min_confidence: ConfidenceArg,
     },
 
-    /// Test archive integrity using shared password and encoding resolution.
+    /// Test archive groups and diagnose damaged volumes (exit: 0 all intact, 1 none, 2 mixed, 130 cancelled; argument errors also use 2).
+    #[command(visible_alias = "t")]
     Test {
-        path: PathBuf,
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
+
+        /// Additional read-only diagnosis after a failed test.
+        #[arg(long, value_enum, default_value_t = DiagnoseArg::Auto)]
+        diagnose: DiagnoseArg,
+
+        /// Time budget in seconds for additional diagnosis only.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        diagnostic_timeout: Option<u64>,
+
+        /// Do not save this test in task history.
+        #[arg(long)]
+        no_history: bool,
 
         /// Password to try first. May be repeated.
         #[arg(short = 'p', long)]
@@ -156,6 +172,7 @@ enum Command {
     },
 
     /// Extract archives, optionally with nested scanning.
+    #[command(visible_alias = "x")]
     Extract {
         paths: Vec<PathBuf>,
 
@@ -226,6 +243,7 @@ enum Command {
     },
 
     /// Preview archive entry names under several encodings.
+    #[command(name = "enc", alias = "encoding-preview")]
     EncodingPreview {
         path: PathBuf,
 
@@ -238,13 +256,15 @@ enum Command {
     },
 
     /// Placeholder for future compression implementation.
+    #[command(visible_alias = "c")]
     Compress { paths: Vec<PathBuf> },
 
     /// Manage password database.
-    #[command(subcommand)]
+    #[command(subcommand, visible_alias = "pw")]
     Password(PasswordCmd),
 
     /// Inspect recorded task history. Defaults to recent tasks.
+    #[command(visible_alias = "hist")]
     History {
         #[command(subcommand)]
         command: Option<HistoryCmd>,
@@ -342,6 +362,12 @@ enum ConfidenceArg {
     Low,
     Medium,
     High,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum DiagnoseArg {
+    Auto,
+    Off,
 }
 
 impl From<ConfidenceArg> for Confidence {
@@ -459,17 +485,49 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             )
             .await
         }
-        Command::Test { .. } => {
-            // Interface is frozen, but the integrity-check backend (full-scan
-            // verification + reliable damaged-volume localization) is split
-            // into a dedicated task (07-03-test-command-backend-split). Until
-            // that lands, `test` must fail loudly rather than fabricate an
-            // intact/corrupt verdict or damaged-volume list.
-            eprintln!(
-                "error: `smartzip test` is not implemented yet; the integrity-check \
-                 backend is tracked separately and will not fake a result"
-            );
-            std::process::exit(1);
+        Command::Test {
+            paths,
+            password,
+            use_clipboard: _use_clipboard,
+            no_empty,
+            encoding,
+            json,
+            deep,
+            max_scan_bytes,
+            min_confidence,
+            diagnose,
+            diagnostic_timeout,
+            no_history,
+        } => {
+            let db = open_db(cli.db)?;
+            test_archives(
+                &backend,
+                &db,
+                smartzip_engine::TestWorkflowRequest {
+                    paths,
+                    encoding: parse_encoding_mode(&encoding),
+                    scanner: ScannerConfig {
+                        min_confidence: min_confidence.into(),
+                        ..scanner_config(deep, max_scan_bytes)
+                    },
+                    password_candidates: PasswordCandidateRequest {
+                        manual: password,
+                        clipboard: None,
+                        include_empty: !no_empty,
+                        limit: 128,
+                    },
+                    diagnose: match diagnose {
+                        DiagnoseArg::Auto => smartzip_engine::DiagnoseMode::Auto,
+                        DiagnoseArg::Off => smartzip_engine::DiagnoseMode::Off,
+                    },
+                    diagnostic_timeout: diagnostic_timeout.map(std::time::Duration::from_secs),
+                    control: smartzip_archive::diagnostic::DiagnosticControl::default(),
+                },
+                json,
+                no_history,
+                verbose_routing,
+            )
+            .await
         }
         Command::Extract {
             paths,
@@ -649,6 +707,171 @@ async fn detect(
 
     print_detect_result(&result, json)?;
     Ok(())
+}
+
+async fn test_archives(
+    backend: &BackendRouter,
+    db: &SmartZipDb,
+    request: smartzip_engine::TestWorkflowRequest,
+    json: bool,
+    no_history: bool,
+    verbose_routing: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::IsTerminal;
+    let service = PasswordService::new(PasswordRepository::new(db.connection()));
+    let engine = SmartZipEngine::with_scanner_config(request.scanner.clone());
+    let recorder = smartzip_engine::history::DbTaskHistoryRecorder::new(db.connection());
+    let prompter = StdinPrompter {
+        lock: StdinLock::new(),
+    };
+    let control = request.control.clone();
+    let signal = tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            control.cancel();
+        }
+    });
+    let listener = (!json).then(|| {
+        Arc::new(move |event: &TaskEvent| match &event.kind {
+            smartzip_core::TaskEventKind::TestPhase { path, phase, .. } => {
+                eprintln!("{}: {}", safe_text(&path.to_string_lossy()), phase)
+            }
+            smartzip_core::TaskEventKind::Warning { message } => {
+                eprintln!("warning: {}", safe_text(message))
+            }
+            smartzip_core::TaskEventKind::Route(route) if verbose_routing => {
+                render_route_event(route, false)
+            }
+            _ => {}
+        }) as smartzip_engine::TaskEventListener
+    });
+    let result = engine
+        .test_archives(
+            backend,
+            &service,
+            request,
+            if !json && std::io::stdin().is_terminal() {
+                Some(&prompter)
+            } else {
+                None
+            },
+            listener,
+            if no_history { None } else { Some(&recorder) },
+        )
+        .await;
+    signal.abort();
+    let result = result?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    } else {
+        for report in &result.files {
+            print_test_report(report);
+        }
+        println!("task-id: {}", result.task_id);
+    }
+    std::process::exit(result.exit_code);
+}
+
+fn safe_text(value: &str) -> String {
+    value
+        .chars()
+        .flat_map(|c| {
+            if c.is_control() {
+                c.escape_default().collect::<Vec<_>>()
+            } else {
+                vec![c]
+            }
+        })
+        .collect()
+}
+
+fn print_test_report(report: &smartzip_archive::integrity::TestArchiveReport) {
+    use smartzip_archive::integrity::{Integrity, SuspectRelation};
+    println!(
+        "{}: {} (coverage={}, localization={}, password={})",
+        safe_text(&report.entrypoint.to_string_lossy()),
+        enum_text(&report.integrity),
+        enum_text(&report.coverage),
+        enum_text(&report.localization),
+        enum_text(&report.password_status)
+    );
+    for volume in &report.confirmed_volumes {
+        println!(
+            "  Confirmed damaged: {}",
+            safe_text(&volume.path.to_string_lossy())
+        );
+        for evidence in report
+            .evidence
+            .iter()
+            .filter(|e| volume.evidence_ids.contains(&e.id))
+        {
+            println!(
+                "    {} [{}]",
+                safe_text(&evidence.summary),
+                safe_text(&evidence.source)
+            );
+        }
+    }
+    for (index, group) in report.suspect_groups.iter().enumerate() {
+        println!(
+            "  Suspected group {} ({}): {}",
+            index + 1,
+            match group.relation {
+                SuspectRelation::OneOrMore => "one or more may be damaged",
+                SuspectRelation::Possible => "possible; exact range unknown",
+            },
+            group
+                .members
+                .iter()
+                .map(|p| safe_text(&p.to_string_lossy()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        for evidence in report
+            .evidence
+            .iter()
+            .filter(|e| group.evidence_ids.contains(&e.id))
+        {
+            println!(
+                "    {} [{}]",
+                safe_text(&evidence.summary),
+                safe_text(&evidence.source)
+            );
+        }
+    }
+    for (label, paths) in [
+        ("Missing", &report.missing_volumes),
+        ("Unreadable", &report.unreadable_volumes),
+    ] {
+        for path in paths {
+            println!("  {label}: {}", safe_text(&path.to_string_lossy()));
+        }
+    }
+    if !report.unchecked_volumes.is_empty() {
+        println!(
+            "  Full-volume health unchecked: {} volume(s)",
+            report.unchecked_volumes.len()
+        );
+    }
+    for reason in &report.stop_reasons {
+        println!("  Note: {}", safe_text(reason));
+    }
+    if report.integrity != Integrity::Intact {
+        println!("  Next: restore missing/unreadable volumes, replace confirmed damaged volumes, then test again; suspected members need further checking.");
+    }
+}
+
+fn enum_text(value: &impl std::fmt::Debug) -> String {
+    format!("{value:?}")
+        .chars()
+        .enumerate()
+        .flat_map(|(index, c)| {
+            if c.is_uppercase() && index > 0 {
+                vec!['_', c.to_ascii_lowercase()]
+            } else {
+                vec![c.to_ascii_lowercase()]
+            }
+        })
+        .collect()
 }
 
 async fn list_archive(
@@ -1404,6 +1627,7 @@ fn history(db: &SmartZipDb, cmd: HistoryCmd) -> Result<(), Box<dyn std::error::E
                         r.damaged_volumes_json.as_deref().unwrap_or("-"),
                         r.output_path.as_deref().unwrap_or("-"),
                     );
+                    print_history_test_report(r.test_report_json.as_deref());
                 }
             }
         }
@@ -1444,6 +1668,7 @@ fn history(db: &SmartZipDb, cmd: HistoryCmd) -> Result<(), Box<dyn std::error::E
                         f.input_path,
                         f.output_path.as_deref().unwrap_or("-"),
                     );
+                    print_history_test_report(f.test_report_json.as_deref());
                 }
                 println!("  events:");
                 for event in &events {
@@ -1457,6 +1682,15 @@ fn history(db: &SmartZipDb, cmd: HistoryCmd) -> Result<(), Box<dyn std::error::E
     }
 
     Ok(())
+}
+
+fn print_history_test_report(json: Option<&str>) {
+    if let Some(json) = json {
+        match serde_json::from_str::<smartzip_archive::integrity::TestArchiveReport>(json) {
+            Ok(report) => print_test_report(&report),
+            Err(_) => eprintln!("  test report has an unsupported or invalid schema"),
+        }
+    }
 }
 
 fn default_output_dir(first_path: &Path) -> PathBuf {
@@ -1733,6 +1967,41 @@ mod tests {
     fn history_without_subcommand_defaults_at_dispatch_layer() {
         let cli = Cli::try_parse_from(["smartzip", "history"]).unwrap();
         assert!(matches!(cli.command, Command::History { command: None }));
+    }
+
+    #[test]
+    fn test_alias_accepts_groups_and_validates_the_diagnostic_budget() {
+        for name in ["test", "t"] {
+            let cli =
+                Cli::try_parse_from(["smartzip", name, "a.part2.rar", "b.zip", "--json"]).unwrap();
+            assert!(matches!(cli.command, Command::Test {
+                paths, diagnose: super::DiagnoseArg::Auto, diagnostic_timeout: None, json: true, ..
+            } if paths.len() == 2));
+            assert!(
+                Cli::try_parse_from(["smartzip", name, "a.zip", "--diagnostic-timeout", "0"])
+                    .is_err()
+            );
+        }
+        let cli = Cli::try_parse_from([
+            "smartzip",
+            "t",
+            "a.zip",
+            "--diagnose",
+            "off",
+            "--diagnostic-timeout",
+            "5",
+            "--no-history",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Test {
+                diagnose: super::DiagnoseArg::Off,
+                diagnostic_timeout: Some(5),
+                no_history: true,
+                ..
+            }
+        ));
     }
 
     #[test]

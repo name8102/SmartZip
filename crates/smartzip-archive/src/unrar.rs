@@ -137,6 +137,9 @@ impl ArchiveAdapter for UnrarBackend {
     fn id(&self) -> &str {
         &self.id
     }
+    fn diagnostic_family(&self) -> Option<&'static str> {
+        Some("unrar")
+    }
 
     async fn probe(&self, path: &Path) -> Result<ArchiveProbe> {
         let result = self
@@ -148,6 +151,18 @@ impl ArchiveAdapter for UnrarBackend {
             })
             .await;
         let (supported, encrypted) = match result {
+            Ok(result)
+                if matches!(
+                    result.diagnostics.failure,
+                    Some(
+                        crate::integrity::TestFailure::PasswordRequired
+                            | crate::integrity::TestFailure::PasswordRejected
+                            | crate::integrity::TestFailure::PasswordIndeterminate
+                    )
+                ) =>
+            {
+                (true, Some(true))
+            }
             Ok(result) => (result.ok, result.encrypted),
             Err(SmartZipError::WrongPassword { .. })
             | Err(SmartZipError::PasswordRequired { .. }) => (true, Some(true)),
@@ -194,21 +209,41 @@ impl ArchiveAdapter for UnrarBackend {
     }
 
     async fn test(&self, request: TestRequest) -> Result<TestResult> {
+        if request
+            .format
+            .as_ref()
+            .is_some_and(|format| *format != ArchiveFormat::Rar)
+        {
+            return Err(SmartZipError::UnsupportedContainer {
+                backend: self.id.clone(),
+                path: request.archive,
+                container: request.format.map(|format| format.as_str().to_string()),
+            });
+        }
         let args = vec![
             "t".to_string(),
             "-y".to_string(),
-            "-idq".to_string(),
+            "-idp".to_string(),
             Self::password_arg(&request.password),
+            "--".to_string(),
             request.archive.to_string_lossy().into_owned(),
         ];
-        let output = self.run(&args).await?;
-        if output.status != Some(0) {
+        let (output, truncated) =
+            crate::test_output::run(&self.executable, &self.id, &args).await?;
+        if output.status != Some(0)
+            && format!("{}\n{}", output.stdout, output.stderr)
+                .to_ascii_lowercase()
+                .contains("unknown method")
+        {
             return Err(self.map_failure(&output, &request.archive));
         }
-        Ok(TestResult {
-            ok: true,
-            encrypted: None,
-        })
+        Ok(crate::test_output::report(
+            &self.id,
+            "unrar",
+            output,
+            truncated,
+            request.password.as_deref(),
+        ))
     }
 
     async fn extract(&self, request: ExtractArchiveRequest) -> Result<ExtractArchiveResult> {

@@ -2,7 +2,8 @@
 
 > 本文档只记录仓库级整体进度与当前实现快照。
 > 具体任务状态、验收步骤和执行记录统一在 `.trellis/tasks/` 下维护。
-> 最后更新：2026-07-02
+> 最后更新：2026-09-05
+> 核对基线：本地 `feat/db-history-persistence` 的 `de0ea48`（2026-07-31）。未刷新远端状态。
 
 ## 当前快照
 
@@ -12,14 +13,14 @@
 |------|------|------|
 | `smartzip-core` | ✅ 已落地 | 共享类型、错误、事件模型 |
 | `smartzip-scanner` | ✅ 已落地 | binwalk 封装、内嵌归档扫描基础 |
-| `smartzip-archive` | 🟡 部分落地 | `BackendRouter`、`UnrarBackend`、`SevenZipCliBackend`、`NativeZipBackend` 已存在 |
-| `smartzip-db` | ✅ 已落地 | v3 文件级历史：瘦身 `tasks`、`file_extractions` append 日志、`known_files` 去重/复用索引与版本化 migration |
+| `smartzip-archive` | 🟡 部分落地 | 能力路由整合已完成；`ArchiveExecutor` / `ArchiveAdapter`、profile 与受限 fallback 已落地，格式覆盖仍持续完善 |
+| `smartzip-db` | ✅ 已落地 | v4 文件级历史：保留 tasks/file_extractions/known_files，新增完整 test_report_json，版本化迁移保留旧记录 |
 | `smartzip-encoding` | ✅ 已落地 | 编码检测与候选输出 |
 | `smartzip-passwords` | ✅ 已落地 | 候选生成、排序、统计 |
-| `smartzip-config` | ✅ 已落地 | TOML 配置加载 |
+| `smartzip-config` | 🟡 部分落地 | TOML 配置与后端 profile 组合已实现；CLI 显式配置目前只消费 routing 部分 |
 | `smartzip-platform` | 🟡 部分落地 | 路径、桌面能力、部分平台封装 |
-| `smartzip-engine` | 🟡 部分落地 | BFS 解压、嵌套发现、布局规划、事件汇总 |
-| `smartzip-cli` | 🟡 部分落地 | `detect`、`extract`、`encoding-preview`、`password`、`history` 子命令 |
+| `smartzip-engine` | 🟡 部分落地 | 薄 facade 与能力模块已拆分；BFS、布局、文件级历史和统一路由事件已接线 |
+| `smartzip-cli` | 🟡 部分落地 | `detect`、`list`、`extract`、`test`、`enc`、`password`、`history` 可执行；`compress` 尚未实现 |
 | `smartzip-gui` | 🟡 原型阶段 | 窗口与基础交互已存在，未形成完整任务工作台 |
 | `packaging/` | ❌ 未开始 | AppImage、dmg、捆绑 7zz 等未完成 |
 
@@ -27,14 +28,34 @@
 
 | 主题 | 当前状态 |
 |------|----------|
-| ZIP 路由 | `BackendRouter` 对 ZIP 默认优先走 `SevenZipCliBackend`；`NativeZipBackend` 目前主要保留为少量特例能力、路径安全校验、压缩和后备路径 |
-| RAR 路由 | `UnrarBackend` 优先，失败或不可用时回退 `SevenZipCliBackend` |
-| 7z 路由 | 仍依赖 `SevenZipCliBackend`；`NativeSevenZipBackend` 尚未实现 |
-| 事件模型 | 当前为 `Vec<TaskEvent>` 汇总结果 + 可选 listener；设计中的有界 `mpsc` 实时通道尚未实现 |
+| 后端路由 | 根据 operation、facts、requirements、能力 profile 过滤和排序，只有允许的错误才 fallback；不是按扩展名固定选择或遇到任意错误都换后端 |
+| ZIP / RAR | 外部 7z/7zz、unrar 和 Native ZIP adapter 按各自能力参与路由；原始名称等特殊要求会影响选择 |
+| 7z 路由 | 仍依赖外部程序 adapter；NativeSevenZipBackend 尚未实现 |
+| 事件模型 | `Vec<TaskEvent>` 汇总结果 + listener，RouteEvent 已纳入同一时间线；有界 mpsc 尚未实现 |
 | 输出布局 | 已实现 plan-execute separation 与 collision-after-layout |
-| 数据库 | v3 已落库：DROP `password_matches`/`encoding_detections`/`embedded_archive_detections`，瘦身 `tasks`，新增 `file_extractions`（append 日志）+ `known_files`（`sample_hash+size` 去重/复用索引）；schema 支持 v1→v3 迁移 |
-| 任务历史 | `extract` 通过注入的 `TaskHistoryRecorder` 写 task/event/per-file 历史，并用 `known_files` 去重、复用确认编码与开包密码；`history tasks/files/show` 读路径已闭合，detect/list/test 文件级接线留后续任务 |
-| CLI 退出码 | 当前稳定使用 `0` 成功、`1` 全失败/通用错误、`2` 部分成功 |
+| 数据库 | v3 已落库：DROP `password_matches`/`encoding_detections`/`embedded_archive_detections`，瘦身 `tasks`，新增 `file_extractions`（append 日志）+ `known_files`（`sample_hash+size` 去重/复用索引）；v4 新增 nullable test_report_json；schema 支持 v1→v4 迁移 |
+| 任务历史 | extract 的文件级历史、去重与复用已接线；detect/list 也已接入文件级记录；test 按卷组写完整诊断，history tasks/files/show 可读 |
+| CLI 退出码 | `0` 成功、`1` 全失败/通用错误、`2` extract 部分处理或 test 部分组完整，test 取消 `130`；clap 参数错误也使用 `2` |
+
+### CLI 交互核对（2026-09-05）
+
+本轮完成 [交互设计草案](../.trellis/tasks/09-05-cli-interaction-design/design.md) 与实施切片，优先密码、编码和用户反馈。用户追加的命名调整已实现：编码预览改为 `enc`，旧 `encoding-preview` 仍兼容；新增 `x/l/d/t/c/pw/hist` 常用短别名，未改变操作逻辑。
+
+| 缺口 | 当前观察 | 后续方向 |
+| --- | --- | --- |
+| 密码验证 | 未加密 ZIP 的 list 也会把任意传入密码保存为成功 | 区分无需密码与可靠验证，阻止错误记忆 |
+| 密码输入与显示 | 输入回显，多层 trim；特定长中文密码导致列表 panic | 内容保真、隐藏输入、可重试、Unicode 安全展示 |
+| 编码选择 | pick-encoding 只有编码名；交互最终选择的持久化来源未统一 | 同一批真实名称对照，显式确认后按指纹记忆 |
+| 终端模式 | JSON 仅关闭 listener，提示仍按各自 stdin 判断 | 统一终端判定、stdout/stderr 与取消语义 |
+| 参数与预览 | 根参数不能放在子命令后；clipboard 忽略；dry-run 仅首个输入文本 | 参数实际生效、按需初始化、多输入候选预览 |
+
+新任务状态为 in_progress，S0 命名/别名已实现，S1–S6 交互功能仍待实施。旧 file-aware CLI 任务仍标为 planning，虽然 detect/list 已有实现，但编码对照等验收尚未完全闭合；未直接修改旧任务为 completed。
+
+test 分卷定位已实现：[实现契约](../.trellis/tasks/2026-07/07-03-test-command-backend-split/design.md)。任意卷分组与入口、完整后端校验、默认追加只读诊断、密码边界、JSON 与 DB v4 历史已接线。RAR5 的独立 CRC 可确认物理卷；7z solid/多 stream、ZIP 数据及元数据的范围形成候选组，未知范围保持可见。
+
+实现验证：完整 workspace 426 项测试通过；check、fmt、routing guard 通过，clippy 成功但仍有既存 warning。另有 18 个真实分卷样本和 10 个密码/历史/退出码用例通过，源卷 hash 不变。详细版本、种子、边界见 [验收记录](../.trellis/tasks/2026-07/07-03-test-command-backend-split/research/implementation-validation.md)。最初 24 次直接后端实验是设计依据，单独保留，不混作产品验收。
+
+此前 CLI 交互设计核对时的验证：CLI build 成功；CLI 6 + engine 177 + passwords 3 + encoding 9，共 195 项相关测试通过；routing guard clean。另用临时 DB/XDG 目录完成 CLI 缺口复现。该次核对未运行完整 workspace 或跨平台终端验收；后续 test 实现已跑完整 workspace，跨平台验收仍未做。详见 [核对证据](../.trellis/tasks/09-05-cli-interaction-design/research/current-state.md)。
 
 ## 里程碑进度
 
@@ -56,12 +77,15 @@
 | 2026-06-12 | 14 | ✅ | smart output layout（plan-execute separation） |
 | 2026-07-02 | 15 | ✅ | 数据库 v2 全部设计表、版本化迁移与任务/检测历史落库（`smartzip history` 子命令） |
 | 2026-07-02 | 16 | ✅ | 历史模型 v3 文件级重构：`file_extractions` + `known_files`、extract 去重/编码/密码复用、history tasks/files/show；detect/list/test 接线留后续任务 |
+| 2026-07-31 | 17 | ✅ | 路由整合落地记录：保留 feat 文件级历史与 detect/list 接线，engine 模块化、单一 executor、统一事件与 staging |
+| 2026-09-05 | 18 | 🟡 | 核对 CLI 并形成密码/编码交互设计；enc 与常用短别名已实现，其余交互切片待实施 |
+| 2026-09-05 | 19 | ✅ | test/t 完整校验、分卷诊断、JSON/历史报告、密码边界与取消；RAR4 等局部算法保守降级 |
 
 ## 与设计的主要差距
 
 | 主题 | 设计方向 | 当前实现 |
 |------|----------|----------|
-| Native ZIP 主路径 | ZIP 最终应由增强后的原生后端承担主能力 | 当前为 `SevenZipCliBackend` 优先 |
+| CLI 密码与编码 | 密码可靠验证/重试、可比较编码预览与显式记忆 | 当前仍有误记密码、输入裁剪、预览与记忆来源缺口 |
 | Native 7z 后端 | 计划评估并接入 `NativeSevenZipBackend` | 尚未实现 |
 | 实时事件通道 | 有界 `mpsc` 实时事件流 | 尚未实现 |
 | GUI 工作台 | 完整任务树、日志、设置、密码管理 | 仍处原型阶段 |

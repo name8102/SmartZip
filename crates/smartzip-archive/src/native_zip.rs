@@ -82,6 +82,9 @@ impl ArchiveAdapter for NativeZipBackend {
     fn id(&self) -> &str {
         &self.id
     }
+    fn diagnostic_family(&self) -> Option<&'static str> {
+        Some("native-zip")
+    }
 
     async fn probe(&self, path: &Path) -> Result<ArchiveProbe> {
         let mut archive = Self::open_archive_read(path)
@@ -124,29 +127,101 @@ impl ArchiveAdapter for NativeZipBackend {
     }
 
     async fn test(&self, request: TestRequest) -> Result<TestResult> {
+        use crate::integrity::{BackendTestDiagnostics, Coverage, TestFailure};
+        if crate::volumes::zip_last_disk_hint(&request.archive).is_some_and(|disk| disk > 0)
+            || request
+                .archive
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e.len() >= 3 && e.bytes().all(|c| c.is_ascii_digit()))
+        {
+            return Err(SmartZipError::UnsupportedContainer {
+                backend: self.id.clone(),
+                path: request.archive.clone(),
+                container: Some("multivolume ZIP".into()),
+            });
+        }
         let mut archive = Self::open_archive_read(&request.archive)
             .map_err(|error| with_backend_identity(error, &self.id))?;
         let has_encrypted = Self::has_encrypted_entries(&mut archive);
         let len = archive.len();
         let mut buf = vec![0u8; 8192];
-
+        let mut result = TestResult {
+            ok: true,
+            encrypted: Some(has_encrypted),
+            diagnostics: BackendTestDiagnostics {
+                adapter_id: self.id.clone(),
+                family: "native-zip".into(),
+                version: Some("zip 8".into()),
+                coverage: Coverage::Complete,
+                ..BackendTestDiagnostics::default()
+            },
+        };
         for i in 0..len {
-            let mut entry = Self::open_entry(&mut archive, i, &request.password, &request.archive)
-                .map_err(|error| with_backend_identity(error, &self.id))?;
+            tokio::task::yield_now().await;
+            let mut entry =
+                match Self::open_entry(&mut archive, i, &request.password, &request.archive) {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        let failure = match &error {
+                            SmartZipError::PasswordRequired { .. } => TestFailure::PasswordRequired,
+                            SmartZipError::WrongPassword { .. } => TestFailure::PasswordRejected,
+                            SmartZipError::CorruptedArchive { .. } => TestFailure::Corruption,
+                            SmartZipError::UnsupportedCodec { .. }
+                            | SmartZipError::UnsupportedContainer { .. } => {
+                                return Err(with_backend_identity(error, &self.id))
+                            }
+                            _ => TestFailure::Io,
+                        };
+                        result.ok = false;
+                        result.diagnostics.coverage = Coverage::Partial;
+                        result.diagnostics.failure = Some(failure);
+                        if result.diagnostics.stderr.len() < 64 * 1024 {
+                            result
+                                .diagnostics
+                                .stderr
+                                .push_str(&format!("entry {i}: {error}\n"));
+                        }
+                        continue;
+                    }
+                };
             loop {
-                let n = entry
-                    .read(&mut buf)
-                    .map_err(|source| SmartZipError::io(Some(request.archive.clone()), source))?;
-                if n == 0 {
-                    break;
+                match entry.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(_) => tokio::task::yield_now().await,
+                    Err(source) => {
+                        result.ok = false;
+                        result.diagnostics.coverage = Coverage::Partial;
+                        result.diagnostics.failure = Some(if entry.encrypted() {
+                            TestFailure::PasswordIndeterminate
+                        } else if matches!(
+                            source.kind(),
+                            std::io::ErrorKind::InvalidData
+                                | std::io::ErrorKind::UnexpectedEof
+                                | std::io::ErrorKind::Other
+                        ) {
+                            TestFailure::Corruption
+                        } else {
+                            TestFailure::Io
+                        });
+                        if result.diagnostics.damaged_files.len() < 4096 {
+                            result
+                                .diagnostics
+                                .damaged_files
+                                .push(entry.name().to_owned());
+                        }
+                        if result.diagnostics.stderr.len() < 64 * 1024 {
+                            result
+                                .diagnostics
+                                .stderr
+                                .push_str(&format!("entry {i}: {source}\n"));
+                        }
+                        break;
+                    }
                 }
             }
         }
-
-        Ok(TestResult {
-            ok: true,
-            encrypted: Some(has_encrypted),
-        })
+        Ok(result)
     }
 
     async fn extract(&self, request: ExtractArchiveRequest) -> Result<ExtractArchiveResult> {
@@ -759,7 +834,10 @@ mod tests {
                 encoding: EncodingMode::Auto,
             })
             .await;
-        assert!(matches!(result, Err(SmartZipError::WrongPassword { .. })));
+        assert_eq!(
+            result.unwrap().diagnostics.failure,
+            Some(crate::integrity::TestFailure::PasswordRejected)
+        );
     }
 
     #[tokio::test]
@@ -777,10 +855,10 @@ mod tests {
                 encoding: EncodingMode::Auto,
             })
             .await;
-        assert!(matches!(
-            result,
-            Err(SmartZipError::PasswordRequired { .. })
-        ));
+        assert_eq!(
+            result.unwrap().diagnostics.failure,
+            Some(crate::integrity::TestFailure::PasswordRequired)
+        );
     }
 
     #[tokio::test]

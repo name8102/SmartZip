@@ -1,33 +1,62 @@
-# Test Command Backend (split from file-aware CLI)
+# Test：归档校验与分卷损坏定位
 
-## Goal
+> 2026-09-05 已实现并验证。test/t 已接通完整测试、默认追加诊断、JSON 和历史；验证范围见 [实施记录](implement.md)。
 
-从 `07-02-file-aware-cli-commands` 中拆出 `smartzip test` 的真实后端实现。该任务专注于全量校验、损坏文件/坏卷定位、加密档密码处理，以及 `file_extractions` 上的 `intact/corrupt` 与 `damaged_volumes_json` 写入。
+## 用户目标与已确认选择
 
-## Why Split
+用户希望 test 除了执行后端完整性校验，还能尽可能找出具体损坏的分卷；无法确认时给出疑似分卷，让用户优先补下载或替换相关文件。
 
-`test` 命令需要接入 7z/rar/zip 不同后端的全量校验路径，并区分密码错误、归档损坏、分卷缺失、可定位坏卷与不可定位损坏等状态，复杂度显著高于最初预估；继续与 detect/list 绑在同一任务中会阻塞 CLI MVP 落地。
+**已确认：默认尽力定位，允许追加读取和调用另一个可用后端。** 不把追加诊断藏在必须手动发现的开关后。所有诊断只读，不能自动修复、替换、删卷或向原归档写入。
 
-## Scope
+## 实现状态
 
-- 实现 `smartzip test <paths...>` 的真实后端。
-- 复用共享求密码流程。
-- 产出完整 stdout / JSON / history 语义：
-  - `status=intact` / `status=corrupt`
-  - `damaged_volumes_json`
-  - damaged files 列表
-  - damage localization（complete / incomplete / unknown）
-- 维持与设计冻结规格一致的 exit code 语义。
+- CLI `test` / `t` 接受多个归档或任意一卷，按组去重后校验。报告覆盖确认坏卷、候选组、缺失、不可读、未检查及停止原因。
+- ArchiveExecutor 承接主 test 与独立追加 pass；TestResult 保留非零退出的明细。外部文本仅作诊断线索，确认来自本地范围校验。
+- RAR5 头部/非末段 packed CRC、7z header/stream/folder、ZIP/ZIP64 directory/local/descriptor 已有只读实现。不能证明范围时保留候选或 unknown。
+- DB v4 追加完整 test_report_json，旧 damaged_volumes_json 仅投影确认坏卷，history show/files 可读。
+- [后端可行性实验](research/backend-evidence.md) 是 24 次直接后端运行；[产品验收](research/implementation-validation.md) 是 18 个分卷样本和 10 个 CLI 场景，两者分开记录。
 
-## Dependencies
+## 核心要求
 
-- `07-02-file-grain-history`
-- `07-02-file-aware-cli-commands`（共享求密码流程、顶层 parser、history/task 框架）
+1. test/t 接受任意一卷作为入口；收集同组成员、选择格式所需入口，对同组重复输入只执行一次。
+2. 单卷和分卷都先完整校验，失败后自动做有增量价值的诊断；有缺卷时仍检查可独立验证的现存卷。
+3. 分开报告确认损坏的卷、疑似候选组、明确缺失的卷、无法读取的卷、未能检查的范围。
+4. 每个确认/疑似结论附依据与来源；后端只报坏文件时，尝试关联其压缩数据、元数据与解码依赖涉及的物理卷。
+5. 疑似卷保留成组关系：一个或多个可能有问题，不代表每个都坏，也不能默认只坏一卷。
+6. 发现一处坏卷后继续检查其他独立范围；停止条件与未检查范围可见。
+7. 坏密码、缺卷、IO/权限问题、后端不支持、诊断未完成，不得伪装成已确认卷损坏。
+8. CLI、JSON 与 history 共享结构化报告，诊断事件沿用唯一 TaskEvent 时间线。
 
-## Acceptance
+## 格式范围
 
-- `smartzip test` 不再返回未实现错误。
-- 完好归档写 `intact`；损坏归档写 `corrupt`。
-- 能可靠定位时写完整 `damaged_volumes_json`；不能定位时写空数组且在输出中反映 localization。
-- 加密档能通过共享求密码流程测试；只有在可靠确认密码正确时才写 known_files.password_id。
-- `test` 相关集成测试覆盖：完好、损坏、分卷缺失、密码正确/错误、不可区分损坏与密码错等路径。
+| 分卷家族 | 目标 |
+| --- | --- |
+| RAR partNN.rar / rar+r00… | 识别卷序列；RAR5 优先利用卷内证据；RAR4 保留完整后端测试与原始诊断，首版输出保守候选/未知 |
+| 7z.001 / zip.001 等字节切分 | 有效归档头与卷序列驱动虚拟拼接；7z 的 stream/folder 依赖映射到物理卷 |
+| ZIP z01…zip | 按磁盘号、目录与 entry 范围定位；最终 .zip 是后端入口，不能套用“总是首卷” |
+| 单文件 ZIP/7z/RAR | 完整校验与保守错误分类，沿用同一报告模型 |
+
+不将任意 .001 文件自动认作归档；异常命名、无法解密的元数据或不支持的 codec 允许降级，但必须展示原因。
+
+## 验收
+
+- [x] 完好单卷/分卷返回 intact；t 与 test 行为一致。
+- [x] 任意卷输入找到正确入口；三种分卷家族顺序不混淆；同组多输入只测一次。
+- [x] RAR5 中单个/多个非末尾分段损坏能确认对应物理卷，且不误指其他卷。
+- [x] 跨卷文件/solid block 错误输出候选组；不能缩小时明确整个依赖范围或 unknown。
+- [x] 缺中卷/尾卷、截断、重复序号/间隙、合法非均匀大小均有测试；RAR 命名与其他格式签名冲突时标歧义，同格式异组混入仍依赖后端内容校验；缺失/疑似不进入 confirmed。
+- [x] 缺卷引起的级联 CRC/Data Error 不额外确认健康卷损坏；入口路径与进度卷不作为损坏证明。
+- [x] 元数据、校验值位置和 solid/多 stream 依赖进入候选闭包；不把解压后偏移当压缩数据偏移。
+- [x] 正确密码、错误密码、密码与损坏无法区分分别表达；无密码仍提供独立定位证据，不写虚假密码命中。
+- [x] 已确认一卷损坏但后续未检查时报告 coverage=partial，不宣称其余完整。
+- [x] 默认自动追加诊断；禁止无价值重跑；尊重 --backend；取消/预算结束保留已有证据。
+- [x] JSON 与历史保留候选组及依据；旧 damaged_volumes_json 仅投影确认损坏的卷。
+- [x] 全流程不修改原归档、邻卷或输出用户文件；取消可收尾，测试前后源卷 hash 不变。
+
+## 边界与依赖
+
+- 复用密码流程，依赖密码“真实验证”语义修正；不等待全部 CLI 交互切片完成。
+- 补最小只读分卷模型与检查流程，不顺带重写 extract 分卷行为或实现 compress。
+- 不要求枚举所有内嵌/嵌套归档；保留 deep/扫描参数含义，追加诊断使用独立策略参数。
+- 不执行修复、恢复卷重建、联网补下载、猜测缺失数据或自动生成“正确”校验值。PAR2/REV 与外部 checksum 清单留后续扩展。
+- 结果与退出码以 [设计](design.md) 为准；按 [实施计划](implement.md) 推进。
