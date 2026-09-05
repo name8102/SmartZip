@@ -136,7 +136,7 @@ fn engine() -> SmartZipEngine {
 
 #[tokio::test]
 async fn arbitrary_member_deduplicates_one_group_and_history_stores_the_full_report() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     let first = dir.path().join("a.part01.rar");
     let second = dir.path().join("a.part02.rar");
     for p in [&first, &second] {
@@ -181,7 +181,7 @@ async fn arbitrary_member_deduplicates_one_group_and_history_stores_the_full_rep
 
 #[tokio::test]
 async fn diagnostic_pass_is_separate_and_cannot_erase_primary_corruption() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     let path = dir.path().join("a.rar");
     std::fs::write(&path, b"unknown archive").unwrap();
     let (primary, a) = adapter("primary", "unrar", Behavior::Bad, 20);
@@ -212,7 +212,7 @@ async fn diagnostic_pass_is_separate_and_cannot_erase_primary_corruption() {
 
 #[tokio::test]
 async fn off_forced_backend_and_expired_budget_prevent_additional_full_passes() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     let path = dir.path().join("a.rar");
     std::fs::write(&path, b"unknown archive").unwrap();
     for mode in 0..3 {
@@ -239,7 +239,7 @@ async fn off_forced_backend_and_expired_budget_prevent_additional_full_passes() 
 
 #[tokio::test]
 async fn password_is_saved_only_after_verified_success_and_no_failed_guess_is_penalized() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     let path = dir.path().join("a.7z");
     std::fs::write(&path, b"unknown archive").unwrap();
     let (registration, _) = adapter("reader", "7z", Behavior::Password, 10);
@@ -282,7 +282,7 @@ async fn password_is_saved_only_after_verified_success_and_no_failed_guess_is_pe
 
 #[tokio::test]
 async fn changed_input_invalidates_success_and_password_recording() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     let path = dir.path().join("a.7z");
     std::fs::write(&path, b"old bytes").unwrap();
     let (registration, _) = adapter("reader", "7z", Behavior::Change, 10);
@@ -309,7 +309,7 @@ async fn changed_input_invalidates_success_and_password_recording() {
 
 #[tokio::test]
 async fn cancellation_returns_partial_reports_and_records_unstarted_groups() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     let first = dir.path().join("a.rar");
     let second = dir.path().join("b.rar");
     for path in [&first, &second] {
@@ -342,7 +342,7 @@ async fn cancellation_returns_partial_reports_and_records_unstarted_groups() {
 
 #[tokio::test]
 async fn history_write_failure_does_not_change_integrity_or_exit_code() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     let path = dir.path().join("a.rar");
     std::fs::write(&path, b"Rar!\x1a\x07\x01\x00").unwrap();
     let (registration, _) = adapter("reader", "unrar", Behavior::Good, 10);
@@ -376,7 +376,7 @@ async fn history_write_failure_does_not_change_integrity_or_exit_code() {
 
 #[tokio::test]
 async fn indeterminate_failure_does_not_search_more_passwords() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     let path = dir.path().join("a.7z");
     std::fs::write(&path, b"unknown archive").unwrap();
     let (registration, calls) = adapter("reader", "7z", Behavior::Indeterminate, 10);
@@ -392,4 +392,13 @@ async fn indeterminate_failure_does_not_search_more_passwords() {
         .unwrap();
     assert_eq!(result.exit_code, 1);
     assert_eq!(calls.lock().unwrap().len(), 1);
+}
+
+// VolumeSet deliberately canonicalizes parent directories. macOS TMPDIR
+// commonly passes through /var -> /private/var; expected fixture paths must
+// use the same physical parent, including names of deliberately missing files.
+fn canonical_tempdir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .tempdir_in(std::env::temp_dir().canonicalize().unwrap())
+        .unwrap()
 }

@@ -78,7 +78,7 @@ fn confirmed(report: &smartzip_archive::diagnostic::DiagnosticReport) -> Vec<Pat
 
 #[test]
 fn rar5_checks_independent_segments_and_retains_missing_and_damage_separately() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     let paths = rar_set(dir.path());
     let set = VolumeSet::collect(&paths[1]).unwrap();
     let clean = inspect(&set, &[], &DiagnosticControl::default(), 1);
@@ -113,7 +113,7 @@ fn rar5_checks_independent_segments_and_retains_missing_and_damage_separately() 
 
 #[test]
 fn rar5_final_crc_is_not_a_local_packed_crc_and_truncation_is_local() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     let paths = rar_set(dir.path());
     flip(&paths[2], 60);
     let result = inspect(
@@ -143,7 +143,7 @@ fn rar5_final_crc_is_not_a_local_packed_crc_and_truncation_is_local() {
 
 #[test]
 fn rar5_bad_header_stops_that_chain_but_checks_other_volumes_and_missing_tail() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     let paths = rar_set(dir.path());
     flip(&paths[0], 12);
     flip(&paths[1], 80);
@@ -235,7 +235,7 @@ fn zip_set(dir: &Path) -> Vec<PathBuf> {
 
 #[test]
 fn zip_candidates_include_crc_metadata_and_do_not_intersect_two_faults() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     let paths = zip_set(dir.path());
     let set = VolumeSet::collect(&paths[1]).unwrap();
     let clean = inspect(&set, &[], &DiagnosticControl::default(), 1);
@@ -269,7 +269,7 @@ fn zip_candidates_include_crc_metadata_and_do_not_intersect_two_faults() {
 
 #[test]
 fn zip_missing_disk_still_allows_independent_existing_entry_check() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     let paths = zip_set(dir.path());
     fs::remove_file(&paths[0]).unwrap();
     flip(&paths[2], 30);
@@ -289,7 +289,7 @@ fn zip_missing_disk_still_allows_independent_existing_entry_check() {
 
 #[test]
 fn expired_diagnostic_budget_keeps_no_fabricated_checks() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     let paths = rar_set(dir.path());
     let mut control = DiagnosticControl::default();
     control.deadline = Some(std::time::Instant::now());
@@ -341,7 +341,7 @@ fn sevenz_stream_set(dir: &Path, pack_crcs: bool) -> Vec<PathBuf> {
 
 #[test]
 fn sevenz_multistream_folder_keeps_every_packed_input() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     let paths = sevenz_stream_set(dir.path(), false);
     let result = inspect(
         &VolumeSet::collect(&paths[2]).unwrap(),
@@ -362,7 +362,7 @@ fn sevenz_multistream_folder_keeps_every_packed_input() {
 
 #[test]
 fn sevenz_verified_packed_crc_confirms_only_the_modified_volume() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     let paths = sevenz_stream_set(dir.path(), true);
     let clean = inspect(
         &VolumeSet::collect(&paths[0]).unwrap(),
@@ -385,7 +385,7 @@ fn sevenz_verified_packed_crc_confirms_only_the_modified_volume() {
 
 #[test]
 fn shortened_early_sevenz_member_does_not_blame_a_healthy_tail() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     let paths = sevenz_stream_set(dir.path(), true);
     let bytes = fs::read(&paths[1]).unwrap();
     fs::write(&paths[1], &bytes[..bytes.len() - 3]).unwrap();
@@ -404,7 +404,7 @@ fn shortened_early_sevenz_member_does_not_blame_a_healthy_tail() {
 
 #[test]
 fn zip64_split_descriptor_keeps_data_and_reference_volumes_as_candidates() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     let data = vec![0x61; 80];
     let crc = crc32fast::hash(&data);
     let mut bytes = b"PK\x03\x04".to_vec();
@@ -508,4 +508,13 @@ fn zip64_split_descriptor_keeps_data_and_reference_volumes_as_candidates() {
     assert_eq!(descriptor_damage.evidence.len(), 1, "{descriptor_damage:?}");
     assert!(confirmed(&descriptor_damage).is_empty());
     assert!(descriptor_damage.evidence[0].summary.contains("descriptor"));
+}
+
+// VolumeSet deliberately canonicalizes parent directories. macOS TMPDIR
+// commonly passes through /var -> /private/var; expected fixture paths must
+// use the same physical parent, including names of deliberately missing files.
+fn canonical_tempdir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .tempdir_in(std::env::temp_dir().canonicalize().unwrap())
+        .unwrap()
 }
