@@ -1,0 +1,44 @@
+zip v8.6.0
+├── zip feature "_bzip2_any"
+│   └── zip feature "bzip2"
+│       ├── smartzip-archive v0.1.0 (/home/charl/Documents/Project/SmartZip/crates/smartzip-archive)
+│       │   └── smartzip-archive feature "default"
+│       │       ├── smartzip-cli v0.1.0-beta.1 (/home/charl/Documents/Project/SmartZip/crates/smartzip-cli)
+│       │       │   └── smartzip-cli feature "default" (command-line)
+│       │       └── smartzip-engine v0.1.0 (/home/charl/Documents/Project/SmartZip/crates/smartzip-engine)
+│       │           └── smartzip-engine feature "default"
+│       │               └── smartzip-cli v0.1.0-beta.1 (/home/charl/Documents/Project/SmartZip/crates/smartzip-cli) (*)
+│       └── smartzip-engine v0.1.0 (/home/charl/Documents/Project/SmartZip/crates/smartzip-engine) (*)
+│       └── zip feature "bzip2" (*)
+├── zip feature "_deflate-any"
+│   ├── zip feature "deflate-flate2"
+│   │   └── zip feature "deflate-flate2-zlib-rs"
+│   │       └── zip feature "deflate"
+│   │           ├── smartzip-archive v0.1.0 (/home/charl/Documents/Project/SmartZip/crates/smartzip-archive) (*)
+│   │           └── smartzip-engine v0.1.0 (/home/charl/Documents/Project/SmartZip/crates/smartzip-engine) (*)
+│   └── zip feature "deflate-zopfli"
+│       └── zip feature "deflate" (*)
+├── zip feature "aes-crypto"
+│   ├── smartzip-archive v0.1.0 (/home/charl/Documents/Project/SmartZip/crates/smartzip-archive) (*)
+│   └── smartzip-engine v0.1.0 (/home/charl/Documents/Project/SmartZip/crates/smartzip-engine) (*)
+├── zip feature "bzip2" (*)
+├── zip feature "deflate" (*)
+├── zip feature "deflate-flate2" (*)
+├── zip feature "deflate-flate2-zlib-rs" (*)
+├── zip feature "deflate-zopfli" (*)
+├── zip feature "flate2"
+│   └── zip feature "deflate-flate2-zlib-rs" (*)
+├── zip feature "getrandom"
+│   └── zip feature "aes-crypto" (*)
+├── zip feature "lzma"
+│   ├── smartzip-archive v0.1.0 (/home/charl/Documents/Project/SmartZip/crates/smartzip-archive) (*)
+│   └── smartzip-engine v0.1.0 (/home/charl/Documents/Project/SmartZip/crates/smartzip-engine) (*)
+├── zip feature "time"
+│   ├── smartzip-archive v0.1.0 (/home/charl/Documents/Project/SmartZip/crates/smartzip-archive) (*)
+│   └── smartzip-engine v0.1.0 (/home/charl/Documents/Project/SmartZip/crates/smartzip-engine) (*)
+├── zip feature "xz"
+│   ├── smartzip-archive v0.1.0 (/home/charl/Documents/Project/SmartZip/crates/smartzip-archive) (*)
+│   └── smartzip-engine v0.1.0 (/home/charl/Documents/Project/SmartZip/crates/smartzip-engine) (*)
+└── zip feature "zstd"
+    ├── smartzip-archive v0.1.0 (/home/charl/Documents/Project/SmartZip/crates/smartzip-archive) (*)
+    └── smartzip-engine v0.1.0 (/home/charl/Documents/Project/SmartZip/crates/smartzip-engine) (*)

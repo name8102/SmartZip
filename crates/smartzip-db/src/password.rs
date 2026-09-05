@@ -22,6 +22,16 @@ pub struct NewPassword<'a> {
     pub pinned: bool,
 }
 
+const UPSERT_PASSWORD: &str = r#"
+            INSERT INTO passwords(value, source, pinned)
+            VALUES (?1, ?2, ?3)
+            ON CONFLICT(value) DO UPDATE SET
+                source = excluded.source,
+                pinned = passwords.pinned OR excluded.pinned,
+                disabled = 0,
+                updated_at = CURRENT_TIMESTAMP
+            "#;
+
 pub struct PasswordRepository<'a> {
     conn: &'a Connection,
 }
@@ -33,15 +43,7 @@ impl<'a> PasswordRepository<'a> {
 
     pub fn upsert(&self, input: NewPassword<'_>) -> Result<i64> {
         self.conn.execute(
-            r#"
-            INSERT INTO passwords(value, source, pinned)
-            VALUES (?1, ?2, ?3)
-            ON CONFLICT(value) DO UPDATE SET
-                source = excluded.source,
-                pinned = passwords.pinned OR excluded.pinned,
-                disabled = 0,
-                updated_at = CURRENT_TIMESTAMP
-            "#,
+            UPSERT_PASSWORD,
             params![input.value, input.source, input.pinned as i64],
         )?;
         Ok(self.conn.query_row(
@@ -49,6 +51,39 @@ impl<'a> PasswordRepository<'a> {
             params![input.value],
             |row| row.get(0),
         )?)
+    }
+
+    /// Import nonempty trimmed UTF-8 lines atomically, counting duplicates as input rows.
+    pub fn import_lines(&self, reader: impl std::io::BufRead, source: &str) -> Result<u64> {
+        let tx = self.conn.unchecked_transaction()?;
+        let mut count = 0;
+        {
+            let mut statement = tx.prepare(UPSERT_PASSWORD)?;
+            for line in reader.lines() {
+                let line = line?;
+                let value = line.trim();
+                if !value.is_empty() {
+                    statement.execute(params![value, source, false])?;
+                    count += 1;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(count)
+    }
+
+    pub fn disable_many(&self, ids: &[i64]) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut statement = tx.prepare(
+                "UPDATE passwords SET disabled = 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
+            )?;
+            for id in ids {
+                statement.execute(params![id])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn get_by_value(&self, value: &str) -> Result<Option<PasswordRecord>> {
@@ -153,6 +188,65 @@ fn map_password_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<PasswordReco
 mod tests {
     use super::*;
     use crate::SmartZipDb;
+
+    #[test]
+    fn batch_import_preserves_duplicates_pins_and_rolls_back_invalid_utf8() {
+        let db = SmartZipDb::in_memory().unwrap();
+        let repo = PasswordRepository::new(db.connection());
+        let id = repo
+            .upsert(NewPassword {
+                value: "kept",
+                source: "manual",
+                pinned: true,
+            })
+            .unwrap();
+        repo.record_success(id).unwrap();
+        repo.disable_many(&[id]).unwrap();
+        assert_eq!(
+            repo.import_lines(&b" kept \r\n\nnew\nkept\n"[..], "import")
+                .unwrap(),
+            3
+        );
+        let kept = repo.get_by_id(id).unwrap().unwrap();
+        assert!(kept.pinned && !kept.disabled);
+        assert_eq!(kept.success_count, 1);
+        assert_eq!(kept.source, "import");
+        assert!(repo
+            .import_lines(&b"rolled-back\n\xff"[..], "import")
+            .is_err());
+        assert!(repo.get_by_value("rolled-back").unwrap().is_none());
+        // A failure midway through a bulk update must not leave partial disables.
+        db.connection().execute_batch("CREATE TRIGGER reject_disable BEFORE UPDATE ON passwords WHEN NEW.value = 'new' BEGIN SELECT RAISE(ABORT, 'test failure'); END;").unwrap();
+        let new = repo.get_by_value("new").unwrap().unwrap();
+        assert!(repo.disable_many(&[id, new.id]).is_err());
+        assert!(!repo.get_by_id(id).unwrap().unwrap().disabled);
+    }
+
+    #[test]
+    fn ranking_index_matches_order_without_temporary_sort() {
+        let db = SmartZipDb::in_memory().unwrap();
+        let repo = PasswordRepository::new(db.connection());
+        repo.import_lines(&b"first\nsecond\nthird\nfourth"[..], "import")
+            .unwrap();
+        db.connection().execute_batch("UPDATE passwords SET last_success_at = '' WHERE id = 2; UPDATE passwords SET failure_count = 1 WHERE id = 1; UPDATE passwords SET pinned = 1 WHERE id = 4;").unwrap();
+        assert_eq!(
+            repo.ranked_candidates(4)
+                .unwrap()
+                .iter()
+                .map(|p| p.id)
+                .collect::<Vec<_>>(),
+            vec![4, 2, 3, 1]
+        );
+        let plan = db.connection().prepare("EXPLAIN QUERY PLAN SELECT * FROM passwords WHERE disabled = 0 ORDER BY pinned DESC, success_count DESC, COALESCE(last_success_at, '') DESC, failure_count ASC, id ASC LIMIT 128").unwrap().query_map([], |row| row.get::<_, String>(3)).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+        assert!(
+            plan.iter().any(|line| line.contains("idx_passwords_rank")),
+            "{plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|line| line.contains("TEMP B-TREE")),
+            "{plan:?}"
+        );
+    }
 
     #[test]
     fn upsert_and_rank_passwords() {

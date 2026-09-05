@@ -1,0 +1,10 @@
+{
+  "toolchain": "rustc 1.97.1 (8bab26f4f 2026-07-14)",
+  "tests_passed": 426,
+  "tests_failed": 0,
+  "tests_ignored": 0,
+  "release_acceptance_groups": 13,
+  "release_sha256": "84927a4eae01526eebe985324b9ba61f5467ce136623a5689b87d1edb7bcf68a",
+  "clippy": "exit 0; pre-existing warnings remain",
+  "scope": "Linux local; GUI excluded; current macOS CI not run"
+}

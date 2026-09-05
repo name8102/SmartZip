@@ -8,7 +8,7 @@ use std::collections::{HashSet, VecDeque};
 use std::io::Read;
 
 use crate::backend_util::{backend_call, confidence_score};
-use crate::encoding_flow::{assess_zip_encoding, encoding_mode_label, resolve_encoding_mode};
+use crate::encoding_flow::{assess_unencrypted_zip, encoding_mode_label, resolve_encoding_mode};
 use crate::events::{EventSink, TaskEventListener};
 use crate::interactive::{
     EmbeddedSelectionChoice, InteractiveEmbeddedPrompter, InteractiveEncodingPrompter,
@@ -745,12 +745,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
         if candidate_encoding_mode == EncodingMode::Auto
             && candidate.detected_format == Some(ArchiveFormat::Zip)
         {
-            let reader = NativeZipBackend::new();
-            if let Ok(is_encrypted) = reader.has_encrypted_entries(&archive_path) {
-                if !is_encrypted {
-                    zip_encoding_assessment = assess_zip_encoding(&archive_path, None).await;
-                }
-            }
+            zip_encoding_assessment = assess_unencrypted_zip(&archive_path);
         }
         if let Some(assessment) = &zip_encoding_assessment {
             events.push(TaskEvent {
@@ -902,7 +897,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                         let limits = &request.limits;
                         let staged_usage = &staged_usage;
                         async move {
-                            crate::budget::monitor(
+                            let (_, usage) = crate::budget::monitor(
                                 &temp_output_dir,
                                 limits,
                                 committed_usage,
@@ -925,11 +920,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                                 ),
                             )
                             .await?;
-                            staged_usage.set(crate::budget::inspect(
-                                &temp_output_dir,
-                                limits,
-                                committed_usage,
-                            )?);
+                            staged_usage.set(usage);
                             Ok(())
                         }
                     },

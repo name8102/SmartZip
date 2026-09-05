@@ -1,0 +1,58 @@
+{
+  "binary": "/home/charl/Documents/Project/SmartZip/target/release/smartzip",
+  "samples": 7,
+  "import_rows": 5000,
+  "rank_rows": 100000,
+  "cleanup_rows": 5000,
+  "timings_seconds": {
+    "import": {
+      "raw": [
+        0.006613715027924627,
+        0.006610523036215454,
+        0.006616893981117755,
+        0.00989199400646612,
+        0.011817911989055574,
+        0.011797899031080306,
+        0.01204741804394871
+      ],
+      "median": 0.00989199400646612
+    },
+    "rank": {
+      "raw": [
+        0.0028633640031330287,
+        0.002439588017296046,
+        0.002545253955759108,
+        0.002672536007594317,
+        0.0017592490185052156,
+        0.001977101026568562,
+        0.002793437975924462
+      ],
+      "median": 0.002545253955759108
+    },
+    "cleanup": {
+      "raw": [
+        0.008549299032893032,
+        0.010854150983504951,
+        0.01272311998764053,
+        0.008694003976415843,
+        0.009027029038406909,
+        0.008498362032696605,
+        0.013254018034785986
+      ],
+      "median": 0.009027029038406909
+    }
+  },
+  "scope": "warm local filesystem; synthetic passwords; CLI startup included; setup excluded",
+  "query_plan": [
+    [
+      5,
+      0,
+      62,
+      "SEARCH passwords USING INDEX idx_passwords_rank (disabled=?)"
+    ]
+  ],
+  "binary_sha256": "d9169b673ae332b5ef6caffa4f8395d1cbbae66e43e898e23256721f5407d5b1",
+  "baseline_commit": "291bc3f",
+  "python_sqlite_version": "3.53.4",
+  "platform": "Linux-7.2.2-1-cachyos-x86_64-with-glibc2.44"
+}

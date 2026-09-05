@@ -76,13 +76,18 @@ pub(crate) fn inspect(path: &Path, limits: &ExtractionLimits, previous: Usage) -
             )));
         }
     }
+    check_free_space(path, limits)?;
+    Ok(usage)
+}
+
+fn check_free_space(path: &Path, limits: &ExtractionLimits) -> Result<()> {
     if free_bytes(path)? < limits.min_free_bytes {
         return Err(exceeded(format!(
             "free disk space fell below {} bytes",
             limits.min_free_bytes
         )));
     }
-    Ok(usage)
+    Ok(())
 }
 
 fn free_bytes(path: &Path) -> Result<u64> {
@@ -109,40 +114,153 @@ fn free_bytes(path: &Path) -> Result<u64> {
     }
 }
 
+// Both tree traversal and statvfs can block on a slow filesystem. Keep the
+// handle owned until completion, including when the backend finishes first.
+fn scan(
+    path: &Path,
+    limits: &ExtractionLimits,
+    previous: Usage,
+    full: bool,
+) -> tokio::task::JoinHandle<Result<Usage>> {
+    let path = path.to_owned();
+    let limits = limits.clone();
+    tokio::task::spawn_blocking(move || {
+        if full {
+            inspect(&path, &limits, previous)
+        } else {
+            check_free_space(&path, &limits).map(|()| previous)
+        }
+    })
+}
+
+fn scan_result(
+    result: std::result::Result<Result<Usage>, tokio::task::JoinError>,
+) -> Result<Usage> {
+    result.map_err(|error| SmartZipError::io(None, std::io::Error::other(error)))?
+}
+
 pub(crate) async fn monitor<T>(
     path: &Path,
     limits: &ExtractionLimits,
     previous: Usage,
     context: Arc<TaskExecutionContext>,
     operation: impl std::future::Future<Output = Result<T>>,
-) -> Result<T> {
-    inspect(path, limits, previous)?;
+) -> Result<(T, Usage)> {
+    use std::time::Duration;
+    use tokio::time::{Instant, MissedTickBehavior};
+    scan_result(scan(path, limits, previous, true).await)?;
     let mut operation = std::pin::pin!(operation);
-    let mut interval = tokio::time::interval(std::time::Duration::from_millis(50));
-    loop {
+    let period = Duration::from_millis(50);
+    let mut interval = tokio::time::interval_at(Instant::now() + period, period);
+    interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut next_tree = Instant::now() + period;
+    let value = loop {
         tokio::select! {
-            result = &mut operation => {
-                let value = result?;
-                if context.is_cancelled() { return Err(SmartZipError::Cancelled); }
-                inspect(path, limits, previous)?;
-                return Ok(value);
-            }
+            result = &mut operation => break result?,
             _ = interval.tick() => {
-                if let Err(error) = inspect(path, limits, previous) {
+                let started = Instant::now();
+                let full = started >= next_tree;
+                let mut pending = scan(path, limits, previous, full);
+                let result = tokio::select! {
+                    result = &mut operation => {
+                        // Drain the scanner before the caller can remove staging.
+                        let checked = scan_result(pending.await);
+                        let value = result?;
+                        checked?;
+                        break value;
+                    }
+                    result = &mut pending => scan_result(result),
+                };
+                if let Err(error) = result {
                     context.cancel();
-                    // Do not drop the future: adapters must terminate and reap
-                    // their processes before staging can safely be removed.
+                    // Adapters must terminate and reap processes before cleanup.
                     let _ = operation.await;
                     return Err(error);
                 }
+                if full {
+                    // Keep traversal duty cycle bounded on large output trees.
+                    let delay = (started.elapsed() * 4).clamp(period, Duration::from_secs(1));
+                    next_tree = Instant::now() + delay;
+                }
             }
         }
+    };
+    if context.is_cancelled() {
+        return Err(SmartZipError::Cancelled);
     }
+    // A scan started while extraction was active cannot certify its final tree.
+    let usage = scan_result(scan(path, limits, previous, true).await)?;
+    if context.is_cancelled() {
+        return Err(SmartZipError::Cancelled);
+    }
+    Ok((value, usage))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test(flavor = "current_thread")]
+    async fn final_usage_includes_last_backend_write_and_prior_outputs() {
+        let root = tempfile::tempdir().unwrap();
+        let limits = ExtractionLimits {
+            min_free_bytes: 0,
+            ..Default::default()
+        };
+        let (_, usage) = monitor(
+            root.path(),
+            &limits,
+            Usage { files: 2, bytes: 7 },
+            Arc::new(TaskExecutionContext::detached()),
+            async {
+                tokio::task::yield_now().await;
+                std::fs::write(root.path().join("last"), [0; 5]).unwrap();
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!((usage.files, usage.bytes), (3, 12));
+    }
+
+    #[test]
+    fn waiting_for_filesystem_worker_keeps_runtime_responsive() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (release, wait) = std::sync::mpsc::channel();
+            let occupied = tokio::task::spawn_blocking(move || wait.recv().unwrap());
+            let ticked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let heartbeat_ticked = ticked.clone();
+            let heartbeat = tokio::spawn(async move {
+                tokio::task::yield_now().await;
+                heartbeat_ticked.store(true, std::sync::atomic::Ordering::SeqCst);
+                release.send(()).unwrap();
+            });
+            let root = tempfile::tempdir().unwrap();
+            let limits = ExtractionLimits {
+                min_free_bytes: 0,
+                ..Default::default()
+            };
+            monitor(
+                root.path(),
+                &limits,
+                Usage::default(),
+                Arc::new(TaskExecutionContext::detached()),
+                async {
+                    assert!(ticked.load(std::sync::atomic::Ordering::SeqCst));
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+            heartbeat.await.unwrap();
+            occupied.await.unwrap();
+        });
+    }
+
     #[tokio::test]
     async fn growing_output_stops_backend_and_fails_budget() {
         let root = tempfile::tempdir().unwrap();

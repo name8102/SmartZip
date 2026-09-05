@@ -1,6 +1,6 @@
 //! Root resolve, prepare archive, password access loop.
 
-use smartzip_archive::{ArchiveExecutor, ListRequest, NativeZipBackend};
+use smartzip_archive::{ArchiveExecutor, ListRequest};
 use smartzip_core::{
     ArchiveFormat, EncodingMode, TaskEvent, TaskEventKind, TaskExecutionContext, TaskId,
 };
@@ -9,7 +9,7 @@ use smartzip_scanner::{EmbeddedArchiveFinding, EmbeddedScanner, ScannerConfig};
 use std::path::{Path, PathBuf};
 
 use crate::backend_util::backend_call;
-use crate::encoding_flow::{assess_zip_encoding, resolve_encoding_mode};
+use crate::encoding_flow::{assess_unencrypted_zip, assess_zip_encoding, resolve_encoding_mode};
 use crate::events::EventSink;
 use crate::interactive::{
     EmbeddedSelectionChoice, InteractiveEmbeddedPrompter, InteractiveEncodingPrompter,
@@ -209,12 +209,7 @@ pub(crate) async fn prepare_resolved_archive(
     let mut zip_encoding_assessment = None;
     if encoding_mode == EncodingMode::Auto && candidate.detected_format == Some(ArchiveFormat::Zip)
     {
-        let reader = NativeZipBackend::new();
-        if let Ok(is_encrypted) = reader.has_encrypted_entries(&archive_path) {
-            if !is_encrypted {
-                zip_encoding_assessment = assess_zip_encoding(&archive_path, None).await;
-            }
-        }
+        zip_encoding_assessment = assess_unencrypted_zip(&archive_path);
     }
     if let Some(assessment) = &zip_encoding_assessment {
         events.push(TaskEvent {

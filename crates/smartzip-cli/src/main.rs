@@ -1662,15 +1662,8 @@ fn password(db: &SmartZipDb, cmd: PasswordCmd) -> Result<(), Box<dyn std::error:
             println!("removed password id={id}");
         }
         PasswordCmd::Import { path, source } => {
-            let content = std::fs::read_to_string(&path)?;
-            let mut count = 0u32;
-            for line in content.lines() {
-                let trimmed = line.trim();
-                if !trimmed.is_empty() {
-                    service.add_password(trimmed, &source, false)?;
-                    count += 1;
-                }
-            }
+            let reader = std::io::BufReader::new(std::fs::File::open(&path)?);
+            let count = PasswordRepository::new(db.connection()).import_lines(reader, &source)?;
             println!("imported {count} password(s) from {}", path.display());
         }
         PasswordCmd::Export { path } => {
@@ -1709,7 +1702,8 @@ fn password(db: &SmartZipDb, cmd: PasswordCmd) -> Result<(), Box<dyn std::error:
             if let Some(days) = stale_days {
                 let cutoff = chrono::Utc::now() - chrono::Duration::days(days as i64);
                 let cutoff_str = cutoff.format("%Y-%m-%d %H:%M:%S").to_string();
-                let already_disabled: Vec<i64> = to_disable.clone();
+                let already_disabled: std::collections::HashSet<i64> =
+                    to_disable.iter().copied().collect();
                 for p in all
                     .iter()
                     .filter(|p| !p.pinned && !already_disabled.contains(&p.id))
@@ -1725,9 +1719,7 @@ fn password(db: &SmartZipDb, cmd: PasswordCmd) -> Result<(), Box<dyn std::error:
             }
 
             if apply {
-                for id in &to_disable {
-                    repo.disable(*id)?;
-                }
+                repo.disable_many(&to_disable)?;
                 println!("cleanup applied: {} disabled", to_disable.len());
             } else {
                 println!(

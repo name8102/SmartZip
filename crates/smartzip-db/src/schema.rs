@@ -2,7 +2,7 @@ use rusqlite::Connection;
 use rusqlite_migration::{Migrations, M};
 
 /// Latest schema version this build knows how to produce.
-pub const LATEST_VERSION: u32 = 4;
+pub const LATEST_VERSION: u32 = 5;
 
 const MIGRATIONS_SLICE: &[M<'static>] = &[
     M::up(
@@ -162,6 +162,13 @@ const MIGRATIONS_SLICE: &[M<'static>] = &[
         "#,
     ),
     M::up("ALTER TABLE file_extractions ADD COLUMN test_report_json TEXT;"),
+    M::up(
+        "DROP INDEX IF EXISTS idx_passwords_rank;
+        CREATE INDEX idx_passwords_rank ON passwords(
+            disabled, pinned DESC, success_count DESC,
+            COALESCE(last_success_at, '') DESC, failure_count ASC, id ASC
+        );",
+    ),
 ];
 
 static MIGRATIONS: Migrations<'static> = Migrations::from_slice(MIGRATIONS_SLICE);
@@ -372,7 +379,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(last, "2026-07-03");
-        assert_eq!(current_version(&conn).unwrap(), 4);
+        assert_eq!(current_version(&conn).unwrap(), LATEST_VERSION);
     }
 
     #[test]
@@ -535,7 +542,7 @@ mod tests {
         conn.execute_batch(
             r#"
             CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
-            CREATE TABLE passwords (id INTEGER PRIMARY KEY AUTOINCREMENT, value TEXT NOT NULL UNIQUE, source TEXT NOT NULL);
+            CREATE TABLE passwords (id INTEGER PRIMARY KEY AUTOINCREMENT, value TEXT NOT NULL UNIQUE, source TEXT NOT NULL, pinned INTEGER NOT NULL DEFAULT 0, disabled INTEGER NOT NULL DEFAULT 0, success_count INTEGER NOT NULL DEFAULT 0, failure_count INTEGER NOT NULL DEFAULT 0, last_success_at TEXT);
             CREATE TABLE tasks (id TEXT PRIMARY KEY, kind TEXT NOT NULL, status TEXT NOT NULL, output_path TEXT, started_at TEXT NOT NULL, finished_at TEXT);
             CREATE TABLE task_events (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, level TEXT NOT NULL, event_type TEXT NOT NULL, message TEXT NOT NULL);
             CREATE TABLE file_extractions (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, input_path TEXT NOT NULL, status TEXT NOT NULL);
@@ -586,20 +593,21 @@ mod tests {
     fn migration_failure_does_not_advance_version() {
         use rusqlite_migration::{Migrations, M};
         let mut conn = Connection::open_in_memory().unwrap();
-        // First bring to v1 normally
+        // First bring to the current schema normally
         migrate(&mut conn).unwrap();
         let before: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        // Now try a failing migration on a fresh Migrations set that would be v4
+        // The additional migration must fail without advancing user_version.
         let failing = Migrations::new(vec![
             M::up("CREATE TABLE t1 (id INTEGER PRIMARY KEY);"),
             M::up("CREATE TABLE t2 (id INTEGER PRIMARY KEY);"),
             M::up("CREATE TABLE t3 (id INTEGER PRIMARY KEY);"),
             M::up("CREATE TABLE t4 (id INTEGER PRIMARY KEY);"),
+            M::up("CREATE TABLE t5 (id INTEGER PRIMARY KEY);"),
             M::up("THIS IS NOT VALID SQL"),
         ]);
-        // The DB is at version 3, so the next migration (v4) will fail.
+        // The DB is at version 5, so the next migration (v6) will fail.
         let res = failing.to_latest(&mut conn);
         assert!(res.is_err(), "failing migration should error");
         let after: i64 = conn

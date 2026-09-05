@@ -1,0 +1,66 @@
+{
+  "binary": "/home/charl/Documents/Project/SmartZip/.work/performance/smartzip-baseline",
+  "samples": 7,
+  "import_rows": 5000,
+  "rank_rows": 100000,
+  "cleanup_rows": 5000,
+  "timings_seconds": {
+    "import": {
+      "raw": [
+        0.17473902698839083,
+        0.18299036502139643,
+        0.16527254896936938,
+        0.19532206800067797,
+        0.1290966430096887,
+        0.22082003304967657,
+        0.14868962299078703
+      ],
+      "median": 0.17473902698839083
+    },
+    "rank": {
+      "raw": [
+        0.06492536299629137,
+        0.04176808602642268,
+        0.042195473972242326,
+        0.04205208702478558,
+        0.06325577397365123,
+        0.048302665003575385,
+        0.041917319991625845
+      ],
+      "median": 0.042195473972242326
+    },
+    "cleanup": {
+      "raw": [
+        0.12672233901685104,
+        0.1316427109995857,
+        0.13256524299504235,
+        0.14405445900047198,
+        0.12864699499914423,
+        0.10987991699948907,
+        0.10664047201862559
+      ],
+      "median": 0.12864699499914423
+    }
+  },
+  "scope": "warm local filesystem; synthetic passwords; CLI startup included; setup excluded",
+  "query_plan": [
+    [
+      5,
+      0,
+      62,
+      "SEARCH passwords USING INDEX idx_passwords_rank (disabled=?)"
+    ],
+    [
+      39,
+      0,
+      0,
+      "USE TEMP B-TREE FOR LAST 3 TERMS OF ORDER BY"
+    ]
+  ],
+  "binary_sha256": "bff3d2b33a18376e0a8d3cf09040e9eefc5df9d41b2568c018854b8e9d22aca7",
+  "baseline_commit": "291bc3f",
+  "python_sqlite_version": "3.53.4",
+  "platform": "Linux-7.2.2-1-cachyos-x86_64-with-glibc2.44",
+  "rustc": "1.97.1 (8bab26f4f 2026-07-14)",
+  "fixture_filesystem": "tmpfs (/tmp)"
+}

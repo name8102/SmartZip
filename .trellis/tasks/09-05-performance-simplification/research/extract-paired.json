@@ -1,0 +1,44 @@
+{
+  "platform": "Linux-7.2.2-1-cachyos-x86_64-with-glibc2.44",
+  "files": 3000,
+  "samples": 7,
+  "scope": "synthetic ZIP with 3000 128-byte files; warm filesystem; CLI startup, test-before-extract, layout and nested scan included; fixture and DB initialization excluded",
+  "binaries": {
+    "baseline": {
+      "path": "/home/charl/Documents/Project/SmartZip/.work/performance/smartzip-baseline",
+      "sha256": "bff3d2b33a18376e0a8d3cf09040e9eefc5df9d41b2568c018854b8e9d22aca7"
+    },
+    "optimized": {
+      "path": "/home/charl/Documents/Project/SmartZip/target/release/smartzip",
+      "sha256": "84927a4eae01526eebe985324b9ba61f5467ce136623a5689b87d1edb7bcf68a"
+    }
+  },
+  "timings_seconds": {
+    "baseline": {
+      "raw": [
+        0.4028466049931012,
+        0.5283924419782124,
+        0.40893737599253654,
+        0.5051582510350272,
+        0.42163013701792806,
+        0.4660430899821222,
+        0.42152035201434046
+      ],
+      "median": 0.42163013701792806
+    },
+    "optimized": {
+      "raw": [
+        0.52145646099234,
+        0.5383609919808805,
+        0.5204226339701563,
+        0.379155979026109,
+        0.5185727459611371,
+        0.5252876430167817,
+        0.3571589140337892
+      ],
+      "median": 0.5204226339701563
+    }
+  },
+  "rustc": "1.97.1 (8bab26f4f 2026-07-14)",
+  "fixture_filesystem": "tmpfs (/tmp)"
+}

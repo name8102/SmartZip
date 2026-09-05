@@ -1,6 +1,7 @@
 //! Encoding mode resolve, zip assessment, mojibake heuristics.
 
 use smartzip_archive::native_zip::NativeZipBackend;
+#[cfg(test)]
 use smartzip_archive::ArchiveListing;
 use smartzip_core::EncodingMode;
 use std::path::Path;
@@ -60,6 +61,11 @@ pub(crate) struct ZipEncodingAssessment {
     pub(crate) should_confirm: bool,
 }
 
+pub(crate) fn assess_unencrypted_zip(path: &Path) -> Option<ZipEncodingAssessment> {
+    let entries = NativeZipBackend::new().unencrypted_entries(path).ok()??;
+    assess_raw_names(entries.iter().map(|entry| entry.raw_name.as_slice()))
+}
+
 pub(crate) async fn assess_zip_encoding(
     archive_path: &Path,
     _password: Option<String>,
@@ -69,65 +75,38 @@ pub(crate) async fn assess_zip_encoding(
     // for detector and avoids routing through the backend router.
     let reader = NativeZipBackend::new();
     let entries = reader.raw_entries(archive_path).ok()?;
-    // Filter out empty names and directory entries that have no filename bytes.
-    let raw_entries: Vec<Vec<u8>> = entries
-        .into_iter()
-        .filter_map(|e| {
-            if e.raw_name.is_empty() {
-                None
-            } else {
-                Some(e.raw_name)
-            }
-        })
-        .collect();
-    if raw_entries.is_empty() {
-        return None;
-    }
-    // Reuse existing build logic by faking an ArchiveListing with raw_name.
-    // We construct a minimal listing that only carries raw_name; the builder
-    // only uses raw_name.
-    let fake_listing = smartzip_archive::ArchiveListing {
-        format: Some(smartzip_core::ArchiveFormat::Zip),
-        entries: raw_entries
-            .into_iter()
-            .map(|raw| smartzip_archive::ArchiveEntry {
-                path: std::path::PathBuf::new(),
-                raw_name: raw,
-                compressed_size: None,
-                uncompressed_size: None,
-                is_dir: false,
-            })
-            .collect(),
-    };
-    build_zip_encoding_assessment(fake_listing)
+    assess_raw_names(entries.iter().map(|entry| entry.raw_name.as_slice()))
 }
 
+#[cfg(test)]
 pub(crate) fn build_zip_encoding_assessment(
     listing: ArchiveListing,
 ) -> Option<ZipEncodingAssessment> {
-    let raw_entries: Vec<&[u8]> = listing
-        .entries
-        .iter()
-        .map(|entry| entry.raw_name.as_slice())
-        .filter(|raw| !raw.is_empty())
-        .collect();
+    assess_raw_names(
+        listing
+            .entries
+            .iter()
+            .map(|entry| entry.raw_name.as_slice()),
+    )
+}
+
+fn assess_raw_names<'a>(
+    names: impl IntoIterator<Item = &'a [u8]>,
+) -> Option<ZipEncodingAssessment> {
+    let raw_entries: Vec<&[u8]> = names.into_iter().filter(|raw| !raw.is_empty()).collect();
     if raw_entries.is_empty() {
         return None;
     }
 
     let ascii_only = raw_entries.iter().all(|raw| raw.is_ascii());
-    let raw_names: Vec<u8> = raw_entries
-        .iter()
-        .enumerate()
-        .flat_map(|(idx, raw)| {
-            let mut merged = Vec::new();
-            if idx > 0 {
-                merged.push(b'/');
-            }
-            merged.extend_from_slice(raw);
-            merged
-        })
-        .collect();
+    let capacity = raw_entries.iter().map(|raw| raw.len()).sum::<usize>() + raw_entries.len() - 1;
+    let mut raw_names = Vec::with_capacity(capacity);
+    for (idx, raw) in raw_entries.iter().enumerate() {
+        if idx > 0 {
+            raw_names.push(b'/');
+        }
+        raw_names.extend_from_slice(raw);
+    }
 
     let mut detector = smartzip_encoding::ArchiveEncodingDetector::new();
     let detected_raw = detector.detect(&raw_names);

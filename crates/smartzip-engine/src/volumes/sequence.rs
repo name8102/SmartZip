@@ -175,21 +175,21 @@ fn parse_roman_tokens(normalized: &str, existing: &[OrdinalToken]) -> Vec<Ordina
 /// Generate filename hypotheses by varying exactly one ordinal token.
 /// Returns list of hypotheses, each with varying token index and members grouped.
 #[derive(Debug, Clone)]
-pub struct SequenceHypothesis {
+pub struct SequenceHypothesis<'a> {
     pub varying_token_idx: usize,
     pub varying_token_value_seed: u64,
     pub prefix: String,
     pub suffix: String,
     /// filename_ordinal -> list of candidates (usually 1)
-    pub groups: std::collections::BTreeMap<u64, Vec<crate::volumes::directory::DirectoryFile>>,
+    pub groups: std::collections::BTreeMap<u64, Vec<&'a crate::volumes::directory::DirectoryFile>>,
     /// gap warning: true if ordinal sequence has holes
     pub has_gap: bool,
 }
 
-pub fn generate_single_token_hypotheses(
+pub fn generate_single_token_hypotheses<'a>(
     seed_path: &std::path::Path,
-    index: &crate::volumes::directory::DirectoryVolumeIndex,
-) -> Vec<SequenceHypothesis> {
+    index: &'a crate::volumes::directory::DirectoryVolumeIndex,
+) -> Vec<SequenceHypothesis<'a>> {
     let seed_file = match index.find_file(seed_path) {
         Some(f) => f,
         None => return Vec::new(),
@@ -204,7 +204,7 @@ pub fn generate_single_token_hypotheses(
         let suffix = seed_file.normalized_name[tok.end..].to_string();
         let mut groups: std::collections::BTreeMap<
             u64,
-            Vec<crate::volumes::directory::DirectoryFile>,
+            Vec<&'a crate::volumes::directory::DirectoryFile>,
         > = Default::default();
         for file in &index.files {
             // Must have same number of tokens? Not necessarily, but other tokens must match fixed parts.
@@ -224,34 +224,43 @@ pub fn generate_single_token_hypotheses(
                 continue;
             }
             let mid = &file.normalized_name[mid_start..mid_end];
-            // Mid should be parseable as ordinal integer (via same logic as seed token)
-            // For simplicity, try parse as u64, else try chinese/roman parse via parse_ordinal_tokens on mid string (must be single token covering whole mid)
-            let mid_tokens = parse_ordinal_tokens(mid);
-            // Mid should be exactly one token covering whole mid (trimmed)
-            // But allow leading zeros etc. For mid "03_1" alias? That will be handled via alias module later, not here. So for primary hypothesis, we require mid is pure ordinal token string that matches full mid.
-            // So check if mid tokens len ==1 and token covers trimmed mid and not empty.
             let trimmed = mid.trim();
             if trimmed.is_empty() {
                 continue;
             }
-            // If mid parsing yields one token that spans trimmed, accept.
-            // Else if mid is numeric string directly, accept parse.
-            let parsed_value = if mid_tokens.len() == 1 && mid_tokens[0].raw == trimmed {
-                Some(mid_tokens[0].value)
-            } else if let Ok(v) = trimmed.parse::<u64>() {
-                Some(v)
-            } else {
-                // Try chinese directly
-                <&str as ChineseToNumber<u64>>::to_number(&trimmed, ChineseCountMethod::TenThousand)
-                    .or_else(|_| <&str as ChineseToNumber<u64>>::to_number_naive(&trimmed))
-                    .ok()
-            };
+            // An exact cached token has the same interpretation in the clipped
+            // middle. Keep the parser fallback: clipping can introduce Roman
+            // word boundaries that did not exist in the full filename.
+            let token_start = mid_start + mid.len() - mid.trim_start().len();
+            let token_end = token_start + trimmed.len();
+            let parsed_value = file
+                .filename_ordinals
+                .iter()
+                .find(|token| {
+                    token.start == token_start && token.end == token_end && token.raw == trimmed
+                })
+                .map(|token| token.value)
+                .or_else(|| {
+                    let mid_tokens = parse_ordinal_tokens(mid);
+                    if mid_tokens.len() == 1 && mid_tokens[0].raw == trimmed {
+                        Some(mid_tokens[0].value)
+                    } else if let Ok(value) = trimmed.parse::<u64>() {
+                        Some(value)
+                    } else {
+                        <&str as ChineseToNumber<u64>>::to_number(
+                            &trimmed,
+                            ChineseCountMethod::TenThousand,
+                        )
+                        .or_else(|_| <&str as ChineseToNumber<u64>>::to_number_naive(&trimmed))
+                        .ok()
+                    }
+                });
             let Some(v) = parsed_value else { continue };
             // Additionally, for other tokens in file to be considered matching, we must ensure that all other token positions match seed's fixed tokens?
             // Our prefix/suffix check already ensures fixed parts are equal, but we also need to ensure that other ordinal tokens (outside varying) are not varying arbitrarily.
             // Example seed "资源2026_第①卷.jpg" has tokens [2026, 1]. Varying token idx 1 -> prefix "资源2026_第", suffix "卷.jpg". Any file with same prefix/suffix and any mid ordinal would be grouped, regardless of other token 2026 fixed as part of prefix. That's correct because other token is fixed inside prefix.
             // So hypothesis grouping via prefix/suffix already enforces single varying token.
-            groups.entry(v).or_default().push(file.clone());
+            groups.entry(v).or_default().push(file);
         }
         // Hypothesis must contain seed's ordinal
         if !groups.contains_key(&tok.value) {
@@ -273,7 +282,7 @@ pub fn generate_single_token_hypotheses(
 }
 
 fn check_gap(
-    groups: &std::collections::BTreeMap<u64, Vec<crate::volumes::directory::DirectoryFile>>,
+    groups: &std::collections::BTreeMap<u64, Vec<&crate::volumes::directory::DirectoryFile>>,
 ) -> bool {
     if groups.is_empty() {
         return false;
@@ -285,4 +294,28 @@ fn check_gap(
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::volumes::directory::DirectoryVolumeIndex;
+
+    #[test]
+    fn hypotheses_borrow_members_and_preserve_clipped_roman_tokens() {
+        let root = tempfile::tempdir().unwrap();
+        for name in ["part1.zip", "part2.zip", "partII.zip"] {
+            std::fs::write(root.path().join(name), []).unwrap();
+        }
+        let index = DirectoryVolumeIndex::from_directory(root.path()).unwrap();
+        let hypotheses = generate_single_token_hypotheses(&root.path().join("part1.zip"), &index);
+        let hypothesis = hypotheses
+            .iter()
+            .find(|h| h.prefix == "part" && h.suffix == ".zip")
+            .unwrap();
+        assert_eq!(hypothesis.groups[&2].len(), 2);
+        for file in hypothesis.groups.values().flatten() {
+            assert!(std::ptr::eq(*file, index.find_file(&file.path).unwrap()));
+        }
+    }
 }

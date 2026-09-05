@@ -1,0 +1,18 @@
+{
+  "passed": 13,
+  "checks": [
+    "doctor: real backend version and capabilities",
+    "real ZIP extraction and repeated input to a new destination",
+    "benign duplicate and collision skip remain successful",
+    "mixed batch, JSON, history and exit status agree",
+    "unreadable detect and all-failed encoding preview return failure",
+    "suspicious encoding skip continues the remaining batch",
+    "file/byte/free-space limits roll back staging and retain old output",
+    "dangerous paths and link traversal rejected before commit",
+    "real encrypted 7z: correct, wrong and unavailable passwords",
+    "terminal password preserves whitespace, hides echo, cancels and restores terminal",
+    "real split 7z, missing volume and corrupted ZIP",
+    "growing external output: dynamic stop; Ctrl+C reaps child and cleans staging",
+    "Unicode password listing, private database mode and source preservation"
+  ]
+}

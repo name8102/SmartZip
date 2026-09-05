@@ -175,16 +175,16 @@ impl VolumeResolver {
         // For NotApplicable but possibly raw continuation (7z chunk without header), we still need hypothesis if ordinal exists.
         // So attempt to load directory index and generate hypotheses.
         let index = match self.cache.get_or_index(parent) {
-            Ok(idx) => idx.clone(),
+            Ok(idx) => idx,
             Err(_) => return VolumeResolution::Single,
         };
 
         // If probe was Standalone we already returned. For NotApplicable without sequence evidence, return Single.
         // Generate primary single-token hypotheses.
-        let mut hypotheses = generate_single_token_hypotheses(path, &index);
+        let mut hypotheses = generate_single_token_hypotheses(path, index);
         if hypotheses.is_empty() {
             // Try format-specific fallback for ZIP/RAR split where extensions differ, but still validate via same structural path.
-            if let Some(fallback_hyp) = try_fallback_hypothesis(path, &index, &probe) {
+            if let Some(fallback_hyp) = try_fallback_hypothesis(path, index, &probe) {
                 hypotheses = vec![fallback_hyp];
             } else {
                 match probe {
@@ -208,7 +208,7 @@ impl VolumeResolver {
         let mut ambiguous_hypotheses = Vec::new();
 
         for hyp in hypotheses {
-            let formats = collect_candidate_formats(&hyp, &index, &probe);
+            let formats = collect_candidate_formats(&hyp, index, &probe);
             // If no strong format evidence, try the hypothesis once with format inferred via first-hit (legacy) to avoid missing weak cases
             let formats = if formats.is_empty() {
                 vec![None]
@@ -217,8 +217,8 @@ impl VolumeResolver {
             };
             for fmt_opt in formats {
                 let outcome = match fmt_opt {
-                    Some(fmt) => resolve_hypothesis_with_forced_format(&hyp, &index, &probe, fmt),
-                    None => resolve_hypothesis(&hyp, &index, &probe),
+                    Some(fmt) => resolve_hypothesis_with_forced_format(&hyp, index, &probe, fmt),
+                    None => resolve_hypothesis(&hyp, index, &probe),
                 };
                 match outcome {
                     HypothesisOutcome::Resolved { set, warnings } => {
@@ -371,14 +371,14 @@ enum HypothesisOutcome {
 }
 
 fn resolve_hypothesis(
-    hyp: &SequenceHypothesis,
+    hyp: &SequenceHypothesis<'_>,
     index: &DirectoryVolumeIndex,
     seed_probe: &VolumeProbeResult,
 ) -> HypothesisOutcome {
     resolve_hypothesis_inner(hyp, index, seed_probe, None)
 }
 fn resolve_hypothesis_with_forced_format(
-    hyp: &SequenceHypothesis,
+    hyp: &SequenceHypothesis<'_>,
     index: &DirectoryVolumeIndex,
     seed_probe: &VolumeProbeResult,
     forced: ArchiveFormat,
@@ -386,7 +386,7 @@ fn resolve_hypothesis_with_forced_format(
     resolve_hypothesis_inner(hyp, index, seed_probe, Some(forced))
 }
 fn collect_candidate_formats(
-    hyp: &SequenceHypothesis,
+    hyp: &SequenceHypothesis<'_>,
     index: &DirectoryVolumeIndex,
     seed_probe: &VolumeProbeResult,
 ) -> Vec<ArchiveFormat> {
@@ -417,7 +417,7 @@ fn collect_candidate_formats(
     formats
 }
 fn resolve_hypothesis_inner(
-    hyp: &SequenceHypothesis,
+    hyp: &SequenceHypothesis<'_>,
     index: &DirectoryVolumeIndex,
     seed_probe: &VolumeProbeResult,
     forced_format: Option<ArchiveFormat>,
@@ -1271,11 +1271,11 @@ fn is_zip_raw_logical_closure(members: &[VolumeMember]) -> bool {
     false
 }
 
-fn try_fallback_hypothesis(
+fn try_fallback_hypothesis<'a>(
     seed_path: &Path,
-    index: &DirectoryVolumeIndex,
+    index: &'a DirectoryVolumeIndex,
     _probe: &VolumeProbeResult,
-) -> Option<SequenceHypothesis> {
+) -> Option<SequenceHypothesis<'a>> {
     let seed_file = index.find_file(seed_path)?;
     let seed_norm = &seed_file.normalized_name;
     let (seed_base, seed_ext) = split_base_ext(seed_norm)?;
@@ -1298,11 +1298,11 @@ fn try_fallback_hypothesis(
     None
 }
 
-fn zip_fallback_hypothesis(
+fn zip_fallback_hypothesis<'a>(
     seed_base: &str,
-    index: &DirectoryVolumeIndex,
-) -> Option<SequenceHypothesis> {
-    let mut groups: BTreeMap<u64, Vec<directory::DirectoryFile>> = BTreeMap::new();
+    index: &'a DirectoryVolumeIndex,
+) -> Option<SequenceHypothesis<'a>> {
+    let mut groups: BTreeMap<u64, Vec<&directory::DirectoryFile>> = BTreeMap::new();
     let mut max_z: Option<u64> = None;
     for file in &index.files {
         let Some((base, ext)) = split_base_ext(&file.normalized_name) else {
@@ -1313,7 +1313,7 @@ fn zip_fallback_hypothesis(
         }
         if ext.starts_with('z') && ext.len() > 1 && ext[1..].chars().all(|c| c.is_ascii_digit()) {
             if let Ok(v) = ext[1..].parse::<u64>() {
-                groups.entry(v).or_default().push(file.clone());
+                groups.entry(v).or_default().push(file);
                 max_z = Some(max_z.map_or(v, |m| m.max(v)));
             }
         }
@@ -1324,7 +1324,7 @@ fn zip_fallback_hypothesis(
         };
         if base == seed_base && ext == "zip" {
             let zip_ord = max_z.map_or(1, |m| m + 1);
-            groups.entry(zip_ord).or_default().push(file.clone());
+            groups.entry(zip_ord).or_default().push(file);
             break;
         }
     }
@@ -1345,11 +1345,11 @@ fn zip_fallback_hypothesis(
         has_gap,
     })
 }
-fn rar_old_fallback_hypothesis(
+fn rar_old_fallback_hypothesis<'a>(
     seed_base: &str,
-    index: &DirectoryVolumeIndex,
-) -> Option<SequenceHypothesis> {
-    let mut groups: BTreeMap<u64, Vec<directory::DirectoryFile>> = BTreeMap::new();
+    index: &'a DirectoryVolumeIndex,
+) -> Option<SequenceHypothesis<'a>> {
+    let mut groups: BTreeMap<u64, Vec<&directory::DirectoryFile>> = BTreeMap::new();
     for file in &index.files {
         let Some((base, ext)) = split_base_ext(&file.normalized_name) else {
             continue;
@@ -1368,7 +1368,7 @@ fn rar_old_fallback_hypothesis(
             None
         };
         if let Some(o) = ord {
-            groups.entry(o).or_default().push(file.clone());
+            groups.entry(o).or_default().push(file);
         }
     }
     if groups.len() < 2 {
