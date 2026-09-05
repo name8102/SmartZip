@@ -117,7 +117,8 @@ def create_encrypted_7z(output: Path, files: dict, password: str):
             target.write_bytes(data)
 
         with py7zr.SevenZipFile(output, 'w', password=password) as zf:
-            zf.writeall(str(work), arcname='')
+            for arcname in files:
+                zf.write(str(work / arcname), arcname=arcname)
     finally:
         shutil.rmtree(work)
 

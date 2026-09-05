@@ -1,7 +1,7 @@
 //! Business-container, scan-policy, and min-size gates.
 
 use smartzip_core::{TaskEvent, TaskEventKind, TaskId};
-use smartzip_scanner::{EmbeddedArchiveFinding, ScanMode, ScannerConfig};
+use smartzip_scanner::{EmbeddedArchiveFinding, ScannerConfig};
 use std::path::Path;
 
 use crate::events::EventSink;
@@ -39,19 +39,11 @@ pub(crate) fn embedded_policy_from_request(
 }
 
 pub(crate) fn full_root_scanner_config(requested: &ScannerConfig) -> ScannerConfig {
-    ScannerConfig {
-        mode: ScanMode::Deep,
-        max_scan_bytes: None,
-        ..requested.clone()
-    }
+    requested.clone()
 }
 
 pub(crate) fn default_root_scanner_config(requested: &ScannerConfig) -> ScannerConfig {
-    if requested == &ScannerConfig::default() || requested.max_scan_bytes.is_none() {
-        full_root_scanner_config(requested)
-    } else {
-        requested.clone()
-    }
+    requested.clone()
 }
 
 pub(crate) fn finding_meets_min_size(

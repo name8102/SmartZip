@@ -49,6 +49,7 @@ fn request(inputs: Vec<PathBuf>, output_dir: PathBuf) -> ExtractWorkflowRequest 
         dominant_min_ratio: 0.70,
         confirm_large_scan: false,
         force: false,
+        limits: Default::default(),
     }
 }
 
@@ -112,8 +113,10 @@ async fn extract_records_task_events_and_file_row() {
         "events should be persisted once when the final snapshot is replayed",
     );
     assert!(
-        events.iter().any(|e| e.event_type == "Completed"),
-        "timeline should include a Completed event"
+        events
+            .iter()
+            .any(|e| e.event_type == "Finished" && e.message == "completed"),
+        "timeline should include the completed Finished event"
     );
 
     // A per-file extraction row was logged for the root input.
@@ -231,7 +234,7 @@ async fn extraction_without_recorder_writes_no_history() {
 }
 
 #[tokio::test]
-async fn duplicate_is_skipped_and_force_reextracts() {
+async fn history_does_not_skip_a_new_destination() {
     let archive = fixture_path("enc_utf8.zip");
     let backend = backend();
     let db = SmartZipDb::in_memory().unwrap();
@@ -271,13 +274,13 @@ async fn duplicate_is_skipped_and_force_reextracts() {
         )
         .await
         .unwrap();
-    assert!(second.processed.is_empty());
+    assert_eq!(second.processed.len(), 1);
     let duplicate_rows = FileExtractionRepository::new(db.connection())
         .list_by_task(second.task_id.as_str())
         .unwrap();
     assert!(duplicate_rows
         .iter()
-        .any(|row| row.status == "skipped" && row.reason.as_deref() == Some("duplicate")));
+        .any(|row| row.status == "extracted" && row.output_path.is_some()));
 
     let forced_output = TempDir::new().unwrap();
     let mut forced_request = request(vec![archive], forced_output.path().to_path_buf());

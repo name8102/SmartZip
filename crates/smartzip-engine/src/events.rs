@@ -9,6 +9,7 @@ pub type TaskEventListener = Arc<dyn Fn(&TaskEvent) + Send + Sync>;
 pub(crate) struct EventSink {
     events: Arc<Mutex<Vec<TaskEvent>>>,
     listener: Option<TaskEventListener>,
+    progress_count: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl TaskEventSink for EventSink {
@@ -22,12 +23,21 @@ impl EventSink {
         Self {
             events: Arc::new(Mutex::new(Vec::new())),
             listener,
+            progress_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
     pub(crate) fn push(&self, event: TaskEvent) {
         if let Some(listener) = &self.listener {
             listener(&event);
+        }
+        if matches!(event.kind, smartzip_core::TaskEventKind::Progress(_))
+            && self
+                .progress_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                >= 4096
+        {
+            return;
         }
         self.events
             .lock()

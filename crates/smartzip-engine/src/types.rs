@@ -94,6 +94,7 @@ pub(crate) struct ArchiveAccessOutcome {
 }
 
 pub struct SmartZipEngine {
+    pub(crate) cancellation: tokio_util::sync::CancellationToken,
     pub(crate) scanner: smartzip_scanner::EmbeddedScanner,
     pub(crate) archive_recycler: ArchiveRecycleHandler,
     pub(crate) min_embedded_size_bytes: u64,
@@ -117,6 +118,8 @@ pub struct ExtractWorkflowRequest {
     /// Bypass the `known_files` dedup skip and re-extract even when this file
     /// was already extracted inside the dedup window.
     pub force: bool,
+    #[serde(default)]
+    pub limits: crate::budget::ExtractionLimits,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -139,6 +142,8 @@ pub enum CandidateSource {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExtractWorkflowResult {
+    pub status: crate::history::TaskCompletionStatus,
+    pub failed_count: usize,
     pub task_id: TaskId,
     pub processed: Vec<ExtractionCandidate>,
     pub skipped: Vec<ExtractionCandidate>,

@@ -18,6 +18,15 @@ pub trait ArchiveExecutor: Send + Sync {
         Arc::new(TaskExecutionContext::new(task_id, events))
     }
 
+    fn begin_task_with_cancellation(
+        &self,
+        task_id: TaskId,
+        events: Arc<dyn TaskEventSink>,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) -> Arc<TaskExecutionContext> {
+        Arc::new(TaskExecutionContext::new(task_id, events).with_cancellation(cancellation))
+    }
+
     async fn probe(&self, path: &Path) -> Result<ArchiveProbe>;
     async fn probe_with_context(
         &self,
@@ -38,9 +47,10 @@ pub trait ArchiveExecutor: Send + Sync {
     async fn test_with_context(
         &self,
         request: TestRequest,
-        _context: Arc<TaskExecutionContext>,
+        context: Arc<TaskExecutionContext>,
     ) -> Result<TestResult> {
-        self.test(request).await
+        let token = context.cancellation_token();
+        tokio::select! { biased; _ = token.cancelled() => Err(smartzip_core::SmartZipError::Cancelled), result = self.test(request) => result }
     }
     /// One independent diagnostic pass, outside normal error fallback. None
     /// means no adapter with additional diagnostic value is available.
@@ -90,6 +100,9 @@ pub trait ArchiveExecutor: Send + Sync {
 #[async_trait]
 pub trait ArchiveAdapter: Send + Sync {
     fn id(&self) -> &str;
+    fn executable_path(&self) -> Option<&Path> {
+        None
+    }
     /// Known diagnostic implementation family, used to avoid repeating the
     /// same implementation under another executable path.
     fn diagnostic_family(&self) -> Option<&'static str> {
@@ -115,9 +128,10 @@ pub trait ArchiveAdapter: Send + Sync {
     async fn test_with_context(
         &self,
         request: TestRequest,
-        _context: std::sync::Arc<TaskExecutionContext>,
+        context: std::sync::Arc<TaskExecutionContext>,
     ) -> Result<TestResult> {
-        self.test(request).await
+        let token = context.cancellation_token();
+        tokio::select! { biased; _ = token.cancelled() => Err(smartzip_core::SmartZipError::Cancelled), result = self.test(request) => result }
     }
     async fn extract(&self, request: ExtractArchiveRequest) -> Result<ExtractArchiveResult>;
     /// Context-aware extract that can observe cancellation. Default impl

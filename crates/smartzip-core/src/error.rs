@@ -91,6 +91,9 @@ pub enum SmartZipError {
         threshold: u64,
     },
 
+    #[error("extraction resource limit: {detail}")]
+    ResourceLimit { detail: String },
+
     #[error("operation cancelled")]
     Cancelled,
 }

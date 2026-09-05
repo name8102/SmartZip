@@ -62,18 +62,40 @@ impl BackendConfig {
     }
 }
 
-/// The CLI currently consumes only backend routing configuration. Keep the
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ExtractionLimits {
+    pub max_files: u64,
+    pub max_output_bytes: u64,
+    pub min_free_bytes: u64,
+    pub max_nested_candidates: usize,
+}
+impl Default for ExtractionLimits {
+    fn default() -> Self {
+        Self {
+            max_files: 100_000,
+            max_output_bytes: 20 * 1024 * 1024 * 1024,
+            min_free_bytes: 512 * 1024 * 1024,
+            max_nested_candidates: 10_000,
+        }
+    }
+}
+
+/// Routing and extraction resource configuration. Keep the
 /// wrapper so config files have one stable root without carrying dead defaults.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SmartZipConfig {
     #[serde(default)]
     pub backends: BackendConfig,
+    #[serde(default)]
+    pub extraction: ExtractionLimits,
 }
 
 impl Default for SmartZipConfig {
     fn default() -> Self {
         Self {
             backends: BackendConfig::default(),
+            extraction: ExtractionLimits::default(),
         }
     }
 }

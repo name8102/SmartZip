@@ -66,12 +66,7 @@ impl<'a> PasswordService<'a> {
     ) -> smartzip_db::Result<Vec<PasswordCandidate>> {
         let mut candidates = Vec::new();
 
-        for value in request
-            .manual
-            .into_iter()
-            .map(normalize_password)
-            .filter(|v| !v.is_empty())
-        {
+        for value in request.manual.into_iter().filter(|v| !v.is_empty()) {
             push_unique(
                 &mut candidates,
                 PasswordCandidate {
@@ -110,9 +105,6 @@ impl<'a> PasswordService<'a> {
 
         for record in self.repo.ranked_candidates(request.limit)? {
             push_unique(&mut candidates, candidate_from_record(record));
-            if candidates.len() >= request.limit {
-                break;
-            }
         }
 
         Ok(candidates)
@@ -195,7 +187,7 @@ mod tests {
             })
             .unwrap();
 
-        assert_eq!(candidates[0].value, "手动密码");
+        assert_eq!(candidates[0].value, " 手动密码\n");
         assert_eq!(candidates[0].source, PasswordSource::Manual);
         assert_eq!(candidates[1].value, "剪贴板密码");
         assert_eq!(candidates[1].source, PasswordSource::Clipboard);

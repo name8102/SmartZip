@@ -21,6 +21,7 @@ smartzip-platform.workspace = true
 smartzip-scanner.workspace = true
 futures-util.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 tempfile.workspace = true
 unicode-normalization.workspace = true
 walkdir.workspace = true

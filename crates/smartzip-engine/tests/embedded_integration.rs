@@ -26,6 +26,22 @@ fn embedded_fixture_dir() -> PathBuf {
 }
 
 fn embedded_fixture(name: &str) -> PathBuf {
+    if name == "root_embedded_zip_low_ratio.bin" {
+        static GENERATED: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+        return GENERATED
+            .get_or_init(|| {
+                let dir = tempfile::tempdir().unwrap();
+                let mut data = vec![0x42; 1024 * 1024];
+                data.extend(
+                    std::fs::read(embedded_fixture_dir().join("direct_zip_renamed_jpg.jpg"))
+                        .unwrap(),
+                );
+                std::fs::write(dir.path().join(name), data).unwrap();
+                dir
+            })
+            .path()
+            .join(name);
+    }
     embedded_fixture_dir().join(name)
 }
 

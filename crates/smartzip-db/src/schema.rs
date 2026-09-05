@@ -553,8 +553,8 @@ mod tests {
         let uv2: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(uv2, 3);
-        assert_eq!(current_version(&conn).unwrap(), 3);
+        assert_eq!(uv2, LATEST_VERSION as i64);
+        assert_eq!(current_version(&conn).unwrap(), LATEST_VERSION);
         assert!(!table_exists(&conn, "schema_migrations"));
     }
 
@@ -596,6 +596,7 @@ mod tests {
             M::up("CREATE TABLE t1 (id INTEGER PRIMARY KEY);"),
             M::up("CREATE TABLE t2 (id INTEGER PRIMARY KEY);"),
             M::up("CREATE TABLE t3 (id INTEGER PRIMARY KEY);"),
+            M::up("CREATE TABLE t4 (id INTEGER PRIMARY KEY);"),
             M::up("THIS IS NOT VALID SQL"),
         ]);
         // The DB is at version 3, so the next migration (v4) will fail.
@@ -605,7 +606,7 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(before, after, "user_version must not advance on failure");
-        assert_eq!(after, 3);
+        assert_eq!(after, LATEST_VERSION as i64);
     }
     #[test]
     fn legacy_missing_version_column_fails_closed() {

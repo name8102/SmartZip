@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 const DEFAULT_RECURSION_LIMIT: u8 = 3;
 
 #[derive(Debug, Parser)]
-#[command(name = "smartzip")]
+#[command(name = "smartzip", version)]
 #[command(about = "SmartZip cross-platform archive helper")]
 struct Cli {
     /// Path to database file. Defaults to the platform data directory if not set.
@@ -39,8 +39,82 @@ struct Cli {
     #[arg(long)]
     verbose_routing: bool,
 
+    #[command(flatten)]
+    safety: SafetyOptions,
+
     #[command(subcommand)]
     command: Command,
+}
+
+#[derive(Debug, Clone, clap::Args)]
+struct SafetyOptions {
+    /// Maximum stored password candidates (manual passwords are tried first).
+    #[arg(long, global = true, default_value_t = 128)]
+    password_limit: usize,
+    #[arg(skip)]
+    defaults: smartzip_config::ExtractionLimits,
+
+    /// Maximum total output entries, including directories and nested outputs.
+    #[arg(long, global = true)]
+    max_files: Option<u64>,
+    #[arg(long, global = true)]
+    max_output_bytes: Option<u64>,
+    #[arg(long, global = true)]
+    min_free_bytes: Option<u64>,
+    #[arg(long, global = true)]
+    max_nested_candidates: Option<usize>,
+    /// Disable all prompts, even when stdin is a terminal.
+    #[arg(long, global = true)]
+    non_interactive: bool,
+    /// Existing output policy. Ask becomes skip without an interactive terminal.
+    #[arg(long, global = true, value_enum, default_value_t = ConflictArg::Ask)]
+    on_conflict: ConflictArg,
+    /// Suspicious names policy. Ask becomes skip without an interactive terminal.
+    #[arg(long, global = true, value_enum, default_value_t = SuspiciousEncodingArg::Ask)]
+    suspicious_encoding: SuspiciousEncodingArg,
+}
+impl SafetyOptions {
+    fn limits(&self) -> smartzip_engine::budget::ExtractionLimits {
+        smartzip_engine::budget::ExtractionLimits {
+            max_files: self.max_files.unwrap_or(self.defaults.max_files),
+            max_output_bytes: self
+                .max_output_bytes
+                .unwrap_or(self.defaults.max_output_bytes),
+            min_free_bytes: self.min_free_bytes.unwrap_or(self.defaults.min_free_bytes),
+            max_nested_candidates: self
+                .max_nested_candidates
+                .unwrap_or(self.defaults.max_nested_candidates),
+        }
+    }
+}
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ConflictArg {
+    Ask,
+    Skip,
+    Overwrite,
+    Rename,
+}
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum SuspiciousEncodingArg {
+    Ask,
+    Skip,
+    Accept,
+}
+
+#[derive(Debug)]
+struct CommandExit(i32);
+impl std::fmt::Display for CommandExit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "command exited with {}", self.0)
+    }
+}
+impl std::error::Error for CommandExit {}
+fn command_exit(code: i32) -> Result<(), Box<dyn std::error::Error>> {
+    if code == 0 {
+        Ok(())
+    } else {
+        Err(Box::new(CommandExit(code)))
+    }
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -68,6 +142,11 @@ impl From<EmbeddedModeArg> for smartzip_core::EmbeddedScanMode {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Diagnose backend availability, versions, capabilities and database location.
+    Doctor {
+        #[arg(long)]
+        json: bool,
+    },
     /// Inspect archive format, encoding, embedded findings, and password requirements.
     #[command(visible_alias = "d")]
     Detect {
@@ -191,6 +270,9 @@ enum Command {
         /// Use deep scan for nested archives.
         #[arg(long)]
         deep: bool,
+
+        #[arg(long)]
+        max_scan_bytes: Option<u64>,
 
         /// Encoding for entry names: "auto", "UTF-8", "GB18030", "GBK", "Big5", "Shift_JIS", "EUC-JP", "EUC-KR".
         #[arg(long, default_value = "auto")]
@@ -407,23 +489,88 @@ impl From<SingleRootNameArg> for smartzip_engine::layout::SingleRootNamePolicy {
 }
 
 #[tokio::main]
-async fn main() {
-    if let Err(error) = run().await {
-        eprintln!("error: {error}");
-        std::process::exit(1);
+async fn main() -> std::process::ExitCode {
+    let cli = Cli::parse();
+    let json = matches!(
+        &cli.command,
+        Command::Doctor { json: true }
+            | Command::Detect { json: true, .. }
+            | Command::List { json: true, .. }
+            | Command::Test { json: true, .. }
+            | Command::Extract { json: true, .. }
+            | Command::EncodingPreview { json: true, .. }
+    );
+    if let Err(error) = run(cli).await {
+        if let Some(exit) = error.downcast_ref::<CommandExit>() {
+            return std::process::ExitCode::from(exit.0 as u8);
+        }
+        let cancelled = matches!(
+            error.downcast_ref::<smartzip_core::SmartZipError>(),
+            Some(smartzip_core::SmartZipError::Cancelled)
+        );
+        let code = if cancelled { 130 } else { 1 };
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({"schema_version": 1, "status": if cancelled { "cancelled" } else { "failed" }, "exit_code": code, "error": error.to_string()})
+            );
+        } else {
+            eprintln!("error: {error}");
+        }
+        return std::process::ExitCode::from(code as u8);
     }
+    std::process::ExitCode::SUCCESS
 }
 
-async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let cli = Cli::parse();
+async fn run(mut cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(path) = &cli.config {
+        cli.safety.defaults = SmartZipConfig::load(path)?.extraction;
+    }
     let verbose_routing = cli.verbose_routing;
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let signal_token = cancellation.clone();
+    let signal = tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            signal_token.cancel();
+        }
+    });
     let backend = build_backend(
         cli.config.as_deref(),
         cli.backend.as_deref(),
         verbose_routing,
     )?;
 
-    match cli.command {
+    let result = match cli.command {
+        Command::Doctor { json } => {
+            let db_path = cli.db.unwrap_or_else(|| PlatformPaths::new().db_path());
+            let adapters = backend.diagnostics();
+            let healthy = adapters
+                .iter()
+                .any(|a| a["family"] == "7z" && a["version"].is_string());
+            let result = serde_json::json!({"schema_version": 1, "version": env!("CARGO_PKG_VERSION"), "database": db_path,
+                "backends": adapters, "warnings": backend.warnings(), "status": if healthy { "completed" } else { "failed" },
+                "exit_code": if healthy { 0 } else { 1 }, "extraction_limits": cli.safety.limits(), "scan_default_bytes": smartzip_scanner::DEFAULT_SCAN_BYTES,
+                "scan_hard_limit_bytes": smartzip_scanner::MAX_SCAN_BYTES});
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                println!(
+                    "SmartZip {}\nDatabase: {}",
+                    env!("CARGO_PKG_VERSION"),
+                    db_path.display()
+                );
+                for adapter in &adapters {
+                    println!(
+                        "{}: {} ({}) {}",
+                        adapter["id"], adapter["version"], adapter["family"], adapter["executable"]
+                    );
+                }
+                if !healthy {
+                    eprintln!("7-Zip backend missing or unusable; install 7z or 7zz");
+                }
+            }
+            command_exit(if healthy { 0 } else { 1 })
+        }
         Command::Detect {
             path,
             deep,
@@ -441,6 +588,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 max_scan_bytes,
                 min_confidence,
                 verbose_routing,
+                &cli.safety,
+                cancellation.clone(),
             )
             .await
         }
@@ -469,6 +618,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 max_scan_bytes,
                 min_confidence,
                 verbose_routing,
+                &cli.safety,
+                cancellation.clone(),
             )
             .await
         }
@@ -501,18 +652,22 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         manual: password,
                         clipboard: None,
                         include_empty: !no_empty,
-                        limit: 128,
+                        limit: cli.safety.password_limit,
                     },
                     diagnose: match diagnose {
                         DiagnoseArg::Auto => smartzip_engine::DiagnoseMode::Auto,
                         DiagnoseArg::Off => smartzip_engine::DiagnoseMode::Off,
                     },
                     diagnostic_timeout: diagnostic_timeout.map(std::time::Duration::from_secs),
-                    control: smartzip_archive::diagnostic::DiagnosticControl::default(),
+                    control: smartzip_archive::diagnostic::DiagnosticControl::with_cancellation(
+                        cancellation.clone(),
+                    ),
                 },
                 json,
                 no_history,
                 verbose_routing,
+                &cli.safety,
+                cancellation.clone(),
             )
             .await
         }
@@ -523,6 +678,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             password: manual_passwords,
             no_empty,
             deep,
+            max_scan_bytes,
             encoding,
             json,
             layout,
@@ -544,6 +700,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 manual_passwords,
                 no_empty,
                 deep,
+                max_scan_bytes,
                 &encoding,
                 json,
                 layout.into(),
@@ -555,6 +712,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 force,
                 no_history,
                 verbose_routing,
+                &cli.safety,
+                cancellation.clone(),
             )
             .await
         }
@@ -562,7 +721,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             path,
             password,
             json,
-        } => preview_encodings(&backend, path, password, json, verbose_routing).await,
+        } => {
+            preview_encodings(
+                &backend,
+                path,
+                password,
+                json,
+                verbose_routing,
+                cancellation.clone(),
+            )
+            .await
+        }
         Command::Password(cmd) => {
             let db = open_db(cli.db)?;
             password(&db, cmd)
@@ -577,7 +746,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }),
             )
         }
-    }
+    };
+    signal.abort();
+    result
 }
 
 fn build_backend(
@@ -660,13 +831,16 @@ async fn detect(
     max_scan_bytes: Option<u64>,
     min_confidence: ConfidenceArg,
     verbose_routing: bool,
+    _safety: &SafetyOptions,
+    cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config = ScannerConfig {
         min_confidence: min_confidence.into(),
         ..scanner_config(deep, max_scan_bytes)
     };
     let service = PasswordService::new(PasswordRepository::new(db.connection()));
-    let engine = SmartZipEngine::with_scanner_config(config.clone());
+    let engine = SmartZipEngine::with_scanner_config(config.clone())
+        .with_cancellation_token(cancellation.clone());
     let recorder = smartzip_engine::history::DbTaskHistoryRecorder::new(db.connection());
     let result = engine
         .inspect_file_with_listener(
@@ -682,7 +856,7 @@ async fn detect(
         .await?;
 
     print_detect_result(&result, json)?;
-    Ok(())
+    command_exit(if result.status == "unreadable" { 1 } else { 0 })
 }
 
 async fn test_archives(
@@ -692,20 +866,15 @@ async fn test_archives(
     json: bool,
     no_history: bool,
     verbose_routing: bool,
+    safety: &SafetyOptions,
+    cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use std::io::IsTerminal;
     let service = PasswordService::new(PasswordRepository::new(db.connection()));
     let engine = SmartZipEngine::with_scanner_config(request.scanner.clone());
     let recorder = smartzip_engine::history::DbTaskHistoryRecorder::new(db.connection());
     let prompter = StdinPrompter {
-        lock: StdinLock::new(),
+        lock: StdinLock::configured(cancellation.clone(), safety, json),
     };
-    let control = request.control.clone();
-    let signal = tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            control.cancel();
-        }
-    });
     let listener = (!json).then(|| {
         Arc::new(move |event: &TaskEvent| match &event.kind {
             smartzip_core::TaskEventKind::TestPhase { path, phase, .. } => {
@@ -725,7 +894,7 @@ async fn test_archives(
             backend,
             &service,
             request,
-            if !json && std::io::stdin().is_terminal() {
+            if prompter.lock.interactive {
                 Some(&prompter)
             } else {
                 None
@@ -734,7 +903,6 @@ async fn test_archives(
             if no_history { None } else { Some(&recorder) },
         )
         .await;
-    signal.abort();
     let result = result?;
     if json {
         println!("{}", serde_json::to_string_pretty(&result)?);
@@ -744,7 +912,7 @@ async fn test_archives(
         }
         println!("task-id: {}", result.task_id);
     }
-    std::process::exit(result.exit_code);
+    command_exit(result.exit_code)
 }
 
 fn safe_text(value: &str) -> String {
@@ -863,16 +1031,23 @@ async fn list_archive(
     max_scan_bytes: Option<u64>,
     min_confidence: ConfidenceArg,
     verbose_routing: bool,
+    safety: &SafetyOptions,
+    cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config = ScannerConfig {
         min_confidence: min_confidence.into(),
         ..scanner_config(deep, max_scan_bytes)
     };
     let service = PasswordService::new(PasswordRepository::new(db.connection()));
-    let engine = SmartZipEngine::with_scanner_config(config.clone());
+    let engine = SmartZipEngine::with_scanner_config(config.clone())
+        .with_cancellation_token(cancellation.clone());
     let recorder = smartzip_engine::history::DbTaskHistoryRecorder::new(db.connection());
-    let stdin_lock = StdinLock::new();
-    let encoding_mode = select_list_encoding(path.clone(), encoding, pick_encoding)?;
+    let stdin_lock = StdinLock::configured(cancellation.clone(), safety, json);
+    let password_prompter = StdinPrompter {
+        lock: stdin_lock.clone(),
+    };
+    let encoding_mode =
+        select_list_encoding(path.clone(), encoding, pick_encoding, stdin_lock.clone()).await?;
     let result = engine
         .list_archive_with_listener_interactive(
             backend,
@@ -885,12 +1060,14 @@ async fn list_archive(
                     manual: manual_passwords,
                     clipboard: None,
                     include_empty: !no_empty,
-                    limit: 128,
+                    limit: safety.password_limit,
                 },
             },
-            Some(&StdinPrompter {
-                lock: stdin_lock.clone(),
-            }),
+            if stdin_lock.interactive {
+                Some(&password_prompter)
+            } else {
+                None
+            },
             Some(&StdinEncodingPrompter { lock: stdin_lock }),
             routing_listener(json, verbose_routing),
             Some(&recorder),
@@ -996,42 +1173,38 @@ fn parse_encoding_mode(encoding: &str) -> EncodingMode {
     }
 }
 
-fn select_list_encoding(
+async fn select_list_encoding(
     path: PathBuf,
     encoding: &str,
     pick_encoding: bool,
+    control: StdinLock,
 ) -> Result<EncodingMode, Box<dyn std::error::Error>> {
-    if pick_encoding {
-        prompt_pick_encoding(&path)
-    } else {
-        Ok(parse_encoding_mode(encoding))
+    if !pick_encoding || !control.interactive {
+        return Ok(parse_encoding_mode(encoding));
     }
-}
-
-fn prompt_pick_encoding(path: &Path) -> Result<EncodingMode, Box<dyn std::error::Error>> {
-    use std::io::{self, IsTerminal, Write};
-
-    if !io::stdin().is_terminal() {
-        return Ok(EncodingMode::Auto);
-    }
-
-    let candidates = encoding_preview_candidates();
-    eprintln!("\n  Candidate encodings for {}:", path.display());
-    for (idx, candidate) in candidates.iter().enumerate() {
-        eprintln!("  [{}] {}", idx + 1, candidate);
-    }
-    eprint!("  Pick encoding number (Enter for auto): ");
-    let _ = io::stderr().flush();
-
-    let mut choice = String::new();
-    io::stdin().read_line(&mut choice)?;
+    let choice = tokio::task::spawn_blocking(move || {
+        use std::io::Write;
+        let _guard = control.gate.lock().unwrap();
+        let candidates = encoding_preview_candidates();
+        eprintln!("\n  Candidate encodings for {}:", path.display());
+        for (idx, candidate) in candidates.iter().enumerate() {
+            eprintln!("  [{}] {}", idx + 1, candidate);
+        }
+        eprint!("  Pick encoding number (Enter for auto): ");
+        let _ = std::io::stderr().flush();
+        terminal_line(&control, false)
+    })
+    .await?;
+    let Some(choice) = choice else {
+        return Err(smartzip_core::SmartZipError::Cancelled.into());
+    };
     let trimmed = choice.trim();
     if trimmed.is_empty() {
         return Ok(EncodingMode::Auto);
     }
     let idx: usize = trimmed.parse()?;
-    let selected = candidates
-        .get(idx.saturating_sub(1))
+    let selected = encoding_preview_candidates()
+        .get(idx.checked_sub(1).ok_or("invalid encoding choice")?)
         .copied()
         .ok_or_else(|| format!("invalid encoding choice: {trimmed}"))?;
     Ok(parse_encoding_mode(selected))
@@ -1046,6 +1219,7 @@ async fn extract(
     manual_passwords: Vec<String>,
     no_empty: bool,
     deep: bool,
+    max_scan_bytes: Option<u64>,
     encoding: &str,
     json: bool,
     layout_policy: smartzip_engine::layout::OutputLayoutPolicy,
@@ -1057,6 +1231,8 @@ async fn extract(
     force: bool,
     no_history: bool,
     verbose_routing: bool,
+    safety: &SafetyOptions,
+    cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if paths.is_empty() {
         return Err("no paths provided".into());
@@ -1086,8 +1262,11 @@ async fn extract(
 
     let service = PasswordService::new(PasswordRepository::new(db.connection()));
 
-    let stdin_lock = StdinLock::new();
-    let engine = SmartZipEngine::default();
+    let stdin_lock = StdinLock::configured(cancellation.clone(), safety, json);
+    let password_prompter = StdinPrompter {
+        lock: stdin_lock.clone(),
+    };
+    let engine = SmartZipEngine::default().with_cancellation_token(cancellation.clone());
     let event_listener = routing_listener(json, verbose_routing);
 
     // History recorder shares the same connection as the password service.
@@ -1107,13 +1286,13 @@ async fn extract(
                 inputs: paths,
                 output_dir,
                 recursion_limit,
-                scanner: scanner_config(deep, None),
+                scanner: scanner_config(deep, max_scan_bytes),
                 encoding_mode,
                 password_candidates: PasswordCandidateRequest {
                     manual: manual_passwords,
                     clipboard: None,
                     include_empty: !no_empty,
-                    limit: 128,
+                    limit: safety.password_limit,
                 },
                 layout_policy,
                 single_root_name_policy,
@@ -1121,10 +1300,13 @@ async fn extract(
                 dominant_min_ratio,
                 confirm_large_scan,
                 force,
+                limits: safety.limits(),
             },
-            Some(&StdinPrompter {
-                lock: stdin_lock.clone(),
-            }),
+            if stdin_lock.interactive {
+                Some(&password_prompter)
+            } else {
+                None
+            },
             Some(&StdinOutputPrompter {
                 lock: stdin_lock.clone(),
             }),
@@ -1137,7 +1319,7 @@ async fn extract(
         )
         .await?;
 
-    let exit_code = extraction_exit_code(result.processed.len(), result.skipped.len());
+    let exit_code = result.status.exit_code() as i32;
     if json {
         println!(
             "{}",
@@ -1160,7 +1342,12 @@ async fn extract(
         }
     }
 
-    std::process::exit(exit_code);
+    command_exit(exit_code)
+}
+
+struct SilentSink;
+impl TaskEventSink for SilentSink {
+    fn push(&self, _: TaskEvent) {}
 }
 
 struct RoutingPrintSink;
@@ -1299,6 +1486,7 @@ async fn preview_encodings(
     password: Option<String>,
     json: bool,
     verbose_routing: bool,
+    cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let candidates = encoding_preview_candidates();
     let mut previews = Vec::new();
@@ -1314,11 +1502,23 @@ async fn preview_encodings(
             password: password.clone(),
             encoding: mode,
         };
+        if cancellation.is_cancelled() {
+            return Err(smartzip_core::SmartZipError::Cancelled.into());
+        }
         let listing = if verbose_routing {
-            let context = backend.begin_task(TaskId::new(), std::sync::Arc::new(RoutingPrintSink));
+            let context = backend.begin_task_with_cancellation(
+                TaskId::new(),
+                std::sync::Arc::new(RoutingPrintSink),
+                cancellation.clone(),
+            );
             backend.list_with_context(request, context).await
         } else {
-            backend.list(request).await
+            let context = backend.begin_task_with_cancellation(
+                TaskId::new(),
+                std::sync::Arc::new(SilentSink),
+                cancellation.clone(),
+            );
+            backend.list_with_context(request, context).await
         };
         match listing {
             Ok(listing) => previews.push(EncodingPreviewEntry {
@@ -1340,6 +1540,10 @@ async fn preview_encodings(
         }
     }
 
+    if cancellation.is_cancelled() {
+        return Err(smartzip_core::SmartZipError::Cancelled.into());
+    }
+    let failed = previews.iter().all(|preview| !preview.ok);
     if json {
         let output: Vec<serde_json::Value> = previews
             .into_iter()
@@ -1373,7 +1577,7 @@ async fn preview_encodings(
         }
     }
 
-    Ok(())
+    command_exit(if failed { 1 } else { 0 })
 }
 
 fn encoding_preview_candidates() -> &'static [&'static str] {
@@ -1395,6 +1599,8 @@ fn build_extract_json_output(
 ) -> serde_json::Value {
     serde_json::json!({
         "task_id": result.task_id,
+        "status": result.status,
+        "failed_count": result.failed_count,
         "processed_count": result.processed.len(),
         "skipped_count": result.skipped.len(),
         "enqueued_count": result.enqueued.len(),
@@ -1404,16 +1610,6 @@ fn build_extract_json_output(
         "events": result.events,
         "exit_code": exit_code,
     })
-}
-
-fn extraction_exit_code(processed_count: usize, skipped_count: usize) -> i32 {
-    if processed_count > 0 && skipped_count == 0 {
-        0
-    } else if processed_count > 0 && skipped_count > 0 {
-        2
-    } else {
-        1
-    }
 }
 
 fn password(db: &SmartZipDb, cmd: PasswordCmd) -> Result<(), Box<dyn std::error::Error>> {
@@ -1435,7 +1631,7 @@ fn password(db: &SmartZipDb, cmd: PasswordCmd) -> Result<(), Box<dyn std::error:
                 );
                 for p in &passwords {
                     let value = if p.value.len() > 30 {
-                        format!("{}...", &p.value[..27])
+                        format!("{}...", p.value.chars().take(27).collect::<String>())
                     } else {
                         p.value.clone()
                     };
@@ -1682,17 +1878,110 @@ fn default_output_dir(first_path: &Path) -> PathBuf {
 /// Prevents interleaved display when output-collision and password prompts
 /// are both active concurrently (e.g. engine continues processing while an
 /// output-collision prompt is pending, then a password prompt is triggered).
-struct StdinLock(Arc<Mutex<()>>);
-
+#[derive(Clone)]
+struct StdinLock {
+    gate: Arc<Mutex<()>>,
+    cancellation: tokio_util::sync::CancellationToken,
+    interactive: bool,
+    conflict: ConflictArg,
+    encoding: SuspiciousEncodingArg,
+}
 impl StdinLock {
-    fn new() -> Self {
-        Self(Arc::new(Mutex::new(())))
+    fn configured(
+        cancellation: tokio_util::sync::CancellationToken,
+        safety: &SafetyOptions,
+        json: bool,
+    ) -> Self {
+        use std::io::IsTerminal;
+        Self {
+            gate: Arc::new(Mutex::new(())),
+            cancellation,
+            interactive: !json && !safety.non_interactive && std::io::stdin().is_terminal(),
+            conflict: safety.on_conflict,
+            encoding: safety.suspicious_encoding,
+        }
     }
 }
 
-impl Clone for StdinLock {
-    fn clone(&self) -> Self {
-        Self(Arc::clone(&self.0))
+/// A blocking prompt with bounded waits. Ctrl+C wakes the token; no stdin
+/// worker remains blocked when the async workflow is cancelled.
+fn terminal_line(control: &StdinLock, hidden: bool) -> Option<String> {
+    if !control.interactive || control.cancellation.is_cancelled() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        struct EchoGuard(Option<libc::termios>);
+        impl Drop for EchoGuard {
+            fn drop(&mut self) {
+                if let Some(old) = &self.0 {
+                    // SAFETY: stdin descriptor and saved termios remain valid.
+                    unsafe {
+                        libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, old);
+                    }
+                }
+            }
+        }
+        let mut guard = EchoGuard(None);
+        if hidden {
+            let mut old = std::mem::MaybeUninit::<libc::termios>::uninit();
+            // SAFETY: tcgetattr writes into allocated storage on success.
+            if unsafe { libc::tcgetattr(libc::STDIN_FILENO, old.as_mut_ptr()) } != 0 {
+                return None;
+            }
+            let old = unsafe { old.assume_init() };
+            let mut quiet = old;
+            quiet.c_lflag &= !libc::ECHO;
+            if unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &quiet) } != 0 {
+                return None;
+            }
+            guard.0 = Some(old);
+        }
+        let mut bytes = Vec::new();
+        loop {
+            if control.cancellation.is_cancelled() {
+                return None;
+            }
+            let mut descriptor = libc::pollfd {
+                fd: libc::STDIN_FILENO,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: poll sees one live pollfd; read writes at most one byte.
+            let ready = unsafe { libc::poll(&mut descriptor, 1, 50) };
+            if ready < 0 {
+                if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return None;
+            }
+            if ready == 0 {
+                continue;
+            }
+            let mut byte = 0u8;
+            let count = unsafe { libc::read(libc::STDIN_FILENO, (&mut byte as *mut u8).cast(), 1) };
+            if count <= 0 {
+                return None;
+            }
+            if byte == b'\n' {
+                if bytes.last() == Some(&b'\r') {
+                    bytes.pop();
+                }
+                if hidden {
+                    eprintln!();
+                }
+                return String::from_utf8(bytes).ok();
+            }
+            if bytes.len() >= 64 * 1024 {
+                return None;
+            }
+            bytes.push(byte);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = hidden;
+        None
     }
 }
 
@@ -1703,11 +1992,11 @@ struct StdinPrompter {
 #[async_trait]
 impl InteractivePasswordPrompter for StdinPrompter {
     async fn prompt(&self, archive_path: &Path) -> Option<String> {
-        let lock = self.lock.0.clone();
+        let control = self.lock.clone();
         let path = archive_path.to_path_buf();
         tokio::task::spawn_blocking(move || {
-            let _guard = lock.lock().unwrap();
-            prompt_password_stdin(&path)
+            let _guard = control.gate.lock().unwrap();
+            prompt_password_stdin(&path, &control)
         })
         .await
         .unwrap_or(None)
@@ -1721,10 +2010,10 @@ struct StdinOutputPrompter {
 #[async_trait]
 impl InteractiveOutputPrompter for StdinOutputPrompter {
     async fn prompt(&self, archive_path: PathBuf, output_path: PathBuf) -> OutputCollisionStrategy {
-        let lock = self.lock.0.clone();
+        let control = self.lock.clone();
         tokio::task::spawn_blocking(move || {
-            let _guard = lock.lock().unwrap();
-            prompt_output_collision_stdin(&archive_path, &output_path)
+            let _guard = control.gate.lock().unwrap();
+            prompt_output_collision_stdin(&archive_path, &output_path, &control)
         })
         .await
         .unwrap_or(OutputCollisionStrategy::Skip)
@@ -1742,12 +2031,12 @@ impl InteractiveEmbeddedPrompter for StdinEmbeddedPrompter {
         archive_path: &Path,
         decision: &smartzip_core::DetectionDecision,
     ) -> EmbeddedSelectionChoice {
-        let lock = self.lock.0.clone();
+        let control = self.lock.clone();
         let path = archive_path.to_path_buf();
         let decision = decision.clone();
         tokio::task::spawn_blocking(move || {
-            let _guard = lock.lock().unwrap();
-            prompt_embedded_stdin(&path, &decision)
+            let _guard = control.gate.lock().unwrap();
+            prompt_embedded_stdin(&path, &decision, &control)
         })
         .await
         .unwrap_or(EmbeddedSelectionChoice::Skip)
@@ -1765,22 +2054,22 @@ impl InteractiveEncodingPrompter for StdinEncodingPrompter {
         archive_path: &Path,
         context: &smartzip_engine::EncodingConfirmationContext,
     ) -> EncodingConfirmationChoice {
-        let lock = self.lock.0.clone();
+        let control = self.lock.clone();
         let path = archive_path.to_path_buf();
         let context = context.clone();
         tokio::task::spawn_blocking(move || {
-            let _guard = lock.lock().unwrap();
-            prompt_encoding_stdin(&path, &context)
+            let _guard = control.gate.lock().unwrap();
+            prompt_encoding_stdin(&path, &context, &control)
         })
         .await
-        .unwrap_or(EncodingConfirmationChoice::AcceptDetected)
+        .unwrap_or(EncodingConfirmationChoice::SkipArchive)
     }
 }
 
-fn prompt_password_stdin(path: &Path) -> Option<String> {
-    use std::io::{self, IsTerminal, Write};
+fn prompt_password_stdin(path: &Path, control: &StdinLock) -> Option<String> {
+    use std::io::{self, Write};
 
-    if !io::stdin().is_terminal() {
+    if !control.interactive || control.cancellation.is_cancelled() {
         return None;
     }
 
@@ -1790,9 +2079,7 @@ fn prompt_password_stdin(path: &Path) -> Option<String> {
     );
     let _ = io::stderr().flush();
 
-    let mut pw = String::new();
-    io::stdin().read_line(&mut pw).ok()?;
-    let pw = pw.trim().to_string();
+    let pw = terminal_line(control, true)?;
 
     if pw.is_empty() {
         eprintln!("  (skipped)");
@@ -1805,10 +2092,20 @@ fn prompt_password_stdin(path: &Path) -> Option<String> {
 fn prompt_output_collision_stdin(
     archive_path: &Path,
     output_path: &Path,
+    control: &StdinLock,
 ) -> OutputCollisionStrategy {
-    use std::io::{self, IsTerminal, Write};
+    use std::io::{self, Write};
 
-    if !io::stdin().is_terminal() {
+    if control.cancellation.is_cancelled() {
+        return OutputCollisionStrategy::Skip;
+    }
+    match control.conflict {
+        ConflictArg::Overwrite => return OutputCollisionStrategy::Overwrite,
+        ConflictArg::Rename => return OutputCollisionStrategy::Rename,
+        ConflictArg::Skip => return OutputCollisionStrategy::Skip,
+        ConflictArg::Ask => {}
+    }
+    if !control.interactive {
         return OutputCollisionStrategy::Skip;
     }
 
@@ -1820,10 +2117,9 @@ fn prompt_output_collision_stdin(
         );
         let _ = io::stderr().flush();
 
-        let mut choice = String::new();
-        if io::stdin().read_line(&mut choice).is_err() {
+        let Some(choice) = terminal_line(control, false) else {
             return OutputCollisionStrategy::Skip;
-        }
+        };
 
         match choice.trim().to_ascii_lowercase().as_str() {
             "s" | "skip" => {
@@ -1842,10 +2138,11 @@ fn prompt_output_collision_stdin(
 fn prompt_embedded_stdin(
     path: &Path,
     decision: &smartzip_core::DetectionDecision,
+    control: &StdinLock,
 ) -> EmbeddedSelectionChoice {
-    use std::io::{self, IsTerminal, Write};
+    use std::io::{self, Write};
 
-    if !io::stdin().is_terminal() {
+    if !control.interactive || control.cancellation.is_cancelled() {
         return EmbeddedSelectionChoice::Skip;
     }
 
@@ -1859,10 +2156,9 @@ fn prompt_embedded_stdin(
         eprint!("  Choose [e]xtract, [s]kip, [a]lways extract remaining ask findings: ");
         let _ = io::stderr().flush();
 
-        let mut choice = String::new();
-        if io::stdin().read_line(&mut choice).is_err() {
+        let Some(choice) = terminal_line(control, false) else {
             return EmbeddedSelectionChoice::Skip;
-        }
+        };
 
         match choice.trim().to_ascii_lowercase().as_str() {
             "e" | "extract" => return EmbeddedSelectionChoice::Extract,
@@ -1876,11 +2172,20 @@ fn prompt_embedded_stdin(
 fn prompt_encoding_stdin(
     path: &Path,
     context: &smartzip_engine::EncodingConfirmationContext,
+    control: &StdinLock,
 ) -> EncodingConfirmationChoice {
-    use std::io::{self, IsTerminal, Write};
+    use std::io::{self, Write};
 
-    if !io::stdin().is_terminal() {
-        return EncodingConfirmationChoice::AcceptDetected;
+    if control.cancellation.is_cancelled() {
+        return EncodingConfirmationChoice::SkipArchive;
+    }
+    match control.encoding {
+        SuspiciousEncodingArg::Accept => return EncodingConfirmationChoice::AcceptDetected,
+        SuspiciousEncodingArg::Skip => return EncodingConfirmationChoice::SkipArchive,
+        SuspiciousEncodingArg::Ask => {}
+    }
+    if !control.interactive {
+        return EncodingConfirmationChoice::SkipArchive;
     }
 
     let detected = match &context.detected.selected {
@@ -1903,10 +2208,9 @@ fn prompt_encoding_stdin(
         eprint!("  Choose [Enter] accept, [m]anual encoding, [s]kip archive: ");
         let _ = io::stderr().flush();
 
-        let mut choice = String::new();
-        if io::stdin().read_line(&mut choice).is_err() {
-            return EncodingConfirmationChoice::AcceptDetected;
-        }
+        let Some(choice) = terminal_line(control, false) else {
+            return EncodingConfirmationChoice::SkipArchive;
+        };
         match choice.trim() {
             "" => return EncodingConfirmationChoice::AcceptDetected,
             value if value.eq_ignore_ascii_case("s") || value.eq_ignore_ascii_case("skip") => {
@@ -1915,10 +2219,9 @@ fn prompt_encoding_stdin(
             value if value.eq_ignore_ascii_case("m") || value.eq_ignore_ascii_case("manual") => {
                 eprint!("  Enter encoding name: ");
                 let _ = io::stderr().flush();
-                let mut encoding = String::new();
-                if io::stdin().read_line(&mut encoding).is_err() {
-                    return EncodingConfirmationChoice::AcceptDetected;
-                }
+                let Some(encoding) = terminal_line(control, false) else {
+                    return EncodingConfirmationChoice::SkipArchive;
+                };
                 let encoding = encoding.trim();
                 if !encoding.is_empty() {
                     return EncodingConfirmationChoice::Override(encoding.to_string());
@@ -1931,9 +2234,7 @@ fn prompt_encoding_stdin(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        build_extract_json_output, encoding_preview_candidates, extraction_exit_code, Cli, Command,
-    };
+    use super::{build_extract_json_output, encoding_preview_candidates, Cli, Command};
     use clap::Parser;
     use serde_json::json;
     use smartzip_core::TaskId;
@@ -1981,24 +2282,27 @@ mod tests {
     }
 
     #[test]
-    fn exit_code_is_success_when_all_candidates_process() {
-        assert_eq!(extraction_exit_code(1, 0), 0);
-    }
-
-    #[test]
-    fn exit_code_is_partial_when_some_candidates_are_skipped() {
-        assert_eq!(extraction_exit_code(2, 1), 2);
-    }
-
-    #[test]
-    fn exit_code_is_failure_when_nothing_processes() {
-        assert_eq!(extraction_exit_code(0, 3), 1);
-        assert_eq!(extraction_exit_code(0, 0), 1);
+    fn exit_codes_use_errors_and_cancellation_not_benign_skips() {
+        use smartzip_engine::history::TaskCompletionStatus as Status;
+        for (success, errors, cancelled, code) in [
+            (0, 0, false, 0),
+            (2, 0, false, 0),
+            (2, 1, false, 2),
+            (0, 1, false, 1),
+            (2, 1, true, 130),
+        ] {
+            assert_eq!(
+                Status::from_counts(success, errors, cancelled).exit_code(),
+                code
+            );
+        }
     }
 
     #[test]
     fn extract_json_output_includes_exit_code_and_counts() {
         let result = ExtractWorkflowResult {
+            status: smartzip_engine::history::TaskCompletionStatus::Completed,
+            failed_count: 0,
             task_id: TaskId::new(),
             processed: Vec::new(),
             skipped: Vec::new(),

@@ -66,11 +66,21 @@ pub(crate) async fn run<B: ArchiveExecutor>(
     }
     let task_id = TaskId::new();
     let events = EventSink::new(listener);
-    let context = backend.begin_task(task_id.clone(), Arc::new(events.clone()));
+    let context = backend.begin_task_with_cancellation(
+        task_id.clone(),
+        Arc::new(events.clone()),
+        request.control.cancellation_token(),
+    );
     events.push(TaskEvent::started(task_id.clone()));
     if let Some(history) = history {
         history.start_task(&task_id, "test", None);
     }
+    let mut completion = crate::history::CompletionGuard::new(
+        history,
+        task_id.clone(),
+        events.clone(),
+        request.control.cancellation_token(),
+    );
     let mut candidates = match passwords.ranked_candidates(request.password_candidates.clone()) {
         Ok(candidates) => candidates,
         Err(error) => {
@@ -221,10 +231,13 @@ pub(crate) async fn run<B: ArchiveExecutor>(
                 pass_id = pass_id.saturating_add(1);
                 phase(&events, &task_id, report, pass_id, "integrity");
                 let test_request = backend_request(report, &request.encoding, Some(&candidate));
-                let result = tokio::select! { biased;
-                    _=cancelled(&request.control)=>Err(SmartZipError::Cancelled),
-                    result=backend_call("archive-executor","testing",&report.entrypoint,backend.test_with_context(test_request,context.clone()))=>result,
-                };
+                let result = backend_call(
+                    "archive-executor",
+                    "testing",
+                    &report.entrypoint,
+                    backend.test_with_context(test_request, context.clone()),
+                )
+                .await;
                 let result = executed_result(result);
                 let failure = result.diagnostics.failure;
                 let ok = result.ok;
@@ -266,6 +279,7 @@ pub(crate) async fn run<B: ArchiveExecutor>(
                     Some(TestFailure::PasswordIndeterminate) => {
                         password_was_required = true;
                         report.password_status = PasswordStatus::Indeterminate;
+                        break;
                     }
                     _ => {
                         report.password_status =
@@ -279,12 +293,6 @@ pub(crate) async fn run<B: ArchiveExecutor>(
                 }
                 // A corrupt encryption/check field can resemble a rejected
                 // credential. Test never penalizes a library candidate here.
-                if index >= 128 {
-                    report
-                        .stop_reasons
-                        .push("password attempt budget reached".into());
-                    break;
-                }
                 if index >= attempts.len() && prompted {
                     break;
                 }
@@ -349,10 +357,25 @@ pub(crate) async fn run<B: ArchiveExecutor>(
                     pass_id = pass_id.saturating_add(1);
                     phase(&events, &task_id, report, pass_id, "diagnostic_backend");
                     let test_request = backend_request(report, &request.encoding, chosen.as_ref());
-                    let result = tokio::select! { biased;
-                        _=cancelled(&control)=>Err(SmartZipError::Cancelled),
-                        _=deadline(control.deadline)=>{report.stop_reasons.push("diagnostic timeout reached before backend completion".into());Ok(None)},
-                        result=backend.diagnose_test_with_context(test_request,&previous,report.volumes.family!=VolumeFamily::Single,context.clone())=>result,
+                    let diagnostic_context = backend.begin_task_with_cancellation(
+                        task_id.clone(),
+                        Arc::new(events.clone()),
+                        context.cancellation_token().child_token(),
+                    );
+                    let mut future = std::pin::pin!(backend.diagnose_test_with_context(
+                        test_request,
+                        &previous,
+                        report.volumes.family != VolumeFamily::Single,
+                        diagnostic_context.clone()
+                    ));
+                    let result = tokio::select! {
+                        result = &mut future => result,
+                        _ = deadline(control.deadline) => {
+                            diagnostic_context.cancel();
+                            let _ = future.await;
+                            report.stop_reasons.push("diagnostic timeout reached before backend completion".into());
+                            Ok(None)
+                        }
                     };
                     match result {
                         Ok(Some(result))=>{
@@ -450,6 +473,7 @@ pub(crate) async fn run<B: ArchiveExecutor>(
             },
         );
     }
+    completion.complete();
     Ok(TestWorkflowResult {
         schema_version: 1,
         command: "test".into(),

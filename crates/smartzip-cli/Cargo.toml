@@ -1,6 +1,6 @@
 [package]
 name = "smartzip-cli"
-version = "0.1.0"
+version = "0.1.0-beta.1"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -11,6 +11,8 @@ name = "smartzip"
 path = "src/main.rs"
 
 [dependencies]
+libc.workspace = true
+tokio-util.workspace = true
 chrono = "0.4"
 clap.workspace = true
 serde_json.workspace = true

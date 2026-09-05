@@ -77,6 +77,7 @@ pub(crate) fn detect(
 
 pub(crate) async fn inspect_file_with_listener<B: ArchiveExecutor>(
     min_embedded_size_bytes: u64,
+    cancellation: tokio_util::sync::CancellationToken,
     backend: &B,
     _passwords: &PasswordService<'_>,
     request: InspectRequest,
@@ -85,11 +86,21 @@ pub(crate) async fn inspect_file_with_listener<B: ArchiveExecutor>(
 ) -> smartzip_core::Result<FileAwareDetectResult> {
     let task_id = TaskId::new();
     let events = EventSink::new(listener);
-    let task_context = backend.begin_task(task_id.clone(), std::sync::Arc::new(events.clone()));
+    let task_context = backend.begin_task_with_cancellation(
+        task_id.clone(),
+        std::sync::Arc::new(events.clone()),
+        cancellation,
+    );
     events.push(TaskEvent::started(task_id.clone()));
     if let Some(recorder) = history {
         recorder.start_task(&task_id, "detect", None);
     }
+    let mut completion = crate::history::CompletionGuard::new(
+        history,
+        task_id.clone(),
+        events.clone(),
+        task_context.cancellation_token(),
+    );
 
     let candidate = resolve_root_candidate(
         &request.path,
@@ -165,7 +176,12 @@ pub(crate) async fn inspect_file_with_listener<B: ArchiveExecutor>(
             encoding = Some(assessment.detected_raw.selected.clone());
             encoding_confidence = Some(assessment.detected_raw.confidence);
         }
-        status = "detected".to_string();
+        status = if probe.supported {
+            "detected"
+        } else {
+            "unreadable"
+        }
+        .to_string();
         if let Some(recorder) = history {
             recorder.record_file_extraction(
                 &task_id,
@@ -232,6 +248,7 @@ pub(crate) async fn inspect_file_with_listener<B: ArchiveExecutor>(
         );
     }
 
+    completion.complete();
     Ok(FileAwareDetectResult {
         task_id,
         path: request.path,
@@ -252,6 +269,7 @@ pub(crate) async fn inspect_file_with_listener<B: ArchiveExecutor>(
 
 pub(crate) async fn list_archive_with_listener_interactive<B: ArchiveExecutor>(
     min_embedded_size_bytes: u64,
+    cancellation: tokio_util::sync::CancellationToken,
     backend: &B,
     passwords: &PasswordService<'_>,
     request: ListArchiveRequest,
@@ -262,11 +280,21 @@ pub(crate) async fn list_archive_with_listener_interactive<B: ArchiveExecutor>(
 ) -> smartzip_core::Result<ListArchiveResult> {
     let task_id = TaskId::new();
     let events = EventSink::new(listener);
-    let task_context = backend.begin_task(task_id.clone(), std::sync::Arc::new(events.clone()));
+    let task_context = backend.begin_task_with_cancellation(
+        task_id.clone(),
+        std::sync::Arc::new(events.clone()),
+        cancellation,
+    );
     events.push(TaskEvent::started(task_id.clone()));
     if let Some(recorder) = history {
         recorder.start_task(&task_id, "list", None);
     }
+    let mut completion = crate::history::CompletionGuard::new(
+        history,
+        task_id.clone(),
+        events.clone(),
+        task_context.cancellation_token(),
+    );
 
     // List and extract share the same resolver/materialization entrypoint.
     let candidate = resolve_root_candidate(
@@ -447,6 +475,7 @@ pub(crate) async fn list_archive_with_listener_interactive<B: ArchiveExecutor>(
         );
     }
 
+    completion.complete();
     Ok(ListArchiveResult {
         task_id,
         path: request.path,

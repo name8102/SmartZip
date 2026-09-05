@@ -61,7 +61,15 @@ pub(crate) async fn resolve_root_candidate(
     };
 
     let header_result = crate::detect::probe_file_header(&candidate.path);
-    let findings = scan_embedded_findings(&candidate.path, scanner, min_embedded_size_bytes);
+    let findings = if header_result
+        .as_ref()
+        .is_some_and(|(_, offset)| *offset == 0)
+        && scanner.mode != smartzip_scanner::ScanMode::Deep
+    {
+        Vec::new()
+    } else {
+        scan_embedded_findings(&candidate.path, scanner, min_embedded_size_bytes)
+    };
     if !findings.is_empty() {
         let mut policy = smartzip_core::EmbeddedScanPolicy::default();
         policy.min_finding_size_bytes = min_embedded_size_bytes;
@@ -314,14 +322,20 @@ pub(crate) async fn access_archive_with_password<B: ArchiveExecutor>(
                 if matches!(&error, smartzip_core::SmartZipError::WrongPassword { .. }) {
                     saw_wrong_password = true;
                     let _ = passwords.record_failure(password);
+                } else if matches!(
+                    &error,
+                    smartzip_core::SmartZipError::PasswordRequired { .. }
+                ) && pw_value.as_deref().is_none_or(str::is_empty)
+                {
+                    saw_wrong_password = true;
                 } else {
-                    last_error = Some(error);
+                    return Err(error);
                 }
             }
         }
     }
 
-    if used_password.is_none() {
+    if listing.is_none() && used_password.is_none() {
         if let Some(prompter) = password_prompter {
             events.push(TaskEvent {
                 task_id: task_id.clone(),
@@ -331,12 +345,9 @@ pub(crate) async fn access_archive_with_password<B: ArchiveExecutor>(
                 ))),
             });
             let interactive_password = prompter.prompt(&resolved.candidate.path).await;
-            password_prompt_cancelled = interactive_password
-                .as_deref()
-                .map(str::trim)
-                .is_none_or(str::is_empty);
+            password_prompt_cancelled = interactive_password.as_deref().is_none_or(str::is_empty);
             if let Some(interactive_pw) = interactive_password {
-                let pw = interactive_pw.trim().to_string();
+                let pw = interactive_pw;
                 if !pw.is_empty() {
                     let accepted = PasswordCandidate {
                         id: None,
@@ -411,9 +422,13 @@ pub(crate) async fn access_archive_with_password<B: ArchiveExecutor>(
         assessment.as_ref(),
         encoding_prompter,
     )
-    .await?;
+    .await?
+    .ok_or_else(|| smartzip_core::SmartZipError::BackendProtocolError {
+        backend: "user-input".into(),
+        detail: "archive skipped during encoding confirmation".into(),
+    })?;
 
-    if load_listing {
+    if load_listing && (listing.is_none() || encoding_mode != resolved.encoding_mode) {
         listing = Some(
             backend_call(
                 "archive-backend",

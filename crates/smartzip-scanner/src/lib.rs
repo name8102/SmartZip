@@ -7,6 +7,10 @@ use std::io::Read;
 use std::path::Path;
 
 /// Default threshold for requiring user confirmation before scanning large files.
+pub const DEFAULT_SCAN_BYTES: u64 = 64 * 1024 * 1024;
+/// Absolute input-buffer bound, including explicitly requested deep scans.
+pub const MAX_SCAN_BYTES: u64 = 256 * 1024 * 1024;
+
 pub const DEFAULT_LARGE_SCAN_THRESHOLD: u64 = 10 * 1024 * 1024 * 1024; // 10GB
 
 /// Minimum confidence threshold for scanner findings.
@@ -32,7 +36,7 @@ impl Confidence {
 pub enum ScanMode {
     /// Scan only up to the configured limit. Suitable for default GUI usage.
     Fast,
-    /// Scan all data unless `max_scan_bytes` caps it.
+    /// Search signatures thoroughly within the bounded scan window.
     Deep,
 }
 
@@ -50,7 +54,7 @@ impl Default for ScannerConfig {
     fn default() -> Self {
         Self {
             mode: ScanMode::Fast,
-            max_scan_bytes: Some(64 * 1024 * 1024),
+            max_scan_bytes: Some(DEFAULT_SCAN_BYTES),
             max_findings: 64,
             min_confidence: Confidence::Medium,
             include_formats: default_include_formats(),
@@ -101,7 +105,15 @@ impl EmbeddedScanner {
     }
 
     /// Scan a byte slice that is already loaded by the caller.
+    pub fn scan_limit(&self) -> u64 {
+        self.config
+            .max_scan_bytes
+            .unwrap_or(DEFAULT_SCAN_BYTES)
+            .min(MAX_SCAN_BYTES)
+    }
+
     pub fn scan_bytes(&self, data: &[u8]) -> Vec<EmbeddedArchiveFinding> {
+        let data = &data[..data.len().min(self.scan_limit() as usize)];
         self.binwalk
             .scan(data)
             .into_iter()
@@ -117,14 +129,9 @@ impl EmbeddedScanner {
         &self,
         path: impl AsRef<Path>,
     ) -> std::io::Result<Vec<EmbeddedArchiveFinding>> {
-        let mut file = fs::File::open(path)?;
+        let file = fs::File::open(path)?;
         let mut data = Vec::new();
-        if let Some(max_bytes) = self.config.max_scan_bytes {
-            let mut limited = file.take(max_bytes);
-            limited.read_to_end(&mut data)?;
-        } else {
-            file.read_to_end(&mut data)?;
-        }
+        file.take(self.scan_limit()).read_to_end(&mut data)?;
         Ok(self.scan_bytes(&data))
     }
 
@@ -212,6 +219,29 @@ fn format_to_binwalk_names(format: &ArchiveFormat) -> Vec<&'static str> {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn deep_scan_is_bounded_even_without_an_explicit_limit() {
+        let scanner = EmbeddedScanner::new(ScannerConfig {
+            max_scan_bytes: None,
+            ..Default::default()
+        });
+        assert_eq!(scanner.scan_limit(), DEFAULT_SCAN_BYTES);
+        let scanner = EmbeddedScanner::new(ScannerConfig {
+            max_scan_bytes: Some(u64::MAX),
+            ..Default::default()
+        });
+        assert_eq!(scanner.scan_limit(), MAX_SCAN_BYTES);
+        let root = std::env::temp_dir().join(format!("smartzip-sparse-{}", std::process::id()));
+        let file = fs::File::create(&root).unwrap();
+        file.set_len(16 * 1024 * 1024 * 1024).unwrap();
+        let scanner = EmbeddedScanner::new(ScannerConfig {
+            max_scan_bytes: Some(4096),
+            ..Default::default()
+        });
+        assert!(scanner.scan_path(&root).unwrap().is_empty());
+        fs::remove_file(root).unwrap();
+    }
 
     #[test]
     fn maps_known_binwalk_names() {

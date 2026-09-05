@@ -142,6 +142,18 @@ impl TaskExecutionContext {
         }
     }
 
+    pub fn with_cancellation(mut self, cancellation: tokio_util::sync::CancellationToken) -> Self {
+        self.cancellation = cancellation;
+        self
+    }
+
+    pub fn emit_progress(&self, progress: crate::TaskProgress) {
+        self.sink.push(TaskEvent {
+            task_id: self.task_id.clone(),
+            kind: TaskEventKind::Progress(progress),
+        });
+    }
+
     pub fn cancellation_token(&self) -> tokio_util::sync::CancellationToken {
         self.cancellation.clone()
     }

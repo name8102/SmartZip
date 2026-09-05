@@ -17,6 +17,8 @@ pub type Result<T> = std::result::Result<T, DbError>;
 #[derive(Debug, thiserror::Error)]
 pub enum DbError {
     #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
     #[error(transparent)]
     Migration(#[from] rusqlite_migration::Error),
@@ -31,6 +33,18 @@ pub struct SmartZipDb {
 
 impl SmartZipDb {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .mode(0o600)
+                .open(path.as_ref())?;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
         let mut conn = Connection::open(path.as_ref())?;
         schema::migrate(&mut conn)?;
         Ok(Self {

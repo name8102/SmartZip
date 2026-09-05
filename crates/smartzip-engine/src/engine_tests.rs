@@ -95,12 +95,12 @@ fn detects_empty_file_without_findings() {
 }
 
 #[test]
-fn root_scan_is_full_while_default_nested_scan_stays_fast() {
+fn root_scan_preserves_bounded_configuration() {
     let nested = ScannerConfig::default();
     let root = full_root_scanner_config(&nested);
 
-    assert_eq!(root.mode, ScanMode::Deep);
-    assert_eq!(root.max_scan_bytes, None);
+    assert_eq!(root.mode, ScanMode::Fast);
+    assert_eq!(root.max_scan_bytes, Some(64 * 1024 * 1024));
     assert_eq!(nested.mode, ScanMode::Fast);
     assert_eq!(nested.max_scan_bytes, Some(64 * 1024 * 1024));
 }
@@ -204,6 +204,7 @@ async fn embedded_ask_without_prompter_skips_archive() {
                 dominant_min_ratio: 0.70,
                 confirm_large_scan: false,
                 force: false,
+                limits: Default::default(),
             },
             None,
             None,
@@ -378,6 +379,7 @@ async fn recursive_extract_enqueues_nested_archives_and_skips_non_first_volume()
                 dominant_min_ratio: 0.70,
                 confirm_large_scan: false,
                 force: false,
+                limits: Default::default(),
             },
             None,
             None,
@@ -452,6 +454,7 @@ async fn extract_fails_when_output_target_already_exists() {
                 dominant_min_ratio: 0.70,
                 confirm_large_scan: false,
                 force: false,
+                limits: Default::default(),
             },
             None,
             None,
@@ -535,6 +538,7 @@ async fn extract_keeps_other_archives_moving_while_prompt_waits() {
                 dominant_min_ratio: 0.70,
                 confirm_large_scan: false,
                 force: false,
+                limits: Default::default(),
             },
             None,
             Some(&output_prompter),
@@ -646,6 +650,7 @@ async fn explicit_encoding_override_is_preserved_for_test_and_extract() {
                 dominant_min_ratio: 0.70,
                 confirm_large_scan: false,
                 force: false,
+                limits: Default::default(),
             },
             None,
             None,
@@ -760,6 +765,7 @@ async fn backend_failures_do_not_record_password_failures() {
                 dominant_min_ratio: 0.70,
                 confirm_large_scan: false,
                 force: false,
+                limits: Default::default(),
             },
             None,
             None,
@@ -899,6 +905,7 @@ async fn interactive_password_is_reused_for_later_files_in_same_batch() {
                 dominant_min_ratio: 0.70,
                 confirm_large_scan: false,
                 force: false,
+                limits: Default::default(),
             },
             Some(&prompter),
             None,
@@ -1033,6 +1040,7 @@ async fn extract_via_real_seven_zip_with_smart_output() {
                 dominant_min_ratio: 0.70,
                 confirm_large_scan: false,
                 force: false,
+                limits: Default::default(),
             },
             None,
             None,
@@ -1102,6 +1110,7 @@ async fn embedded_archive_is_carved_before_extraction_and_recurses() {
                 dominant_min_ratio: 0.70,
                 confirm_large_scan: false,
                 force: false,
+                limits: Default::default(),
             },
             None,
             None,

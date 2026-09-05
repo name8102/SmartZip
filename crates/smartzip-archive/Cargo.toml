@@ -13,6 +13,7 @@ process-wrap.workspace = true
 flate2 = "1"
 lzma-rust2 = { version = "0.16.4", default-features = false, features = ["std"] }
 serde.workspace = true
+serde_json.workspace = true
 smartzip-config.workspace = true
 smartzip-core.workspace = true
 smartzip-encoding.workspace = true

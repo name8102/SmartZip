@@ -1,4 +1,5 @@
 use crate::backend::ArchiveAdapter;
+use crate::test_output::collect_bounded_output;
 use crate::types::*;
 use async_trait::async_trait;
 #[cfg(windows)]
@@ -69,6 +70,27 @@ impl UnrarBackend {
         &self.executable
     }
 
+    async fn validate_before_extract(
+        &self,
+        archive: &Path,
+        password: &Option<String>,
+        token: &CancellationToken,
+    ) -> Result<()> {
+        let args = vec![
+            "lt".into(),
+            "-cfg-".into(),
+            "-c-".into(),
+            Self::password_arg(password),
+            "--".into(),
+            archive.to_string_lossy().into_owned(),
+        ];
+        let output = self.run_with_token(&args, token).await?;
+        if output.status != Some(0) {
+            return Err(self.map_failure(&output, archive));
+        }
+        validate_extraction_listing(&output.stdout)
+    }
+
     async fn run(&self, args: &[String]) -> Result<BackendCommandOutput> {
         self.run_with_token(args, &CancellationToken::new()).await
     }
@@ -102,20 +124,10 @@ impl UnrarBackend {
         // Keep pipes for reading; on cancel we kill the whole group and wait.
         let stdout = child.stdout().take();
         let stderr = child.stderr().take();
-        let stdout_task = stdout.map(|mut s| {
-            tokio::spawn(async move {
-                let mut buf = Vec::new();
-                let _ = tokio::io::AsyncReadExt::read_to_end(&mut s, &mut buf).await;
-                buf
-            })
-        });
-        let stderr_task = stderr.map(|mut s| {
-            tokio::spawn(async move {
-                let mut buf = Vec::new();
-                let _ = tokio::io::AsyncReadExt::read_to_end(&mut s, &mut buf).await;
-                buf
-            })
-        });
+        let stdout_task =
+            stdout.map(|stream| tokio::spawn(crate::test_output::bounded_read(stream)));
+        let stderr_task =
+            stderr.map(|stream| tokio::spawn(crate::test_output::bounded_read(stream)));
         let status = tokio::select! {
             res = child.wait() => res.map_err(|source| SmartZipError::io(Some(self.executable.clone()), source))?,
             _ = token.cancelled() => {
@@ -127,16 +139,8 @@ impl UnrarBackend {
                 return Err(SmartZipError::Cancelled);
             }
         };
-        let stdout = if let Some(t) = stdout_task {
-            t.await.unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-        let stderr = if let Some(t) = stderr_task {
-            t.await.unwrap_or_default()
-        } else {
-            Vec::new()
-        };
+        let stdout = collect_bounded_output(stdout_task).await?;
+        let stderr = collect_bounded_output(stderr_task).await?;
         Ok(BackendCommandOutput {
             status: status.code(),
             stdout: String::from_utf8_lossy(&stdout).into_owned(),
@@ -193,6 +197,9 @@ impl UnrarBackend {
 impl ArchiveAdapter for UnrarBackend {
     fn id(&self) -> &str {
         &self.id
+    }
+    fn executable_path(&self) -> Option<&Path> {
+        Some(&self.executable)
     }
     fn diagnostic_family(&self) -> Option<&'static str> {
         Some("unrar")
@@ -386,10 +393,18 @@ impl ArchiveAdapter for UnrarBackend {
     }
 
     async fn extract(&self, request: ExtractArchiveRequest) -> Result<ExtractArchiveResult> {
+        self.validate_before_extract(
+            &request.archive,
+            &request.password,
+            &CancellationToken::new(),
+        )
+        .await?;
         std::fs::create_dir_all(&request.output_dir)
             .map_err(|source| SmartZipError::io(Some(request.output_dir.clone()), source))?;
         let args = vec![
             "x".to_string(),
+            "-cfg-".to_string(),
+            "-ol-".to_string(),
             "-y".to_string(),
             "-o+".to_string(),
             "-idq".to_string(),
@@ -411,10 +426,18 @@ impl ArchiveAdapter for UnrarBackend {
         request: ExtractArchiveRequest,
         context: std::sync::Arc<TaskExecutionContext>,
     ) -> Result<ExtractArchiveResult> {
+        self.validate_before_extract(
+            &request.archive,
+            &request.password,
+            &context.cancellation_token(),
+        )
+        .await?;
         std::fs::create_dir_all(&request.output_dir)
             .map_err(|source| SmartZipError::io(Some(request.output_dir.clone()), source))?;
         let args = vec![
             "x".to_string(),
+            "-cfg-".to_string(),
+            "-ol-".to_string(),
             "-y".to_string(),
             "-o+".to_string(),
             "-idq".to_string(),
@@ -465,4 +488,24 @@ fn locate_executable(bundled: Option<&PathBuf>, candidates: &[String]) -> Option
         }
     }
     None
+}
+
+// Technical listing exposes the original paths and link entry types before
+// the external process is allowed to create anything in staging.
+fn validate_extraction_listing(stdout: &str) -> Result<()> {
+    for line in stdout.lines().map(str::trim_start) {
+        if let Some(name) = line.strip_prefix("Name: ") {
+            if crate::safety::safe_entry_path(name.as_bytes()).is_none() {
+                return Err(SmartZipError::UnsafeArchivePath { entry: name.into() });
+            }
+        }
+        if let Some(kind) = line.strip_prefix("Type: ") {
+            if !matches!(kind.trim(), "File" | "Directory") {
+                return Err(SmartZipError::UnsafeArchivePath {
+                    entry: format!("unsupported RAR entry type: {kind}"),
+                });
+            }
+        }
+    }
+    Ok(())
 }

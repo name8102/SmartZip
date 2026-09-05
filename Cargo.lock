@@ -5754,6 +5754,7 @@ dependencies = [
  "process-wrap",
  "rstest",
  "serde",
+ "serde_json",
  "smartzip-config",
  "smartzip-core",
  "smartzip-encoding",
@@ -5766,11 +5767,12 @@ dependencies = [
 
 [[package]]
 name = "smartzip-cli"
-version = "0.1.0"
+version = "0.1.0-beta.1"
 dependencies = [
  "async-trait",
  "chrono",
  "clap",
+ "libc",
  "serde_json",
  "smartzip-archive",
  "smartzip-config",
@@ -5781,6 +5783,7 @@ dependencies = [
  "smartzip-platform",
  "smartzip-scanner",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -5852,6 +5855,7 @@ dependencies = [
  "smartzip-scanner",
  "tempfile",
  "tokio",
+ "tokio-util",
  "unicode-normalization",
  "walkdir",
  "zip",

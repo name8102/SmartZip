@@ -1,4 +1,5 @@
 use crate::backend::ArchiveAdapter;
+use crate::test_output::collect_bounded_output;
 use crate::types::*;
 use async_trait::async_trait;
 #[cfg(windows)]
@@ -240,22 +241,10 @@ impl SevenZipBackend {
         let stderr = child.stderr().take();
         // Use the same reader infrastructure as streaming but without progress
         // observer; this lets us keep the child handle for kill on cancel.
-        let stdout_task = stdout.map(|s| {
-            tokio::spawn(async move {
-                let mut buf = Vec::new();
-                let mut s = s;
-                let _ = tokio::io::AsyncReadExt::read_to_end(&mut s, &mut buf).await;
-                buf
-            })
-        });
-        let stderr_task = stderr.map(|s| {
-            tokio::spawn(async move {
-                let mut buf = Vec::new();
-                let mut s = s;
-                let _ = tokio::io::AsyncReadExt::read_to_end(&mut s, &mut buf).await;
-                buf
-            })
-        });
+        let stdout_task =
+            stdout.map(|stream| tokio::spawn(crate::test_output::bounded_read(stream)));
+        let stderr_task =
+            stderr.map(|stream| tokio::spawn(crate::test_output::bounded_read(stream)));
         let status = tokio::select! {
             res = child.wait() => res.map_err(|source| SmartZipError::io(Some(self.executable.clone()), source))?,
             _ = token.cancelled() => {
@@ -267,16 +256,8 @@ impl SevenZipBackend {
                 return Err(SmartZipError::Cancelled);
             }
         };
-        let stdout = if let Some(t) = stdout_task {
-            t.await.unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-        let stderr = if let Some(t) = stderr_task {
-            t.await.unwrap_or_default()
-        } else {
-            Vec::new()
-        };
+        let stdout = collect_bounded_output(stdout_task).await?;
+        let stderr = collect_bounded_output(stderr_task).await?;
         Ok(BackendCommandOutput {
             status: status.code(),
             stdout: String::from_utf8_lossy(&stdout).into_owned(),
@@ -519,6 +500,22 @@ impl SevenZipBackend {
         request: ExtractArchiveRequest,
         token: &CancellationToken,
     ) -> Result<SevenZipResult<ExtractArchiveResult>> {
+        let mut listing_args = vec![
+            "l".into(),
+            "-slt".into(),
+            "-sccUTF-8".into(),
+            format!("-p{}", request.password.as_deref().unwrap_or_default()),
+        ];
+        if let Some(enc) = Self::encoding_arg(&request.encoding) {
+            listing_args.push(enc);
+        }
+        listing_args.push("--".into());
+        listing_args.push(request.archive.to_string_lossy().into_owned());
+        let listing = self.run_with_token(&listing_args, token).await?;
+        if listing.status != Some(0) {
+            return Err(self.map_failure(&listing, &request.archive));
+        }
+        validate_extraction_listing(&listing.stdout)?;
         let mut args: Vec<String> = vec!["x".into(), "-y".into(), "-bsp1".into()];
         if let Some(pw) = Self::password_arg(&request.password) {
             args.push(pw);
@@ -527,6 +524,7 @@ impl SevenZipBackend {
             args.push(enc);
         }
         args.push(format!("-o{}", request.output_dir.display()));
+        args.push("--".into());
         args.push(request.archive.to_string_lossy().into_owned());
         let output = self
             .run_streaming_with_token(&args, SevenZipOperation::Extract, token)
@@ -547,7 +545,7 @@ impl SevenZipBackend {
     fn password_arg(password: &Option<String>) -> Option<String> {
         password.as_ref().map(|password| {
             if password.is_empty() {
-                "-p\"\"".to_string()
+                "-p".to_string()
             } else {
                 format!("-p{password}")
             }
@@ -559,6 +557,9 @@ impl SevenZipBackend {
 impl ArchiveAdapter for SevenZipBackend {
     fn id(&self) -> &str {
         &self.id
+    }
+    fn executable_path(&self) -> Option<&Path> {
+        Some(&self.executable)
     }
     fn diagnostic_family(&self) -> Option<&'static str> {
         Some("7z")
@@ -759,7 +760,22 @@ impl ArchiveAdapter for SevenZipBackend {
     ) -> Result<ExtractArchiveResult> {
         let token = context.cancellation_token();
         let path = request.archive.clone();
-        let result = self.extract_with_report_and_token(request, &token).await?;
+        let previous = self.observer.clone();
+        let observer_context = context.clone();
+        let backend = self.clone().with_observer(move |event| {
+            if let SevenZipEvent::Progress { percent, item, .. } = &event {
+                observer_context.emit_progress(smartzip_core::TaskProgress::percent(
+                    *percent,
+                    item.clone().unwrap_or_else(|| "extracting".into()),
+                ));
+            }
+            if let Some(observer) = &previous {
+                observer(event);
+            }
+        });
+        let result = backend
+            .extract_with_report_and_token(request, &token)
+            .await?;
         if result.value.is_none() {
             return Err(self.map_reported_failure(&result, &path));
         }
@@ -841,6 +857,37 @@ fn extract_unsupported_method(output: &str) -> Option<String> {
     })
 }
 
+fn validate_extraction_listing(stdout: &str) -> Result<()> {
+    for entry in parse_entries(stdout) {
+        if crate::safety::safe_entry_path(entry.path.to_string_lossy().as_bytes()).is_none() {
+            return Err(SmartZipError::UnsafeArchivePath {
+                entry: entry.path.display().to_string(),
+            });
+        }
+    }
+    for line in stdout.lines() {
+        if line
+            .strip_prefix("Symbolic Link = ")
+            .is_some_and(|target| !target.is_empty())
+            || line
+                .strip_prefix("Hard Link = ")
+                .is_some_and(|target| !target.is_empty())
+            || line
+                .strip_prefix("Attributes = ")
+                .is_some_and(|attributes| {
+                    attributes
+                        .split_whitespace()
+                        .any(|a| a.starts_with('l') && a.len() == 10)
+                })
+        {
+            return Err(SmartZipError::UnsafeArchivePath {
+                entry: "archive contains a link".into(),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn parse_entries(stdout: &str) -> Vec<ArchiveEntry> {
     let mut entries = Vec::new();
     let mut current_path: Option<PathBuf> = None;
@@ -910,7 +957,8 @@ async fn read_stream<R: tokio::io::AsyncRead + Unpin>(
         if count == 0 {
             break;
         }
-        raw.extend_from_slice(&chunk[..count]);
+        let remaining = crate::test_output::MAX_OUTPUT.saturating_sub(raw.len());
+        raw.extend_from_slice(&chunk[..count.min(remaining)]);
         for &byte in &chunk[..count] {
             if matches!(byte, b'\r' | b'\n' | 0x08) {
                 if !oversized {
@@ -1403,7 +1451,7 @@ mod tests {
     fn empty_password_is_passed_explicitly() {
         assert_eq!(
             SevenZipBackend::password_arg(&Some(String::new())),
-            Some("-p\"\"".into())
+            Some("-p".into())
         );
     }
 

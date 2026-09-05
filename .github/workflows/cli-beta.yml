@@ -1,0 +1,76 @@
+name: CLI beta
+on:
+  push:
+    branches: [main]
+    tags: ['v*-beta.*']
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - runner: macos-14
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Linux dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y 7zip zip ripgrep pkg-config liblzma-dev libbz2-dev
+      - name: macOS dependencies
+        if: runner.os == 'macOS'
+        run: brew install sevenzip xz pkg-config ripgrep
+      - name: Toolchain
+        run: |
+          rustup toolchain install 1.97.1 --profile minimal --component rustfmt
+          rustup default 1.97.1
+          rustc --version --verbose
+          command -v 7z || command -v 7zz
+      - name: Format and routing contracts
+        run: |
+          cargo fmt --all --check
+          bash scripts/check_routing_guards.sh
+      - name: CLI and library tests (real backend required)
+        run: cargo test --workspace --exclude smartzip-gui --locked
+      - name: Build CLI
+        run: cargo build --release --locked -p smartzip-cli --target ${{ matrix.target }}
+      - name: Package and verify unpacked binary
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          python3 scripts/package_cli_beta.py "target/$TARGET/release/smartzip" "$TARGET" dist
+          scratch=$(mktemp -d)
+          tar -xzf dist/*.tar.gz -C "$scratch"
+          python3 scripts/verify_cli_beta.py "$scratch"/*/smartzip
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: cli-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+  prerelease:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: verify
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: cli-*
+          merge-multiple: true
+          path: dist
+      - name: Verify version, checksums and publish beta
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          python3 -c 'import os,tomllib; v=tomllib.load(open("crates/smartzip-cli/Cargo.toml","rb"))["package"]["version"]; assert os.environ["TAG"] == "v"+v and "-beta." in v'
+          (cd dist && sha256sum -c *.sha256)
+          gh release create "$TAG" dist/* --verify-tag --prerelease --title "SmartZip $TAG CLI beta" --notes-file docs/cli-beta-release-notes.md

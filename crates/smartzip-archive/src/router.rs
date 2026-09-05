@@ -60,6 +60,18 @@ pub struct BackendRouter {
 }
 
 impl BackendRouter {
+    pub fn diagnostics(&self) -> Vec<serde_json::Value> {
+        self.adapters.iter().map(|registration| {
+            let adapter = &registration.adapter;
+            let family = adapter.diagnostic_family().unwrap_or("unknown");
+            let version = adapter.executable_path().map(|path| identify_version(path, if family == "unrar" { "unrar-cli" } else { "seven-zip-cli" }));
+            serde_json::json!({"id": adapter.id(), "family": family, "executable": adapter.executable_path(),
+                "version": version.as_ref().and_then(|v| v.as_ref().ok()),
+                "error": version.as_ref().and_then(|v| v.as_ref().err()).map(ToString::to_string),
+                "capabilities": registration.capabilities})
+        }).collect()
+    }
+
     pub fn from_adapters(adapters: Vec<AdapterRegistration>) -> Self {
         Self {
             adapters,

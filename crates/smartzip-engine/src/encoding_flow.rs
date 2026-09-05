@@ -1,7 +1,7 @@
 //! Encoding mode resolve, zip assessment, mojibake heuristics.
 
 use smartzip_archive::native_zip::NativeZipBackend;
-use smartzip_archive::{ArchiveEntry, ArchiveListing};
+use smartzip_archive::ArchiveListing;
 use smartzip_core::EncodingMode;
 use std::path::Path;
 
@@ -25,13 +25,13 @@ pub(crate) async fn resolve_encoding_mode(
     requested: EncodingMode,
     assessment: Option<&ZipEncodingAssessment>,
     prompter: Option<&dyn InteractiveEncodingPrompter>,
-) -> smartzip_core::Result<EncodingMode> {
+) -> smartzip_core::Result<Option<EncodingMode>> {
     if requested != EncodingMode::Auto {
-        return Ok(requested);
+        return Ok(Some(requested));
     }
 
     let Some(assessment) = assessment else {
-        return Ok(EncodingMode::Auto);
+        return Ok(Some(EncodingMode::Auto));
     };
 
     if assessment.should_confirm {
@@ -39,22 +39,18 @@ pub(crate) async fn resolve_encoding_mode(
             match prompter.prompt(archive_path, &assessment.context).await {
                 EncodingConfirmationChoice::AcceptDetected => {}
                 EncodingConfirmationChoice::Override(encoding) => {
-                    return Ok(EncodingMode::Override(encoding));
+                    return Ok(Some(EncodingMode::Override(encoding)));
                 }
                 EncodingConfirmationChoice::SkipArchive => {
-                    return Err(smartzip_core::SmartZipError::BackendFailed {
-                        backend: "encoding-confirmation".into(),
-                        exit_code: None,
-                        stderr: format!("encoding confirmation skipped {}", archive_path.display()),
-                    });
+                    return Ok(None);
                 }
             }
         }
     }
 
-    Ok(EncodingMode::Override(
+    Ok(Some(EncodingMode::Override(
         assessment.detected_raw.selected.clone(),
-    ))
+    )))
 }
 
 #[derive(Debug, Clone)]

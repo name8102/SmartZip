@@ -8,9 +8,11 @@ use std::process::Stdio;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 
-const MAX_OUTPUT: usize = 1024 * 1024;
+pub(crate) const MAX_OUTPUT: usize = 16 * 1024 * 1024;
 
-async fn bounded_read(mut stream: impl AsyncRead + Unpin) -> std::io::Result<(Vec<u8>, bool)> {
+pub(crate) async fn bounded_read(
+    mut stream: impl AsyncRead + Unpin,
+) -> std::io::Result<(Vec<u8>, bool)> {
     let mut retained = Vec::new();
     let mut buffer = [0; 16 * 1024];
     let mut truncated = false;
@@ -277,7 +279,12 @@ mod tests {
             "test".into(),
             pid_path.to_string_lossy().into_owned(),
         ];
-        let pending = tokio::spawn(async move { run(Path::new("/bin/sh"), "test", &args).await });
+        let token = tokio_util::sync::CancellationToken::new();
+        let child_token = token.clone();
+        let pending =
+            tokio::spawn(
+                async move { run(Path::new("/bin/sh"), "test", &args, &child_token).await },
+            );
         let pid = tokio::time::timeout(std::time::Duration::from_secs(3), async {
             loop {
                 if let Ok(pid) = std::fs::read_to_string(&pid_path) {
@@ -290,8 +297,11 @@ mod tests {
         })
         .await
         .unwrap();
-        pending.abort();
-        assert!(pending.await.unwrap_err().is_cancelled());
+        token.cancel();
+        assert!(matches!(
+            pending.await.unwrap(),
+            Err(SmartZipError::Cancelled)
+        ));
         tokio::time::timeout(std::time::Duration::from_secs(3), async {
             while Path::new(&format!("/proc/{pid}")).exists() {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -300,4 +310,22 @@ mod tests {
         .await
         .expect("cancelled test subprocess was not reaped");
     }
+}
+
+pub(crate) async fn collect_bounded_output(
+    task: Option<tokio::task::JoinHandle<std::io::Result<(Vec<u8>, bool)>>>,
+) -> Result<Vec<u8>> {
+    let Some(task) = task else {
+        return Ok(Vec::new());
+    };
+    let (bytes, truncated) = task
+        .await
+        .map_err(|e| SmartZipError::io(None, std::io::Error::other(e)))?
+        .map_err(|e| SmartZipError::io(None, e))?;
+    if truncated {
+        return Err(SmartZipError::ResourceLimit {
+            detail: "backend output exceeded 16 MiB; incomplete output was rejected".into(),
+        });
+    }
+    Ok(bytes)
 }

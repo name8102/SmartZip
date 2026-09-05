@@ -31,7 +31,8 @@ use smartzip_db::{
 use std::path::Path;
 
 /// Terminal status reported to [`TaskHistoryRecorder::finish`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TaskCompletionStatus {
     Completed,
     Partial,
@@ -40,6 +41,26 @@ pub enum TaskCompletionStatus {
 }
 
 impl TaskCompletionStatus {
+    pub fn exit_code(self) -> u8 {
+        match self {
+            Self::Completed => 0,
+            Self::Partial => 2,
+            Self::Failed => 1,
+            Self::Cancelled => 130,
+        }
+    }
+    pub fn from_counts(succeeded: usize, failed: usize, cancelled: bool) -> Self {
+        if cancelled {
+            Self::Cancelled
+        } else if failed == 0 {
+            Self::Completed
+        } else if succeeded == 0 {
+            Self::Failed
+        } else {
+            Self::Partial
+        }
+    }
+
     fn to_status(self) -> TaskStatus {
         match self {
             Self::Completed => TaskStatus::Completed,
@@ -445,11 +466,75 @@ fn describe_event(kind: &TaskEventKind) -> (TaskEventLevel, String, String, Opti
         TaskEventKind::Failed { error } => {
             (TaskEventLevel::Error, "Failed".into(), error.clone(), None)
         }
+        TaskEventKind::Finished { status } => (
+            TaskEventLevel::Info,
+            "Finished".into(),
+            status.clone(),
+            serde_json::to_string(kind).ok(),
+        ),
         TaskEventKind::Completed => (
             TaskEventLevel::Info,
             "Completed".into(),
             "task completed".into(),
             None,
         ),
+    }
+}
+
+/// Ensure every started task gets a terminal history row even on an early `?`.
+pub(crate) struct CompletionGuard<'a> {
+    recorder: Option<&'a dyn TaskHistoryRecorder>,
+    task_id: TaskId,
+    events: crate::events::EventSink,
+    cancellation: tokio_util::sync::CancellationToken,
+    finished: bool,
+}
+impl<'a> CompletionGuard<'a> {
+    pub(crate) fn new(
+        recorder: Option<&'a dyn TaskHistoryRecorder>,
+        task_id: TaskId,
+        events: crate::events::EventSink,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) -> Self {
+        Self {
+            recorder,
+            task_id,
+            events,
+            cancellation,
+            finished: false,
+        }
+    }
+    pub(crate) fn complete(&mut self) {
+        self.finished = true;
+    }
+}
+impl Drop for CompletionGuard<'_> {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        let status = if self.cancellation.is_cancelled() {
+            TaskCompletionStatus::Cancelled
+        } else {
+            TaskCompletionStatus::Failed
+        };
+        self.events.push(TaskEvent {
+            task_id: self.task_id.clone(),
+            kind: TaskEventKind::Finished {
+                status: format!("{status:?}").to_ascii_lowercase(),
+            },
+        });
+        if let Some(recorder) = self.recorder {
+            for event in self.events.snapshot() {
+                recorder.record_event(&self.task_id, &event);
+            }
+            recorder.finish(
+                &self.task_id,
+                TaskOutcome {
+                    status,
+                    output_path: None,
+                },
+            );
+        }
     }
 }

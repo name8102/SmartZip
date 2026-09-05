@@ -17,8 +17,8 @@ SmartZip 是一个用 Rust 重写的跨平台压缩包辅助工具，目标是�
 ## 当前状态与下一步
 
 - 能力路由整合已落地：后端按能力、配置与归档要求选择，CLI 与 engine 使用统一执行入口；文件级历史与密码/编码记忆保留。
-- `test` 已接通后端、自动诊断、JSON 和历史报告；[分卷定位说明](.trellis/tasks/2026-07/07-03-test-command-backend-split/design.md) 记录证据规则与格式边界。`compress` 仍是占位命令。
-- 下一轮优先完善 CLI 的密码输入、可靠验证与保存反馈，以及真实文件名编码对照选择。详见 [CLI 交互设计草案](.trellis/tasks/09-05-cli-interaction-design/design.md)；其中新增参数尚未实现。
+- `test` 已接通后端、自动诊断、JSON 和历史报告；[分卷定位说明](.trellis/tasks/2026-07/07-03-test-command-backend-split/design.md) 记录证据规则与格式边界。压缩命令与 GUI 不在 CLI beta 范围。
+- CLI beta 已加入可恢复覆盖提交、扫描与产出预算、Ctrl+C、非交互策略和 `doctor`。安装、平台范围、退出码、JSON 与限制见 [CLI beta 指南](docs/cli-beta.md)。设计草案中超出本轮的交互能力仍待实现。
 - 当前核对结果与已知缺口见 [实现进度](docs/implementation-progress.md)。
 
 ## 快速开始
@@ -28,6 +28,7 @@ SmartZip 是一个用 Rust 重写的跨平台压缩包辅助工具，目标是�
 ```bash
 just install
 smartzip --help
+smartzip doctor
 ```
 
 查看帮助：
@@ -58,7 +59,6 @@ cargo run -p smartzip-cli -- password add <password>
 | `list` | `l` |
 | `detect` | `d` |
 | `test` | `t` |
-| `compress`（尚未实现） | `c` |
 | `password` | `pw` |
 | `history` | `hist` |
 
@@ -96,7 +96,6 @@ cargo run -p smartzip-cli -- --db ./smartzip.db extract <path>
 - `crates/smartzip-platform`：平台相关能力
 - `crates/smartzip-gui`：图形界面
 - `docs/`：需求、设计、实现进展等文档
-- `graphify-out/`：项目知识图谱输出（保留追踪）
 
 ## 开发
 

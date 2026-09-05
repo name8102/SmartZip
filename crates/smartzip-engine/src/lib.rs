@@ -15,6 +15,7 @@ pub mod name_score;
 
 mod access;
 mod backend_util;
+pub mod budget;
 mod encoding_flow;
 mod events;
 mod extract_workflow;
@@ -70,9 +71,15 @@ impl SmartZipEngine {
         )
         .await
     }
+    pub fn with_cancellation_token(mut self, token: tokio_util::sync::CancellationToken) -> Self {
+        self.cancellation = token;
+        self
+    }
+
     pub fn new(scanner: EmbeddedScanner) -> Self {
         Self {
             scanner,
+            cancellation: tokio_util::sync::CancellationToken::new(),
             archive_recycler: Arc::new(smartzip_platform::move_to_trash),
             min_embedded_size_bytes: smartzip_core::DEFAULT_MIN_EMBEDDED_FINDING_SIZE,
         }
@@ -107,6 +114,7 @@ impl SmartZipEngine {
     ) -> smartzip_core::Result<FileAwareDetectResult> {
         workflow::inspect_file_with_listener(
             self.min_embedded_size_bytes,
+            self.cancellation.clone(),
             backend,
             passwords,
             request,
@@ -128,6 +136,7 @@ impl SmartZipEngine {
     ) -> smartzip_core::Result<ListArchiveResult> {
         workflow::list_archive_with_listener_interactive(
             self.min_embedded_size_bytes,
+            self.cancellation.clone(),
             backend,
             passwords,
             request,
@@ -224,6 +233,7 @@ impl SmartZipEngine {
             &self.scanner,
             self.min_embedded_size_bytes,
             &self.archive_recycler,
+            self.cancellation.clone(),
             backend,
             passwords,
             request,

@@ -18,6 +18,7 @@ enum Behavior {
     Good,
     Bad,
     Password,
+    Indeterminate,
     Change,
     Slow,
 }
@@ -69,11 +70,12 @@ impl ArchiveAdapter for Adapter {
             std::fs::write(&request.archive, b"changed length").unwrap();
         }
         let failure = match self.behavior {
+            Behavior::Indeterminate => Some(TestFailure::PasswordIndeterminate),
             Behavior::Bad => Some(TestFailure::Corruption),
             Behavior::Password => match request.password.as_deref() {
                 None => Some(TestFailure::PasswordRequired),
                 Some("correct") => None,
-                _ => Some(TestFailure::PasswordIndeterminate),
+                _ => Some(TestFailure::PasswordRejected),
             },
             _ => None,
         };
@@ -370,4 +372,24 @@ async fn history_write_failure_does_not_change_integrity_or_exit_code() {
             .unwrap(),
         0
     );
+}
+
+#[tokio::test]
+async fn indeterminate_failure_does_not_search_more_passwords() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.7z");
+    std::fs::write(&path, b"unknown archive").unwrap();
+    let (registration, calls) = adapter("reader", "7z", Behavior::Indeterminate, 10);
+    let backend = BackendRouter::from_adapters(vec![registration]);
+    let db = SmartZipDb::in_memory().unwrap();
+    let service = PasswordService::new(PasswordRepository::new(db.connection()));
+    let mut req = request(vec![path]);
+    req.diagnose = DiagnoseMode::Off;
+    req.password_candidates.manual = vec!["wrong".into(), "correct".into()];
+    let result = engine()
+        .test_archives(&backend, &service, req, None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(result.exit_code, 1);
+    assert_eq!(calls.lock().unwrap().len(), 1);
 }

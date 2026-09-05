@@ -22,8 +22,7 @@ use crate::nested::{
     recyclable_nested_archive_path, recycle_archive, root_embedded_candidates,
 };
 use crate::password_order::{
-    order_password_candidates, password_attempt_index, password_source_label, password_value,
-    remember_batch_password,
+    order_password_candidates, password_source_label, password_value, remember_batch_password,
 };
 use crate::policy::{
     embedded_policy_from_request, ext_business_container_kind, finding_meets_min_size,
@@ -44,6 +43,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
     engine_scanner: &EmbeddedScanner,
     min_embedded_size_bytes: u64,
     archive_recycler: &ArchiveRecycleHandler,
+    cancellation: tokio_util::sync::CancellationToken,
     backend: &B,
     passwords: &PasswordService<'_>,
     request: ExtractWorkflowRequest,
@@ -56,7 +56,11 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
 ) -> smartzip_core::Result<ExtractWorkflowResult> {
     let task_id = TaskId::new();
     let events = EventSink::new(listener);
-    let task_context = backend.begin_task(task_id.clone(), std::sync::Arc::new(events.clone()));
+    let task_context = backend.begin_task_with_cancellation(
+        task_id.clone(),
+        std::sync::Arc::new(events.clone()),
+        cancellation.child_token(),
+    );
     let nested_scanner = if request.scanner == *engine_scanner.config() {
         None
     } else {
@@ -115,22 +119,27 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
     if let Some(recorder) = history {
         recorder.start_extract(&task_id, Some(&request.output_dir));
     }
-    // Dedup window lower bound: skip a re-extract only when the prior
-    // success is at or after this instant. Hardcoded to 30 days for now;
-    // TODO: read the window from config once the config layer lands.
-    let dedup_window_start = {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-        smartzip_db::timestamp::format_utc_seconds(now - 30 * 24 * 3600)
-    };
-    let mut hist_saw_failure = false;
+    let mut completion = crate::history::CompletionGuard::new(
+        history,
+        task_id.clone(),
+        events.clone(),
+        cancellation.clone(),
+    );
+    let mut failed_count = 0usize;
+    let mut was_cancelled = false;
+    let mut committed_usage = crate::budget::Usage::default();
     let mut volume_resolver = VolumeResolver::new();
     let mut processed_volume_keys: std::collections::HashSet<String> =
         std::collections::HashSet::new();
 
     loop {
+        if cancellation.is_cancelled() {
+            was_cancelled = true;
+            break;
+        }
+        if task_context.is_cancelled() {
+            break;
+        }
         let Some(mut candidate) = queue.pop_front() else {
             break;
         };
@@ -200,7 +209,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                 candidate: failed,
                 problem,
             } => {
-                hist_saw_failure = true;
+                failed_count += 1;
                 events.push(TaskEvent {
                     task_id: task_id.clone(),
                     kind: TaskEventKind::Failed {
@@ -238,7 +247,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                 candidate: failed,
                 hypotheses,
             } => {
-                hist_saw_failure = true;
+                failed_count += 1;
                 events.push(TaskEvent {
                     task_id: task_id.clone(),
                     kind: TaskEventKind::Failed {
@@ -276,7 +285,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                 candidate: failed,
                 error,
             } => {
-                hist_saw_failure = true;
+                failed_count += 1;
                 events.push(TaskEvent {
                     task_id: task_id.clone(),
                     kind: TaskEventKind::Failed {
@@ -317,7 +326,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
             let mut file = match std::fs::File::open(&candidate.path) {
                 Ok(f) => f,
                 Err(_) => {
-                    hist_saw_failure = true;
+                    failed_count += 1;
                     record_skip(history, &task_id, &candidate, "not_found");
                     skipped.push(candidate);
                     continue;
@@ -394,14 +403,35 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
         } else {
             nested_scanner
         };
-        let findings: Vec<_> = if should_scan_candidate_for_embedded(
-            &candidate,
-            &embedded_policy,
-            nested_embedded_enabled,
-            request.confirm_large_scan,
-            &events,
-            &task_id,
-        ) {
+        let header_archive = header_result
+            .as_ref()
+            .is_some_and(|(_, offset)| *offset == 0);
+        let explicit_scan = matches!(request.scanner.mode, smartzip_scanner::ScanMode::Deep)
+            || matches!(
+                embedded_policy.mode,
+                smartzip_core::EmbeddedScanMode::All | smartzip_core::EmbeddedScanMode::Aggressive
+            );
+        let findings: Vec<_> = if (!header_archive || explicit_scan)
+            && should_scan_candidate_for_embedded(
+                &candidate,
+                &embedded_policy,
+                nested_embedded_enabled,
+                request.confirm_large_scan,
+                &events,
+                &task_id,
+            ) {
+            if std::fs::metadata(&candidate.path).is_ok_and(|m| m.len() > scan_with.scan_limit()) {
+                events.push(TaskEvent {
+                    task_id: task_id.clone(),
+                    kind: TaskEventKind::Warning {
+                        message: format!(
+                            "embedded scan limited to first {} bytes of {}",
+                            scan_with.scan_limit(),
+                            candidate.path.display()
+                        ),
+                    },
+                });
+            }
             scan_with
                 .scan_path(&candidate.path)
                 .unwrap_or_default()
@@ -602,7 +632,16 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
             if let Some(path) = volume_archive_path {
                 (path, None, volume_materialized)
             } else {
-                let inp = materialize_archive_input(&candidate)?;
+                let inp = match materialize_archive_input(&candidate) {
+                    Ok(input) => input,
+                    Err(error) => {
+                        failed_count += 1;
+                        events.push(TaskEvent::failed(task_id.clone(), &error));
+                        record_skip(history, &task_id, &candidate, &error.to_string());
+                        skipped.push(candidate);
+                        continue;
+                    }
+                };
                 let p = inp.path.clone();
                 (p, inp._temp, None)
             };
@@ -632,49 +671,8 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
 
         // Dedup: a prior successful extract inside the window means skip,
         // unless --force. Emit a hint event and log a skipped row.
-        if !request.force {
-            if let (Some(hash), Some(size), Some(hit)) =
-                (sample_hash.as_deref(), sample_size, known_hit.as_ref())
-            {
-                if hit
-                    .last_extract_at
-                    .as_deref()
-                    .is_some_and(|at| at >= dedup_window_start.as_str())
-                {
-                    events.push(TaskEvent {
-                            task_id: task_id.clone(),
-                            kind: TaskEventKind::Warning {
-                                message: format!(
-                                    "skipping {} — already extracted within the dedup window (use --force to re-extract)",
-                                    candidate.path.display()
-                                ),
-                            },
-                        });
-                    if let Some(recorder) = history {
-                        recorder.record_file_extraction(
-                            &task_id,
-                            crate::history::FileExtractionRow {
-                                input_path: &original_input_path,
-                                sample_hash: Some(hash),
-                                file_size: Some(size),
-                                offset: candidate.embedded_offset.map(|o| o as i64),
-                                output_path: None,
-                                has_password: false,
-                                password_id: None,
-                                status: "skipped",
-                                reason: Some("duplicate"),
-                                encoding: None,
-                                encoding_corrected: false,
-                                damaged_volumes_json: None,
-                                test_report_json: None,
-                            },
-                        );
-                    }
-                    skipped.push(candidate);
-                    continue;
-                }
-            }
-        }
+        // Historical fingerprints remember credentials and encoding. Extraction
+        // itself always checks this invocation's actual output collision.
 
         // Confirmed-encoding reuse: a user-confirmed encoding for this exact
         // file beats auto-detection, but never a command-line override.
@@ -778,639 +776,256 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
         let mut candidate_password_id: Option<i64> = None;
         let mut candidate_has_password = false;
         let mut candidate_encoding_used: Option<String> = None;
-        // The executor owns backend selection; test before extraction for every
-        // archive so password failures are classified before materialization.
-        let test_before_extract = true;
-        let total_password_attempts = candidate_passwords.len();
-        for password in &candidate_passwords {
-            let pw_value = password_value(password);
-            let attempt_index = password_attempt_index(password, &candidate_passwords);
-            events.push(TaskEvent {
-                task_id: task_id.clone(),
-                kind: TaskEventKind::Progress(smartzip_core::TaskProgress::indeterminate(format!(
-                    "Trying password [{}/{}] ({}) for {}",
-                    attempt_index,
-                    total_password_attempts,
-                    password_source_label(password),
-                    candidate.path.display()
-                ))),
-            });
-            if test_before_extract {
-                match backend_call(
-                    "archive-backend",
-                    "test",
-                    &archive_path,
-                    backend.test_with_context(
-                        TestRequest {
-                            archive: archive_path.clone(),
-                            format: candidate.detected_format.clone(),
-                            password: pw_value.clone(),
-                            encoding: candidate_encoding_mode.clone(),
-                        },
-                        std::sync::Arc::clone(&task_context),
-                    ),
-                )
-                .await
-                {
-                    Ok(result) if result.ok => {
-                        let matched_password_id = passwords.record_success(password).ok().flatten();
-                        events.push(TaskEvent {
-                            task_id: task_id.clone(),
-                            kind: TaskEventKind::Progress(
-                                smartzip_core::TaskProgress::indeterminate(format!(
-                                    "Password accepted ({}) for {}",
-                                    password_source_label(password),
-                                    candidate.path.display()
-                                )),
-                            ),
-                        });
-                        candidate_password_id = matched_password_id;
-                        candidate_has_password =
-                            pw_value.as_deref().map(|v| !v.is_empty()).unwrap_or(false);
-
-                        if zip_encoding_assessment.is_none()
-                            && candidate_encoding_mode == EncodingMode::Auto
-                            && candidate.detected_format == Some(ArchiveFormat::Zip)
-                        {
-                            zip_encoding_assessment =
-                                assess_zip_encoding(&archive_path, pw_value.clone()).await;
-                            if let Some(assessment) = &zip_encoding_assessment {
-                                events.push(TaskEvent {
-                                    task_id: task_id.clone(),
-                                    kind: TaskEventKind::EncodingDetected(
-                                        assessment.context.detected.clone(),
-                                    ),
-                                });
-                            }
-                        }
-
-                        let encoding_to_use = resolve_encoding_mode(
-                            &archive_path,
-                            candidate_encoding_mode.clone(),
-                            zip_encoding_assessment.as_ref(),
-                            encoding_prompter,
-                        )
-                        .await?;
-                        candidate_encoding_used = Some(encoding_mode_label(&encoding_to_use));
-                        let extract_archive_path = archive_path.clone();
-                        let extract_format = candidate.detected_format.clone();
-                        let extract_password = pw_value.clone();
-                        let extract_encoding = encoding_to_use.clone();
-                        let extract_facts = archive_facts.clone();
-                        let extract_context = task_context.clone();
-                        events.push(TaskEvent {
-                            task_id: task_id.clone(),
-                            kind: TaskEventKind::Progress(
-                                smartzip_core::TaskProgress::indeterminate(format!(
-                                    "Extracting {} to {}",
-                                    candidate.path.display(),
-                                    output_dir.display()
-                                )),
-                            ),
-                        });
-
-                        let extract_result = output_materializer
-                            .materialize(
-                                MaterializeRequest {
-                                    output_dir: output_dir.clone(),
-                                    archive_path: candidate.path.clone(),
-                                    commit_policy: CommitPolicy::FailIfExists,
-                                    archive_stem: Some(
-                                        archive_stem(&candidate.path)
-                                            .to_string_lossy()
-                                            .into_owned(),
-                                    ),
-                                    layout_policy: request.layout_policy,
-                                    single_root_name_policy: request.single_root_name_policy,
-                                },
-                                |temp_output_dir| async move {
-                                    backend_call(
-                                        "archive-backend",
-                                        "extract",
-                                        &extract_archive_path,
-                                        backend.extract_with_facts_and_context(
-                                            ExtractArchiveRequest {
-                                                archive: extract_archive_path.clone(),
-                                                format: extract_format,
-                                                output_dir: temp_output_dir,
-                                                password: extract_password,
-                                                encoding: extract_encoding,
-                                            },
-                                            &extract_facts,
-                                            std::sync::Arc::clone(&extract_context),
-                                        ),
-                                    )
-                                    .await
-                                    .map(|_| ())
-                                },
-                                collision_resolver.as_ref(),
-                            )
-                            .await;
-
-                        match extract_result {
-                            Ok(result) => {
-                                if result.output_dir != output_dir {
-                                    candidate.relative_path = output_relative_path_for(
-                                        &request.output_dir,
-                                        &result.output_dir,
-                                    );
-                                }
-                                actual_output_dir = result.output_dir;
-                                extracted = true;
-                                break;
-                            }
-                            Err(failure) => {
-                                if failure.kind
-                                    == materialize::MaterializeFailureKind::CollisionSkipped
-                                {
-                                    terminal_skip = true;
-                                    break;
-                                }
-                                if let Some(temp_dir) = &failure.preserved_temp_dir {
-                                    eprintln!(
-                                        "preserved failed extraction temp dir: {}",
-                                        temp_dir.display()
-                                    );
-                                }
-                                last_error = Some(failure.error);
-                            }
-                        }
-                    }
-                    Ok(result) => {
-                        let error = crate::backend_util::failed_test_error(&result, &archive_path);
-                        if matches!(&error, smartzip_core::SmartZipError::WrongPassword { .. }) {
-                            saw_wrong_password = true;
-                            let _ = passwords.record_failure(password);
-                        } else {
-                            last_error = Some(error);
-                        }
-                    }
-                    Err(error) => {
-                        if matches!(&error, smartzip_core::SmartZipError::WrongPassword { .. }) {
-                            saw_wrong_password = true;
-                            let _ = passwords.record_failure(password);
-                        } else {
-                            last_error = Some(error);
-                        }
+        // Resolve encoding once per node. A deliberate skip is a node outcome.
+        let encoding_choice = tokio::select! {
+            _ = cancellation.cancelled() => { None }
+            result = resolve_encoding_mode(&archive_path, candidate_encoding_mode.clone(), zip_encoding_assessment.as_ref(), encoding_prompter) => result?,
+        };
+        let mut skip_reason = "target_exists";
+        if encoding_choice.is_none() {
+            terminal_skip = true;
+            skip_reason = "encoding_skipped";
+        }
+        let mut attempts: VecDeque<_> = candidate_passwords.into_iter().collect();
+        let mut prompted = false;
+        let mut saw_password_required = false;
+        while !terminal_skip && !cancellation.is_cancelled() {
+            let password = if let Some(password) = attempts.pop_front() {
+                password
+            } else if !prompted
+                && (saw_wrong_password || saw_password_required || last_error.is_none())
+            {
+                prompted = true;
+                let input = if let Some(prompter) = password_prompter {
+                    tokio::select! { _ = cancellation.cancelled() => None, value = prompter.prompt(&candidate.path) => value }
+                } else {
+                    None
+                };
+                match input.filter(|value| !value.is_empty()) {
+                    Some(value) => PasswordCandidate {
+                        id: None,
+                        value,
+                        source: smartzip_passwords::PasswordSource::Manual,
+                    },
+                    None => {
+                        password_prompt_cancelled = true;
+                        break;
                     }
                 }
             } else {
-                events.push(TaskEvent {
-                    task_id: task_id.clone(),
-                    kind: TaskEventKind::Progress(smartzip_core::TaskProgress::indeterminate(
-                        format!(
-                            "Attempting direct extract with password [{}/{}] ({}) for {}",
-                            attempt_index,
-                            total_password_attempts,
-                            password_source_label(password),
-                            candidate.path.display()
+                break;
+            };
+            if task_context.is_cancelled() {
+                break;
+            }
+            let pw_value = password_value(&password);
+            events.push(TaskEvent {
+                task_id: task_id.clone(),
+                kind: TaskEventKind::PasswordTried {
+                    candidate_id: password.id,
+                },
+            });
+            events.push(TaskEvent {
+                task_id: task_id.clone(),
+                kind: TaskEventKind::Progress(smartzip_core::TaskProgress::indeterminate(format!(
+                    "Testing password candidate ({}) for {}",
+                    password_source_label(&password),
+                    candidate.path.display()
+                ))),
+            });
+            let test = backend_call(
+                "archive-backend",
+                "test",
+                &archive_path,
+                backend.test_with_context(
+                    TestRequest {
+                        archive: archive_path.clone(),
+                        format: candidate.detected_format.clone(),
+                        password: pw_value.clone(),
+                        encoding: candidate_encoding_mode.clone(),
+                    },
+                    task_context.clone(),
+                ),
+            )
+            .await
+            .and_then(|result| {
+                if result.ok {
+                    Ok(result)
+                } else {
+                    Err(crate::backend_util::failed_test_error(
+                        &result,
+                        &archive_path,
+                    ))
+                }
+            });
+            let test = match test {
+                Ok(test) => test,
+                Err(smartzip_core::SmartZipError::WrongPassword { .. }) => {
+                    saw_wrong_password = true;
+                    let _ = passwords.record_failure(&password);
+                    continue;
+                }
+                Err(smartzip_core::SmartZipError::PasswordRequired { .. })
+                    if pw_value.as_deref().is_none_or(str::is_empty) =>
+                {
+                    saw_password_required = true;
+                    continue;
+                }
+                Err(error) => {
+                    last_error = Some(error);
+                    break;
+                }
+            };
+            let encoding = encoding_choice
+                .clone()
+                .expect("encoding skip exits before attempts");
+            candidate_encoding_used = Some(encoding_mode_label(&encoding));
+            let staged_usage = std::cell::Cell::new(committed_usage);
+            let result = output_materializer
+                .materialize(
+                    MaterializeRequest {
+                        output_dir: output_dir.clone(),
+                        archive_path: candidate.path.clone(),
+                        commit_policy: CommitPolicy::FailIfExists,
+                        archive_stem: Some(
+                            archive_stem(&candidate.path).to_string_lossy().into_owned(),
                         ),
-                    )),
-                });
-                let extract_encoding_mode = resolve_encoding_mode(
-                    &archive_path,
-                    candidate_encoding_mode.clone(),
-                    zip_encoding_assessment.as_ref(),
-                    encoding_prompter,
-                )
-                .await?;
-                candidate_encoding_used = Some(encoding_mode_label(&extract_encoding_mode));
-                let extract_archive_path = archive_path.clone();
-                let extract_format = candidate.detected_format.clone();
-                let extract_password = pw_value.clone();
-                let extract_encoding = extract_encoding_mode.clone();
-                let extract_facts = archive_facts.clone();
-                let extract_context = task_context.clone();
-                events.push(TaskEvent {
-                    task_id: task_id.clone(),
-                    kind: TaskEventKind::Progress(smartzip_core::TaskProgress::indeterminate(
-                        format!(
-                            "Extracting {} to {}",
-                            candidate.path.display(),
-                            output_dir.display()
-                        ),
-                    )),
-                });
-                let extract_result = output_materializer
-                    .materialize(
-                        MaterializeRequest {
-                            output_dir: output_dir.clone(),
-                            archive_path: candidate.path.clone(),
-                            commit_policy: CommitPolicy::FailIfExists,
-                            archive_stem: Some(
-                                archive_stem(&candidate.path).to_string_lossy().into_owned(),
-                            ),
-                            layout_policy: request.layout_policy,
-                            single_root_name_policy: request.single_root_name_policy,
-                        },
-                        |temp_output_dir| async move {
-                            backend_call(
-                                "archive-backend",
-                                "extract",
-                                &extract_archive_path,
-                                backend.extract_with_facts_and_context(
-                                    ExtractArchiveRequest {
-                                        archive: extract_archive_path.clone(),
-                                        format: extract_format,
-                                        output_dir: temp_output_dir,
-                                        password: extract_password,
-                                        encoding: extract_encoding,
-                                    },
-                                    &extract_facts,
-                                    std::sync::Arc::clone(&extract_context),
+                        layout_policy: request.layout_policy,
+                        single_root_name_policy: request.single_root_name_policy,
+                    },
+                    |temp_output_dir| {
+                        let archive_path = archive_path.clone();
+                        let format = candidate.detected_format.clone();
+                        let password = pw_value.clone();
+                        let context = task_context.clone();
+                        let facts = &archive_facts;
+                        let limits = &request.limits;
+                        let staged_usage = &staged_usage;
+                        async move {
+                            crate::budget::monitor(
+                                &temp_output_dir,
+                                limits,
+                                committed_usage,
+                                context.clone(),
+                                backend_call(
+                                    "archive-backend",
+                                    "extract",
+                                    &archive_path,
+                                    backend.extract_with_facts_and_context(
+                                        ExtractArchiveRequest {
+                                            archive: archive_path.clone(),
+                                            format,
+                                            output_dir: temp_output_dir.clone(),
+                                            password,
+                                            encoding,
+                                        },
+                                        facts,
+                                        context.clone(),
+                                    ),
                                 ),
                             )
-                            .await
-                            .map(|_| ())
-                        },
-                        collision_resolver.as_ref(),
-                    )
-                    .await;
-
-                match extract_result {
-                    Ok(result) => {
-                        let matched_password_id = passwords.record_success(password).ok().flatten();
-                        events.push(TaskEvent {
-                            task_id: task_id.clone(),
-                            kind: TaskEventKind::Progress(
-                                smartzip_core::TaskProgress::indeterminate(format!(
-                                    "Password accepted ({}) for {}",
-                                    password_source_label(password),
-                                    candidate.path.display()
-                                )),
-                            ),
-                        });
-                        candidate_password_id = matched_password_id;
-                        candidate_has_password =
-                            pw_value.as_deref().map(|v| !v.is_empty()).unwrap_or(false);
-                        if result.output_dir != output_dir {
-                            candidate.relative_path =
-                                output_relative_path_for(&request.output_dir, &result.output_dir);
+                            .await?;
+                            staged_usage.set(crate::budget::inspect(
+                                &temp_output_dir,
+                                limits,
+                                committed_usage,
+                            )?);
+                            Ok(())
                         }
-                        actual_output_dir = result.output_dir;
-                        extracted = true;
+                    },
+                    collision_resolver.as_ref(),
+                )
+                .await;
+            match result {
+                Ok(result) => {
+                    committed_usage = staged_usage.get();
+                    if let Some(plan) = result.layout_plan.as_ref() {
+                        for message in &plan.warnings {
+                            events.push(TaskEvent {
+                                task_id: task_id.clone(),
+                                kind: TaskEventKind::Warning {
+                                    message: message.clone(),
+                                },
+                            });
+                        }
+                    }
+                    if result.output_dir != output_dir {
+                        candidate.relative_path =
+                            output_relative_path_for(&request.output_dir, &result.output_dir);
+                    }
+                    actual_output_dir = result.output_dir;
+                    // Credential success needs evidence that encryption was used.
+                    candidate_has_password = pw_value.as_deref().is_some_and(|p| !p.is_empty())
+                        && (test.encrypted == Some(true)
+                            || saw_password_required
+                            || saw_wrong_password
+                            || (candidate.detected_format == Some(ArchiveFormat::Zip)
+                                && NativeZipBackend::new()
+                                    .has_encrypted_entries(&archive_path)
+                                    .unwrap_or(false)));
+                    if candidate_has_password {
+                        candidate_password_id = passwords.record_success(&password).ok().flatten();
+                        remember_batch_password(
+                            &mut batch_passwords,
+                            &password.value,
+                            candidate_password_id,
+                        );
+                    }
+                    extracted = true;
+                    break;
+                }
+                Err(failure) => {
+                    if failure.kind == materialize::MaterializeFailureKind::CollisionSkipped {
+                        terminal_skip = true;
                         break;
                     }
-                    Err(failure) => {
-                        if failure.kind == materialize::MaterializeFailureKind::CollisionSkipped {
-                            terminal_skip = true;
-                            break;
-                        }
-                        if let Some(temp_dir) = &failure.preserved_temp_dir {
-                            eprintln!(
-                                "preserved failed extraction temp dir: {}",
-                                temp_dir.display()
-                            );
-                        }
-                        if matches!(
-                            &failure.error,
-                            smartzip_core::SmartZipError::WrongPassword { .. }
-                        ) {
-                            saw_wrong_password = true;
-                            let _ = passwords.record_failure(password);
-                        } else {
-                            last_error = Some(failure.error);
-                        }
+                    if let Some(path) = &failure.preserved_temp_dir {
+                        events.push(TaskEvent {
+                            task_id: task_id.clone(),
+                            kind: TaskEventKind::Warning {
+                                message: format!("recovery output retained at {}", path.display()),
+                            },
+                        });
                     }
+                    if failure.kind == materialize::MaterializeFailureKind::ExtractFailed
+                        && matches!(
+                            failure.error,
+                            smartzip_core::SmartZipError::WrongPassword { .. }
+                        )
+                    {
+                        saw_wrong_password = true;
+                        let _ = passwords.record_failure(&password);
+                        continue;
+                    }
+                    last_error = Some(failure.error);
+                    break;
                 }
             }
         }
-
-        if !extracted && !terminal_skip {
-            // Interactive fallback: prompt the user for a password. Use test->extract
-            // and reuse the materialized archive path (carved temp when embedded).
-            if let Some(prompter) = password_prompter {
-                events.push(TaskEvent {
-                    task_id: task_id.clone(),
-                    kind: TaskEventKind::Progress(smartzip_core::TaskProgress::indeterminate(
-                        format!("Prompting for password: {}", candidate.path.display()),
-                    )),
-                });
-                let interactive_password = prompter.prompt(&candidate.path).await;
-                password_prompt_cancelled = interactive_password
-                    .as_deref()
-                    .map(str::trim)
-                    .is_none_or(str::is_empty);
-                if let Some(interactive_pw) = interactive_password {
-                    let pw = interactive_pw.trim().to_string();
-                    if !pw.is_empty() {
-                        if test_before_extract {
-                            match backend_call(
-                                "archive-backend",
-                                "test",
-                                &archive_path,
-                                backend.test_with_context(
-                                    TestRequest {
-                                        archive: archive_path.clone(),
-                                        format: candidate.detected_format.clone(),
-                                        password: Some(pw.clone()),
-                                        encoding: candidate_encoding_mode.clone(),
-                                    },
-                                    std::sync::Arc::clone(&task_context),
-                                ),
-                            )
-                            .await
-                            {
-                                Ok(result) if result.ok => {
-                                    events.push(TaskEvent {
-                                        task_id: task_id.clone(),
-                                        kind: TaskEventKind::Progress(
-                                            smartzip_core::TaskProgress::indeterminate(format!(
-                                                "Interactive password accepted for {}",
-                                                candidate.path.display()
-                                            )),
-                                        ),
-                                    });
-                                    if zip_encoding_assessment.is_none()
-                                        && candidate_encoding_mode == EncodingMode::Auto
-                                        && candidate.detected_format == Some(ArchiveFormat::Zip)
-                                    {
-                                        zip_encoding_assessment =
-                                            assess_zip_encoding(&archive_path, Some(pw.clone()))
-                                                .await;
-                                        if let Some(assessment) = &zip_encoding_assessment {
-                                            events.push(TaskEvent {
-                                                task_id: task_id.clone(),
-                                                kind: TaskEventKind::EncodingDetected(
-                                                    assessment.context.detected.clone(),
-                                                ),
-                                            });
-                                        }
-                                    }
-                                    let encoding_to_use = resolve_encoding_mode(
-                                        &archive_path,
-                                        candidate_encoding_mode.clone(),
-                                        zip_encoding_assessment.as_ref(),
-                                        encoding_prompter,
-                                    )
-                                    .await?;
-                                    candidate_encoding_used =
-                                        Some(encoding_mode_label(&encoding_to_use));
-                                    let extract_archive_path = archive_path.clone();
-                                    let extract_format = candidate.detected_format.clone();
-                                    let extract_password = pw.clone();
-                                    let extract_encoding = encoding_to_use.clone();
-                                    let extract_facts = archive_facts.clone();
-                                    let extract_context = task_context.clone();
-                                    events.push(TaskEvent {
-                                        task_id: task_id.clone(),
-                                        kind: TaskEventKind::Progress(
-                                            smartzip_core::TaskProgress::indeterminate(format!(
-                                                "Extracting {} to {}",
-                                                candidate.path.display(),
-                                                output_dir.display()
-                                            )),
-                                        ),
-                                    });
-                                    let extract_result = output_materializer
-                                        .materialize(
-                                            MaterializeRequest {
-                                                output_dir: output_dir.clone(),
-                                                archive_path: candidate.path.clone(),
-                                                commit_policy: CommitPolicy::FailIfExists,
-                                                archive_stem: Some(
-                                                    archive_stem(&candidate.path)
-                                                        .to_string_lossy()
-                                                        .into_owned(),
-                                                ),
-                                                layout_policy: request.layout_policy,
-                                                single_root_name_policy: request
-                                                    .single_root_name_policy,
-                                            },
-                                            |temp_output_dir| async move {
-                                                backend_call(
-                                                    "archive-backend",
-                                                    "extract",
-                                                    &extract_archive_path,
-                                                    backend.extract_with_facts_and_context(
-                                                        ExtractArchiveRequest {
-                                                            archive: extract_archive_path.clone(),
-                                                            format: extract_format,
-                                                            output_dir: temp_output_dir,
-                                                            password: Some(extract_password),
-                                                            encoding: extract_encoding,
-                                                        },
-                                                        &extract_facts,
-                                                        std::sync::Arc::clone(&extract_context),
-                                                    ),
-                                                )
-                                                .await
-                                                .map(|_| ())
-                                            },
-                                            output_prompter
-                                                .map(|p| make_collision_resolver(p))
-                                                .as_ref(),
-                                        )
-                                        .await;
-
-                                    match extract_result {
-                                        Ok(result) => {
-                                            if result.output_dir != output_dir {
-                                                candidate.relative_path = output_relative_path_for(
-                                                    &request.output_dir,
-                                                    &result.output_dir,
-                                                );
-                                            }
-                                            actual_output_dir = result.output_dir;
-                                            let accepted = PasswordCandidate {
-                                                id: None,
-                                                value: pw.clone(),
-                                                source: smartzip_passwords::PasswordSource::Manual,
-                                            };
-                                            candidate_password_id =
-                                                passwords.record_success(&accepted).ok().flatten();
-                                            candidate_has_password = true;
-                                            remember_batch_password(
-                                                &mut batch_passwords,
-                                                &accepted.value,
-                                                candidate_password_id,
-                                            );
-                                            extracted = true;
-                                        }
-                                        Err(failure) => {
-                                            if let Some(temp_dir) = &failure.preserved_temp_dir {
-                                                eprintln!(
-                                                    "preserved failed extraction temp dir: {}",
-                                                    temp_dir.display()
-                                                );
-                                            }
-                                            eprintln!(
-                                                "Interactive extract failed for {}: {}",
-                                                archive_path.display(),
-                                                failure.error
-                                            );
-                                        }
-                                    }
-                                }
-                                Ok(result) => {
-                                    let error = crate::backend_util::failed_test_error(
-                                        &result,
-                                        &archive_path,
-                                    );
-                                    if matches!(
-                                        &error,
-                                        smartzip_core::SmartZipError::WrongPassword { .. }
-                                    ) {
-                                        saw_wrong_password = true;
-                                    } else {
-                                        last_error = Some(error);
-                                    }
-                                    eprintln!(
-                                        "Interactive password did not validate for {}",
-                                        archive_path.display()
-                                    );
-                                }
-                                Err(error) => {
-                                    if matches!(
-                                        &error,
-                                        smartzip_core::SmartZipError::WrongPassword { .. }
-                                    ) {
-                                        saw_wrong_password = true;
-                                    }
-                                    eprintln!(
-                                        "Interactive password test failed for {}: {}",
-                                        archive_path.display(),
-                                        error
-                                    );
-                                }
-                            }
-                        } else {
-                            events.push(TaskEvent {
-                                    task_id: task_id.clone(),
-                                    kind: TaskEventKind::Progress(
-                                        smartzip_core::TaskProgress::indeterminate(format!(
-                                            "Attempting direct extract with interactive password for {}",
-                                            candidate.path.display()
-                                        )),
-                                    ),
-                                });
-                            let extract_archive_path = archive_path.clone();
-                            let extract_format = candidate.detected_format.clone();
-                            let extract_password = pw.clone();
-                            let extract_facts = archive_facts.clone();
-                            let extract_context = task_context.clone();
-                            let extract_encoding = resolve_encoding_mode(
-                                &archive_path,
-                                candidate_encoding_mode.clone(),
-                                zip_encoding_assessment.as_ref(),
-                                encoding_prompter,
-                            )
-                            .await?;
-                            candidate_encoding_used = Some(encoding_mode_label(&extract_encoding));
-                            events.push(TaskEvent {
-                                task_id: task_id.clone(),
-                                kind: TaskEventKind::Progress(
-                                    smartzip_core::TaskProgress::indeterminate(format!(
-                                        "Extracting {} to {}",
-                                        candidate.path.display(),
-                                        output_dir.display()
-                                    )),
-                                ),
-                            });
-                            let extract_result = output_materializer
-                                .materialize(
-                                    MaterializeRequest {
-                                        output_dir: output_dir.clone(),
-                                        archive_path: candidate.path.clone(),
-                                        commit_policy: CommitPolicy::FailIfExists,
-                                        archive_stem: Some(
-                                            archive_stem(&candidate.path)
-                                                .to_string_lossy()
-                                                .into_owned(),
-                                        ),
-                                        layout_policy: request.layout_policy,
-                                        single_root_name_policy: request.single_root_name_policy,
-                                    },
-                                    |temp_output_dir| async move {
-                                        backend_call(
-                                            "archive-backend",
-                                            "extract",
-                                            &extract_archive_path,
-                                            backend.extract_with_facts_and_context(
-                                                ExtractArchiveRequest {
-                                                    archive: extract_archive_path.clone(),
-                                                    format: extract_format,
-                                                    output_dir: temp_output_dir,
-                                                    password: Some(extract_password),
-                                                    encoding: extract_encoding,
-                                                },
-                                                &extract_facts,
-                                                std::sync::Arc::clone(&extract_context),
-                                            ),
-                                        )
-                                        .await
-                                        .map(|_| ())
-                                    },
-                                    output_prompter.map(|p| make_collision_resolver(p)).as_ref(),
-                                )
-                                .await;
-
-                            match extract_result {
-                                Ok(result) => {
-                                    if result.output_dir != output_dir {
-                                        candidate.relative_path = output_relative_path_for(
-                                            &request.output_dir,
-                                            &result.output_dir,
-                                        );
-                                    }
-                                    actual_output_dir = result.output_dir;
-                                    events.push(TaskEvent {
-                                        task_id: task_id.clone(),
-                                        kind: TaskEventKind::Progress(
-                                            smartzip_core::TaskProgress::indeterminate(format!(
-                                                "Interactive password accepted for {}",
-                                                candidate.path.display()
-                                            )),
-                                        ),
-                                    });
-                                    let accepted = PasswordCandidate {
-                                        id: None,
-                                        value: pw.clone(),
-                                        source: smartzip_passwords::PasswordSource::Manual,
-                                    };
-                                    candidate_password_id =
-                                        passwords.record_success(&accepted).ok().flatten();
-                                    candidate_has_password = true;
-                                    remember_batch_password(
-                                        &mut batch_passwords,
-                                        &accepted.value,
-                                        candidate_password_id,
-                                    );
-                                    extracted = true;
-                                }
-                                Err(failure) => {
-                                    if matches!(
-                                        &failure.error,
-                                        smartzip_core::SmartZipError::WrongPassword { .. }
-                                    ) {
-                                        saw_wrong_password = true;
-                                        eprintln!(
-                                            "Interactive password did not validate for {}",
-                                            archive_path.display()
-                                        );
-                                    } else {
-                                        if let Some(temp_dir) = &failure.preserved_temp_dir {
-                                            eprintln!(
-                                                "preserved failed extraction temp dir: {}",
-                                                temp_dir.display()
-                                            );
-                                        }
-                                        eprintln!(
-                                            "Interactive extract failed for {}: {}",
-                                            archive_path.display(),
-                                            failure.error
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+        if cancellation.is_cancelled()
+            || matches!(last_error, Some(smartzip_core::SmartZipError::Cancelled))
+        {
+            was_cancelled = true;
+            record_skip(history, &task_id, &candidate, "cancelled");
+            skipped.push(candidate);
+            break;
         }
 
         if !extracted && !terminal_skip {
             if password_prompt_cancelled {
+                if password_prompter.is_none() {
+                    failed_count += 1;
+                    let error = if saw_wrong_password {
+                        smartzip_core::SmartZipError::WrongPassword {
+                            path: candidate.path.clone(),
+                        }
+                    } else {
+                        smartzip_core::SmartZipError::PasswordRequired {
+                            path: candidate.path.clone(),
+                        }
+                    };
+                    events.push(TaskEvent::failed(task_id.clone(), &error));
+                }
                 if let Some(recorder) = history {
                     recorder.record_file_extraction(
                         &task_id,
@@ -1422,8 +1037,16 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                             output_path: None,
                             has_password: false,
                             password_id: None,
-                            status: "skipped",
-                            reason: Some("password_required"),
+                            status: if password_prompter.is_none() {
+                                "failed"
+                            } else {
+                                "skipped"
+                            },
+                            reason: Some(if saw_wrong_password {
+                                "wrong_password"
+                            } else {
+                                "password_required"
+                            }),
                             encoding: candidate_encoding_used.as_deref(),
                             encoding_corrected: reused_confirmed_encoding
                                 || matches!(request.encoding_mode, EncodingMode::Override(_)),
@@ -1437,7 +1060,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                     path: candidate.path.clone(),
                 })
             }) {
-                hist_saw_failure = true;
+                failed_count += 1;
                 // File-grain failure: classify the reason from the error so
                 // `history files --reason` can filter later.
                 let reason = match &error {
@@ -1495,7 +1118,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
             }
         }
         if terminal_skip {
-            record_skip(history, &task_id, &candidate, "target_exists");
+            record_skip(history, &task_id, &candidate, skip_reason);
             skipped.push(candidate);
             continue;
         }
@@ -1560,6 +1183,8 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
             }
         }
 
+        // Staging usage was counted before commit/recycling, including
+        // containers which will subsequently be expanded and recycled.
         processed.push(candidate.clone());
         let output_relative_path = candidate_output_relative_path(&candidate);
         let nested_candidates = discover_nested_candidates(
@@ -1571,6 +1196,15 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
             nested_embedded_enabled,
         );
         for nested in nested_candidates {
+            if enqueued.len() >= request.limits.max_nested_candidates {
+                failed_count += 1;
+                events.push(TaskEvent::failed(
+                    task_id.clone(),
+                    &crate::budget::exceeded("nested candidate limit exceeded"),
+                ));
+                task_context.cancel();
+                break;
+            }
             enqueued.push(nested.clone());
             queue.push_back(nested);
         }
@@ -1621,9 +1255,16 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
         }
     }
 
+    let status = crate::history::TaskCompletionStatus::from_counts(
+        processed.len(),
+        failed_count,
+        was_cancelled,
+    );
     events.push(TaskEvent {
         task_id: task_id.clone(),
-        kind: TaskEventKind::Completed,
+        kind: TaskEventKind::Finished {
+            status: format!("{status:?}").to_ascii_lowercase(),
+        },
     });
 
     let snapshot = events.snapshot();
@@ -1636,13 +1277,6 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
         for event in &snapshot {
             recorder.record_event(&task_id, event);
         }
-        let status = if processed.is_empty() {
-            crate::history::TaskCompletionStatus::Failed
-        } else if hist_saw_failure || !skipped.is_empty() {
-            crate::history::TaskCompletionStatus::Partial
-        } else {
-            crate::history::TaskCompletionStatus::Completed
-        };
         recorder.finish(
             &task_id,
             crate::history::TaskOutcome {
@@ -1652,7 +1286,10 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
         );
     }
 
+    completion.complete();
     Ok(ExtractWorkflowResult {
+        status,
+        failed_count,
         task_id,
         processed,
         skipped,

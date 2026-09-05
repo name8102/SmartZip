@@ -97,6 +97,10 @@ pub enum TaskEventKind {
     Failed {
         error: String,
     },
+    /// Terminal task outcome, shared with workflow JSON and history.
+    Finished {
+        status: String,
+    },
     Completed,
 }
 

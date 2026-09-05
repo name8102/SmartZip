@@ -8,10 +8,6 @@ use crate::volumes::VolumeSet;
 use smartzip_core::ArchiveFormat;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::PathBuf;
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
 use std::time::Instant;
 
 pub(super) const MAX_METADATA: usize = 16 * 1024 * 1024;
@@ -20,16 +16,26 @@ const MAX_EVIDENCE: usize = 4096;
 
 #[derive(Clone, Default, Debug)]
 pub struct DiagnosticControl {
-    cancelled: Arc<AtomicBool>,
+    cancelled: tokio_util::sync::CancellationToken,
     pub deadline: Option<Instant>,
 }
 
 impl DiagnosticControl {
+    pub fn with_cancellation(token: tokio_util::sync::CancellationToken) -> Self {
+        Self {
+            cancelled: token,
+            deadline: None,
+        }
+    }
+    pub fn cancellation_token(&self) -> tokio_util::sync::CancellationToken {
+        self.cancelled.clone()
+    }
+
     pub fn cancel(&self) {
-        self.cancelled.store(true, Ordering::Relaxed);
+        self.cancelled.cancel();
     }
     pub fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::Relaxed)
+        self.cancelled.is_cancelled()
     }
     pub fn check(&self) -> io::Result<()> {
         if self.is_cancelled() {
