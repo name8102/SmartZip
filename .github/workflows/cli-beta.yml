@@ -22,7 +22,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Linux dependencies
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y 7zip zip ripgrep pkg-config liblzma-dev libbz2-dev
+        run: sudo apt-get update && sudo apt-get install -y 7zip zip ripgrep pkg-config liblzma-dev libbz2-dev libfontconfig1-dev libfreetype6-dev
       - name: macOS dependencies
         if: runner.os == 'macOS'
         run: brew install sevenzip xz pkg-config ripgrep

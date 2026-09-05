@@ -16,7 +16,7 @@ smartzip doctor --json
 
 `doctor` 显示后端路径、版本、能力、数据库路径和资源默认值；没有后端返回 1。若加载器在启动前报告缺少动态库，先安装对应依赖；Linux 可用 `ldd smartzip`，macOS 可用 `otool -L smartzip` 排查。
 
-从源码构建：`cargo build --release --locked -p smartzip-cli`。CI 固定 Rust 1.97.1，运行 CLI 和库测试，以及解包后二进制的真实后端验收。GUI 不属于这条发布链。
+从源码构建：`cargo build --release --locked -p smartzip-cli`。Ubuntu 构建还需 `pkg-config liblzma-dev libbz2-dev libfontconfig1-dev libfreetype6-dev`（扫描库的间接编译依赖）。CI 固定 Rust 1.97.1，运行 CLI 和库测试，以及解包后二进制的真实后端验收。GUI 不属于这条发布链。
 
 ## 日常使用
 

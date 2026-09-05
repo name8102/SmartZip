@@ -23,3 +23,5 @@ Trellis runtime/scripts/specs are absent; task artifacts and CONTEXT.md are the 
 - Local binary links liblzma/libbz2/system C libraries. The hosted Linux and macOS jobs install their declared backend/runtime dependencies and rerun unpacked-binary acceptance.
 
 Remote CI is pending at this checkpoint. No beta tag or public release has been created. The pipeline publishes only a matching beta tag after both target jobs succeed. Dynamic budgets are polling checkpoints, not strict OS quotas; crash/power-loss recovery, GUI/compression and parallel password recovery remain out of scope.
+
+First hosted run 33954631865 found missing fontconfig development files on Ubuntu before tests; the CLI scanner dependency graph requires them even though the optimized executable does not link fontconfig. Added fontconfig/freetype development packages and rerun the gate.
