@@ -2,10 +2,9 @@
   "name": "performance-simplification",
   "title": "Behavior-preserving CLI performance optimization",
   "status": "completed",
-  "labels": [
-    "ready-for-agent"
-  ],
+  "labels": [],
   "createdAt": "2026-09-05",
   "completedAt": "2026-09-05",
-  "validation": "426 stable tests and 13 release acceptance groups passed; data operations improved; whole extraction speedup not established"
+  "validation": "426 stable tests and 13 release acceptance groups passed; data operations improved; whole extraction speedup not established",
+  "commit": "12df2ff"
 }
