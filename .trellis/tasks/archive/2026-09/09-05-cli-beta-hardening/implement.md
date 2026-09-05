@@ -27,3 +27,14 @@ Remote CI is pending at this checkpoint. No beta tag or public release has been 
 First hosted run 33954631865 found missing fontconfig development files on Ubuntu before tests; the CLI scanner dependency graph requires them even though the optimized executable does not link fontconfig. Added fontconfig/freetype development packages and rerun the gate.
 
 macOS first-run tests exposed fixture expectations using /var while VolumeSet reports canonical /private/var. Volume diagnostic and test-workflow fixtures now create temporary trees under the canonical parent; data/evidence assertions stay unchanged.
+
+## Hosted delivery gate: PASS
+
+Commit a21c3eb (same production code as 555c4b3) passed both native jobs in GitHub run [33954747834](https://github.com/name8102/SmartZip/actions/runs/33954747834):
+
+- Ubuntu 24.04 / x86_64-unknown-linux-gnu: CLI and library tests, locked release build, archive creation, unpacked real-backend acceptance, artifact upload all successful.
+- macOS 14 / aarch64-apple-darwin: the same complete gate successful.
+- Prerelease job intentionally skipped for a main-branch push. No tag/release created.
+- Canonical-path fixture correction additionally reproduced on Linux using a symlinked TMPDIR; all 18 relevant tests passed.
+
+Task complete. Only task/archive/journal documentation changes follow this verified code revision.

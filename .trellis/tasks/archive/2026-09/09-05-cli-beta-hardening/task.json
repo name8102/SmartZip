@@ -1,0 +1,9 @@
+{
+  "name": "cli-beta-hardening",
+  "title": "CLI beta reliability and release gates",
+  "status": "completed",
+  "labels": [],
+  "created_at": "2026-09-05",
+  "completedAt": "2026-09-05",
+  "commit": "a21c3eb"
+}

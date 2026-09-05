@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 1
-- **Last Active**: 2026-06-30
+- **Total Sessions**: 2
+- **Last Active**: 2026-09-05
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~41 | Active |
+| `journal-1.md` | ~56 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -30,6 +30,7 @@
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
 | 1 | 2026-06-30 | Add nested path collision regressions | `c5c3eb8` | `main` |
+| 2 | 2026-09-05 | Merge main and harden CLI beta delivery | `555c4b3`, `a21c3eb` | `main` |
 <!-- @@@/auto:session-history -->
 
 ---
