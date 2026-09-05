@@ -585,6 +585,7 @@ impl ArchiveExecutor for EncodingAwareBackend {
         Ok(TestResult {
             ok: true,
             encrypted: Some(false),
+            ..TestResult::default()
         })
     }
 
@@ -815,6 +816,7 @@ impl ArchiveExecutor for BatchPasswordBackend {
             Ok(TestResult {
                 ok: true,
                 encrypted: Some(true),
+                ..TestResult::default()
             })
         } else {
             Err(smartzip_core::SmartZipError::WrongPassword {
@@ -948,6 +950,7 @@ impl ArchiveExecutor for FakeBackend {
         Ok(TestResult {
             ok: true,
             encrypted: Some(true),
+            ..TestResult::default()
         })
     }
 
@@ -1212,6 +1215,7 @@ impl ArchiveExecutor for EmbeddedAwareFakeBackend {
         Ok(TestResult {
             ok: true,
             encrypted: Some(true),
+            ..TestResult::default()
         })
     }
 

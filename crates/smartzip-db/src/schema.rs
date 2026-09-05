@@ -2,7 +2,7 @@ use rusqlite::Connection;
 use rusqlite_migration::{Migrations, M};
 
 /// Latest schema version this build knows how to produce.
-pub const LATEST_VERSION: u32 = 3;
+pub const LATEST_VERSION: u32 = 4;
 
 const MIGRATIONS_SLICE: &[M<'static>] = &[
     M::up(
@@ -161,6 +161,7 @@ const MIGRATIONS_SLICE: &[M<'static>] = &[
         );
         "#,
     ),
+    M::up("ALTER TABLE file_extractions ADD COLUMN test_report_json TEXT;"),
 ];
 
 static MIGRATIONS: Migrations<'static> = Migrations::from_slice(MIGRATIONS_SLICE);
@@ -340,6 +341,38 @@ mod tests {
         assert_eq!(current_version(&conn).unwrap(), LATEST_VERSION);
         // Legacy table should have been cleaned up.
         assert!(!table_exists(&conn, "schema_migrations"));
+    }
+
+    #[test]
+    fn v4_preserves_v3_history_and_defaults_old_reports_to_null() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        MIGRATIONS.to_version(&mut conn, 3).unwrap();
+        conn.execute_batch(r#"
+            INSERT INTO tasks (id, kind, status, started_at) VALUES ('old', 'extract', 'completed', '2026-07-03');
+            INSERT INTO file_extractions (task_id, input_path, status, damaged_volumes_json)
+                VALUES ('old', 'archive.zip', 'extracted', '["legacy.part2.rar"]');
+            INSERT INTO known_files (sample_hash, size, last_extract_at) VALUES ('hash', 42, '2026-07-03');
+        "#).unwrap();
+        migrate(&mut conn).unwrap();
+        migrate(&mut conn).unwrap();
+        let row: (String, String, Option<String>) = conn
+            .query_row(
+                "SELECT input_path, damaged_volumes_json, test_report_json FROM file_extractions",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            ("archive.zip".into(), "[\"legacy.part2.rar\"]".into(), None)
+        );
+        let last: String = conn
+            .query_row("SELECT last_extract_at FROM known_files", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(last, "2026-07-03");
+        assert_eq!(current_version(&conn).unwrap(), 4);
     }
 
     #[test]

@@ -576,38 +576,36 @@ MVP 范围：
 - 输出人类可读日志或 JSON。
 - 返回明确 exit code。
 
-建议使用 `clap`。
-
-命令：
+当前使用 `clap`。可用命令示例：
 
 ```bash
 smartzip extract <paths...>
 smartzip extract --encoding auto <paths...>
 smartzip extract --encoding gb18030 <paths...>
-smartzip extract --scan-embedded <paths...>
-smartzip compress <paths...>
+smartzip extract --deep --embedded ask <paths...>
 smartzip detect <path>
-smartzip open <path>
+smartzip list <path>
+smartzip enc <path>
 smartzip password list
 smartzip password add <password>
 smartzip password remove <id>
-smartzip config path
-smartzip db path
+smartzip history tasks
 ```
 
-退出码（目标设计；当前 CLI 实现仅稳定使用 0=成功、1=全部失败/通用错误、2=部分成功）：
+`test` / `t` 已实现完整校验、默认分卷诊断和历史报告；`compress` 仍为占位。`open`、`config path`、`db path` 尚无 CLI 实现。
+
+命令短别名已实现：`extract → x`、`list → l`、`detect → d`、`test → t`、`compress → c`、`password → pw`、`history → hist`。编码预览主命令为 `enc`，旧名称 `encoding-preview` 继续兼容。
+
+当前退出码（实现事实）：
 
 | code | 含义 |
 | --- | --- |
 | 0 | 成功 |
-| 1 | 通用错误 |
-| 2 | 参数错误 |
-| 3 | 部分成功 |
-| 4 | 密码错误 |
-| 5 | 格式不支持 |
-| 6 | 文件损坏 |
-| 7 | 用户取消 |
-| 8 | 安全检查失败 |
+| 1 | 全失败、通用错误或命令尚未实现 |
+| 2 | extract 部分处理或 test 部分组完整；clap 参数错误也使用此值 |
+| 130 | test 用户取消 |
+
+test 执行阶段采用 0/1/2/130；旧 test 草案中的 3/4/5 不适用。extract 的退出码保持不变，其他命令的统一 JSON 错误信封仍待 CLI 交互任务实施。
 
 ### 3.10 `smartzip-gui`
 
@@ -660,11 +658,11 @@ pub enum MainTab {
 > - `tasks` **瘦身**为纯操作级父表（删 `input_summary / error_code / error_message / password_attempts / encoding_selected / embedded_found`，只留 `id / kind / status / output_path / started_at / finished_at`）。这些聚合列的明细全部下沉到 `file_extractions`。
 > - 新增 `file_extractions`（append-only 文件级日志，一行 = 一次解压动作）。
 > - 新增 `known_files`（`UNIQUE(sample_hash, size)` 去重/复用索引）。
-> - 旧库无有效数据，v3 迁移直接 DROP + 建新、不回填；`LATEST_VERSION = 3`。
+> - 旧库无有效数据，v3 迁移直接 DROP + 建新、不回填；这是当时的 v3 迁移策略。当前 `LATEST_VERSION = 4`，v4 只 ALTER 增加 nullable `test_report_json`，保留现有任务、文件记录及 known_files。
 >
 > 使用场景锚定“解压来自网络的压缩包”：路径可明文存、密码只存 `password_id` 不存明文；核心痛点是重复下载、老式非 UTF-8 ZIP 文件名乱码、分卷缺失、内嵌/嵌套档。完整裁决见任务 `prd.md` 的 Confirmed Facts。写入仍为 best-effort（失败降级 `Warning`、不中断解压），归 engine 通过注入的 `TaskHistoryRecorder` 完成，CLI 只建连接 + 注入。
 >
-> 本次（`07-02-file-grain-history`）只落数据库层 + 闭合 `extract` / `history`；`detect / test / list` 命令的写入接线在后续任务 `.trellis/tasks/2026-07/07-02-file-aware-cli-commands`。hashcat `crack_jobs`、配置通配符密码层、`compress` 写库见各自 Out of Scope。下面 4.1 `passwords` 不变；4.2–4.6 已按 v3 更新。
+> 本次（`07-02-file-grain-history`）只落数据库层 + 闭合 `extract` / `history`；`detect / test / list` 命令的写入接线在后续任务 `.trellis/tasks/2026-07/07-02-file-aware-cli-commands`。hashcat `crack_jobs`、配置通配符密码层、`compress` 写库见各自 Out of Scope。目前 detect/list/test 已接入文件级历史；下面 4.1 `passwords` 不变，4.2–4.6 包含 v4 的 test 报告扩展。
 
 ### 4.1 `passwords`
 
@@ -750,7 +748,8 @@ CREATE TABLE file_extractions (
   reason               TEXT,               -- status=extracted 时为 NULL
   encoding             TEXT,               -- 最终选定编码名
   encoding_corrected   INTEGER NOT NULL DEFAULT 0,  -- 人工确认过（唯一不可再生的编码信号）
-  damaged_volumes_json TEXT,               -- test 定位的坏卷列表（本次仅预留，extract 不写）
+  damaged_volumes_json TEXT,               -- test 确认损坏路径数组，extract 不写
+  test_report_json     TEXT,               -- v4：完整分组报告，旧记录 NULL
   created_at           TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -763,7 +762,7 @@ CREATE INDEX idx_file_extractions_dedup  ON file_extractions(sample_hash, file_s
 
 - `extract`：`extracted / skipped / failed / partial`
 - `detect`：`detected / unreadable`（本次仅预留，后续任务接线）
-- `test`：`intact / corrupt`（本次仅预留）
+- `test`：`intact / corrupt / partial / skipped / failed`，以 test_report_json 中 integrity、coverage 和 password_status 为准
 
 `reason` 枚举：`not_found / wrong_password / corrupt / target_exists / not_first_volume / recursion_limit / duplicate / business_container / password_required`。“需密码但最终没拿到”（候选试穿 + 用户取消）统一记 `status=skipped` + `reason=password_required`，不为加密单设终态。
 
@@ -1003,30 +1002,33 @@ Record task and events
 
 ## 8. CLI 设计
 
-> **命令模型（v3，锚定 `07-02-file-grain-history` / `07-02-file-aware-cli-commands`）**：三个“输入是压缩包”的命令共享同一条底层管线，按“走多远”区分——`detect` 探到格式+编码即停（纯报告）；`list` 走完整管线直到列出条目（编码确认循环、内嵌定位、求密码都在此）；`extract` 继续到落盘。`test` 是独立的全量校验命令。**detect ⊂ list 前缀子集**：编码确认循环属于 list（要列出条目让用户看乱码才能确认），不属于 detect。求密码是 list/test/extract 共享的交互子流程（候选顺序：命令行 `--password` > `known_files` 命中 > 当前批次命中 > 配置通配符[将来] > 密码库；交互成功立即写库并供同批复用；试穿+用户取消统一记 `skipped`/`password_required`）。CLI 只做基本功能，最佳编码交互体验在 GUI 实现。
+> 2026-09-05 更新：下一轮以 [CLI 交互设计草案](../.trellis/tasks/09-05-cli-interaction-design/design.md) 为详细提案，优先密码与编码。下述当前命令示例不代表草案新增参数已经实现。
 
-### 8.1 解压 `extract`
+detect 探测并报告，list 继续到可读条目，extract 继续到内容落盘；复用 engine 的归档访问与密码/编码能力。detect 不求密码、不确认编码。test 是独立全量校验命令，extract 不隐式增加 test 步骤。CLI 保持逐行提示与数字选择，复杂编码工作台放在 GUI。
+
+### 8.1 本轮交互目标（待实现）
+
+1. 密码隐藏输入并保留内容，输错可重试；仅可靠验证成功后保存，支持仅本批次使用。普通 ZIP 列目录成功不能作为密码正确证据。
+2. 编码选择展示同一批真实名称、复列后显式确认；最终选择携带来源，只有人工确认可写 confirmed_encoding，选择绑定当前文件指纹。
+3. 所有提示共享终端规则；提示/进度写 stderr；JSON 与显式非交互模式不读取答案；跳过归档、EOF、取消任务有不同语义。
+4. 输出冲突针对布局后的真实目标；批次选择限定问题类型；最终摘要给出路径与原因。
+
+新增选项、交互示例、保存规则和兼容边界以草案为准；[实施切片](../.trellis/tasks/09-05-cli-interaction-design/implement.md) 明确先修密码真实性，再做密码交互、编码对照与批次体验。
+
+### 8.2 解压 `extract`（已接线）
 
 ```bash
 smartzip extract archive.zip
 smartzip extract a.zip b.7z c.rar --output ~/Downloads/out
 smartzip extract archive.zip --encoding auto
 smartzip extract archive.zip --encoding gb18030
-smartzip extract suspicious.bin --scan-embedded
+smartzip extract suspicious.bin --deep --embedded ask
 smartzip extract archive.zip --force          # 忽略 known_files 去重跳过，强制重解
 ```
 
 去重：命中 `known_files`（`sample_hash + size`，`last_extract_at` 在时间窗内，默认 1 个月）时**跳过并显式提示**，`--force` 绕过。命中时同时复用 `confirmed_encoding`（人工确认过的）与 `password_id`。
 
-### 8.2 压缩 `compress`
-
-```bash
-smartzip compress file.txt
-smartzip compress dir1 dir2 --format 7z
-smartzip compress *.jpg --format zip --level fast
-```
-
-### 8.3 检测 `detect`
+### 8.3 检测 `detect`（已接线）
 
 ```bash
 smartzip detect file.bin            # 格式 + 猜测编码 + 内嵌计数 + 文件名是否加密（纯报告，非交互）
@@ -1036,24 +1038,32 @@ smartzip detect file.bin --deep
 
 detect 不列条目、不确认编码、不解压。写 `tasks` + `file_extractions`（status=`detected`/`unreadable`），**不写** `known_files`（它没让用户确认编码）。
 
-### 8.4 列条目 `list`（新，后续任务接线）
+### 8.4 列条目与编码预览（已接线，交互待完善）
 
 ```bash
 smartzip list archive.zip                     # 列出条目，用最佳猜测编码
 smartzip list archive.zip --encoding gb18030  # 乱码时指定编码重列
-smartzip list archive.zip --pick-encoding     # 候选编码预览表，选一个（半交互，非 TUI）
+smartzip enc archive.zip        # 查看不同编码下的名称
+smartzip list archive.zip --pick-encoding     # 当前只列编码名称，尚无对照选择流程
 ```
 
-list 要求“最终必须看到内容”：乱码→切编码重列、内嵌→定位、文件名加密→走求密码流程。用户选定的编码 = 人工确认 → 写 `known_files.confirmed_encoding`；求到密码 → 写 `known_files.password_id`。
+list 的目标是看到可读内容：乱码时切换编码，文件名加密时获取访问密码。当前显式 `--encoding` / pick 选择可走确认编码写库路径，交互回调的最终选择仍需统一来源。只有可靠确认有效的密码才应记入 known_files；当前实现误把某些 list 成功当作密码成功，已纳入本轮设计的首个修复切片。
 
-### 8.5 校验 `test`（新，后续任务接线）
+### 8.5 校验与压缩
 
 ```bash
-smartzip test archive.7z              # 全量校验，定位损坏
-smartzip test movie.part1.rar         # 分卷：定位缺失/损坏的具体卷
+smartzip test archive.7z
+smartzip t movie.part03.rar other.zip --json
+smartzip t archive.z02 --diagnostic-timeout 30
+smartzip t archive.zip --diagnose off --no-history
+smartzip compress file.txt           # 仍明确返回未实现错误
 ```
 
-test 全量校验（后端 `t`），status=`intact`/`corrupt`，坏卷列表写 `file_extractions.damaged_volumes_json`（报全部坏卷）。加密档试穿密码库+交互询问，试出的密码写 `known_files.password_id`。**test 独立于 extract**：extract 不含 test 步骤（全量扫描代价高）。
+test 已实现任意卷入口与同组去重，失败后默认追加只读诊断；分别报告确认坏卷、疑似组、缺失、不可读和未检查范围。RAR5 使用本卷 header/packed CRC；7z 用可信 header 的 stream/folder 依赖；ZIP 用目录/local header/descriptor、ZIP64 与磁盘号定位，候选包含未受校验保护的参考 CRC 元数据。受加密、缺卷、编码或格式能力限制时保留未知范围。
+
+详细证据契约和当前边界见 [分卷 test 设计](../.trellis/tasks/2026-07/07-03-test-command-backend-split/design.md)。所有 pass 共用 TaskEvent，复核经 executor 调度且尊重 `--backend`；`--diagnose off` 仅禁追加阶段。DB v4 保存完整 JSON 报告，旧 damaged_volumes_json 只投影确认坏卷；test 不写 last_extract_at，也不以首片 hash 代表整组。
+
+执行结果为 0=全部组完整，1=无组完整，2=部分组完整，130=取消。参数错误沿用 clap 的 2。JSON 不交互；缺密码与密码/损坏歧义分别报告，不记虚假密码成功。
 
 ### 8.6 历史 `history`（两模式 + 下钻）
 
@@ -1071,8 +1081,10 @@ smartzip history show <task_id>               # 某次操作的事件时间线 +
 smartzip password list
 smartzip password add 'password123'
 smartzip password import passwords.txt
-smartzip password cleanup --max 5000
+smartzip password cleanup --max-passwords 5000
 ```
+
+cleanup 默认仅预览，`--apply` 才执行。当前 `--db`、`--config`、`--backend`、`--verbose-routing` 必须放在子命令前；真正 global 参数是下一轮目标。
 
 ## 9. 错误处理设计
 

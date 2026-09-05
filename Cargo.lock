@@ -5747,7 +5747,10 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "crc32fast",
+ "flate2",
  "infer",
+ "libc",
+ "lzma-rust2",
  "process-wrap",
  "rstest",
  "serde",

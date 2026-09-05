@@ -1,0 +1,40 @@
+{
+  "id": "cli-interaction-design",
+  "name": "cli-interaction-design",
+  "title": "CLI 交互完善：密码、编码预览与结果反馈",
+  "description": "基于已落地的能力路由与文件级历史核对 CLI 现状，优先完善密码输入、验证与记忆、文件名编码选择以及批次交互。设计与实施切片已成稿，用户追加的 enc 与短别名已实现，S1–S6 仍待实施。",
+  "status": "in_progress",
+  "package": "smartzip-cli",
+  "priority": "P1",
+  "creator": "charl",
+  "assignee": "charl",
+  "createdAt": "2026-09-05",
+  "completedAt": null,
+  "branch": "feat/db-history-persistence",
+  "base_branch": "feat/db-history-persistence",
+  "parent": null,
+  "children": [],
+  "subtasks": [],
+  "relatedFiles": [
+    "crates/smartzip-cli/src/main.rs",
+    "crates/smartzip-engine/src/interactive.rs",
+    "crates/smartzip-engine/src/access.rs",
+    "crates/smartzip-engine/src/encoding_flow.rs",
+    "crates/smartzip-engine/src/password_order.rs",
+    "crates/smartzip-engine/src/extract_workflow.rs",
+    "crates/smartzip-passwords/src/lib.rs",
+    "docs/design.md",
+    "docs/implementation-progress.md"
+  ],
+  "notes": "2026-09-05 用户明确优先交互体验、密码与编码，并追加缩短 encoding-preview 与增加短别名。基线 de0ea48；S0 命名/别名已实现，密码与编码交互验收项仍待实现。当前 checkout 缺少 .trellis/scripts 与 spec，因此依照现有 task.json 结构手工维护，未重装或迁移 Trellis。",
+  "meta": {
+    "design_status": "draft",
+    "implemented_slices": ["S0"],
+    "baseline_commit": "de0ea48",
+    "related_tasks": [
+      "07-29-feat-routing-integration",
+      "2026-07/07-02-file-aware-cli-commands",
+      "2026-07/07-03-test-command-backend-split"
+    ]
+  }
+}

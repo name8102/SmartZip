@@ -1,0 +1,393 @@
+{
+  "date": "2026-09-05",
+  "sevenzip_version": "26.03",
+  "generated_7z_zip": [
+    {
+      "format": "7z",
+      "case": "good",
+      "exit": 0,
+      "diagnostics": [
+        "Volumes = 5",
+        "T payload/file1.bin",
+        "T payload/file2.bin",
+        "T payload/file3.bin",
+        "Everything is Ok"
+      ]
+    },
+    {
+      "format": "7z",
+      "case": "flip-middle",
+      "exit": 2,
+      "diagnostics": [
+        "Volumes = 5",
+        "T payload/file1.bin",
+        "T payload/file2.bin",
+        "T payload/file3.bin",
+        "Sub items Errors: 1",
+        "Archives with Errors: 1",
+        "Sub items Errors: 1",
+        "ERROR: CRC Failed : payload/file1.bin"
+      ]
+    },
+    {
+      "format": "7z",
+      "case": "flip-two-volumes",
+      "exit": 2,
+      "diagnostics": [
+        "Volumes = 5",
+        "T payload/file1.bin",
+        "T payload/file2.bin",
+        "T payload/file3.bin",
+        "Sub items Errors: 2",
+        "Archives with Errors: 1",
+        "Sub items Errors: 2",
+        "ERROR: CRC Failed : payload/file1.bin",
+        "ERROR: CRC Failed : payload/file3.bin"
+      ]
+    },
+    {
+      "format": "7z",
+      "case": "missing-middle",
+      "exit": 2,
+      "diagnostics": [
+        "ERROR: set.7z.001",
+        "Open ERROR: Cannot open the file as [7z] archive",
+        "ERRORS:",
+        "Unexpected end of archive"
+      ]
+    },
+    {
+      "format": "7z",
+      "case": "truncate-last",
+      "exit": 2,
+      "diagnostics": [
+        "ERROR: set.7z.001",
+        "Open ERROR: Cannot open the file as [7z] archive",
+        "ERRORS:",
+        "Unexpected end of archive"
+      ]
+    },
+    {
+      "format": "7z",
+      "case": "header-flip",
+      "exit": 2,
+      "diagnostics": [
+        "ERROR: set.7z.001",
+        "Open ERROR: Cannot open the file as [7z] archive"
+      ]
+    },
+    {
+      "format": "zip",
+      "case": "good",
+      "exit": 0,
+      "diagnostics": [
+        "Multivolume = +",
+        "Volume Index = 4",
+        "Volumes = 5",
+        "T tmp/smartzip-volume-probe-gk2dg7e1/payload/",
+        "T tmp/smartzip-volume-probe-gk2dg7e1/payload/file3.bin",
+        "T tmp/smartzip-volume-probe-gk2dg7e1/payload/file2.bin",
+        "T tmp/smartzip-volume-probe-gk2dg7e1/payload/file1.bin",
+        "Everything is Ok"
+      ]
+    },
+    {
+      "format": "zip",
+      "case": "flip-middle",
+      "exit": 2,
+      "diagnostics": [
+        "Multivolume = +",
+        "Volume Index = 4",
+        "Volumes = 5",
+        "T tmp/smartzip-volume-probe-gk2dg7e1/payload/",
+        "T tmp/smartzip-volume-probe-gk2dg7e1/payload/file3.bin",
+        "T tmp/smartzip-volume-probe-gk2dg7e1/payload/file2.bin",
+        "T tmp/smartzip-volume-probe-gk2dg7e1/payload/file1.bin",
+        "Sub items Errors: 1",
+        "Archives with Errors: 1",
+        "Sub items Errors: 1",
+        "ERROR: CRC Failed : tmp/smartzip-volume-probe-gk2dg7e1/payload/file3.bin"
+      ]
+    },
+    {
+      "format": "zip",
+      "case": "flip-two-volumes",
+      "exit": 2,
+      "diagnostics": [
+        "Multivolume = +",
+        "Volume Index = 4",
+        "Volumes = 5",
+        "T tmp/smartzip-volume-probe-gk2dg7e1/payload/",
+        "T tmp/smartzip-volume-probe-gk2dg7e1/payload/file3.bin",
+        "T tmp/smartzip-volume-probe-gk2dg7e1/payload/file2.bin",
+        "T tmp/smartzip-volume-probe-gk2dg7e1/payload/file1.bin",
+        "Sub items Errors: 2",
+        "Archives with Errors: 1",
+        "Sub items Errors: 2",
+        "ERROR: CRC Failed : tmp/smartzip-volume-probe-gk2dg7e1/payload/file3.bin",
+        "ERROR: CRC Failed : tmp/smartzip-volume-probe-gk2dg7e1/payload/file1.bin"
+      ]
+    },
+    {
+      "format": "zip",
+      "case": "missing-middle",
+      "exit": 2,
+      "diagnostics": [
+        "ERROR = Missing volume : set.z02",
+        "Multivolume = +",
+        "Volume Index = 4",
+        "Volumes = 5",
+        "T tmp/smartzip-volume-probe-gk2dg7e1/payload/",
+        "T tmp/smartzip-volume-probe-gk2dg7e1/payload/file3.bin",
+        "T tmp/smartzip-volume-probe-gk2dg7e1/payload/file2.bin",
+        "T tmp/smartzip-volume-probe-gk2dg7e1/payload/file1.bin",
+        "Sub items Errors: 2",
+        "Archives with Errors: 1",
+        "Open Errors: 1",
+        "Sub items Errors: 2",
+        "ERRORS:",
+        "Missing volume : set.z02",
+        "ERROR: Data Error : tmp/smartzip-volume-probe-gk2dg7e1/payload/file3.bin",
+        "ERROR: Unavailable data : tmp/smartzip-volume-probe-gk2dg7e1/payload/file2.bin"
+      ]
+    },
+    {
+      "format": "zip",
+      "case": "truncate-last",
+      "exit": 2,
+      "diagnostics": [
+        "ERROR: set.zip",
+        "Open ERROR: Cannot open the file as [zip] archive",
+        "ERRORS:"
+      ]
+    },
+    {
+      "format": "zip",
+      "case": "header-flip",
+      "exit": 2,
+      "diagnostics": [
+        "ERRORS:",
+        "Headers Error",
+        "Multivolume = +",
+        "Volume Index = 4",
+        "Volumes = 5",
+        "T tmp/smartzip-volume-probe-gk2dg7e1/payload/",
+        "T tmp/smartzip-volume-probe-gk2dg7e1/payload/file3.bin",
+        "T tmp/smartzip-volume-probe-gk2dg7e1/payload/file2.bin",
+        "T tmp/smartzip-volume-probe-gk2dg7e1/payload/file1.bin",
+        "Archives with Errors: 1",
+        "Open Errors: 1",
+        "ERRORS:",
+        "Headers Error"
+      ]
+    }
+  ],
+  "rar5": {
+    "source_commit": "ddf8247381814977c2f55a59f48d17460f7d00f0",
+    "volumes": [
+      {
+        "name": "test_read_format_rar5_multiarchive.part01.rar",
+        "size": 15360,
+        "sha256": "2f3894dc4b8a1bba90830ef1f89f457b0295b6f9030c70febd57283721bc2ce3"
+      },
+      {
+        "name": "test_read_format_rar5_multiarchive.part02.rar",
+        "size": 15360,
+        "sha256": "0a5b7a8923beb5747d67f708f17bdc4ebfc8cf2c3010523332e1a1633d7a4c72"
+      },
+      {
+        "name": "test_read_format_rar5_multiarchive.part03.rar",
+        "size": 15360,
+        "sha256": "31699cbed68297245347911910743c3cb0c6075d28336a7dd4864d4019b8208a"
+      },
+      {
+        "name": "test_read_format_rar5_multiarchive.part04.rar",
+        "size": 15360,
+        "sha256": "c2d0d72b7c4dd229a944986eee95f802e487e4570e41f7ca7e77b9e82ca4119c"
+      },
+      {
+        "name": "test_read_format_rar5_multiarchive.part05.rar",
+        "size": 15360,
+        "sha256": "cc69c161ec00e2deeec263fb24f704d1f0d90ccc6b2aeb3baed2539878b5240d"
+      },
+      {
+        "name": "test_read_format_rar5_multiarchive.part06.rar",
+        "size": 15360,
+        "sha256": "86b7efeacaf2443564220c683eec0880b999dbfe27ae1bc2645f0fffe4646d8c"
+      },
+      {
+        "name": "test_read_format_rar5_multiarchive.part07.rar",
+        "size": 15360,
+        "sha256": "0b2c9bc7b5679069f9cbe68a9e08351868a3309bf24a5534d8207cf14d41b8b7"
+      },
+      {
+        "name": "test_read_format_rar5_multiarchive.part08.rar",
+        "size": 9208,
+        "sha256": "b86fa56607d4ee98e0374f84040a0e11ab18bc726a8b772151a1feee9c7045a3"
+      }
+    ],
+    "results": [
+      {
+        "case": "good",
+        "backend": "unrar",
+        "exit": 0,
+        "diagnostics": [
+          "All OK"
+        ]
+      },
+      {
+        "case": "good",
+        "backend": "7z",
+        "exit": 0,
+        "diagnostics": [
+          "Characteristics = Volume Locator QuickOpen:15215",
+          "Multivolume = +",
+          "Volume Index = 0",
+          "Volumes = 8",
+          "Everything is Ok"
+        ]
+      },
+      {
+        "case": "flip-middle",
+        "backend": "unrar",
+        "exit": 3,
+        "diagnostics": [
+          "Total errors: 1",
+          "home/antek/temp/build/unrar5/libarchive/bin/bsdcat_test : packed data checksum error in volume test_read_format_rar5_multiarchive.part02.rar",
+          "home/antek/temp/build/unrar5/libarchive/bin/bsdcat_test - checksum error"
+        ]
+      },
+      {
+        "case": "flip-middle",
+        "backend": "7z",
+        "exit": 2,
+        "diagnostics": [
+          "Characteristics = Volume Locator QuickOpen:15215",
+          "Multivolume = +",
+          "Volume Index = 0",
+          "Volumes = 8",
+          "Sub items Errors: 1",
+          "Archives with Errors: 1",
+          "Sub items Errors: 1",
+          "ERROR: CRC Failed : home/antek/temp/build/unrar5/libarchive/bin/bsdcat_test"
+        ]
+      },
+      {
+        "case": "flip-two-volumes",
+        "backend": "unrar",
+        "exit": 3,
+        "diagnostics": [
+          "Total errors: 2",
+          "home/antek/temp/build/unrar5/libarchive/bin/bsdcat_test : packed data checksum error in volume test_read_format_rar5_multiarchive.part02.rar",
+          "home/antek/temp/build/unrar5/libarchive/bin/bsdcat_test - checksum error",
+          "home/antek/temp/build/unrar5/libarchive/bin/bsdtar_test : packed data checksum error in volume test_read_format_rar5_multiarchive.part06.rar",
+          "home/antek/temp/build/unrar5/libarchive/bin/bsdtar_test - checksum error"
+        ]
+      },
+      {
+        "case": "flip-two-volumes",
+        "backend": "7z",
+        "exit": 2,
+        "diagnostics": [
+          "Characteristics = Volume Locator QuickOpen:15215",
+          "Multivolume = +",
+          "Volume Index = 0",
+          "Volumes = 8",
+          "Sub items Errors: 2",
+          "Archives with Errors: 1",
+          "Sub items Errors: 2",
+          "ERROR: CRC Failed : home/antek/temp/build/unrar5/libarchive/bin/bsdcat_test",
+          "ERROR: CRC Failed : home/antek/temp/build/unrar5/libarchive/bin/bsdtar_test"
+        ]
+      },
+      {
+        "case": "missing-middle",
+        "backend": "unrar",
+        "exit": 6,
+        "diagnostics": [
+          "Total errors: 2",
+          "Cannot find volume test_read_format_rar5_multiarchive.part02.rar",
+          "home/antek/temp/build/unrar5/libarchive/bin/bsdcat_test - checksum error"
+        ]
+      },
+      {
+        "case": "missing-middle",
+        "backend": "7z",
+        "exit": 2,
+        "diagnostics": [
+          "ERROR = Missing volume : test_read_format_rar5_multiarchive.part02.rar",
+          "Characteristics = Volume Locator QuickOpen:15215",
+          "Multivolume = +",
+          "Volume Index = 0",
+          "Volumes = 1",
+          "Sub items Errors: 1",
+          "Archives with Errors: 1",
+          "Open Errors: 1",
+          "Sub items Errors: 1",
+          "ERRORS:",
+          "Missing volume : test_read_format_rar5_multiarchive.part02.rar",
+          "ERROR: Data Error : home/antek/temp/build/unrar5/libarchive/bin/bsdcat_test"
+        ]
+      },
+      {
+        "case": "truncate-last",
+        "backend": "unrar",
+        "exit": 1,
+        "diagnostics": [
+          "Total errors: 1",
+          "Unexpected end of archive"
+        ]
+      },
+      {
+        "case": "truncate-last",
+        "backend": "7z",
+        "exit": 2,
+        "diagnostics": [
+          "ERRORS:",
+          "Unexpected end of archive",
+          "Characteristics = Volume Locator QuickOpen:15215",
+          "Multivolume = +",
+          "Volume Index = 0",
+          "Volumes = 8",
+          "Archives with Errors: 1",
+          "Open Errors: 1",
+          "ERRORS:",
+          "Unexpected end of archive"
+        ]
+      },
+      {
+        "case": "header-flip",
+        "backend": "unrar",
+        "exit": 3,
+        "diagnostics": [
+          "Total errors: 12",
+          "Corrupt header is found",
+          "Corrupt header is found",
+          "Main archive header is corrupt",
+          "Corrupt header is found",
+          "Corrupt header is found",
+          "Corrupt header is found",
+          "Unexpected end of archive",
+          "home/antek/temp/build/unrar5/libarchive/bin/bsdcat_test - checksum error",
+          "Unexpected end of archive"
+        ]
+      },
+      {
+        "case": "header-flip",
+        "backend": "7z",
+        "exit": 2,
+        "diagnostics": [
+          "Characteristics = Volume Locator QuickOpen:15215",
+          "Multivolume = +",
+          "Volume Index = 0",
+          "Volumes = 1",
+          "Sub items Errors: 1",
+          "Archives with Errors: 1",
+          "Sub items Errors: 1",
+          "ERROR: Data Error : home/antek/temp/build/unrar5/libarchive/bin/bsdcat_test"
+        ]
+      }
+    ],
+    "unrar_version": "UNRAR 7.23 freeware      Copyright (c) 1993-2026 Alexander Roshal"
+  }
+}

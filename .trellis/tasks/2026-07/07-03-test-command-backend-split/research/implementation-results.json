@@ -1,0 +1,969 @@
+{
+  "seed": 20260905,
+  "libarchive_commit": "ddf8247381814977c2f55a59f48d17460f7d00f0",
+  "versions": {
+    "7z": [
+      "",
+      "7-Zip 26.03 (x64) : Copyright (c) 1999-2026 Igor Pavlov : 2026-09-03",
+      " 64-bit locale=C.UTF-8 Threads:14 OPEN_MAX:1048576, ASM",
+      "",
+      "",
+      "Libs:"
+    ],
+    "unrar": [
+      "",
+      "UNRAR 7.23 freeware      Copyright (c) 1993-2026 Alexander Roshal",
+      "",
+      "Usage:     unrar <command> -<switch 1> -<switch N> <archive> <files...>",
+      "               <@listfiles...> <path_to_extract/>",
+      ""
+    ],
+    "zip": [
+      "Copyright (c) 1990-2008 Info-ZIP - Type 'zip \"-L\"' for software license.",
+      "This is Zip 3.0 (July 5th 2008), by Info-ZIP.",
+      "Currently maintained by E. Gordon.  Please send bug reports to",
+      "the authors using the web page at www.info-zip.org; see README for details.",
+      "",
+      "Latest sources and executables are at ftp://ftp.info-zip.org/pub/infozip,"
+    ]
+  },
+  "baseline_hashes": {
+    "7z": {
+      "set.7z.002": "fae36209db719509894dc744540541c725096bdcd46028ba0ec160151554118a",
+      "set.7z.003": "1ddd8f450ede40ee77331f5922b612cbbac850f2f164d5c1a3252abf0aae6db2",
+      "set.7z.004": "533abfdbc5ad6594cfb30e854f3407d921168f2de9b75c6a977bec0b0a7c439c",
+      "set.7z.001": "20c5d66529986e3ee019a8edd19d29c64230e9789d025fa5063ffa502a28663a",
+      "set.7z.005": "1beb5db376c26ee151c12d4c039ea6a554ff718ca43403bccbf4fd3c9c985431"
+    },
+    "zip": {
+      "set.z01": "8838727ca5f11a8fde3ab621415de986ac6127ca95aead18c7c9dd35a53ce838",
+      "set.z02": "eef7dce22dcac05957c47b28cd731f82f79365bcd1fab1ea580afa028b85ea97",
+      "set.z04": "296d4f66456b9f63e1c8fe0ad771d138bb300c44eeed4a2384edecb2d315bd74",
+      "set.z03": "1a64c7d53fb9069fda3e748a9180ff133bbc76305990d17cd2b49def14c46418",
+      "set.zip": "8286912e91bd9ea65ea2eadbcf350ae7a123335033ba39792d989960ed530f24"
+    },
+    "rar": {
+      "set.part01.rar": "2f3894dc4b8a1bba90830ef1f89f457b0295b6f9030c70febd57283721bc2ce3",
+      "set.part02.rar": "0a5b7a8923beb5747d67f708f17bdc4ebfc8cf2c3010523332e1a1633d7a4c72",
+      "set.part03.rar": "31699cbed68297245347911910743c3cb0c6075d28336a7dd4864d4019b8208a",
+      "set.part04.rar": "c2d0d72b7c4dd229a944986eee95f802e487e4570e41f7ca7e77b9e82ca4119c",
+      "set.part05.rar": "cc69c161ec00e2deeec263fb24f704d1f0d90ccc6b2aeb3baed2539878b5240d",
+      "set.part06.rar": "86b7efeacaf2443564220c683eec0880b999dbfe27ae1bc2645f0fffe4646d8c",
+      "set.part07.rar": "0b2c9bc7b5679069f9cbe68a9e08351868a3309bf24a5534d8207cf14d41b8b7",
+      "set.part08.rar": "b86fa56607d4ee98e0374f84040a0e11ab18bc726a8b772151a1feee9c7045a3"
+    }
+  },
+  "cases": [
+    {
+      "format": "7z",
+      "case": "good",
+      "exit": 0,
+      "integrity": "intact",
+      "coverage": "complete",
+      "truth": [],
+      "confirmed": [],
+      "suspects": [],
+      "missing": [],
+      "stops": [],
+      "passes": [
+        [
+          "7z",
+          null
+        ]
+      ],
+      "source_hashes_before": {
+        "set.7z.002": "fae36209db719509894dc744540541c725096bdcd46028ba0ec160151554118a",
+        "set.7z.003": "1ddd8f450ede40ee77331f5922b612cbbac850f2f164d5c1a3252abf0aae6db2",
+        "set.7z.004": "533abfdbc5ad6594cfb30e854f3407d921168f2de9b75c6a977bec0b0a7c439c",
+        "set.7z.001": "20c5d66529986e3ee019a8edd19d29c64230e9789d025fa5063ffa502a28663a",
+        "set.7z.005": "1beb5db376c26ee151c12d4c039ea6a554ff718ca43403bccbf4fd3c9c985431"
+      },
+      "source_hashes_after": {
+        "set.7z.002": "fae36209db719509894dc744540541c725096bdcd46028ba0ec160151554118a",
+        "set.7z.003": "1ddd8f450ede40ee77331f5922b612cbbac850f2f164d5c1a3252abf0aae6db2",
+        "set.7z.004": "533abfdbc5ad6594cfb30e854f3407d921168f2de9b75c6a977bec0b0a7c439c",
+        "set.7z.001": "20c5d66529986e3ee019a8edd19d29c64230e9789d025fa5063ffa502a28663a",
+        "set.7z.005": "1beb5db376c26ee151c12d4c039ea6a554ff718ca43403bccbf4fd3c9c985431"
+      },
+      "read_only_verified": true,
+      "mutation_offset": null,
+      "truncated_bytes": null
+    },
+    {
+      "format": "7z",
+      "case": "flip-middle",
+      "exit": 1,
+      "integrity": "corrupt",
+      "coverage": "partial",
+      "truth": [
+        "set.7z.002"
+      ],
+      "confirmed": [],
+      "suspects": [
+        [
+          "set.7z.001",
+          "set.7z.002",
+          "set.7z.003",
+          "set.7z.004",
+          "set.7z.005"
+        ]
+      ],
+      "missing": [],
+      "stops": [
+        "no additional backend diagnostic result (unavailable, forced backend, or budget)"
+      ],
+      "passes": [
+        [
+          "7z",
+          "corruption"
+        ]
+      ],
+      "source_hashes_before": {
+        "set.7z.002": "6384bf124b971a300261754aeb898c1e7c89f09f99d990cc9e12393f3498a1e8",
+        "set.7z.003": "1ddd8f450ede40ee77331f5922b612cbbac850f2f164d5c1a3252abf0aae6db2",
+        "set.7z.004": "533abfdbc5ad6594cfb30e854f3407d921168f2de9b75c6a977bec0b0a7c439c",
+        "set.7z.001": "20c5d66529986e3ee019a8edd19d29c64230e9789d025fa5063ffa502a28663a",
+        "set.7z.005": "1beb5db376c26ee151c12d4c039ea6a554ff718ca43403bccbf4fd3c9c985431"
+      },
+      "source_hashes_after": {
+        "set.7z.002": "6384bf124b971a300261754aeb898c1e7c89f09f99d990cc9e12393f3498a1e8",
+        "set.7z.003": "1ddd8f450ede40ee77331f5922b612cbbac850f2f164d5c1a3252abf0aae6db2",
+        "set.7z.004": "533abfdbc5ad6594cfb30e854f3407d921168f2de9b75c6a977bec0b0a7c439c",
+        "set.7z.001": "20c5d66529986e3ee019a8edd19d29c64230e9789d025fa5063ffa502a28663a",
+        "set.7z.005": "1beb5db376c26ee151c12d4c039ea6a554ff718ca43403bccbf4fd3c9c985431"
+      },
+      "read_only_verified": true,
+      "mutation_offset": 6000,
+      "truncated_bytes": null
+    },
+    {
+      "format": "7z",
+      "case": "flip-two",
+      "exit": 1,
+      "integrity": "corrupt",
+      "coverage": "partial",
+      "truth": [
+        "set.7z.002",
+        "set.7z.004"
+      ],
+      "confirmed": [],
+      "suspects": [
+        [
+          "set.7z.001",
+          "set.7z.002",
+          "set.7z.003",
+          "set.7z.004",
+          "set.7z.005"
+        ]
+      ],
+      "missing": [],
+      "stops": [
+        "no additional backend diagnostic result (unavailable, forced backend, or budget)"
+      ],
+      "passes": [
+        [
+          "7z",
+          "corruption"
+        ]
+      ],
+      "source_hashes_before": {
+        "set.7z.002": "6384bf124b971a300261754aeb898c1e7c89f09f99d990cc9e12393f3498a1e8",
+        "set.7z.003": "1ddd8f450ede40ee77331f5922b612cbbac850f2f164d5c1a3252abf0aae6db2",
+        "set.7z.004": "3bcbb7cfcea13844d13471883d23faa26eefec55f828e6d1a47462d8e82afcb0",
+        "set.7z.001": "20c5d66529986e3ee019a8edd19d29c64230e9789d025fa5063ffa502a28663a",
+        "set.7z.005": "1beb5db376c26ee151c12d4c039ea6a554ff718ca43403bccbf4fd3c9c985431"
+      },
+      "source_hashes_after": {
+        "set.7z.002": "6384bf124b971a300261754aeb898c1e7c89f09f99d990cc9e12393f3498a1e8",
+        "set.7z.003": "1ddd8f450ede40ee77331f5922b612cbbac850f2f164d5c1a3252abf0aae6db2",
+        "set.7z.004": "3bcbb7cfcea13844d13471883d23faa26eefec55f828e6d1a47462d8e82afcb0",
+        "set.7z.001": "20c5d66529986e3ee019a8edd19d29c64230e9789d025fa5063ffa502a28663a",
+        "set.7z.005": "1beb5db376c26ee151c12d4c039ea6a554ff718ca43403bccbf4fd3c9c985431"
+      },
+      "read_only_verified": true,
+      "mutation_offset": 6000,
+      "truncated_bytes": null
+    },
+    {
+      "format": "7z",
+      "case": "missing-middle",
+      "exit": 1,
+      "integrity": "incomplete",
+      "coverage": "partial",
+      "truth": [],
+      "confirmed": [],
+      "suspects": [],
+      "missing": [
+        "set.7z.002"
+      ],
+      "stops": [
+        "volume sequence is incomplete or ambiguous",
+        "no additional backend diagnostic result (unavailable, forced backend, or budget)"
+      ],
+      "passes": [
+        [
+          "7z",
+          "corruption"
+        ]
+      ],
+      "source_hashes_before": {
+        "set.7z.003": "1ddd8f450ede40ee77331f5922b612cbbac850f2f164d5c1a3252abf0aae6db2",
+        "set.7z.004": "533abfdbc5ad6594cfb30e854f3407d921168f2de9b75c6a977bec0b0a7c439c",
+        "set.7z.001": "20c5d66529986e3ee019a8edd19d29c64230e9789d025fa5063ffa502a28663a",
+        "set.7z.005": "1beb5db376c26ee151c12d4c039ea6a554ff718ca43403bccbf4fd3c9c985431"
+      },
+      "source_hashes_after": {
+        "set.7z.003": "1ddd8f450ede40ee77331f5922b612cbbac850f2f164d5c1a3252abf0aae6db2",
+        "set.7z.004": "533abfdbc5ad6594cfb30e854f3407d921168f2de9b75c6a977bec0b0a7c439c",
+        "set.7z.001": "20c5d66529986e3ee019a8edd19d29c64230e9789d025fa5063ffa502a28663a",
+        "set.7z.005": "1beb5db376c26ee151c12d4c039ea6a554ff718ca43403bccbf4fd3c9c985431"
+      },
+      "read_only_verified": true,
+      "mutation_offset": null,
+      "truncated_bytes": null
+    },
+    {
+      "format": "7z",
+      "case": "truncate-last",
+      "exit": 1,
+      "integrity": "corrupt",
+      "coverage": "partial",
+      "truth": [
+        "set.7z.005"
+      ],
+      "confirmed": [],
+      "suspects": [
+        [
+          "set.7z.001",
+          "set.7z.002",
+          "set.7z.003",
+          "set.7z.004",
+          "set.7z.005"
+        ]
+      ],
+      "missing": [],
+      "stops": [
+        "original byte-split boundaries are not known after truncation",
+        "no additional backend diagnostic result (unavailable, forced backend, or budget)"
+      ],
+      "passes": [
+        [
+          "7z",
+          "corruption"
+        ]
+      ],
+      "source_hashes_before": {
+        "set.7z.002": "fae36209db719509894dc744540541c725096bdcd46028ba0ec160151554118a",
+        "set.7z.003": "1ddd8f450ede40ee77331f5922b612cbbac850f2f164d5c1a3252abf0aae6db2",
+        "set.7z.004": "533abfdbc5ad6594cfb30e854f3407d921168f2de9b75c6a977bec0b0a7c439c",
+        "set.7z.001": "20c5d66529986e3ee019a8edd19d29c64230e9789d025fa5063ffa502a28663a",
+        "set.7z.005": "ead348499866dc389af2e8b0d13756b9770b027b0283bbe036e87ac81bcc15f8"
+      },
+      "source_hashes_after": {
+        "set.7z.002": "fae36209db719509894dc744540541c725096bdcd46028ba0ec160151554118a",
+        "set.7z.003": "1ddd8f450ede40ee77331f5922b612cbbac850f2f164d5c1a3252abf0aae6db2",
+        "set.7z.004": "533abfdbc5ad6594cfb30e854f3407d921168f2de9b75c6a977bec0b0a7c439c",
+        "set.7z.001": "20c5d66529986e3ee019a8edd19d29c64230e9789d025fa5063ffa502a28663a",
+        "set.7z.005": "ead348499866dc389af2e8b0d13756b9770b027b0283bbe036e87ac81bcc15f8"
+      },
+      "read_only_verified": true,
+      "mutation_offset": null,
+      "truncated_bytes": 80
+    },
+    {
+      "format": "7z",
+      "case": "header-flip",
+      "exit": 1,
+      "integrity": "corrupt",
+      "coverage": "partial",
+      "truth": [
+        "set.7z.001"
+      ],
+      "confirmed": [
+        "set.7z.001"
+      ],
+      "suspects": [],
+      "missing": [],
+      "stops": [
+        "no additional backend diagnostic result (unavailable, forced backend, or budget)"
+      ],
+      "passes": [
+        [
+          "7z",
+          "unknown"
+        ]
+      ],
+      "source_hashes_before": {
+        "set.7z.002": "fae36209db719509894dc744540541c725096bdcd46028ba0ec160151554118a",
+        "set.7z.003": "1ddd8f450ede40ee77331f5922b612cbbac850f2f164d5c1a3252abf0aae6db2",
+        "set.7z.004": "533abfdbc5ad6594cfb30e854f3407d921168f2de9b75c6a977bec0b0a7c439c",
+        "set.7z.001": "a6117bdb602bb3966bb0260a6cec11684c26626351979afcfb3d364b65183290",
+        "set.7z.005": "1beb5db376c26ee151c12d4c039ea6a554ff718ca43403bccbf4fd3c9c985431"
+      },
+      "source_hashes_after": {
+        "set.7z.002": "fae36209db719509894dc744540541c725096bdcd46028ba0ec160151554118a",
+        "set.7z.003": "1ddd8f450ede40ee77331f5922b612cbbac850f2f164d5c1a3252abf0aae6db2",
+        "set.7z.004": "533abfdbc5ad6594cfb30e854f3407d921168f2de9b75c6a977bec0b0a7c439c",
+        "set.7z.001": "a6117bdb602bb3966bb0260a6cec11684c26626351979afcfb3d364b65183290",
+        "set.7z.005": "1beb5db376c26ee151c12d4c039ea6a554ff718ca43403bccbf4fd3c9c985431"
+      },
+      "read_only_verified": true,
+      "mutation_offset": 12,
+      "truncated_bytes": null
+    },
+    {
+      "format": "zip",
+      "case": "good",
+      "exit": 0,
+      "integrity": "intact",
+      "coverage": "complete",
+      "truth": [],
+      "confirmed": [],
+      "suspects": [],
+      "missing": [],
+      "stops": [],
+      "passes": [
+        [
+          "7z",
+          null
+        ]
+      ],
+      "source_hashes_before": {
+        "set.z01": "8838727ca5f11a8fde3ab621415de986ac6127ca95aead18c7c9dd35a53ce838",
+        "set.z02": "eef7dce22dcac05957c47b28cd731f82f79365bcd1fab1ea580afa028b85ea97",
+        "set.z04": "296d4f66456b9f63e1c8fe0ad771d138bb300c44eeed4a2384edecb2d315bd74",
+        "set.z03": "1a64c7d53fb9069fda3e748a9180ff133bbc76305990d17cd2b49def14c46418",
+        "set.zip": "8286912e91bd9ea65ea2eadbcf350ae7a123335033ba39792d989960ed530f24"
+      },
+      "source_hashes_after": {
+        "set.z01": "8838727ca5f11a8fde3ab621415de986ac6127ca95aead18c7c9dd35a53ce838",
+        "set.z02": "eef7dce22dcac05957c47b28cd731f82f79365bcd1fab1ea580afa028b85ea97",
+        "set.z04": "296d4f66456b9f63e1c8fe0ad771d138bb300c44eeed4a2384edecb2d315bd74",
+        "set.z03": "1a64c7d53fb9069fda3e748a9180ff133bbc76305990d17cd2b49def14c46418",
+        "set.zip": "8286912e91bd9ea65ea2eadbcf350ae7a123335033ba39792d989960ed530f24"
+      },
+      "read_only_verified": true,
+      "mutation_offset": null,
+      "truncated_bytes": null
+    },
+    {
+      "format": "zip",
+      "case": "flip-middle",
+      "exit": 1,
+      "integrity": "corrupt",
+      "coverage": "partial",
+      "truth": [
+        "set.z02"
+      ],
+      "confirmed": [],
+      "suspects": [
+        [
+          "set.z01",
+          "set.z02",
+          "set.zip"
+        ]
+      ],
+      "missing": [],
+      "stops": [
+        "no additional backend diagnostic result (unavailable, forced backend, or budget)"
+      ],
+      "passes": [
+        [
+          "7z",
+          "corruption"
+        ]
+      ],
+      "source_hashes_before": {
+        "set.z01": "8838727ca5f11a8fde3ab621415de986ac6127ca95aead18c7c9dd35a53ce838",
+        "set.z02": "d53fc0be1a59d128e829674b6dafadca1961c93802357255e2fde1cb379c0f45",
+        "set.z04": "296d4f66456b9f63e1c8fe0ad771d138bb300c44eeed4a2384edecb2d315bd74",
+        "set.z03": "1a64c7d53fb9069fda3e748a9180ff133bbc76305990d17cd2b49def14c46418",
+        "set.zip": "8286912e91bd9ea65ea2eadbcf350ae7a123335033ba39792d989960ed530f24"
+      },
+      "source_hashes_after": {
+        "set.z01": "8838727ca5f11a8fde3ab621415de986ac6127ca95aead18c7c9dd35a53ce838",
+        "set.z02": "d53fc0be1a59d128e829674b6dafadca1961c93802357255e2fde1cb379c0f45",
+        "set.z04": "296d4f66456b9f63e1c8fe0ad771d138bb300c44eeed4a2384edecb2d315bd74",
+        "set.z03": "1a64c7d53fb9069fda3e748a9180ff133bbc76305990d17cd2b49def14c46418",
+        "set.zip": "8286912e91bd9ea65ea2eadbcf350ae7a123335033ba39792d989960ed530f24"
+      },
+      "read_only_verified": true,
+      "mutation_offset": 6000,
+      "truncated_bytes": null
+    },
+    {
+      "format": "zip",
+      "case": "flip-two",
+      "exit": 1,
+      "integrity": "corrupt",
+      "coverage": "partial",
+      "truth": [
+        "set.z02",
+        "set.z04"
+      ],
+      "confirmed": [],
+      "suspects": [
+        [
+          "set.z01",
+          "set.z02",
+          "set.zip"
+        ],
+        [
+          "set.z03",
+          "set.z04",
+          "set.zip"
+        ]
+      ],
+      "missing": [],
+      "stops": [
+        "no additional backend diagnostic result (unavailable, forced backend, or budget)"
+      ],
+      "passes": [
+        [
+          "7z",
+          "corruption"
+        ]
+      ],
+      "source_hashes_before": {
+        "set.z01": "8838727ca5f11a8fde3ab621415de986ac6127ca95aead18c7c9dd35a53ce838",
+        "set.z02": "d53fc0be1a59d128e829674b6dafadca1961c93802357255e2fde1cb379c0f45",
+        "set.z04": "a4ab10639099f2e19d8ecf527574b277b544efc9df3616f414c3d2803ac39a79",
+        "set.z03": "1a64c7d53fb9069fda3e748a9180ff133bbc76305990d17cd2b49def14c46418",
+        "set.zip": "8286912e91bd9ea65ea2eadbcf350ae7a123335033ba39792d989960ed530f24"
+      },
+      "source_hashes_after": {
+        "set.z01": "8838727ca5f11a8fde3ab621415de986ac6127ca95aead18c7c9dd35a53ce838",
+        "set.z02": "d53fc0be1a59d128e829674b6dafadca1961c93802357255e2fde1cb379c0f45",
+        "set.z04": "a4ab10639099f2e19d8ecf527574b277b544efc9df3616f414c3d2803ac39a79",
+        "set.z03": "1a64c7d53fb9069fda3e748a9180ff133bbc76305990d17cd2b49def14c46418",
+        "set.zip": "8286912e91bd9ea65ea2eadbcf350ae7a123335033ba39792d989960ed530f24"
+      },
+      "read_only_verified": true,
+      "mutation_offset": 6000,
+      "truncated_bytes": null
+    },
+    {
+      "format": "zip",
+      "case": "missing-middle",
+      "exit": 1,
+      "integrity": "incomplete",
+      "coverage": "partial",
+      "truth": [],
+      "confirmed": [],
+      "suspects": [],
+      "missing": [
+        "set.z02"
+      ],
+      "stops": [
+        "home/charl/Documents/Project/SmartZip/.work/test-implementation/source/file1.bin: ZIP range depends on a missing disk",
+        "home/charl/Documents/Project/SmartZip/.work/test-implementation/source/file2.bin: ZIP range depends on a missing disk",
+        "no additional backend diagnostic result (unavailable, forced backend, or budget)"
+      ],
+      "passes": [
+        [
+          "7z",
+          "missing_volume"
+        ]
+      ],
+      "source_hashes_before": {
+        "set.z01": "8838727ca5f11a8fde3ab621415de986ac6127ca95aead18c7c9dd35a53ce838",
+        "set.z04": "296d4f66456b9f63e1c8fe0ad771d138bb300c44eeed4a2384edecb2d315bd74",
+        "set.z03": "1a64c7d53fb9069fda3e748a9180ff133bbc76305990d17cd2b49def14c46418",
+        "set.zip": "8286912e91bd9ea65ea2eadbcf350ae7a123335033ba39792d989960ed530f24"
+      },
+      "source_hashes_after": {
+        "set.z01": "8838727ca5f11a8fde3ab621415de986ac6127ca95aead18c7c9dd35a53ce838",
+        "set.z04": "296d4f66456b9f63e1c8fe0ad771d138bb300c44eeed4a2384edecb2d315bd74",
+        "set.z03": "1a64c7d53fb9069fda3e748a9180ff133bbc76305990d17cd2b49def14c46418",
+        "set.zip": "8286912e91bd9ea65ea2eadbcf350ae7a123335033ba39792d989960ed530f24"
+      },
+      "read_only_verified": true,
+      "mutation_offset": null,
+      "truncated_bytes": null
+    },
+    {
+      "format": "zip",
+      "case": "truncate-last",
+      "exit": 1,
+      "integrity": "unknown",
+      "coverage": "partial",
+      "truth": [
+        "set.zip"
+      ],
+      "confirmed": [],
+      "suspects": [
+        [
+          "set.z01",
+          "set.z02",
+          "set.z03",
+          "set.z04",
+          "set.zip"
+        ]
+      ],
+      "missing": [],
+      "stops": [
+        "ZIP end directory is missing/truncated; physical localization unavailable",
+        "no additional backend diagnostic result (unavailable, forced backend, or budget)"
+      ],
+      "passes": [
+        [
+          "7z",
+          "unknown"
+        ]
+      ],
+      "source_hashes_before": {
+        "set.z01": "8838727ca5f11a8fde3ab621415de986ac6127ca95aead18c7c9dd35a53ce838",
+        "set.z02": "eef7dce22dcac05957c47b28cd731f82f79365bcd1fab1ea580afa028b85ea97",
+        "set.z04": "296d4f66456b9f63e1c8fe0ad771d138bb300c44eeed4a2384edecb2d315bd74",
+        "set.z03": "1a64c7d53fb9069fda3e748a9180ff133bbc76305990d17cd2b49def14c46418",
+        "set.zip": "88c5261a0d38ade8a73fa1636bd434d531a8d7e0f1743c115d15a8f71abc6f23"
+      },
+      "source_hashes_after": {
+        "set.z01": "8838727ca5f11a8fde3ab621415de986ac6127ca95aead18c7c9dd35a53ce838",
+        "set.z02": "eef7dce22dcac05957c47b28cd731f82f79365bcd1fab1ea580afa028b85ea97",
+        "set.z04": "296d4f66456b9f63e1c8fe0ad771d138bb300c44eeed4a2384edecb2d315bd74",
+        "set.z03": "1a64c7d53fb9069fda3e748a9180ff133bbc76305990d17cd2b49def14c46418",
+        "set.zip": "88c5261a0d38ade8a73fa1636bd434d531a8d7e0f1743c115d15a8f71abc6f23"
+      },
+      "read_only_verified": true,
+      "mutation_offset": null,
+      "truncated_bytes": 80
+    },
+    {
+      "format": "zip",
+      "case": "header-flip",
+      "exit": 1,
+      "integrity": "unknown",
+      "coverage": "partial",
+      "truth": [
+        "set.z01"
+      ],
+      "confirmed": [],
+      "suspects": [
+        [
+          "set.z01",
+          "set.z02",
+          "set.z03",
+          "set.z04",
+          "set.zip"
+        ]
+      ],
+      "missing": [],
+      "stops": [
+        "home/charl/Documents/Project/SmartZip/.work/test-implementation/source/file1.bin: ZIP local header and directory disagree; candidate offsets are untrusted",
+        "additional diagnostic backend: backend sevenzip:/usr/bin/7z does not support codec None for /home/charl/Documents/Project/SmartZip/.work/test-implementation/zip-header-flip/set.zip"
+      ],
+      "passes": [
+        [
+          "",
+          "unknown"
+        ]
+      ],
+      "source_hashes_before": {
+        "set.z01": "4c2ec192bcdc3644538582c9bff059294622a4fa446125c631e7607a33ef3661",
+        "set.z02": "eef7dce22dcac05957c47b28cd731f82f79365bcd1fab1ea580afa028b85ea97",
+        "set.z04": "296d4f66456b9f63e1c8fe0ad771d138bb300c44eeed4a2384edecb2d315bd74",
+        "set.z03": "1a64c7d53fb9069fda3e748a9180ff133bbc76305990d17cd2b49def14c46418",
+        "set.zip": "8286912e91bd9ea65ea2eadbcf350ae7a123335033ba39792d989960ed530f24"
+      },
+      "source_hashes_after": {
+        "set.z01": "4c2ec192bcdc3644538582c9bff059294622a4fa446125c631e7607a33ef3661",
+        "set.z02": "eef7dce22dcac05957c47b28cd731f82f79365bcd1fab1ea580afa028b85ea97",
+        "set.z04": "296d4f66456b9f63e1c8fe0ad771d138bb300c44eeed4a2384edecb2d315bd74",
+        "set.z03": "1a64c7d53fb9069fda3e748a9180ff133bbc76305990d17cd2b49def14c46418",
+        "set.zip": "8286912e91bd9ea65ea2eadbcf350ae7a123335033ba39792d989960ed530f24"
+      },
+      "read_only_verified": true,
+      "mutation_offset": 12,
+      "truncated_bytes": null
+    },
+    {
+      "format": "rar",
+      "case": "good",
+      "exit": 0,
+      "integrity": "intact",
+      "coverage": "complete",
+      "truth": [],
+      "confirmed": [],
+      "suspects": [],
+      "missing": [],
+      "stops": [],
+      "passes": [
+        [
+          "unrar",
+          null
+        ]
+      ],
+      "source_hashes_before": {
+        "set.part01.rar": "2f3894dc4b8a1bba90830ef1f89f457b0295b6f9030c70febd57283721bc2ce3",
+        "set.part02.rar": "0a5b7a8923beb5747d67f708f17bdc4ebfc8cf2c3010523332e1a1633d7a4c72",
+        "set.part03.rar": "31699cbed68297245347911910743c3cb0c6075d28336a7dd4864d4019b8208a",
+        "set.part04.rar": "c2d0d72b7c4dd229a944986eee95f802e487e4570e41f7ca7e77b9e82ca4119c",
+        "set.part05.rar": "cc69c161ec00e2deeec263fb24f704d1f0d90ccc6b2aeb3baed2539878b5240d",
+        "set.part06.rar": "86b7efeacaf2443564220c683eec0880b999dbfe27ae1bc2645f0fffe4646d8c",
+        "set.part07.rar": "0b2c9bc7b5679069f9cbe68a9e08351868a3309bf24a5534d8207cf14d41b8b7",
+        "set.part08.rar": "b86fa56607d4ee98e0374f84040a0e11ab18bc726a8b772151a1feee9c7045a3"
+      },
+      "source_hashes_after": {
+        "set.part01.rar": "2f3894dc4b8a1bba90830ef1f89f457b0295b6f9030c70febd57283721bc2ce3",
+        "set.part02.rar": "0a5b7a8923beb5747d67f708f17bdc4ebfc8cf2c3010523332e1a1633d7a4c72",
+        "set.part03.rar": "31699cbed68297245347911910743c3cb0c6075d28336a7dd4864d4019b8208a",
+        "set.part04.rar": "c2d0d72b7c4dd229a944986eee95f802e487e4570e41f7ca7e77b9e82ca4119c",
+        "set.part05.rar": "cc69c161ec00e2deeec263fb24f704d1f0d90ccc6b2aeb3baed2539878b5240d",
+        "set.part06.rar": "86b7efeacaf2443564220c683eec0880b999dbfe27ae1bc2645f0fffe4646d8c",
+        "set.part07.rar": "0b2c9bc7b5679069f9cbe68a9e08351868a3309bf24a5534d8207cf14d41b8b7",
+        "set.part08.rar": "b86fa56607d4ee98e0374f84040a0e11ab18bc726a8b772151a1feee9c7045a3"
+      },
+      "read_only_verified": true,
+      "mutation_offset": null,
+      "truncated_bytes": null
+    },
+    {
+      "format": "rar",
+      "case": "flip-middle",
+      "exit": 1,
+      "integrity": "corrupt",
+      "coverage": "partial",
+      "truth": [
+        "set.part02.rar"
+      ],
+      "confirmed": [
+        "set.part02.rar"
+      ],
+      "suspects": [],
+      "missing": [],
+      "stops": [],
+      "passes": [
+        [
+          "unrar",
+          "corruption"
+        ],
+        [
+          "7z",
+          "corruption"
+        ]
+      ],
+      "source_hashes_before": {
+        "set.part01.rar": "2f3894dc4b8a1bba90830ef1f89f457b0295b6f9030c70febd57283721bc2ce3",
+        "set.part02.rar": "ae918a571572564a04b7d6b37258d75c78b9235da18d0fcb8997336880474eec",
+        "set.part03.rar": "31699cbed68297245347911910743c3cb0c6075d28336a7dd4864d4019b8208a",
+        "set.part04.rar": "c2d0d72b7c4dd229a944986eee95f802e487e4570e41f7ca7e77b9e82ca4119c",
+        "set.part05.rar": "cc69c161ec00e2deeec263fb24f704d1f0d90ccc6b2aeb3baed2539878b5240d",
+        "set.part06.rar": "86b7efeacaf2443564220c683eec0880b999dbfe27ae1bc2645f0fffe4646d8c",
+        "set.part07.rar": "0b2c9bc7b5679069f9cbe68a9e08351868a3309bf24a5534d8207cf14d41b8b7",
+        "set.part08.rar": "b86fa56607d4ee98e0374f84040a0e11ab18bc726a8b772151a1feee9c7045a3"
+      },
+      "source_hashes_after": {
+        "set.part01.rar": "2f3894dc4b8a1bba90830ef1f89f457b0295b6f9030c70febd57283721bc2ce3",
+        "set.part02.rar": "ae918a571572564a04b7d6b37258d75c78b9235da18d0fcb8997336880474eec",
+        "set.part03.rar": "31699cbed68297245347911910743c3cb0c6075d28336a7dd4864d4019b8208a",
+        "set.part04.rar": "c2d0d72b7c4dd229a944986eee95f802e487e4570e41f7ca7e77b9e82ca4119c",
+        "set.part05.rar": "cc69c161ec00e2deeec263fb24f704d1f0d90ccc6b2aeb3baed2539878b5240d",
+        "set.part06.rar": "86b7efeacaf2443564220c683eec0880b999dbfe27ae1bc2645f0fffe4646d8c",
+        "set.part07.rar": "0b2c9bc7b5679069f9cbe68a9e08351868a3309bf24a5534d8207cf14d41b8b7",
+        "set.part08.rar": "b86fa56607d4ee98e0374f84040a0e11ab18bc726a8b772151a1feee9c7045a3"
+      },
+      "read_only_verified": true,
+      "mutation_offset": 500,
+      "truncated_bytes": null
+    },
+    {
+      "format": "rar",
+      "case": "flip-two",
+      "exit": 1,
+      "integrity": "corrupt",
+      "coverage": "partial",
+      "truth": [
+        "set.part02.rar",
+        "set.part07.rar"
+      ],
+      "confirmed": [
+        "set.part02.rar",
+        "set.part07.rar"
+      ],
+      "suspects": [],
+      "missing": [],
+      "stops": [],
+      "passes": [
+        [
+          "unrar",
+          "corruption"
+        ],
+        [
+          "7z",
+          "corruption"
+        ]
+      ],
+      "source_hashes_before": {
+        "set.part01.rar": "2f3894dc4b8a1bba90830ef1f89f457b0295b6f9030c70febd57283721bc2ce3",
+        "set.part02.rar": "ae918a571572564a04b7d6b37258d75c78b9235da18d0fcb8997336880474eec",
+        "set.part03.rar": "31699cbed68297245347911910743c3cb0c6075d28336a7dd4864d4019b8208a",
+        "set.part04.rar": "c2d0d72b7c4dd229a944986eee95f802e487e4570e41f7ca7e77b9e82ca4119c",
+        "set.part05.rar": "cc69c161ec00e2deeec263fb24f704d1f0d90ccc6b2aeb3baed2539878b5240d",
+        "set.part06.rar": "86b7efeacaf2443564220c683eec0880b999dbfe27ae1bc2645f0fffe4646d8c",
+        "set.part07.rar": "45df31d747f442d13697aac1aaedf39771a52d32d79e65f2e86e8d0254bef3d2",
+        "set.part08.rar": "b86fa56607d4ee98e0374f84040a0e11ab18bc726a8b772151a1feee9c7045a3"
+      },
+      "source_hashes_after": {
+        "set.part01.rar": "2f3894dc4b8a1bba90830ef1f89f457b0295b6f9030c70febd57283721bc2ce3",
+        "set.part02.rar": "ae918a571572564a04b7d6b37258d75c78b9235da18d0fcb8997336880474eec",
+        "set.part03.rar": "31699cbed68297245347911910743c3cb0c6075d28336a7dd4864d4019b8208a",
+        "set.part04.rar": "c2d0d72b7c4dd229a944986eee95f802e487e4570e41f7ca7e77b9e82ca4119c",
+        "set.part05.rar": "cc69c161ec00e2deeec263fb24f704d1f0d90ccc6b2aeb3baed2539878b5240d",
+        "set.part06.rar": "86b7efeacaf2443564220c683eec0880b999dbfe27ae1bc2645f0fffe4646d8c",
+        "set.part07.rar": "45df31d747f442d13697aac1aaedf39771a52d32d79e65f2e86e8d0254bef3d2",
+        "set.part08.rar": "b86fa56607d4ee98e0374f84040a0e11ab18bc726a8b772151a1feee9c7045a3"
+      },
+      "read_only_verified": true,
+      "mutation_offset": 500,
+      "truncated_bytes": null
+    },
+    {
+      "format": "rar",
+      "case": "missing-middle",
+      "exit": 1,
+      "integrity": "incomplete",
+      "coverage": "partial",
+      "truth": [],
+      "confirmed": [],
+      "suspects": [],
+      "missing": [
+        "set.part02.rar"
+      ],
+      "stops": [],
+      "passes": [
+        [
+          "unrar",
+          "missing_volume"
+        ],
+        [
+          "7z",
+          "missing_volume"
+        ]
+      ],
+      "source_hashes_before": {
+        "set.part01.rar": "2f3894dc4b8a1bba90830ef1f89f457b0295b6f9030c70febd57283721bc2ce3",
+        "set.part03.rar": "31699cbed68297245347911910743c3cb0c6075d28336a7dd4864d4019b8208a",
+        "set.part04.rar": "c2d0d72b7c4dd229a944986eee95f802e487e4570e41f7ca7e77b9e82ca4119c",
+        "set.part05.rar": "cc69c161ec00e2deeec263fb24f704d1f0d90ccc6b2aeb3baed2539878b5240d",
+        "set.part06.rar": "86b7efeacaf2443564220c683eec0880b999dbfe27ae1bc2645f0fffe4646d8c",
+        "set.part07.rar": "0b2c9bc7b5679069f9cbe68a9e08351868a3309bf24a5534d8207cf14d41b8b7",
+        "set.part08.rar": "b86fa56607d4ee98e0374f84040a0e11ab18bc726a8b772151a1feee9c7045a3"
+      },
+      "source_hashes_after": {
+        "set.part01.rar": "2f3894dc4b8a1bba90830ef1f89f457b0295b6f9030c70febd57283721bc2ce3",
+        "set.part03.rar": "31699cbed68297245347911910743c3cb0c6075d28336a7dd4864d4019b8208a",
+        "set.part04.rar": "c2d0d72b7c4dd229a944986eee95f802e487e4570e41f7ca7e77b9e82ca4119c",
+        "set.part05.rar": "cc69c161ec00e2deeec263fb24f704d1f0d90ccc6b2aeb3baed2539878b5240d",
+        "set.part06.rar": "86b7efeacaf2443564220c683eec0880b999dbfe27ae1bc2645f0fffe4646d8c",
+        "set.part07.rar": "0b2c9bc7b5679069f9cbe68a9e08351868a3309bf24a5534d8207cf14d41b8b7",
+        "set.part08.rar": "b86fa56607d4ee98e0374f84040a0e11ab18bc726a8b772151a1feee9c7045a3"
+      },
+      "read_only_verified": true,
+      "mutation_offset": null,
+      "truncated_bytes": null
+    },
+    {
+      "format": "rar",
+      "case": "truncate-last",
+      "exit": 1,
+      "integrity": "corrupt",
+      "coverage": "partial",
+      "truth": [
+        "set.part08.rar"
+      ],
+      "confirmed": [
+        "set.part08.rar"
+      ],
+      "suspects": [],
+      "missing": [],
+      "stops": [],
+      "passes": [
+        [
+          "unrar",
+          "corruption"
+        ],
+        [
+          "7z",
+          "corruption"
+        ]
+      ],
+      "source_hashes_before": {
+        "set.part01.rar": "2f3894dc4b8a1bba90830ef1f89f457b0295b6f9030c70febd57283721bc2ce3",
+        "set.part02.rar": "0a5b7a8923beb5747d67f708f17bdc4ebfc8cf2c3010523332e1a1633d7a4c72",
+        "set.part03.rar": "31699cbed68297245347911910743c3cb0c6075d28336a7dd4864d4019b8208a",
+        "set.part04.rar": "c2d0d72b7c4dd229a944986eee95f802e487e4570e41f7ca7e77b9e82ca4119c",
+        "set.part05.rar": "cc69c161ec00e2deeec263fb24f704d1f0d90ccc6b2aeb3baed2539878b5240d",
+        "set.part06.rar": "86b7efeacaf2443564220c683eec0880b999dbfe27ae1bc2645f0fffe4646d8c",
+        "set.part07.rar": "0b2c9bc7b5679069f9cbe68a9e08351868a3309bf24a5534d8207cf14d41b8b7",
+        "set.part08.rar": "11f453df79e181a59c9769c1d12f70f87aa6aabc79704eed34aecbec1cc52f0e"
+      },
+      "source_hashes_after": {
+        "set.part01.rar": "2f3894dc4b8a1bba90830ef1f89f457b0295b6f9030c70febd57283721bc2ce3",
+        "set.part02.rar": "0a5b7a8923beb5747d67f708f17bdc4ebfc8cf2c3010523332e1a1633d7a4c72",
+        "set.part03.rar": "31699cbed68297245347911910743c3cb0c6075d28336a7dd4864d4019b8208a",
+        "set.part04.rar": "c2d0d72b7c4dd229a944986eee95f802e487e4570e41f7ca7e77b9e82ca4119c",
+        "set.part05.rar": "cc69c161ec00e2deeec263fb24f704d1f0d90ccc6b2aeb3baed2539878b5240d",
+        "set.part06.rar": "86b7efeacaf2443564220c683eec0880b999dbfe27ae1bc2645f0fffe4646d8c",
+        "set.part07.rar": "0b2c9bc7b5679069f9cbe68a9e08351868a3309bf24a5534d8207cf14d41b8b7",
+        "set.part08.rar": "11f453df79e181a59c9769c1d12f70f87aa6aabc79704eed34aecbec1cc52f0e"
+      },
+      "read_only_verified": true,
+      "mutation_offset": null,
+      "truncated_bytes": 80
+    },
+    {
+      "format": "rar",
+      "case": "header-flip",
+      "exit": 1,
+      "integrity": "corrupt",
+      "coverage": "partial",
+      "truth": [
+        "set.part02.rar"
+      ],
+      "confirmed": [
+        "set.part02.rar"
+      ],
+      "suspects": [
+        [
+          "set.part01.rar",
+          "set.part02.rar",
+          "set.part03.rar",
+          "set.part04.rar",
+          "set.part05.rar",
+          "set.part06.rar",
+          "set.part07.rar",
+          "set.part08.rar"
+        ]
+      ],
+      "missing": [],
+      "stops": [],
+      "passes": [
+        [
+          "unrar",
+          "corruption"
+        ],
+        [
+          "7z",
+          "corruption"
+        ]
+      ],
+      "source_hashes_before": {
+        "set.part01.rar": "2f3894dc4b8a1bba90830ef1f89f457b0295b6f9030c70febd57283721bc2ce3",
+        "set.part02.rar": "9a8e0c91fa895d7a3e73cc853cb66ec35284fe9770d858edc1f6928b8161176c",
+        "set.part03.rar": "31699cbed68297245347911910743c3cb0c6075d28336a7dd4864d4019b8208a",
+        "set.part04.rar": "c2d0d72b7c4dd229a944986eee95f802e487e4570e41f7ca7e77b9e82ca4119c",
+        "set.part05.rar": "cc69c161ec00e2deeec263fb24f704d1f0d90ccc6b2aeb3baed2539878b5240d",
+        "set.part06.rar": "86b7efeacaf2443564220c683eec0880b999dbfe27ae1bc2645f0fffe4646d8c",
+        "set.part07.rar": "0b2c9bc7b5679069f9cbe68a9e08351868a3309bf24a5534d8207cf14d41b8b7",
+        "set.part08.rar": "b86fa56607d4ee98e0374f84040a0e11ab18bc726a8b772151a1feee9c7045a3"
+      },
+      "source_hashes_after": {
+        "set.part01.rar": "2f3894dc4b8a1bba90830ef1f89f457b0295b6f9030c70febd57283721bc2ce3",
+        "set.part02.rar": "9a8e0c91fa895d7a3e73cc853cb66ec35284fe9770d858edc1f6928b8161176c",
+        "set.part03.rar": "31699cbed68297245347911910743c3cb0c6075d28336a7dd4864d4019b8208a",
+        "set.part04.rar": "c2d0d72b7c4dd229a944986eee95f802e487e4570e41f7ca7e77b9e82ca4119c",
+        "set.part05.rar": "cc69c161ec00e2deeec263fb24f704d1f0d90ccc6b2aeb3baed2539878b5240d",
+        "set.part06.rar": "86b7efeacaf2443564220c683eec0880b999dbfe27ae1bc2645f0fffe4646d8c",
+        "set.part07.rar": "0b2c9bc7b5679069f9cbe68a9e08351868a3309bf24a5534d8207cf14d41b8b7",
+        "set.part08.rar": "b86fa56607d4ee98e0374f84040a0e11ab18bc726a8b772151a1feee9c7045a3"
+      },
+      "read_only_verified": true,
+      "mutation_offset": 12,
+      "truncated_bytes": null
+    }
+  ],
+  "cli_checks": [
+    {
+      "case": "7z-missing",
+      "exit": 1,
+      "password_status": [
+        "required"
+      ],
+      "groups": 1,
+      "history_rows": 1
+    },
+    {
+      "case": "7z-correct",
+      "exit": 0,
+      "password_status": [
+        "verified"
+      ],
+      "groups": 1,
+      "history_rows": 1
+    },
+    {
+      "case": "7z-wrong",
+      "exit": 1,
+      "password_status": [
+        "indeterminate"
+      ],
+      "groups": 1,
+      "history_rows": 1
+    },
+    {
+      "case": "zip-missing",
+      "exit": 1,
+      "password_status": [
+        "required"
+      ],
+      "groups": 1,
+      "history_rows": 1
+    },
+    {
+      "case": "zip-correct",
+      "exit": 0,
+      "password_status": [
+        "verified"
+      ],
+      "groups": 1,
+      "history_rows": 1
+    },
+    {
+      "case": "zip-wrong",
+      "exit": 1,
+      "password_status": [
+        "rejected"
+      ],
+      "groups": 1,
+      "history_rows": 1
+    },
+    {
+      "case": "mixed",
+      "exit": 2,
+      "password_status": [
+        "not_needed",
+        "not_needed"
+      ],
+      "groups": 2,
+      "history_rows": 2
+    },
+    {
+      "case": "deduplicated",
+      "exit": 0,
+      "password_status": [
+        "not_needed"
+      ],
+      "groups": 1,
+      "history_rows": 1
+    },
+    {
+      "case": "no-history",
+      "exit": 0,
+      "password_status": [
+        "not_needed"
+      ],
+      "groups": 1,
+      "history_rows": 0
+    },
+    {
+      "case": "no-empty-clear",
+      "exit": 0,
+      "password_status": [
+        "indeterminate"
+      ],
+      "groups": 1,
+      "history_rows": 1
+    }
+  ]
+}

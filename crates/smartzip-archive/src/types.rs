@@ -44,10 +44,12 @@ pub struct TestRequest {
     pub encoding: EncodingMode,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TestResult {
     pub ok: bool,
     pub encrypted: Option<bool>,
+    #[serde(default)]
+    pub diagnostics: crate::integrity::BackendTestDiagnostics,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

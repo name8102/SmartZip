@@ -7,8 +7,11 @@ authors.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+libc.workspace = true
 async-trait.workspace = true
 process-wrap.workspace = true
+flate2 = "1"
+lzma-rust2 = { version = "0.16.4", default-features = false, features = ["std"] }
 serde.workspace = true
 smartzip-config.workspace = true
 smartzip-core.workspace = true
@@ -22,5 +25,4 @@ infer.workspace = true
 crc32fast.workspace = true
 
 [dev-dependencies]
-crc32fast = "1"
 rstest.workspace = true

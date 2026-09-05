@@ -227,6 +227,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                             encoding: None,
                             encoding_corrected: false,
                             damaged_volumes_json: None,
+                            test_report_json: None,
                         },
                     );
                 }
@@ -264,6 +265,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                             encoding: None,
                             encoding_corrected: false,
                             damaged_volumes_json: None,
+                            test_report_json: None,
                         },
                     );
                 }
@@ -300,6 +302,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                             encoding: None,
                             encoding_corrected: false,
                             damaged_volumes_json: None,
+                            test_report_json: None,
                         },
                     );
                 }
@@ -663,6 +666,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                                 encoding: None,
                                 encoding_corrected: false,
                                 damaged_volumes_json: None,
+                                test_report_json: None,
                             },
                         );
                     }
@@ -932,7 +936,15 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                             }
                         }
                     }
-                    Ok(_) => {}
+                    Ok(result) => {
+                        let error = crate::backend_util::failed_test_error(&result, &archive_path);
+                        if matches!(&error, smartzip_core::SmartZipError::WrongPassword { .. }) {
+                            saw_wrong_password = true;
+                            let _ = passwords.record_failure(password);
+                        } else {
+                            last_error = Some(error);
+                        }
+                    }
                     Err(error) => {
                         if matches!(&error, smartzip_core::SmartZipError::WrongPassword { .. }) {
                             saw_wrong_password = true;
@@ -1230,8 +1242,19 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                                         }
                                     }
                                 }
-                                Ok(_) => {
-                                    saw_wrong_password = true;
+                                Ok(result) => {
+                                    let error = crate::backend_util::failed_test_error(
+                                        &result,
+                                        &archive_path,
+                                    );
+                                    if matches!(
+                                        &error,
+                                        smartzip_core::SmartZipError::WrongPassword { .. }
+                                    ) {
+                                        saw_wrong_password = true;
+                                    } else {
+                                        last_error = Some(error);
+                                    }
                                     eprintln!(
                                         "Interactive password did not validate for {}",
                                         archive_path.display()
@@ -1405,6 +1428,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                             encoding_corrected: reused_confirmed_encoding
                                 || matches!(request.encoding_mode, EncodingMode::Override(_)),
                             damaged_volumes_json: None,
+                            test_report_json: None,
                         },
                     );
                 }
@@ -1439,6 +1463,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                             encoding_corrected: reused_confirmed_encoding
                                 || matches!(request.encoding_mode, EncodingMode::Override(_)),
                             damaged_volumes_json: None,
+                            test_report_json: None,
                         },
                     );
                 }
@@ -1464,6 +1489,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                         encoding_corrected: reused_confirmed_encoding
                             || matches!(request.encoding_mode, EncodingMode::Override(_)),
                         damaged_volumes_json: None,
+                        test_report_json: None,
                     },
                 );
             }
@@ -1505,6 +1531,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                     encoding_corrected: reused_confirmed_encoding
                         || matches!(request.encoding_mode, EncodingMode::Override(_)),
                     damaged_volumes_json: None,
+                    test_report_json: None,
                 },
             );
             if let (Some(hash), Some(size)) = (sample_hash.as_deref(), sample_size) {

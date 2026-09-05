@@ -652,10 +652,96 @@ impl ArchiveExecutor for BackendRouter {
             |adapter| {
                 let request = request.clone();
                 let context = std::sync::Arc::clone(&context);
-                Box::pin(async move { adapter.test_with_context(request, context).await })
+                Box::pin(async move {
+                    let mut result = adapter.test_with_context(request, context).await?;
+                    result.diagnostics.adapter_id = adapter.id().to_owned();
+                    if result.diagnostics.family.is_empty() {
+                        result.diagnostics.family =
+                            adapter.diagnostic_family().unwrap_or("unknown").to_owned();
+                    }
+                    Ok(result)
+                })
             },
         )
         .await
+    }
+
+    async fn diagnose_test_with_context(
+        &self,
+        request: TestRequest,
+        previous: &crate::integrity::BackendTestDiagnostics,
+        multivolume: bool,
+        context: std::sync::Arc<TaskExecutionContext>,
+    ) -> Result<Option<TestResult>> {
+        if self.forced_adapter.is_some() {
+            return Ok(None);
+        }
+        let container = infer_format(request.format.clone(), &request.archive);
+        let requirements = request_requirements(
+            ArchiveOperation::Test,
+            container.as_ref(),
+            request.password.as_deref(),
+            Some(&request.encoding),
+        );
+        let mut plan = self.plan_with_context(
+            ArchiveOperation::Test,
+            container.as_ref(),
+            requirements,
+            None,
+        );
+        plan.candidates.retain(|candidate| {
+            self.registration(&candidate.adapter_id)
+                .is_some_and(|registration| {
+                    candidate.adapter_id != previous.adapter_id
+                        && registration
+                            .adapter
+                            .diagnostic_family()
+                            .is_some_and(|family| {
+                                family != previous.family
+                                    && match container {
+                                        Some(ArchiveFormat::Rar) => {
+                                            matches!(family, "unrar" | "7z")
+                                        }
+                                        Some(ArchiveFormat::Zip) => {
+                                            family == "7z" || family == "native-zip" && !multivolume
+                                        }
+                                        _ => false,
+                                    }
+                            })
+                })
+        });
+        // At most one additional full test, with a different implementation.
+        plan.candidates.truncate(1);
+        let Some(candidate) = plan.candidates.first().cloned() else {
+            return Ok(None);
+        };
+        context.emit_route(RouteEvent::RoutePlanned { plan });
+        let Some(registration) = self.registration(&candidate.adapter_id) else {
+            return Ok(None);
+        };
+        context.emit_route(RouteEvent::BackendAttemptStarted {
+            adapter_id: candidate.adapter_id.clone(),
+        });
+        match registration
+            .adapter
+            .test_with_context(request, context.clone())
+            .await
+        {
+            Ok(mut result) => {
+                result.diagnostics.adapter_id = candidate.adapter_id.clone();
+                context.emit_route(RouteEvent::BackendSelected {
+                    adapter_id: candidate.adapter_id,
+                });
+                Ok(Some(result))
+            }
+            Err(error) => {
+                context.emit_route(RouteEvent::BackendAttemptFailed {
+                    adapter_id: candidate.adapter_id,
+                    class: error_class(&error).into(),
+                });
+                Err(error)
+            }
+        }
     }
 
     async fn extract(&self, request: ExtractArchiveRequest) -> Result<ExtractArchiveResult> {
@@ -1090,6 +1176,7 @@ mod tests {
             Ok(TestResult {
                 ok: true,
                 encrypted: None,
+                ..TestResult::default()
             })
         }
 

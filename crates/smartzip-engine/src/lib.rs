@@ -22,6 +22,8 @@ pub mod interactive;
 mod nested;
 mod password_order;
 mod policy;
+mod test_reduce;
+mod test_workflow;
 mod types;
 pub mod volumes;
 mod workflow;
@@ -41,6 +43,7 @@ pub use interactive::{
     InteractivePasswordPrompter, OutputCollisionStrategy,
 };
 pub use nested::format_from_extension;
+pub use test_workflow::{DiagnoseMode, TestWorkflowRequest, TestWorkflowResult};
 pub use types::{
     ArchiveRecycleHandler, CandidateSource, DetectRequest, DetectResult, ExtractWorkflowRequest,
     ExtractWorkflowResult, ExtractionCandidate, FileAwareDetectResult, InspectRequest,
@@ -48,6 +51,25 @@ pub use types::{
 };
 
 impl SmartZipEngine {
+    pub async fn test_archives<B: ArchiveExecutor>(
+        &self,
+        backend: &B,
+        passwords: &PasswordService<'_>,
+        request: TestWorkflowRequest,
+        password_prompter: Option<&dyn InteractivePasswordPrompter>,
+        listener: Option<TaskEventListener>,
+        history: Option<&dyn history::TaskHistoryRecorder>,
+    ) -> smartzip_core::Result<TestWorkflowResult> {
+        test_workflow::run(
+            backend,
+            passwords,
+            request,
+            password_prompter,
+            listener,
+            history,
+        )
+        .await
+    }
     pub fn new(scanner: EmbeddedScanner) -> Self {
         Self {
             scanner,

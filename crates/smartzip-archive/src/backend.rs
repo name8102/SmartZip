@@ -42,6 +42,17 @@ pub trait ArchiveExecutor: Send + Sync {
     ) -> Result<TestResult> {
         self.test(request).await
     }
+    /// One independent diagnostic pass, outside normal error fallback. None
+    /// means no adapter with additional diagnostic value is available.
+    async fn diagnose_test_with_context(
+        &self,
+        _request: TestRequest,
+        _previous: &crate::integrity::BackendTestDiagnostics,
+        _multivolume: bool,
+        _context: Arc<TaskExecutionContext>,
+    ) -> Result<Option<TestResult>> {
+        Ok(None)
+    }
     async fn extract(&self, request: ExtractArchiveRequest) -> Result<ExtractArchiveResult>;
     async fn extract_with_context(
         &self,
@@ -79,6 +90,11 @@ pub trait ArchiveExecutor: Send + Sync {
 #[async_trait]
 pub trait ArchiveAdapter: Send + Sync {
     fn id(&self) -> &str;
+    /// Known diagnostic implementation family, used to avoid repeating the
+    /// same implementation under another executable path.
+    fn diagnostic_family(&self) -> Option<&'static str> {
+        None
+    }
     async fn probe(&self, path: &Path) -> Result<ArchiveProbe>;
     async fn probe_with_context(
         &self,

@@ -64,6 +64,15 @@
 | **sample_hash** | 采样内容哈希，用于对“重复下载的同一压缩包”去重。`BLAKE3(前 64KB ‖ 后 64KB)` + `file_size` 联合判等；文件 < 128KB 全量哈希；carve/内嵌档对 `[offset, offset+size)` 段采样，size 未知时不算、不参与去重。取代 v2 的 `path_hash`（后者随 `encoding_detections` / `embedded_archive_detections` 删除而废弃——路径不再作 join key）。 |
 | **known_files** | `UNIQUE(sample_hash, size)` 去重/复用索引。存 `password_id`（精确密码记忆）、`confirmed_encoding`（人工确认编码，自动猜测不覆盖）、`last_extract_at`（非空即成功解压过，去重判据）、`names_offsets_json`（name+offset 配对列表）。取代 v2 的 `password_matches` backfill 与 `encoding_detections` 的复用职责。 |
 
+### 完整性校验（2026-09-05）
+
+- **VolumeSet**：只读收集同组卷、数值排序、入口、缺失/不可读与 identity/size/mtime 快照。RAR/字节切分从首卷开始，原生 split ZIP 从末段 `.zip` 开始。
+- **TestArchiveReport**：一组一个报告，分开 integrity、coverage、password_status、confirmed_volumes、suspect_groups、missing/unreadable/unchecked 和带物理范围的依据。局部通过不代表整卷健康，候选组不能求交集得出确认坏卷。
+- **Diagnostic pass**：engine 在失败主测试后发起的独立只读阶段，ArchiveExecutor 至多选择一个不同实现家族的后端；仍尊重强制 `--backend`，普通 corruption fallback 规则保持不变。本地格式校验不经过外部后端路由。
+- DB **v4** 给 file_extractions 增加 nullable test_report_json，旧数据保留；damaged_volumes_json 只投影 confirmed 路径。test 不更新 known_files / last_extract_at，也不用首片 hash 表示整组。
+- 外部 test 非零退出可返回 `TestResult { ok: false, diagnostics }` 保留证据；调用者必须检查 ok。旧解压流程在既有 test-before-extract 分支把失败报告转换回错误状态，密码/损坏歧义不记密码失败统计。
+
+
 ## Architecture Decisions (ADR-worthy)
 
 ### ADR-001: Thin engine with caller injection
