@@ -46,9 +46,9 @@ pub struct MaterializeRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MaterializeResult {
+pub(crate) struct MaterializeResult {
     pub output_dir: PathBuf,
-    pub layout_plan: Option<LayoutPlan>,
+    pub layout_plan: LayoutPlan,
 }
 
 #[derive(Debug)]
@@ -144,7 +144,7 @@ impl OutputMaterializer {
             let _ = std::fs::remove_dir_all(temp.path());
             return Ok(MaterializeResult {
                 output_dir: request.output_dir,
-                layout_plan: Some(layout_plan),
+                layout_plan,
             });
         }
 
@@ -232,7 +232,7 @@ impl OutputMaterializer {
                 }
                 Ok(MaterializeResult {
                     output_dir: commit_target,
-                    layout_plan: Some(layout_plan),
+                    layout_plan,
                 })
             }
             Err(mut failure) => {
@@ -501,7 +501,7 @@ mod tests {
             .await
             .unwrap();
 
-        let plan = result.layout_plan.as_ref().unwrap();
+        let plan = &result.layout_plan;
         assert_eq!(
             plan.kind,
             LayoutPlanKind::CommitWholeTempAsArchiveDir {
@@ -540,7 +540,7 @@ mod tests {
             .await
             .unwrap();
 
-        let plan = result.layout_plan.as_ref().unwrap();
+        let plan = &result.layout_plan;
         assert_eq!(
             plan.kind,
             LayoutPlanKind::CommitWholeTempAsArchiveDir {
@@ -646,7 +646,7 @@ mod tests {
             .await
             .unwrap();
 
-        let plan = result.layout_plan.as_ref().unwrap();
+        let plan = &result.layout_plan;
         assert_eq!(
             plan.kind,
             LayoutPlanKind::CommitSingleDirContentsAsArchiveName
@@ -686,7 +686,7 @@ mod tests {
             .await
             .unwrap();
 
-        let plan = result.layout_plan.as_ref().unwrap();
+        let plan = &result.layout_plan;
         assert_eq!(plan.kind, LayoutPlanKind::CommitSingleDirAsInnerName);
         assert_eq!(result.output_dir, plan.target);
         assert!(plan.target.exists());
@@ -721,7 +721,7 @@ mod tests {
             .await
             .unwrap();
 
-        let plan = result.layout_plan.as_ref().unwrap();
+        let plan = &result.layout_plan;
         assert_eq!(plan.kind, LayoutPlanKind::CommitSingleFileAsInnerName);
         assert_eq!(result.output_dir, plan.target);
         assert!(plan.target.exists());

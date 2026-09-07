@@ -68,6 +68,33 @@ pub enum VolumeResolution {
     },
 }
 
+impl VolumeResolution {
+    /// Borrow a resolved set without making callers distinguish warning variants.
+    pub fn resolved_set(&self) -> Option<&VolumeSet> {
+        match self {
+            Self::Resolved(set) | Self::ResolvedWithWarnings { set, .. } => Some(set),
+            _ => None,
+        }
+    }
+
+    /// Preserve unresolved diagnostics for the caller instead of discarding them.
+    pub fn into_resolved_parts(self) -> Result<(VolumeSet, Vec<VolumeWarning>), Self> {
+        match self {
+            Self::Resolved(set) => Ok((set, Vec::new())),
+            Self::ResolvedWithWarnings { set, warnings } => Ok((set, warnings)),
+            other => Err(other),
+        }
+    }
+
+    fn resolved(set: VolumeSet, warnings: Vec<VolumeWarning>) -> Self {
+        if warnings.is_empty() {
+            Self::Resolved(set)
+        } else {
+            Self::ResolvedWithWarnings { set, warnings }
+        }
+    }
+}
+
 /// One canonical volume-preparation result for list and extract callers.
 /// The materialized handle keeps canonical members alive until backend use ends.
 pub enum VolumePreparation {
@@ -268,11 +295,7 @@ impl VolumeResolver {
         }
         if resolved_hypotheses.len() == 1 {
             let (set, warnings) = resolved_hypotheses.into_iter().next().unwrap();
-            if warnings.is_empty() {
-                return VolumeResolution::Resolved(set);
-            } else {
-                return VolumeResolution::ResolvedWithWarnings { set, warnings };
-            }
+            return VolumeResolution::resolved(set, warnings);
         }
         if resolved_hypotheses.len() > 1 {
             // Multiple distinct plausible groupings -> GroupingAmbiguous
@@ -286,11 +309,7 @@ impl VolumeResolver {
             }
             if unique.len() == 1 {
                 let (set, warnings) = resolved_hypotheses.into_iter().next().unwrap();
-                if warnings.is_empty() {
-                    return VolumeResolution::Resolved(set);
-                } else {
-                    return VolumeResolution::ResolvedWithWarnings { set, warnings };
-                }
+                return VolumeResolution::resolved(set, warnings);
             }
             let hypos: Vec<VolumeSetHypothesis> = resolved_hypotheses
                 .into_iter()
@@ -320,20 +339,20 @@ impl VolumeResolver {
         mut candidate: crate::types::ExtractionCandidate,
         resolution: VolumeResolution,
     ) -> VolumePreparation {
-        match resolution {
-            VolumeResolution::Single => VolumePreparation::Single(candidate),
-            VolumeResolution::Resolved(set) => prepare_resolved(&mut candidate, set, Vec::new()),
-            VolumeResolution::ResolvedWithWarnings { set, warnings } => {
-                prepare_resolved(&mut candidate, set, warnings)
-            }
-            VolumeResolution::Incomplete(problem) => {
+        match resolution.into_resolved_parts() {
+            Ok((set, warnings)) => prepare_resolved(&mut candidate, set, warnings),
+            Err(VolumeResolution::Single) => VolumePreparation::Single(candidate),
+            Err(VolumeResolution::Incomplete(problem)) => {
                 VolumePreparation::Incomplete { candidate, problem }
             }
-            VolumeResolution::GroupingAmbiguous { hypotheses } => {
+            Err(VolumeResolution::GroupingAmbiguous { hypotheses }) => {
                 VolumePreparation::GroupingAmbiguous {
                     candidate,
                     hypotheses,
                 }
+            }
+            Err(VolumeResolution::Resolved(_) | VolumeResolution::ResolvedWithWarnings { .. }) => {
+                unreachable!("resolved variants are returned as Ok")
             }
         }
     }

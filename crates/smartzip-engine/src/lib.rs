@@ -115,7 +115,7 @@ impl SmartZipEngine {
     pub async fn inspect_file_with_listener<B: ArchiveExecutor>(
         &self,
         backend: &B,
-        passwords: &PasswordService<'_>,
+        _passwords: &PasswordService<'_>,
         request: InspectRequest,
         listener: Option<TaskEventListener>,
         history: Option<&dyn history::TaskHistoryRecorder>,
@@ -124,7 +124,6 @@ impl SmartZipEngine {
             self.cancellation.clone(),
             self.run_policy.as_deref(),
             backend,
-            passwords,
             request,
             listener,
             history,

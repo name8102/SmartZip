@@ -30,7 +30,7 @@ use crate::types::{
     ArchiveRecycleHandler, CandidateSource, ExtractWorkflowRequest, ExtractWorkflowResult,
     ExtractionCandidate,
 };
-use crate::volumes::{VolumeResolution, VolumeResolver};
+use crate::volumes::VolumeResolver;
 
 /// Override how successfully processed nested archives are recycled.
 ///
@@ -232,9 +232,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
             crate::volumes::VolumePreparation::Single(candidate)
         } else if candidate.source != CandidateSource::EmbeddedFinding {
             let resolution = volume_resolver.resolve(&candidate);
-            if let VolumeResolution::Resolved(set)
-            | VolumeResolution::ResolvedWithWarnings { set, .. } = &resolution
-            {
+            if let Some(set) = resolution.resolved_set() {
                 let key = volume_set_key(set);
                 if processed_volume_keys.contains(&key) {
                     continue;
@@ -841,7 +839,6 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
             });
         }
 
-        let _key = candidate_key(&candidate);
         let archive_facts = ArchiveFacts {
             container: candidate.detected_format.clone(),
             ..ArchiveFacts::default()
@@ -997,15 +994,13 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
             match result {
                 Ok(result) => {
                     committed_usage = staged_usage.get();
-                    if let Some(plan) = result.layout_plan.as_ref() {
-                        for message in &plan.warnings {
-                            events.push(TaskEvent {
-                                task_id: task_id.clone(),
-                                kind: TaskEventKind::Warning {
-                                    message: message.clone(),
-                                },
-                            });
-                        }
+                    for message in &result.layout_plan.warnings {
+                        events.push(TaskEvent {
+                            task_id: task_id.clone(),
+                            kind: TaskEventKind::Warning {
+                                message: message.clone(),
+                            },
+                        });
                     }
                     if result.output_dir != output_dir {
                         candidate.relative_path =

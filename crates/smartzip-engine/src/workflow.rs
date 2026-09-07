@@ -79,7 +79,6 @@ pub(crate) async fn inspect_file_with_listener<B: ArchiveExecutor>(
     cancellation: tokio_util::sync::CancellationToken,
     run_policy: Option<&crate::CompiledRunPolicy>,
     backend: &B,
-    _passwords: &PasswordService<'_>,
     request: InspectRequest,
     listener: Option<TaskEventListener>,
     history: Option<&dyn crate::history::TaskHistoryRecorder>,

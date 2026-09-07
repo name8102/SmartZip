@@ -232,19 +232,6 @@ pub fn plan_layout(req: &LayoutRequest) -> LayoutPlan {
 }
 
 fn decide_single_dir(req: &LayoutRequest, item: &TopLevelItemSummary) -> LayoutPlan {
-    // 1. Raw policy → always raw
-    if req.layout_policy == OutputLayoutPolicy::Raw {
-        return LayoutPlan {
-            source: PlanSource::WholeTempDir,
-            kind: LayoutPlanKind::RawArchiveDir {
-                name: req.archive_stem.clone(),
-            },
-            target: req.output_root.join(&req.archive_stem),
-            reason: LayoutDecisionReason::RawPolicyForced,
-            warnings: vec![],
-        };
-    }
-
     // 2. Explicit name policies → first priority
     match req.single_root_name_policy {
         SingleRootNamePolicy::PreferArchiveName => {
@@ -337,19 +324,6 @@ fn decide_single_dir(req: &LayoutRequest, item: &TopLevelItemSummary) -> LayoutP
 }
 
 fn decide_single_file(req: &LayoutRequest, item: &TopLevelItemSummary) -> LayoutPlan {
-    // 1. Raw policy → always raw
-    if req.layout_policy == OutputLayoutPolicy::Raw {
-        return LayoutPlan {
-            source: PlanSource::WholeTempDir,
-            kind: LayoutPlanKind::RawArchiveDir {
-                name: req.archive_stem.clone(),
-            },
-            target: req.output_root.join(&req.archive_stem),
-            reason: LayoutDecisionReason::RawPolicyForced,
-            warnings: vec![],
-        };
-    }
-
     // 2. Explicit name policies → first priority
     match req.single_root_name_policy {
         SingleRootNamePolicy::PreferArchiveName => {

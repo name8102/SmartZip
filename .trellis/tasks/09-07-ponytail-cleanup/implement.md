@@ -11,3 +11,9 @@
 ### Commit 0：characterization
 
 新增 3 项 CLI 合同测试：5 个命令完整 help 快照/输出通道，参数错误退出 2 且不建状态目录，真实 UTF-8 ZIP 的关键事件顺序/结果状态/根输入字节保持。完整门槛通过，日志 target/ponytail-validation/00-characterization/；真实 release beta 23 项通过。没有修改生产代码。
+
+### Commit 1：死结构与兼容入口
+
+删除 layout 子分支中不可达的 Raw 分支、私有 MaterializeResult 的无意义 Option、extract 第二次未消费的 candidate key、DB recorder 与 trait 相同的 start override，以及 inspect 私有 workflow 的 PasswordService 参数。外部 inspect 签名保留。VolumeResolution 增加统一借用/归约入口，归约用 Result 保留未解析诊断，既有公开 variant 不删除。
+
+完整门槛通过，日志 target/ponytail-validation/01-dead-structure/；release beta 23 项通过。随后清理一个不再使用的 import 并再次通过 all-targets check、fmt、diff check。未触碰输出事务算法。

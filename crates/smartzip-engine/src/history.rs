@@ -245,14 +245,6 @@ impl<'a> TaskHistoryRecorder for DbTaskHistoryRecorder<'a> {
         }
     }
 
-    fn start_extract(&self, task_id: &TaskId, output_path: Option<&Path>) {
-        self.start_task(task_id, "extract", output_path);
-    }
-
-    fn start_detect(&self, task_id: &TaskId, _path: &Path) {
-        self.start_task(task_id, "detect", None);
-    }
-
     fn record_event(&self, task_id: &TaskId, event: &TaskEvent) {
         let (level, event_type, message, data_json) = describe_event(&event.kind);
         let created_at = now_utc_iso8601();
