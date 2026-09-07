@@ -1,0 +1,70 @@
+Extract archives, optionally with nested scanning
+
+Usage: smartzip extract [OPTIONS] [PATHS]...
+
+Arguments:
+  [PATHS]...  
+
+Options:
+  -o, --output <OUTPUT>
+          Output directory. Defaults to first archive's parent directory
+      --config <CONFIG>
+          Path to the TOML routing configuration
+      --recursion-limit <RECURSION_LIMIT>
+          Maximum nested archive depth [default: 3]
+      --no-config
+          Ignore external TOML (does not disable state)
+  -p, --password <PASSWORD>
+          Password to try first. May be repeated
+      --no-empty
+          Skip empty password attempt
+      --stateless
+          Do not read or write persistent runtime state
+      --deep
+          Use deep scan for nested archives
+      --set <RUNTIME_SET>
+          
+      --max-scan-bytes <MAX_SCAN_BYTES>
+          Nested scan byte limit (0 = unlimited); explicit root archives are parsed in full
+      --no-recursive
+          
+      --encoding <ENCODING>
+          Encoding for entry names: "auto", "UTF-8", "GB18030", "GBK", "Big5", "Shift_JIS", "EUC-JP", "EUC-KR" [default: auto]
+      --explain
+          
+      --json
+          
+      --layout <LAYOUT>
+          Output layout policy: "conservative", "smart", "raw", "flat-single" [default: conservative] [possible values: conservative, smart, raw, flat-single]
+      --password-limit <PASSWORD_LIMIT>
+          Maximum stored password candidates (manual passwords are tried first) [default: 128]
+      --single-root-name <SINGLE_ROOT_NAME>
+          Single root name policy: "auto", "archive", "inner", "preserve-both" [default: auto] [possible values: auto, archive, inner, preserve-both]
+      --dry-run
+          Show planned output without extracting
+      --max-files <MAX_FILES>
+          Maximum total output entries, including directories and nested outputs
+      --embedded <EMBEDDED>
+          Embedded scan mode: "auto", "ask", "largest", "aggressive", "all", "ignore" [default: auto] [possible values: auto, ask, largest, aggressive, all, ignore]
+      --max-output-bytes <MAX_OUTPUT_BYTES>
+          
+      --dominant-min-ratio <DOMINANT_MIN_RATIO>
+          Minimum ratio for a finding to be considered dominant (0.0-1.0) [default: 0.7]
+      --min-free-bytes <MIN_FREE_BYTES>
+          
+      --confirm-large-scan
+          Auto-confirm large file scans (>10GB)
+      --max-nested-candidates <MAX_NESTED_CANDIDATES>
+          
+      --no-history
+          Do not record this extraction in the task history tables. Password statistics are still updated
+      --non-interactive
+          Disable all prompts, even when stdin is a terminal
+      --force
+          Re-extract even if this file was already extracted recently, bypassing the known_files dedup window
+      --on-conflict <ON_CONFLICT>
+          Existing output policy. Ask becomes skip without an interactive terminal [default: ask] [possible values: ask, skip, overwrite, rename]
+      --suspicious-encoding <SUSPICIOUS_ENCODING>
+          Suspicious names policy. Ask becomes skip without an interactive terminal [default: ask] [possible values: ask, skip, accept]
+  -h, --help
+          Print help

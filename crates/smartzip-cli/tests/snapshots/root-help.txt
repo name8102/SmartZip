@@ -1,0 +1,55 @@
+SmartZip cross-platform archive helper
+
+Usage: smartzip [OPTIONS] <COMMAND>
+
+Commands:
+  config    Inspect or edit configuration without accessing archives, databases or backends
+  doctor    Diagnose backend availability, versions, capabilities and database location
+  detect    Inspect archive format, encoding, embedded findings, and password requirements [alias: d]
+  list      List archive entries using shared password and encoding resolution [alias: l]
+  test      Test archive groups and diagnose damaged volumes (exit: 0 all intact, 1 none, 2 mixed, 130 cancelled; argument errors also use 2) [alias: t]
+  extract   Extract archives, optionally with nested scanning [alias: x]
+  enc       Preview archive entry names under several encodings
+  password  Manage password database [alias: pw]
+  history   Inspect recorded task history. Defaults to recent tasks [alias: hist]
+  help      Print this message or the help of the given subcommand(s)
+
+Options:
+      --db <DB>
+          Path to database file. Defaults to the platform data directory if not set
+      --config <CONFIG>
+          Path to the TOML routing configuration
+      --no-config
+          Ignore external TOML (does not disable state)
+      --stateless
+          Do not read or write persistent runtime state
+      --set <RUNTIME_SET>
+          
+      --no-recursive
+          
+      --explain
+          
+      --backend <BACKEND>
+          Force one configured/discovered backend adapter by ID
+      --verbose-routing
+          Print router warnings and route diagnostics
+      --password-limit <PASSWORD_LIMIT>
+          Maximum stored password candidates (manual passwords are tried first) [default: 128]
+      --max-files <MAX_FILES>
+          Maximum total output entries, including directories and nested outputs
+      --max-output-bytes <MAX_OUTPUT_BYTES>
+          
+      --min-free-bytes <MIN_FREE_BYTES>
+          
+      --max-nested-candidates <MAX_NESTED_CANDIDATES>
+          
+      --non-interactive
+          Disable all prompts, even when stdin is a terminal
+      --on-conflict <ON_CONFLICT>
+          Existing output policy. Ask becomes skip without an interactive terminal [default: ask] [possible values: ask, skip, overwrite, rename]
+      --suspicious-encoding <SUSPICIOUS_ENCODING>
+          Suspicious names policy. Ask becomes skip without an interactive terminal [default: ask] [possible values: ask, skip, accept]
+  -h, --help
+          Print help
+  -V, --version
+          Print version

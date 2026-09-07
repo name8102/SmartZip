@@ -1,0 +1,60 @@
+Test archive groups and diagnose damaged volumes (exit: 0 all intact, 1 none, 2 mixed, 130 cancelled; argument errors also use 2)
+
+Usage: smartzip test [OPTIONS] <PATHS>...
+
+Arguments:
+  <PATHS>...  
+
+Options:
+      --diagnose <DIAGNOSE>
+          Additional read-only diagnosis after a failed test [default: auto] [possible values: auto, off]
+      --config <CONFIG>
+          Path to the TOML routing configuration
+      --diagnostic-timeout <DIAGNOSTIC_TIMEOUT>
+          Time budget in seconds for additional diagnosis only
+      --no-config
+          Ignore external TOML (does not disable state)
+      --no-history
+          Do not save this test in task history
+  -p, --password <PASSWORD>
+          Password to try first. May be repeated
+      --stateless
+          Do not read or write persistent runtime state
+      --set <RUNTIME_SET>
+          
+      --use-clipboard
+          Read password from clipboard (platform-dependent placeholder)
+      --no-empty
+          Skip empty password attempt
+      --no-recursive
+          
+      --encoding <ENCODING>
+          Encoding for entry names: "auto", "UTF-8", "GB18030", "GBK", "Big5", "Shift_JIS", "EUC-JP", "EUC-KR" [default: auto]
+      --explain
+          
+      --json
+          
+      --deep
+          
+      --max-scan-bytes <MAX_SCAN_BYTES>
+          Nested scan byte limit (0 = unlimited); explicit root archives are parsed in full
+      --password-limit <PASSWORD_LIMIT>
+          Maximum stored password candidates (manual passwords are tried first) [default: 128]
+      --max-files <MAX_FILES>
+          Maximum total output entries, including directories and nested outputs
+      --min-confidence <MIN_CONFIDENCE>
+          [default: medium] [possible values: low, medium, high]
+      --max-output-bytes <MAX_OUTPUT_BYTES>
+          
+      --min-free-bytes <MIN_FREE_BYTES>
+          
+      --max-nested-candidates <MAX_NESTED_CANDIDATES>
+          
+      --non-interactive
+          Disable all prompts, even when stdin is a terminal
+      --on-conflict <ON_CONFLICT>
+          Existing output policy. Ask becomes skip without an interactive terminal [default: ask] [possible values: ask, skip, overwrite, rename]
+      --suspicious-encoding <SUSPICIOUS_ENCODING>
+          Suspicious names policy. Ask becomes skip without an interactive terminal [default: ask] [possible values: ask, skip, accept]
+  -h, --help
+          Print help
