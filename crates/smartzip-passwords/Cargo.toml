@@ -7,5 +7,6 @@ authors.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+smartzip-config.workspace = true
 serde.workspace = true
 smartzip-db.workspace = true

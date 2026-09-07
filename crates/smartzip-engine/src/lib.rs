@@ -23,6 +23,8 @@ pub mod interactive;
 mod nested;
 mod password_order;
 mod policy;
+pub mod run_policy;
+pub use run_policy::CompiledRunPolicy;
 mod test_reduce;
 mod test_workflow;
 mod types;
@@ -79,10 +81,16 @@ impl SmartZipEngine {
     pub fn new(scanner: EmbeddedScanner) -> Self {
         Self {
             scanner,
+            run_policy: None,
             cancellation: tokio_util::sync::CancellationToken::new(),
             archive_recycler: Arc::new(smartzip_platform::move_to_trash),
             min_embedded_size_bytes: smartzip_core::DEFAULT_MIN_EMBEDDED_FINDING_SIZE,
         }
+    }
+
+    pub fn with_run_policy(mut self, policy: CompiledRunPolicy) -> Self {
+        self.run_policy = Some(Arc::new(policy));
+        self
     }
 
     /// Override how successfully processed nested archives are recycled.
@@ -114,6 +122,7 @@ impl SmartZipEngine {
     ) -> smartzip_core::Result<FileAwareDetectResult> {
         workflow::inspect_file_with_listener(
             self.cancellation.clone(),
+            self.run_policy.as_deref(),
             backend,
             passwords,
             request,
@@ -135,6 +144,7 @@ impl SmartZipEngine {
     ) -> smartzip_core::Result<ListArchiveResult> {
         workflow::list_archive_with_listener_interactive(
             self.cancellation.clone(),
+            self.run_policy.as_deref(),
             backend,
             passwords,
             request,
@@ -229,6 +239,7 @@ impl SmartZipEngine {
     ) -> smartzip_core::Result<ExtractWorkflowResult> {
         workflow::extract_recursive_with_listener_interactive(
             &self.scanner,
+            self.run_policy.as_deref(),
             self.min_embedded_size_bytes,
             &self.archive_recycler,
             self.cancellation.clone(),

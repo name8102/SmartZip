@@ -79,6 +79,7 @@ pub(crate) struct ResolvedArchive {
     pub(crate) known_hit: Option<crate::history::KnownFileHit>,
     pub(crate) encoding_mode: EncodingMode,
     pub(crate) reused_confirmed_encoding: bool,
+    pub(crate) detect_encoding: bool,
     pub(crate) zip_encoding_assessment: Option<ZipEncodingAssessment>,
     pub(crate) recorder_name: Option<String>,
 }
@@ -88,12 +89,11 @@ pub(crate) struct ArchiveAccessOutcome {
     pub(crate) password_id: Option<i64>,
     pub(crate) has_password: bool,
     pub(crate) encoding_mode: EncodingMode,
-    pub(crate) listing: Option<ArchiveListing>,
-    pub(crate) encrypted: Option<bool>,
-    pub(crate) events: Vec<TaskEvent>,
+    pub(crate) listing: ArchiveListing,
 }
 
 pub struct SmartZipEngine {
+    pub(crate) run_policy: Option<Arc<crate::CompiledRunPolicy>>,
     pub(crate) cancellation: tokio_util::sync::CancellationToken,
     pub(crate) scanner: smartzip_scanner::EmbeddedScanner,
     pub(crate) archive_recycler: ArchiveRecycleHandler,

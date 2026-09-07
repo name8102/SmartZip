@@ -1,7 +1,7 @@
 //! Application routing configuration via TOML.
 
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -11,6 +11,7 @@ pub enum AdapterFamily {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BackendInstallation {
     pub id: String,
     pub family: AdapterFamily,
@@ -28,6 +29,7 @@ fn enabled_by_default() -> bool {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BackendConfig {
     #[serde(default = "enabled_by_default")]
     pub auto_discover: bool,
@@ -48,6 +50,11 @@ impl BackendConfig {
     pub fn validate(&self) -> std::result::Result<(), String> {
         let mut ids = std::collections::HashSet::new();
         for installation in &self.installations {
+            if installation.executable.as_os_str().is_empty()
+                || installation.executable.to_string_lossy().contains('\0')
+            {
+                return Err("backend executable must be a nonempty valid path".into());
+            }
             if installation.id.trim().is_empty() {
                 return Err("backend installation ID cannot be empty".into());
             }
@@ -63,7 +70,7 @@ impl BackendConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ExtractionLimits {
     pub max_files: u64,
     pub max_output_bytes: u64,
@@ -81,66 +88,9 @@ impl Default for ExtractionLimits {
     }
 }
 
-/// Routing and extraction resource configuration. Keep the
-/// wrapper so config files have one stable root without carrying dead defaults.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SmartZipConfig {
-    #[serde(default)]
-    pub backends: BackendConfig,
-    #[serde(default)]
-    pub extraction: ExtractionLimits,
-}
-
-impl Default for SmartZipConfig {
-    fn default() -> Self {
-        Self {
-            backends: BackendConfig::default(),
-            extraction: ExtractionLimits::default(),
-        }
-    }
-}
-
-impl SmartZipConfig {
-    pub fn load(path: impl AsRef<Path>) -> std::io::Result<Self> {
-        let content = std::fs::read_to_string(path)?;
-        toml::from_str(&content)
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn loads_backend_configuration() {
-        let path =
-            std::env::temp_dir().join(format!("smartzip-config-{}.toml", std::process::id()));
-        std::fs::write(
-            &path,
-            "[backends]\nauto_discover = false\n[[backends.installations]]\nid = 'local-7z'\nfamily = 'seven-zip-cli'\nexecutable = '/opt/bin/7z'\npriority = 10\n",
-        )
-        .unwrap();
-        let loaded = SmartZipConfig::load(&path).unwrap();
-        assert!(!loaded.backends.auto_discover);
-        assert_eq!(loaded.backends.installations[0].id, "local-7z");
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn duplicate_backend_ids_are_rejected() {
-        let installation = BackendInstallation {
-            id: "duplicate".into(),
-            family: AdapterFamily::SevenZipCli,
-            executable: PathBuf::from("7z"),
-            declared_version: None,
-            enabled: true,
-            priority: 0,
-        };
-        let config = BackendConfig {
-            installations: vec![installation.clone(), installation],
-            ..BackendConfig::default()
-        };
-        assert!(config.validate().unwrap_err().contains("duplicate"));
-    }
-}
+mod model;
+mod resolve;
+mod store;
+pub use model::*;
+pub use resolve::*;
+pub use store::*;

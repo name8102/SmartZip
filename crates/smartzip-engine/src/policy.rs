@@ -1,10 +1,8 @@
 //! Business-container, scan-policy, and min-size gates.
 
-use smartzip_core::TaskId;
 use smartzip_scanner::{EmbeddedArchiveFinding, ScanMode, ScannerConfig};
 use std::path::Path;
 
-use crate::events::EventSink;
 use crate::types::{CandidateSource, ExtractWorkflowRequest, ExtractionCandidate};
 
 pub(crate) fn is_business_container(path: &Path) -> bool {
@@ -46,10 +44,6 @@ pub(crate) fn full_root_scanner_config(requested: &ScannerConfig) -> ScannerConf
     }
 }
 
-pub(crate) fn default_root_scanner_config(requested: &ScannerConfig) -> ScannerConfig {
-    full_root_scanner_config(requested)
-}
-
 pub(crate) fn finding_meets_min_size(
     finding: &EmbeddedArchiveFinding,
     policy: &smartzip_core::EmbeddedScanPolicy,
@@ -64,9 +58,6 @@ pub(crate) fn should_scan_candidate_for_embedded(
     candidate: &ExtractionCandidate,
     policy: &smartzip_core::EmbeddedScanPolicy,
     nested_embedded_enabled: bool,
-    _confirm_large_scan: bool,
-    _events: &EventSink,
-    _task_id: &TaskId,
 ) -> bool {
     if matches!(policy.mode, smartzip_core::EmbeddedScanMode::Ignore) {
         return false;

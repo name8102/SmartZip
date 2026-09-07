@@ -5781,8 +5781,10 @@ dependencies = [
  "smartzip-passwords",
  "smartzip-platform",
  "smartzip-scanner",
+ "tempfile",
  "tokio",
  "tokio-util",
+ "toml 0.8.23",
 ]
 
 [[package]]
@@ -5790,7 +5792,9 @@ name = "smartzip-config"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "tempfile",
  "toml 0.8.23",
+ "toml_edit 0.22.27",
 ]
 
 [[package]]
@@ -5874,6 +5878,7 @@ name = "smartzip-passwords"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "smartzip-config",
  "smartzip-db",
 ]
 
@@ -5883,6 +5888,7 @@ version = "0.1.0"
 dependencies = [
  "directories",
  "serde",
+ "tempfile",
  "trash",
 ]
 

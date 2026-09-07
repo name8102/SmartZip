@@ -17,10 +17,6 @@ pub(crate) fn encoding_mode_label(mode: &EncodingMode) -> String {
     }
 }
 
-/// Append a `skipped` row to `file_extractions` for a candidate that never
-/// reached extraction. `reason` is one of the skip reason strings from the v3
-/// schema (`duplicate` / `recursion_limit` / `not_first_volume` /
-
 pub(crate) async fn resolve_encoding_mode(
     archive_path: &Path,
     requested: EncodingMode,
@@ -61,10 +57,7 @@ pub(crate) struct ZipEncodingAssessment {
     pub(crate) should_confirm: bool,
 }
 
-pub(crate) async fn assess_zip_encoding(
-    archive_path: &Path,
-    _password: Option<String>,
-) -> Option<ZipEncodingAssessment> {
+pub(crate) async fn assess_zip_encoding(archive_path: &Path) -> Option<ZipEncodingAssessment> {
     // ZIP raw filename reading is now via the narrowed NativeZip helper, not
     // via the generic ArchiveAdapter/list path. This keeps raw bytes intact
     // for detector and avoids routing through the backend router.

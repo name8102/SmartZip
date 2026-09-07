@@ -17,8 +17,8 @@ Usage: scripts/crap-scan.sh [--quick] [--top N] [--out-dir DIR]
 Runs cargo-crap with a workflow tuned for SmartZip investigation.
 
 Defaults:
-  - only analyzes smartzip-engine and smartzip-cli risk hotspots
-  - collects LLVM coverage first
+  - analyzes production code across the workspace
+  - collects LLVM coverage first; any test failure stops the scan
   - writes LCOV to target/crap/smartzip.lcov
 
 Options:
@@ -63,32 +63,19 @@ done
 mkdir -p "$OUT_DIR"
 
 common_crap_args=(
+    --workspace
     --exclude 'tests/**'
+    --exclude 'src/engine_tests.rs'
     --top "$TOP"
     --format human
 )
-
-scan_target() {
-    local label="$1"
-    local path="$2"
-
-    echo
-    echo "== cargo-crap: $label =="
-
-    if [[ "$MODE" == "quick" ]]; then
-        cargo crap --path "$path" "${common_crap_args[@]}"
-    else
-        cargo crap --path "$path" "${common_crap_args[@]}" --lcov "$LCOV_PATH"
-    fi
-}
 
 echo "== SmartZip CRAP scan =="
 echo "mode: $MODE"
 echo "top:  $TOP"
 
 if [[ "$MODE" == "quick" ]]; then
-    scan_target "smartzip-engine" "crates/smartzip-engine"
-    scan_target "smartzip-cli" "crates/smartzip-cli"
+    cargo crap "${common_crap_args[@]}"
     exit 0
 fi
 
@@ -100,12 +87,8 @@ XDG_DATA_HOME=/tmp \
 XDG_CONFIG_HOME=/tmp \
 XDG_CACHE_HOME=/tmp \
 cargo llvm-cov \
-    -p smartzip-engine \
-    -p smartzip-cli \
-    --tests \
-    --ignore-run-fail \
+    --workspace \
     --lcov \
     --output-path "$LCOV_PATH"
 
-scan_target "smartzip-engine" "crates/smartzip-engine"
-scan_target "smartzip-cli" "crates/smartzip-cli"
+cargo crap "${common_crap_args[@]}" --lcov "$LCOV_PATH"

@@ -17,10 +17,7 @@ pub fn sampled_fingerprint(path: &Path) -> std::io::Result<blake3::Hash> {
         return Ok(hasher.finalize());
     }
 
-    // If file < SAMPLE_BLOCK*5, hash entire? But requirement says do not hash complete large volumes.
-    // For small files (< 128KB originally sample_hash uses 64KB head/tail, but here we use bounded samples anyway.
-    // If file is small (< 64KB), reading entire is bounded anyway, but we follow spec: bounded samples only.
-    // We'll read at most 5*SAMPLE_BLOCK bytes.
+    // Read at most five sample blocks, including for small files.
     let positions: [u64; 5] = [
         0,
         len / 4,
@@ -28,12 +25,10 @@ pub fn sampled_fingerprint(path: &Path) -> std::io::Result<blake3::Hash> {
         len * 3 / 4,
         len.saturating_sub(SAMPLE_BLOCK as u64),
     ];
-    let mut buf = vec![0u8; SAMPLE_BLOCK];
+    let mut buf = [0u8; SAMPLE_BLOCK];
     for pos in positions {
-        let pos = pos.min(len.saturating_sub(1));
         file.seek(SeekFrom::Start(pos))?;
         let to_read = std::cmp::min(SAMPLE_BLOCK as u64, len - pos) as usize;
-        buf.truncate(to_read);
         let mut read = 0usize;
         while read < to_read {
             let n = file.read(&mut buf[read..to_read])?;
@@ -43,8 +38,6 @@ pub fn sampled_fingerprint(path: &Path) -> std::io::Result<blake3::Hash> {
             read += n;
         }
         hasher.update(&buf[..read]);
-        // Reset buf size for next iteration
-        buf.resize(SAMPLE_BLOCK, 0);
     }
     Ok(hasher.finalize())
 }

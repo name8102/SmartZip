@@ -11,6 +11,7 @@ name = "smartzip"
 path = "src/main.rs"
 
 [dependencies]
+toml.workspace = true
 libc.workspace = true
 tokio-util.workspace = true
 chrono = "0.4"
@@ -26,3 +27,6 @@ smartzip-scanner.workspace = true
 tokio.workspace = true
 smartzip-platform.workspace = true
 async-trait.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

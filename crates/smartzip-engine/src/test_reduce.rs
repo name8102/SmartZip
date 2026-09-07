@@ -153,11 +153,6 @@ pub(crate) fn reduce(report: &mut TestArchiveReport) {
     }
     report.localization = if report.integrity == Integrity::Intact {
         Localization::NotApplicable
-    } else if report.coverage == Coverage::Complete
-        && !report.confirmed_volumes.is_empty()
-        && report.suspect_groups.is_empty()
-    {
-        Localization::Exact
     } else if !report.confirmed_volumes.is_empty() || !report.suspect_groups.is_empty() {
         Localization::Partial
     } else {

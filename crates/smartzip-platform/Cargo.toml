@@ -10,3 +10,6 @@ rust-version.workspace = true
 serde.workspace = true
 directories.workspace = true
 trash.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

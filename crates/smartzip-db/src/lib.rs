@@ -53,6 +53,15 @@ impl SmartZipDb {
         })
     }
 
+    pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
+        let conn =
+            Connection::open_with_flags(path.as_ref(), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        Ok(Self {
+            conn,
+            path: Some(path.as_ref().into()),
+        })
+    }
+
     pub fn in_memory() -> Result<Self> {
         let mut conn = Connection::open_in_memory()?;
         schema::migrate(&mut conn)?;

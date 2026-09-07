@@ -14,7 +14,7 @@ use crate::encoding_flow::encoding_mode_label;
 use crate::events::{EventSink, TaskEventListener};
 use crate::interactive::{InteractiveEncodingPrompter, InteractivePasswordPrompter};
 use crate::password_order::load_password_candidates;
-use crate::policy::{default_root_scanner_config, ext_business_container_kind};
+use crate::policy::{ext_business_container_kind, full_root_scanner_config};
 use crate::types::{
     DetectRequest, DetectResult, FileAwareDetectResult, InspectRequest, ListArchiveRequest,
     ListArchiveResult,
@@ -32,7 +32,7 @@ pub(crate) fn detect(
     let task_id = TaskId::new();
     let mut events = vec![TaskEvent::started(task_id.clone())];
 
-    let effective_config = default_root_scanner_config(&request.scanner);
+    let effective_config = full_root_scanner_config(&request.scanner);
     let scanner = if effective_config == *engine_scanner.config() {
         None
     } else {
@@ -77,6 +77,7 @@ pub(crate) fn detect(
 
 pub(crate) async fn inspect_file_with_listener<B: ArchiveExecutor>(
     cancellation: tokio_util::sync::CancellationToken,
+    run_policy: Option<&crate::CompiledRunPolicy>,
     backend: &B,
     _passwords: &PasswordService<'_>,
     request: InspectRequest,
@@ -91,6 +92,9 @@ pub(crate) async fn inspect_file_with_listener<B: ArchiveExecutor>(
         cancellation,
     );
     events.push(TaskEvent::started(task_id.clone()));
+    if let Some(policy) = run_policy {
+        policy.emit_plan(&events, &task_id);
+    }
     if let Some(recorder) = history {
         recorder.start_task(&task_id, "detect", None);
     }
@@ -101,8 +105,14 @@ pub(crate) async fn inspect_file_with_listener<B: ArchiveExecutor>(
         task_context.cancellation_token(),
     );
 
-    let findings = scan_embedded_findings(&request.path, &request.scanner);
-    let candidate = resolve_root_candidate(&request.path, &findings, &events, &task_id);
+    let scan_root = run_policy
+        .is_none_or(|p| p.values().extraction.embedded.root != smartzip_config::RootScan::Off);
+    let findings = if scan_root {
+        scan_embedded_findings(&request.path, &request.scanner)
+    } else {
+        Vec::new()
+    };
+    let candidate = resolve_root_candidate(&request.path, &findings, &events, &task_id, scan_root);
 
     let mut detected_format = candidate.as_ref().and_then(|c| c.detected_format.clone());
     let mut status = "unreadable".to_string();
@@ -139,6 +149,7 @@ pub(crate) async fn inspect_file_with_listener<B: ArchiveExecutor>(
             history,
             &events,
             &task_id,
+            run_policy,
         )
         .await?;
         known_password = resolved
@@ -259,6 +270,7 @@ pub(crate) async fn inspect_file_with_listener<B: ArchiveExecutor>(
 
 pub(crate) async fn list_archive_with_listener_interactive<B: ArchiveExecutor>(
     cancellation: tokio_util::sync::CancellationToken,
+    run_policy: Option<&crate::CompiledRunPolicy>,
     backend: &B,
     passwords: &PasswordService<'_>,
     request: ListArchiveRequest,
@@ -267,6 +279,18 @@ pub(crate) async fn list_archive_with_listener_interactive<B: ArchiveExecutor>(
     listener: Option<TaskEventListener>,
     history: Option<&dyn crate::history::TaskHistoryRecorder>,
 ) -> smartzip_core::Result<ListArchiveResult> {
+    let password_prompter = password_prompter.filter(|_| {
+        run_policy
+            .is_none_or(|p| p.values().interaction.mode != smartzip_config::InteractionMode::Never)
+    });
+    let policy_encoding = run_policy.map(|policy| crate::run_policy::PolicyEncodingPrompter {
+        policy,
+        delegate: encoding_prompter,
+    });
+    let encoding_prompter = policy_encoding
+        .as_ref()
+        .map(|p| p as &dyn InteractiveEncodingPrompter)
+        .or(encoding_prompter);
     let task_id = TaskId::new();
     let events = EventSink::new(listener);
     let task_context = backend.begin_task_with_cancellation(
@@ -275,6 +299,9 @@ pub(crate) async fn list_archive_with_listener_interactive<B: ArchiveExecutor>(
         cancellation,
     );
     events.push(TaskEvent::started(task_id.clone()));
+    if let Some(policy) = run_policy {
+        policy.emit_plan(&events, &task_id);
+    }
     if let Some(recorder) = history {
         recorder.start_task(&task_id, "list", None);
     }
@@ -286,8 +313,14 @@ pub(crate) async fn list_archive_with_listener_interactive<B: ArchiveExecutor>(
     );
 
     // List and extract share the same resolver/materialization entrypoint.
-    let findings = scan_embedded_findings(&request.path, &request.scanner);
-    let candidate = resolve_root_candidate(&request.path, &findings, &events, &task_id)
+    let scan_root = run_policy
+        .is_none_or(|p| p.values().extraction.embedded.root != smartzip_config::RootScan::Off);
+    let findings = if scan_root {
+        scan_embedded_findings(&request.path, &request.scanner)
+    } else {
+        Vec::new()
+    };
+    let candidate = resolve_root_candidate(&request.path, &findings, &events, &task_id, scan_root)
         .unwrap_or_else(|| crate::types::ExtractionCandidate {
             path: request.path.clone(),
             relative_path: std::path::PathBuf::from(request.path.file_name().unwrap_or_default()),
@@ -299,8 +332,12 @@ pub(crate) async fn list_archive_with_listener_interactive<B: ArchiveExecutor>(
         });
 
     let mut volume_resolver = crate::volumes::VolumeResolver::new();
-    let (candidate, backend_path_override, _volume_keep) = match volume_resolver.prepare(candidate)
-    {
+    let preparation = if run_policy.is_some_and(|p| !p.values().extraction.volumes.auto_discover) {
+        crate::volumes::VolumePreparation::Single(candidate)
+    } else {
+        volume_resolver.prepare(candidate)
+    };
+    let (candidate, backend_path_override, _volume_keep) = match preparation {
         crate::volumes::VolumePreparation::Single(candidate) => (candidate, None, None),
         crate::volumes::VolumePreparation::Resolved {
             candidate,
@@ -349,41 +386,25 @@ pub(crate) async fn list_archive_with_listener_interactive<B: ArchiveExecutor>(
         history,
         &events,
         &task_id,
+        run_policy,
     )
     .await?;
     let password_candidates =
         load_password_candidates(passwords, request.password_candidates.clone())?;
-    let mut batch_passwords = Vec::new();
     let outcome = access_archive_with_password(
         backend,
         std::sync::Arc::clone(&task_context),
         passwords,
         &resolved,
         &password_candidates,
-        &mut batch_passwords,
         password_prompter,
         encoding_prompter,
         &events,
         &task_id,
-        true,
     )
     .await?;
 
-    for event in outcome.events {
-        events.push(event);
-    }
-
-    let listing =
-        outcome
-            .listing
-            .clone()
-            .ok_or_else(|| smartzip_core::SmartZipError::UnsupportedFormat {
-                path: request.path.clone(),
-                format: candidate
-                    .detected_format
-                    .as_ref()
-                    .map(|f| f.as_str().to_string()),
-            })?;
+    let listing = outcome.listing;
 
     if let Some(recorder) = history {
         // History follows the logical candidate/request identity, never the
@@ -462,7 +483,7 @@ pub(crate) async fn list_archive_with_listener_interactive<B: ArchiveExecutor>(
         path: request.path,
         detected_format: candidate.detected_format,
         entries: listing.entries,
-        encrypted: outcome.encrypted,
+        encrypted: None,
         encoding: encoding_mode_label(&outcome.encoding_mode),
         password_id: outcome.password_id,
         used_password: outcome.has_password,

@@ -211,8 +211,13 @@ impl<'a> DbTaskHistoryRecorder<'a> {
         FileExtractionRepository::new(self.conn)
     }
 
-    fn known_repo(&self) -> KnownFileRepository<'a> {
-        KnownFileRepository::new(self.conn)
+    fn legacy_known_store(&self) -> DbKnownFileStore<'a> {
+        DbKnownFileStore {
+            connection: self.conn,
+            writable: true,
+            password_hint: true,
+            encoding_hint: true,
+        }
     }
 
     /// Expose the underlying [`PasswordRepository`] so callers can share the
@@ -288,51 +293,14 @@ impl<'a> TaskHistoryRecorder for DbTaskHistoryRecorder<'a> {
         }
     }
 
-    fn lookup_known_file(&self, sample_hash: &str, size: i64) -> Option<KnownFileHit> {
-        match self.known_repo().find(sample_hash, size) {
-            Ok(Some(known)) => Some(KnownFileHit {
-                password_id: known.password_id,
-                confirmed_encoding: known.confirmed_encoding,
-                last_extract_at: known.last_extract_at,
-            }),
-            Ok(None) => None,
-            Err(error) => {
-                Self::warn("known_file lookup", error);
-                None
-            }
-        }
+    fn lookup_known_file(&self, hash: &str, size: i64) -> Option<KnownFileHit> {
+        self.legacy_known_store().lookup(hash, size)
     }
-
     fn upsert_known_file_extract(&self, upsert: KnownFileUpsert<'_>) {
-        let name_offset = upsert.name.map(|name| NameOffset {
-            name: name.to_string(),
-            offset: upsert.offset,
-        });
-        let last_extract_at = now_utc_iso8601();
-        if let Err(error) = self.known_repo().upsert_extract(
-            upsert.sample_hash,
-            upsert.size,
-            name_offset,
-            upsert.password_id,
-            &last_extract_at,
-        ) {
-            Self::warn("known_file upsert", error);
-        }
+        self.legacy_known_store().remember_extract(upsert);
     }
-
     fn upsert_known_file_confirmed_encoding(&self, upsert: KnownFileEncodingUpsert<'_>) {
-        let name_offset = upsert.name.map(|name| NameOffset {
-            name: name.to_string(),
-            offset: upsert.offset,
-        });
-        if let Err(error) = self.known_repo().upsert_confirmed_encoding(
-            upsert.sample_hash,
-            upsert.size,
-            name_offset,
-            upsert.encoding,
-        ) {
-            Self::warn("known_file confirmed encoding upsert", error);
-        }
+        self.legacy_known_store().remember_encoding(upsert);
     }
 
     fn finish(&self, task_id: &TaskId, outcome: TaskOutcome<'_>) {
@@ -354,6 +322,17 @@ impl<'a> TaskHistoryRecorder for DbTaskHistoryRecorder<'a> {
 /// Map a [`TaskEventKind`] to the row shape stored in `task_events`.
 fn describe_event(kind: &TaskEventKind) -> (TaskEventLevel, String, String, Option<String>) {
     match kind {
+        TaskEventKind::Decision {
+            stage,
+            action,
+            reason,
+            ..
+        } => (
+            TaskEventLevel::Info,
+            "decision".into(),
+            format!("{stage}: {action} ({reason})"),
+            serde_json::to_string(kind).ok(),
+        ),
         TaskEventKind::Started => (
             TaskEventLevel::Info,
             "Started".into(),
@@ -535,6 +514,128 @@ impl Drop for CompletionGuard<'_> {
                     output_path: None,
                 },
             );
+        }
+    }
+}
+
+/// Independent known-file storage for configuration-driven tasks.
+/// It neither creates task history nor controls whether history is enabled.
+pub trait KnownFileStore {
+    fn lookup(&self, hash: &str, size: i64) -> Option<KnownFileHit>;
+    fn remember_extract(&self, upsert: KnownFileUpsert<'_>);
+    fn remember_encoding(&self, upsert: KnownFileEncodingUpsert<'_>);
+}
+
+pub struct DbKnownFileStore<'a> {
+    pub connection: &'a rusqlite::Connection,
+    pub writable: bool,
+    pub password_hint: bool,
+    pub encoding_hint: bool,
+}
+impl KnownFileStore for DbKnownFileStore<'_> {
+    fn lookup(&self, sample_hash: &str, size: i64) -> Option<KnownFileHit> {
+        if !self.password_hint && !self.encoding_hint {
+            return None;
+        }
+        match KnownFileRepository::new(self.connection).find(sample_hash, size) {
+            Ok(Some(known)) => Some(KnownFileHit {
+                password_id: if self.password_hint {
+                    known.password_id
+                } else {
+                    None
+                },
+                confirmed_encoding: if self.encoding_hint {
+                    known.confirmed_encoding
+                } else {
+                    None
+                },
+                last_extract_at: known.last_extract_at,
+            }),
+            Ok(None) => None,
+            Err(error) => {
+                DbTaskHistoryRecorder::warn("known_file lookup", error);
+                None
+            }
+        }
+    }
+
+    fn remember_extract(&self, upsert: KnownFileUpsert<'_>) {
+        if !self.writable {
+            return;
+        }
+        let name_offset = upsert.name.map(|name| NameOffset {
+            name: name.to_string(),
+            offset: upsert.offset,
+        });
+        let last_extract_at = now_utc_iso8601();
+        if let Err(error) = KnownFileRepository::new(self.connection).upsert_extract(
+            upsert.sample_hash,
+            upsert.size,
+            name_offset,
+            upsert.password_id,
+            &last_extract_at,
+        ) {
+            DbTaskHistoryRecorder::warn("known_file upsert", error);
+        }
+    }
+
+    fn remember_encoding(&self, upsert: KnownFileEncodingUpsert<'_>) {
+        if !self.writable {
+            return;
+        }
+        let name_offset = upsert.name.map(|name| NameOffset {
+            name: name.to_string(),
+            offset: upsert.offset,
+        });
+        if let Err(error) = KnownFileRepository::new(self.connection).upsert_confirmed_encoding(
+            upsert.sample_hash,
+            upsert.size,
+            name_offset,
+            upsert.encoding,
+        ) {
+            DbTaskHistoryRecorder::warn("known_file confirmed encoding upsert", error);
+        }
+    }
+}
+
+/// Adapts independently selected stores to the legacy workflow API.
+/// New callers select these capabilities separately; no-history does not disable reuse.
+pub struct RunStores<'a> {
+    pub history: Option<&'a dyn TaskHistoryRecorder>,
+    pub known_files: Option<&'a dyn KnownFileStore>,
+}
+impl TaskHistoryRecorder for RunStores<'_> {
+    fn start_task(&self, id: &TaskId, kind: &str, output: Option<&Path>) {
+        if let Some(s) = self.history {
+            s.start_task(id, kind, output);
+        }
+    }
+    fn record_event(&self, id: &TaskId, event: &TaskEvent) {
+        if let Some(s) = self.history {
+            s.record_event(id, event);
+        }
+    }
+    fn record_file_extraction(&self, id: &TaskId, row: FileExtractionRow<'_>) {
+        if let Some(s) = self.history {
+            s.record_file_extraction(id, row);
+        }
+    }
+    fn finish(&self, id: &TaskId, outcome: TaskOutcome<'_>) {
+        if let Some(s) = self.history {
+            s.finish(id, outcome);
+        }
+    }
+    fn lookup_known_file(&self, hash: &str, size: i64) -> Option<KnownFileHit> {
+        self.known_files.and_then(|s| s.lookup(hash, size))
+    }
+    fn upsert_known_file_extract(&self, upsert: KnownFileUpsert<'_>) {
+        if let Some(s) = self.known_files {
+            s.remember_extract(upsert);
+        }
+    }
+    fn upsert_known_file_confirmed_encoding(&self, upsert: KnownFileEncodingUpsert<'_>) {
+        if let Some(s) = self.known_files {
+            s.remember_encoding(upsert);
         }
     }
 }

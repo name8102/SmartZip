@@ -21,9 +21,7 @@ use crate::nested::{
     output_dir_for_candidate, output_relative_path_for, record_skip,
     recyclable_nested_archive_path, recycle_archive, root_embedded_candidates,
 };
-use crate::password_order::{
-    order_password_candidates, password_source_label, password_value, remember_batch_password,
-};
+use crate::password_order::password_source_label;
 use crate::policy::{
     embedded_policy_from_request, ext_business_container_kind, finding_meets_min_size,
     full_root_scanner_config, should_scan_candidate_for_embedded,
@@ -41,12 +39,13 @@ use crate::volumes::{VolumeResolution, VolumeResolver};
 
 pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecutor>(
     engine_scanner: &EmbeddedScanner,
+    run_policy: Option<&crate::CompiledRunPolicy>,
     min_embedded_size_bytes: u64,
     archive_recycler: &ArchiveRecycleHandler,
     cancellation: tokio_util::sync::CancellationToken,
     backend: &B,
     passwords: &PasswordService<'_>,
-    request: ExtractWorkflowRequest,
+    mut request: ExtractWorkflowRequest,
     password_prompter: Option<&dyn InteractivePasswordPrompter>,
     output_prompter: Option<&dyn InteractiveOutputPrompter>,
     embedded_prompter: Option<&dyn InteractiveEmbeddedPrompter>,
@@ -54,6 +53,38 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
     listener: Option<TaskEventListener>,
     history: Option<&dyn crate::history::TaskHistoryRecorder>,
 ) -> smartzip_core::Result<ExtractWorkflowResult> {
+    if let Some(policy) = run_policy {
+        policy.apply_request(&mut request);
+    }
+    let config = run_policy.map(crate::CompiledRunPolicy::values);
+    let may_prompt =
+        config.is_none_or(|c| c.interaction.mode != smartzip_config::InteractionMode::Never);
+    let password_prompter = password_prompter.filter(|_| passwords.allows_prompt() && may_prompt);
+    let embedded_prompter = embedded_prompter.filter(|_| may_prompt);
+    let policy_output = run_policy.map(|policy| crate::run_policy::PolicyOutputPrompter {
+        policy,
+        delegate: output_prompter,
+    });
+    let output_prompter = policy_output
+        .as_ref()
+        .map(|p| p as &dyn InteractiveOutputPrompter)
+        .or(output_prompter);
+    let policy_encoding = run_policy.map(|policy| crate::run_policy::PolicyEncodingPrompter {
+        policy,
+        delegate: encoding_prompter,
+    });
+    let encoding_prompter = policy_encoding
+        .as_ref()
+        .map(|p| p as &dyn InteractiveEncodingPrompter)
+        .or(encoding_prompter);
+    let delete_recycler: ArchiveRecycleHandler = std::sync::Arc::new(std::fs::remove_file);
+    let archive_recycler = if config
+        .is_some_and(|c| c.extraction.cleanup.nested_archives == smartzip_config::Cleanup::Delete)
+    {
+        &delete_recycler
+    } else {
+        archive_recycler
+    };
     let task_id = TaskId::new();
     let events = EventSink::new(listener);
     let task_context = backend.begin_task_with_cancellation(
@@ -67,9 +98,14 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
         Some(EmbeddedScanner::new(request.scanner.clone()))
     };
     let nested_scanner = nested_scanner.as_ref().unwrap_or(engine_scanner);
-    let root_scanner = EmbeddedScanner::new(full_root_scanner_config(&request.scanner));
+    let root_scanner = config
+        .is_none_or(|c| c.extraction.embedded.root != smartzip_config::RootScan::Off)
+        .then(|| EmbeddedScanner::new(full_root_scanner_config(&request.scanner)));
 
     events.push(TaskEvent::started(task_id.clone()));
+    if let Some(policy) = run_policy {
+        policy.emit_plan(&events, &task_id);
+    }
     let mut queue = VecDeque::new();
     let mut seen = HashSet::new();
     let mut processed = Vec::new();
@@ -80,7 +116,10 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
     let mut root_input_started = 0usize;
     let mut embedded_policy = embedded_policy_from_request(&request);
     embedded_policy.min_finding_size_bytes = min_embedded_size_bytes;
-    let nested_embedded_enabled = !matches!(
+    let nested_embedded_enabled = config.is_none_or(|c| {
+        c.extraction.recursion.enabled
+            && c.extraction.embedded.nested != smartzip_config::NestedScan::Off
+    }) && !matches!(
         embedded_policy.mode,
         smartzip_core::EmbeddedScanMode::Ignore
     );
@@ -133,6 +172,21 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
     let mut consumed_volume_members = HashSet::new();
 
     loop {
+        if failed_count > 0
+            && config.is_some_and(|c| c.extraction.on_error == smartzip_config::OnError::Stop)
+        {
+            if let Some(policy) = run_policy {
+                policy.decision(
+                    &events,
+                    &task_id,
+                    "scheduler",
+                    "stop",
+                    "error_in_previous_candidate",
+                    "extraction.on_error",
+                );
+            }
+            break;
+        }
         if cancellation.is_cancelled() {
             was_cancelled = true;
             break;
@@ -174,7 +228,9 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
             None;
         let mut volume_archive_path: Option<std::path::PathBuf> = None;
         let mut volume_set_for_candidate: Option<crate::volumes::VolumeSet> = None;
-        let preparation = if candidate.source != CandidateSource::EmbeddedFinding {
+        let preparation = if config.is_some_and(|c| !c.extraction.volumes.auto_discover) {
+            crate::volumes::VolumePreparation::Single(candidate)
+        } else if candidate.source != CandidateSource::EmbeddedFinding {
             let resolution = volume_resolver.resolve(&candidate);
             if let VolumeResolution::Resolved(set)
             | VolumeResolution::ResolvedWithWarnings { set, .. } = &resolution
@@ -335,7 +391,16 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
         }
 
         // Header-based detection first, then scanner confirmation
-        let header_result = crate::detect::probe_file_header(&candidate.path);
+        if let Some(policy) = run_policy {
+            embedded_policy.mode = policy.embedded_mode(candidate.depth == 0);
+        }
+        let header_result = if config.is_some()
+            && embedded_policy.mode == smartzip_core::EmbeddedScanMode::Ignore
+        {
+            None
+        } else {
+            crate::detect::probe_file_header(&candidate.path)
+        };
         let _has_non_archive_header = {
             let mut file = match std::fs::File::open(&candidate.path) {
                 Ok(f) => f,
@@ -412,7 +477,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
         }
 
         let scan_with = if candidate.source == CandidateSource::RootInput {
-            &root_scanner
+            root_scanner.as_ref().unwrap_or(nested_scanner)
         } else {
             nested_scanner
         };
@@ -430,9 +495,6 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                 &candidate,
                 &embedded_policy,
                 nested_embedded_enabled,
-                request.confirm_large_scan,
-                &events,
-                &task_id,
             ) {
             if let Some(limit) = scan_with
                 .scan_limit()
@@ -672,17 +734,21 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
         // sampling so we can dedup, reuse a confirmed encoding, and reuse a
         // known password. Carve candidates hash their [offset, offset+size)
         // segment; a size-unknown carve yields no hash and skips dedup.
-        let (sample_hash, sample_size) = match candidate.embedded_offset {
-            Some(offset) if offset > 0 => smartzip_db::sample_hash::sample_hash_segment(
-                &candidate.path,
-                offset,
-                candidate.embedded_size,
-            )
-            .map(|(h, s)| (Some(h), Some(s as i64)))
-            .unwrap_or((None, None)),
-            _ => smartzip_db::sample_hash::sample_hash(&archive_path)
+        let (sample_hash, sample_size) = if history.is_none() {
+            (None, None)
+        } else {
+            match candidate.embedded_offset {
+                Some(offset) if offset > 0 => smartzip_db::sample_hash::sample_hash_segment(
+                    &candidate.path,
+                    offset,
+                    candidate.embedded_size,
+                )
                 .map(|(h, s)| (Some(h), Some(s as i64)))
                 .unwrap_or((None, None)),
+                _ => smartzip_db::sample_hash::sample_hash(&archive_path)
+                    .map(|(h, s)| (Some(h), Some(s as i64)))
+                    .unwrap_or((None, None)),
+            }
         };
         let known_hit = match (history, sample_hash.as_deref(), sample_size) {
             (Some(recorder), Some(hash), Some(size)) => recorder.lookup_known_file(hash, size),
@@ -722,7 +788,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
             .as_ref()
             .and_then(|h| h.password_id)
             .and_then(|id| passwords.candidate_by_id(id).ok().flatten());
-        let candidate_passwords = order_password_candidates(
+        let candidate_passwords = passwords.order_candidates(
             &password_candidates,
             known_password.as_ref(),
             &batch_passwords,
@@ -762,10 +828,11 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
         // Skip auto-detection entirely when a user-confirmed encoding was
         // reused from known_files — that choice already beat auto once.
         let mut zip_encoding_assessment = None;
-        if candidate_encoding_mode == EncodingMode::Auto
+        if config.is_none_or(|c| c.extraction.encoding.mode == "auto")
+            && candidate_encoding_mode == EncodingMode::Auto
             && candidate.detected_format == Some(ArchiveFormat::Zip)
         {
-            zip_encoding_assessment = assess_zip_encoding(&archive_path, None).await;
+            zip_encoding_assessment = assess_zip_encoding(&archive_path).await;
         }
         if let Some(assessment) = &zip_encoding_assessment {
             events.push(TaskEvent {
@@ -839,7 +906,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
             if task_context.is_cancelled() {
                 break;
             }
-            let pw_value = password_value(&password);
+            let pw_value = Some(password.value.clone());
             attempt_index += 1;
             events.push(TaskEvent {
                 task_id: task_id.clone(),
@@ -957,7 +1024,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                                     .unwrap_or(false)));
                     if candidate_has_password {
                         candidate_password_id = passwords.record_success(&password).ok().flatten();
-                        remember_batch_password(
+                        passwords.remember_batch(
                             &mut batch_passwords,
                             &password.value,
                             candidate_password_id,
@@ -1136,6 +1203,32 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
             continue;
         }
         if !extracted {
+            if let Some(policy) = run_policy {
+                let c = policy.values();
+                let key = if skip_reason == "encoding_skipped"
+                    && c.extraction.encoding.on_suspicious
+                        == smartzip_config::SuspiciousEncoding::Ask
+                {
+                    Some("extraction.encoding.on_suspicious")
+                } else if terminal_skip
+                    && skip_reason == "target_exists"
+                    && c.extraction.output.on_conflict == smartzip_config::Conflict::Ask
+                {
+                    Some("extraction.output.on_conflict")
+                } else {
+                    None
+                };
+                if let Some(key) = key {
+                    policy.decision(
+                        &events,
+                        &task_id,
+                        "confirmation",
+                        "skip",
+                        "needs_decision",
+                        key,
+                    );
+                }
+            }
             skipped.push(candidate);
             continue;
         }
@@ -1200,14 +1293,28 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
         // containers which will subsequently be expanded and recycled.
         processed.push(candidate.clone());
         let output_relative_path = candidate_output_relative_path(&candidate);
-        let nested_candidates = discover_nested_candidates(
-            nested_scanner,
-            &actual_output_dir,
-            candidate.depth + 1,
-            &output_relative_path,
-            &embedded_policy,
-            nested_embedded_enabled,
-        );
+        let mut discovery_policy = embedded_policy.clone();
+        if let Some(policy) = run_policy {
+            discovery_policy.mode = policy.embedded_mode(false);
+        }
+        let nested_candidates = if config.is_none() || candidate.depth < request.recursion_limit {
+            discover_nested_candidates(
+                nested_scanner,
+                &actual_output_dir,
+                candidate.depth + 1,
+                &output_relative_path,
+                &discovery_policy,
+                nested_embedded_enabled,
+                config.is_none_or(|c| {
+                    matches!(
+                        c.extraction.embedded.nested,
+                        smartzip_config::NestedScan::Aggressive | smartzip_config::NestedScan::All
+                    )
+                }),
+            )
+        } else {
+            Vec::new()
+        };
         for nested in nested_candidates {
             if enqueued.len() >= request.limits.max_nested_candidates {
                 failed_count += 1;
@@ -1223,6 +1330,13 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
         }
 
         // For volume sets, recycle all members that are inside the managed output root; for singles, recycle the single candidate.
+        if candidate.source == CandidateSource::RootInput
+            || config.is_some_and(|c| {
+                c.extraction.cleanup.nested_archives == smartzip_config::Cleanup::Keep
+            })
+        {
+            continue;
+        }
         if let Some(set) = volume_set_for_candidate {
             for member in set.members {
                 let synthetic = ExtractionCandidate {

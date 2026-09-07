@@ -271,12 +271,16 @@ pub(crate) fn discover_nested_candidates(
     prefix: &Path,
     policy: &smartzip_core::EmbeddedScanPolicy,
     nested_embedded_enabled: bool,
+    scan_unrecognized: bool,
 ) -> Vec<ExtractionCandidate> {
     let mut candidates = Vec::new();
 
     // Handle single-file roots directly when a candidate resolves to one file.
     if root.is_file() {
-        let header_result = crate::detect::probe_file_header(root);
+        let header_result = (nested_embedded_enabled
+            && (scan_unrecognized || format_from_extension(root).is_some()))
+        .then(|| crate::detect::probe_file_header(root))
+        .flatten();
         if let Some((fmt, offset)) = header_result {
             if is_business_container(root) || crate::container::classify_zip_path(root).is_some() {
                 return candidates;
@@ -331,7 +335,10 @@ pub(crate) fn discover_nested_candidates(
         relative_path.push(path.strip_prefix(root).unwrap_or(path.as_path()));
         relative_path.set_file_name(archive_stem(&path));
 
-        let header_result = crate::detect::probe_file_header(&path);
+        let header_result = (nested_embedded_enabled
+            && (scan_unrecognized || detected_format.is_some()))
+        .then(|| crate::detect::probe_file_header(&path))
+        .flatten();
         if let Some((fmt, offset)) = header_result {
             if is_business_container(&path) || crate::container::classify_zip_path(&path).is_some()
             {
@@ -366,7 +373,7 @@ pub(crate) fn discover_nested_candidates(
             continue;
         }
 
-        if !nested_embedded_enabled {
+        if !nested_embedded_enabled || !scan_unrecognized {
             continue;
         }
         let file_size = std::fs::metadata(&path)

@@ -3,7 +3,6 @@
 use crate::encoding_flow::*;
 use crate::interactive::*;
 use crate::nested::*;
-use crate::password_order::*;
 use crate::policy::*;
 use crate::types::*;
 use async_trait::async_trait;
@@ -59,7 +58,9 @@ fn password_order_is_explicit_then_known_then_batch_then_database() {
     let known = password_candidate("known", PasswordSource::Database);
     let batch = vec![password_candidate("batch", PasswordSource::Recent)];
 
-    let ordered = order_password_candidates(&base, Some(&known), &batch);
+    let db = SmartZipDb::in_memory().unwrap();
+    let service = PasswordService::new(PasswordRepository::new(db.connection()));
+    let ordered = service.order_candidates(&base, Some(&known), &batch);
     assert_eq!(
         ordered
             .iter()
@@ -302,13 +303,6 @@ fn only_regular_extracted_archives_inside_output_are_recyclable() {
     assert!(recyclable_nested_archive_path(&candidate, &output).is_none());
 }
 
-#[test]
-fn maps_common_extensions() {
-    assert_eq!(format_from_extension("a.7z"), Some(ArchiveFormat::SevenZip));
-    assert_eq!(format_from_extension("a.tgz"), Some(ArchiveFormat::Gzip));
-    assert_eq!(format_from_extension("a.bin"), None);
-}
-
 #[rstest]
 #[case("a.zip", Some(ArchiveFormat::Zip))]
 #[case("a.7z", Some(ArchiveFormat::SevenZip))]
@@ -333,15 +327,6 @@ fn maps_common_extensions() {
 #[case("A.7Z", Some(ArchiveFormat::SevenZip))]
 fn format_from_extension_parametrized(#[case] path: &str, #[case] expected: Option<ArchiveFormat>) {
     assert_eq!(format_from_extension(path), expected);
-}
-
-#[test]
-fn engine_accepts_custom_scanner_config() {
-    let engine = SmartZipEngine::with_scanner_config(ScannerConfig {
-        mode: ScanMode::Deep,
-        ..ScannerConfig::default()
-    });
-    assert_eq!(engine.scanner.config().mode, ScanMode::Deep);
 }
 
 #[tokio::test]
@@ -1267,4 +1252,229 @@ impl ArchiveExecutor for EmbeddedAwareFakeBackend {
             output: request.output,
         })
     }
+}
+
+struct PasswordListingBackend {
+    requests: Mutex<Vec<ListRequest>>,
+}
+
+#[async_trait]
+impl ArchiveExecutor for PasswordListingBackend {
+    async fn probe(&self, path: &Path) -> smartzip_core::Result<ArchiveProbe> {
+        Ok(ArchiveProbe {
+            path: path.into(),
+            format: Some(ArchiveFormat::Zip),
+            encrypted: Some(true),
+            supported: true,
+        })
+    }
+
+    async fn list(&self, request: ListRequest) -> smartzip_core::Result<ArchiveListing> {
+        let accepted = request.password.as_deref() == Some("correct");
+        let path = request.archive.clone();
+        self.requests.lock().unwrap().push(request);
+        if accepted {
+            Ok(ArchiveListing {
+                format: Some(ArchiveFormat::Zip),
+                entries: Vec::new(),
+            })
+        } else {
+            Err(SmartZipError::WrongPassword { path })
+        }
+    }
+
+    async fn test(&self, _: TestRequest) -> smartzip_core::Result<TestResult> {
+        panic!("listing must not test data")
+    }
+    async fn extract(
+        &self,
+        _: ExtractArchiveRequest,
+    ) -> smartzip_core::Result<ExtractArchiveResult> {
+        panic!("listing must not extract")
+    }
+    async fn compress(
+        &self,
+        _: CompressArchiveRequest,
+    ) -> smartzip_core::Result<CompressArchiveResult> {
+        panic!("listing must not compress")
+    }
+}
+
+struct ListingPasswordPrompt(Option<&'static str>);
+
+#[async_trait]
+impl InteractivePasswordPrompter for ListingPasswordPrompt {
+    async fn prompt(&self, _: &Path) -> Option<String> {
+        self.0.map(str::to_string)
+    }
+}
+
+#[rstest]
+#[case(true, None, None)]
+#[case(false, Some("correct"), None)]
+#[case(false, None, Some("password_required"))]
+#[case(false, Some("still-wrong"), Some("wrong_password"))]
+#[tokio::test]
+async fn listing_retries_in_order_and_preserves_prompt_outcomes(
+    #[case] stored_success: bool,
+    #[case] prompted: Option<&'static str>,
+    #[case] expected_error: Option<&str>,
+) {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("encrypted.zip");
+    std::fs::write(&path, b"listing backend fixture").unwrap();
+    let backend = PasswordListingBackend {
+        requests: Mutex::new(Vec::new()),
+    };
+    let db = SmartZipDb::in_memory().unwrap();
+    let passwords = PasswordService::new(PasswordRepository::new(db.connection()));
+    let mut manual = vec!["wrong".into()];
+    if stored_success {
+        manual.extend(["correct".into(), "unused".into()]);
+    }
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let listener_events = observed.clone();
+    let result = SmartZipEngine::default()
+        .list_archive_with_listener_interactive(
+            &backend,
+            &passwords,
+            ListArchiveRequest {
+                path: path.clone(),
+                scanner: ScannerConfig::default(),
+                encoding_mode: EncodingMode::Override("UTF-8".into()),
+                password_candidates: PasswordCandidateRequest {
+                    manual,
+                    include_empty: false,
+                    ..Default::default()
+                },
+            },
+            Some(&ListingPasswordPrompt(prompted)),
+            None,
+            Some(Arc::new(move |event| {
+                listener_events.lock().unwrap().push(event.clone())
+            })),
+            None,
+        )
+        .await;
+    match expected_error {
+        None => {
+            let result = result.unwrap();
+            assert!(result.used_password);
+            assert!(result.password_id.is_some());
+            assert_eq!(result.encoding, "UTF-8");
+            assert_eq!(result.events, *observed.lock().unwrap());
+        }
+        Some("password_required") => {
+            assert!(matches!(result, Err(SmartZipError::PasswordRequired { path: p }) if p == path))
+        }
+        Some("wrong_password") => {
+            assert!(matches!(result, Err(SmartZipError::WrongPassword { path: p }) if p == path))
+        }
+        _ => unreachable!(),
+    }
+    let requests = backend.requests.lock().unwrap();
+    let attempts: Vec<_> = requests
+        .iter()
+        .map(|r| r.password.as_deref().unwrap())
+        .collect();
+    let mut expected = vec!["wrong"];
+    if stored_success {
+        expected.push("correct");
+    } else if let Some(password) = prompted {
+        expected.push(password);
+    }
+    assert_eq!(attempts, expected);
+    let events = observed.lock().unwrap();
+    let progress: Vec<_> = events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            TaskEventKind::Progress(p) if p.message.starts_with("Trying password") => {
+                Some(p.message.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(progress.len(), if stored_success { 2 } else { 1 });
+    for (index, message) in progress.iter().enumerate() {
+        assert!(message.contains(&format!(
+            "[{}/{}]",
+            index + 1,
+            if stored_success { 3 } else { 1 }
+        )));
+        assert!(!message.contains("correct") && !message.contains("wrong"));
+    }
+}
+
+#[tokio::test]
+async fn configured_cleanup_keep_never_calls_recycler_and_policy_is_a_snapshot() {
+    let root = tempfile::tempdir().unwrap();
+    let input = root.path().join("root.zip");
+    std::fs::write(&input, b"fake archive").unwrap();
+    let mut resolved = smartzip_config::ResolvedConfig::load(None).unwrap();
+    let c = &mut resolved.values;
+    c.state.mode = smartzip_config::StateMode::Off;
+    c.extraction.recursion.max_depth = 1;
+    c.extraction.embedded.root = smartzip_config::RootScan::Off;
+    c.extraction.embedded.nested = smartzip_config::NestedScan::Off;
+    c.extraction.volumes.auto_discover = false;
+    c.extraction.encoding.mode = "backend".into();
+    c.extraction.output.layout = smartzip_config::Layout::Raw;
+    c.extraction.cleanup.nested_archives = smartzip_config::Cleanup::Keep;
+    let policy = crate::CompiledRunPolicy::compile(resolved).unwrap();
+    let service = PasswordService::configured(
+        None,
+        policy.values().passwords.clone(),
+        smartzip_config::StateMode::Off,
+    );
+    let recycled = Arc::new(AtomicUsize::new(0));
+    let calls = recycled.clone();
+    let engine = SmartZipEngine::default()
+        .with_run_policy(policy.clone())
+        .with_archive_recycler(Arc::new(move |_| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }));
+    let mut next_task_policy = policy;
+    next_task_policy
+        .resolved
+        .values
+        .extraction
+        .cleanup
+        .nested_archives = smartzip_config::Cleanup::Delete;
+    next_task_policy
+        .resolved
+        .values
+        .extraction
+        .recursion
+        .enabled = false;
+    let backend = FakeBackend::default();
+    let result = engine
+        .extract_recursive(
+            &backend,
+            &service,
+            ExtractWorkflowRequest {
+                inputs: vec![input.clone()],
+                output_dir: root.path().join("out"),
+                recursion_limit: 0,
+                encoding_mode: EncodingMode::Auto,
+                scanner: ScannerConfig::default(),
+                password_candidates: PasswordCandidateRequest::default(),
+                layout_policy: crate::layout::OutputLayoutPolicy::default(),
+                single_root_name_policy: crate::layout::SingleRootNamePolicy::default(),
+                embedded_scan_mode: smartzip_core::EmbeddedScanMode::Auto,
+                dominant_min_ratio: 0.7,
+                confirm_large_scan: false,
+                force: false,
+                limits: Default::default(),
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.processed.len(), 2);
+    assert_eq!(backend.calls.lock().unwrap().len(), 2);
+    assert_eq!(recycled.load(Ordering::SeqCst), 0);
+    assert!(input.exists());
+    assert!(root.path().join("out/root/nested.zip").exists());
 }

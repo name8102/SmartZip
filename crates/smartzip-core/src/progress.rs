@@ -86,6 +86,14 @@ pub enum TaskEventKind {
         path: PathBuf,
     },
     Route(RouteEvent),
+    Decision {
+        stage: String,
+        action: String,
+        reason: String,
+        policy_key: String,
+        source: String,
+        detail: Option<String>,
+    },
     TestPhase {
         path: PathBuf,
         pass_id: u32,

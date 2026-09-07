@@ -55,6 +55,7 @@ pub(crate) async fn run<B: ArchiveExecutor>(
     listener: Option<TaskEventListener>,
     history: Option<&dyn TaskHistoryRecorder>,
 ) -> Result<TestWorkflowResult> {
+    let prompter = prompter.filter(|_| passwords.allows_prompt());
     if request.paths.is_empty() {
         return Err(SmartZipError::io(
             None,

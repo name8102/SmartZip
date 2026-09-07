@@ -19,6 +19,7 @@ SmartZip 是一个用 Rust 重写的跨平台压缩包辅助工具，目标是�
 - 能力路由整合已落地：后端按能力、配置与归档要求选择，CLI 与 engine 使用统一执行入口；文件级历史与密码/编码记忆保留。
 - `test` 已接通后端、自动诊断、JSON 和历史报告；[分卷定位说明](.trellis/tasks/2026-07/07-03-test-command-backend-split/design.md) 记录证据规则与格式边界。压缩命令与 GUI 不在 CLI beta 范围。
 - CLI beta 已加入可恢复覆盖提交、扫描与产出预算、Ctrl+C、非交互策略和 `doctor`。安装、平台范围、退出码、JSON 与限制见 [CLI beta 指南](docs/cli-beta.md)。设计草案中超出本轮的交互能力仍待实现。
+- CLI 已接入[统一配置](docs/configuration.md)：自动加载、来源解释、功能策略与无状态运行；GUI 暂未接入。
 - 当前核对结果与已知缺口见 [实现进度](docs/implementation-progress.md)。
 
 ## 快速开始
@@ -75,13 +76,13 @@ cargo run -p smartzip-cli -- password add <password>
 
 RAR5 的独立局部校验可以确认具体坏卷；跨卷 ZIP 数据、7z solid 依赖或无法解密的元数据通常只能给候选组或未知范围。疑似组不代表组内每卷都坏。退出码为 `0` 全部完整、`1` 无组完整、`2` 部分组完整、`130` 取消；参数错误仍使用 `2`。
 
-当前 `--db`、`--config`、`--backend`、`--verbose-routing` 是根层参数，必须放在子命令前。例如指定数据库：
+`--config` 可在子命令前后使用；`--db`、`--backend`、`--verbose-routing` 放在子命令前。例如指定数据库：
 
 ```bash
 cargo run -p smartzip-cli -- --db ./smartzip.db extract <path>
 ```
 
-当前 `--use-clipboard` 尚未接线；`list --pick-encoding` 只显示编码名称。需要文件名对照时先使用 `enc`，再通过 `--encoding` 指定。
+当前 `--use-clipboard` 尚未接线，显式使用会报错；`list --pick-encoding` 只显示编码名称。需要文件名对照时先使用 `enc`，再通过 `--encoding` 指定。
 
 ## 工作区结构
 
