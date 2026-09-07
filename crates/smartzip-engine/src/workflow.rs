@@ -76,7 +76,6 @@ pub(crate) fn detect(
 }
 
 pub(crate) async fn inspect_file_with_listener<B: ArchiveExecutor>(
-    min_embedded_size_bytes: u64,
     cancellation: tokio_util::sync::CancellationToken,
     backend: &B,
     _passwords: &PasswordService<'_>,
@@ -102,16 +101,8 @@ pub(crate) async fn inspect_file_with_listener<B: ArchiveExecutor>(
         task_context.cancellation_token(),
     );
 
-    let candidate = resolve_root_candidate(
-        &request.path,
-        &request.scanner,
-        min_embedded_size_bytes,
-        &events,
-        &task_id,
-        None,
-        None,
-    )
-    .await?;
+    let findings = scan_embedded_findings(&request.path, &request.scanner);
+    let candidate = resolve_root_candidate(&request.path, &findings, &events, &task_id);
 
     let mut detected_format = candidate.as_ref().and_then(|c| c.detected_format.clone());
     let mut status = "unreadable".to_string();
@@ -122,7 +113,6 @@ pub(crate) async fn inspect_file_with_listener<B: ArchiveExecutor>(
     let mut needs_password = false;
     let mut known_password = false;
     let mut known_encoding = None;
-    let findings = scan_embedded_findings(&request.path, &request.scanner, min_embedded_size_bytes);
 
     if let Some(kind) = detected_format.as_ref().and_then(|fmt| {
         (*fmt == ArchiveFormat::Zip)
@@ -268,7 +258,6 @@ pub(crate) async fn inspect_file_with_listener<B: ArchiveExecutor>(
 }
 
 pub(crate) async fn list_archive_with_listener_interactive<B: ArchiveExecutor>(
-    min_embedded_size_bytes: u64,
     cancellation: tokio_util::sync::CancellationToken,
     backend: &B,
     passwords: &PasswordService<'_>,
@@ -297,25 +286,17 @@ pub(crate) async fn list_archive_with_listener_interactive<B: ArchiveExecutor>(
     );
 
     // List and extract share the same resolver/materialization entrypoint.
-    let candidate = resolve_root_candidate(
-        &request.path,
-        &request.scanner,
-        min_embedded_size_bytes,
-        &events,
-        &task_id,
-        None,
-        None,
-    )
-    .await?
-    .unwrap_or_else(|| crate::types::ExtractionCandidate {
-        path: request.path.clone(),
-        relative_path: std::path::PathBuf::from(request.path.file_name().unwrap_or_default()),
-        depth: 0,
-        source: crate::types::CandidateSource::RootInput,
-        detected_format: None,
-        embedded_offset: None,
-        embedded_size: None,
-    });
+    let findings = scan_embedded_findings(&request.path, &request.scanner);
+    let candidate = resolve_root_candidate(&request.path, &findings, &events, &task_id)
+        .unwrap_or_else(|| crate::types::ExtractionCandidate {
+            path: request.path.clone(),
+            relative_path: std::path::PathBuf::from(request.path.file_name().unwrap_or_default()),
+            depth: 0,
+            source: crate::types::CandidateSource::RootInput,
+            detected_format: None,
+            embedded_offset: None,
+            embedded_size: None,
+        });
 
     let mut volume_resolver = crate::volumes::VolumeResolver::new();
     let (candidate, backend_path_override, _volume_keep) = match volume_resolver.prepare(candidate)

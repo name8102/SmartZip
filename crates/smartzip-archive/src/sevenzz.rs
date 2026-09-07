@@ -369,7 +369,7 @@ impl SevenZipBackend {
 
     fn map_failure(&self, output: &BackendCommandOutput, path: &Path) -> SmartZipError {
         let combined = format!("{}\n{}", output.stdout, output.stderr);
-        let lower = combined.to_lowercase();
+        let lower = crate::test_output::diagnostic_text(&combined, "7z");
         if output.status == Some(255) {
             return SmartZipError::Cancelled;
         }
@@ -428,7 +428,12 @@ impl SevenZipBackend {
         }
     }
 
-    fn map_reported_failure<T>(&self, result: &SevenZipResult<T>, path: &Path) -> SmartZipError {
+    fn map_reported_failure<T>(
+        &self,
+        result: &SevenZipResult<T>,
+        path: &Path,
+        password: Option<&str>,
+    ) -> SmartZipError {
         let status = match result.status {
             SevenZipExitStatus::Success => Some(0),
             SevenZipExitStatus::Warning => Some(1),
@@ -438,14 +443,13 @@ impl SevenZipBackend {
             SevenZipExitStatus::Cancelled => Some(255),
             SevenZipExitStatus::Unknown(code) => code,
         };
-        self.map_failure(
-            &BackendCommandOutput {
-                status,
-                stdout: result.stdout.clone(),
-                stderr: result.stderr.clone(),
-            },
-            path,
-        )
+        let output = BackendCommandOutput {
+            status,
+            stdout: result.stdout.clone(),
+            stderr: result.stderr.clone(),
+        };
+        crate::test_output::password_error(&output, "7z", password, path)
+            .unwrap_or_else(|| self.map_failure(&output, path))
     }
 
     pub async fn test_with_report(
@@ -513,9 +517,19 @@ impl SevenZipBackend {
         listing_args.push(request.archive.to_string_lossy().into_owned());
         let listing = self.run_with_token(&listing_args, token).await?;
         if listing.status != Some(0) {
-            return Err(self.map_failure(&listing, &request.archive));
+            return Err(crate::test_output::password_error(
+                &listing,
+                "7z",
+                request.password.as_deref(),
+                &request.archive,
+            )
+            .unwrap_or_else(|| self.map_failure(&listing, &request.archive)));
         }
         validate_extraction_listing(&listing.stdout)?;
+        let encrypted = listing
+            .stdout
+            .lines()
+            .any(|line| line.trim_end() == "Encrypted = +");
         let mut args: Vec<String> = vec!["x".into(), "-y".into(), "-bsp1".into()];
         if let Some(pw) = Self::password_arg(&request.password) {
             args.push(pw);
@@ -534,6 +548,7 @@ impl SevenZipBackend {
         Ok(SevenZipResult {
             value: (status == SevenZipExitStatus::Success).then_some(ExtractArchiveResult {
                 output_dir: request.output_dir,
+                encrypted: Some(encrypted),
             }),
             report,
             status,
@@ -623,7 +638,7 @@ impl ArchiveAdapter for SevenZipBackend {
                     // `value == None` is not an `Err`; we must map it
                     // explicitly to distinguish WrongPassword /
                     // PasswordRequired (supported) from UnsupportedContainer.
-                    let mapped = self.map_reported_failure(&seven_result, path);
+                    let mapped = self.map_reported_failure(&seven_result, path, None);
                     match mapped {
                         SmartZipError::WrongPassword { .. }
                         | SmartZipError::PasswordRequired { .. } => (true, Some(true)),
@@ -743,9 +758,10 @@ impl ArchiveAdapter for SevenZipBackend {
 
     async fn extract(&self, request: ExtractArchiveRequest) -> Result<ExtractArchiveResult> {
         let path = request.archive.clone();
+        let password = request.password.clone();
         let result = self.extract_with_report(request).await?;
         if result.value.is_none() {
-            return Err(self.map_reported_failure(&result, &path));
+            return Err(self.map_reported_failure(&result, &path, password.as_deref()));
         }
         match result.value {
             Some(value) => Ok(value),
@@ -760,6 +776,7 @@ impl ArchiveAdapter for SevenZipBackend {
     ) -> Result<ExtractArchiveResult> {
         let token = context.cancellation_token();
         let path = request.archive.clone();
+        let password = request.password.clone();
         let previous = self.observer.clone();
         let observer_context = context.clone();
         let backend = self.clone().with_observer(move |event| {
@@ -777,7 +794,7 @@ impl ArchiveAdapter for SevenZipBackend {
             .extract_with_report_and_token(request, &token)
             .await?;
         if result.value.is_none() {
-            return Err(self.map_reported_failure(&result, &path));
+            return Err(self.map_reported_failure(&result, &path, password.as_deref()));
         }
         match result.value {
             Some(value) => Ok(value),
@@ -859,6 +876,18 @@ fn extract_unsupported_method(output: &str) -> Option<String> {
 
 fn validate_extraction_listing(stdout: &str) -> Result<()> {
     for entry in parse_entries(stdout) {
+        // TAR writers commonly include `.` or `./` for the extraction root.
+        // Only a directory made entirely of current-directory components is
+        // harmless; empty paths, files named `.`, links, and traversal still fail.
+        if entry.is_dir
+            && entry.path.components().next().is_some()
+            && entry
+                .path
+                .components()
+                .all(|part| part == std::path::Component::CurDir)
+        {
+            continue;
+        }
         if crate::safety::safe_entry_path(entry.path.to_string_lossy().as_bytes()).is_none() {
             return Err(SmartZipError::UnsafeArchivePath {
                 entry: entry.path.display().to_string(),
@@ -921,8 +950,10 @@ fn parse_entries(stdout: &str) -> Vec<ArchiveEntry> {
             current_size = size.parse().ok();
         } else if let Some(size) = line.strip_prefix("Packed Size = ") {
             current_packed_size = size.parse().ok();
+        } else if let Some(folder) = line.strip_prefix("Folder = ") {
+            current_is_dir = folder == "+";
         } else if let Some(attributes) = line.strip_prefix("Attributes = ") {
-            current_is_dir = attributes.contains('D');
+            current_is_dir |= attributes.contains('D');
         }
     }
 
@@ -1121,6 +1152,22 @@ fn parse_archive_format(value: &str) -> ArchiveFormat {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extraction_listing_accepts_tar_root_directory_but_rejects_unsafe_entries() {
+        validate_extraction_listing("Path = .\nFolder = +\n\nPath = ./hello.txt\nFolder = -\n")
+            .unwrap();
+        validate_extraction_listing("Path = ./\nFolder = +\n").unwrap();
+        for listing in [
+            "Path = .\nFolder = -\n",
+            "Path = \nFolder = +\n",
+            "Path = /\nFolder = +\n",
+            "Path = ../escape\nFolder = +\n",
+            "Path = .\nFolder = +\nSymbolic Link = /tmp\n",
+        ] {
+            assert!(validate_extraction_listing(listing).is_err(), "{listing}");
+        }
+    }
 
     #[cfg(unix)]
     fn fake_executable(script: &str) -> (tempfile::TempDir, PathBuf) {

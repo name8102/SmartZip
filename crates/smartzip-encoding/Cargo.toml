@@ -10,7 +10,6 @@ rust-version.workspace = true
 chardetng = "0.1"
 encoding_rs = "0.8"
 serde.workspace = true
-smartzip-core.workspace = true
 
 [dev-dependencies]
 rstest.workspace = true

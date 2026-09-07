@@ -21,10 +21,10 @@ authors = ["charl"]
 rust-version = "1.95"
 
 [workspace.dependencies]
+aho-corasick = "1"
 async-trait = "0.1"
 binwalk = "3.1.0"
 blake3 = "1.5"
-chardetng = "0.1"
 clap = { version = "4.5", features = ["derive"] }
 directories = "6"
 gpui = { version = "0.2", features = ["macos-blade"] }

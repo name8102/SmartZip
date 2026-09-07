@@ -1,11 +1,10 @@
 //! Business-container, scan-policy, and min-size gates.
 
-use smartzip_core::{TaskEvent, TaskEventKind, TaskId};
-use smartzip_scanner::{EmbeddedArchiveFinding, ScannerConfig};
+use smartzip_core::TaskId;
+use smartzip_scanner::{EmbeddedArchiveFinding, ScanMode, ScannerConfig};
 use std::path::Path;
 
 use crate::events::EventSink;
-use crate::nested::format_from_extension;
 use crate::types::{CandidateSource, ExtractWorkflowRequest, ExtractionCandidate};
 
 pub(crate) fn is_business_container(path: &Path) -> bool {
@@ -39,11 +38,16 @@ pub(crate) fn embedded_policy_from_request(
 }
 
 pub(crate) fn full_root_scanner_config(requested: &ScannerConfig) -> ScannerConfig {
-    requested.clone()
+    ScannerConfig {
+        mode: ScanMode::Deep,
+        max_scan_bytes: None,
+        max_findings: usize::MAX,
+        ..requested.clone()
+    }
 }
 
 pub(crate) fn default_root_scanner_config(requested: &ScannerConfig) -> ScannerConfig {
-    requested.clone()
+    full_root_scanner_config(requested)
 }
 
 pub(crate) fn finding_meets_min_size(
@@ -60,9 +64,9 @@ pub(crate) fn should_scan_candidate_for_embedded(
     candidate: &ExtractionCandidate,
     policy: &smartzip_core::EmbeddedScanPolicy,
     nested_embedded_enabled: bool,
-    confirm_large_scan: bool,
-    events: &EventSink,
-    task_id: &TaskId,
+    _confirm_large_scan: bool,
+    _events: &EventSink,
+    _task_id: &TaskId,
 ) -> bool {
     if matches!(policy.mode, smartzip_core::EmbeddedScanMode::Ignore) {
         return false;
@@ -79,22 +83,6 @@ pub(crate) fn should_scan_candidate_for_embedded(
     let file_size = std::fs::metadata(&candidate.path)
         .map(|metadata| metadata.len())
         .unwrap_or(0);
-    if candidate.source == CandidateSource::RootInput
-        && !confirm_large_scan
-        && format_from_extension(&candidate.path).is_none()
-        && file_size > policy.root_full_scan_confirm_threshold
-    {
-        events.push(TaskEvent {
-            task_id: task_id.clone(),
-            kind: TaskEventKind::LargeEmbeddedScanConfirmationRequired {
-                path: candidate.path.clone(),
-                file_size,
-                threshold: policy.root_full_scan_confirm_threshold,
-            },
-        });
-        return false;
-    }
-
     if candidate.source != CandidateSource::RootInput
         && policy
             .inner_scan_max_bytes

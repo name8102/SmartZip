@@ -6,10 +6,12 @@ use std::fs;
 use std::io::Read;
 use std::path::Path;
 
-/// Default threshold for requiring user confirmation before scanning large files.
+mod rar;
+mod windows;
+mod zip;
+
+/// Signature search window. Root parsers can read complete archives beyond it.
 pub const DEFAULT_SCAN_BYTES: u64 = 64 * 1024 * 1024;
-/// Absolute input-buffer bound, including explicitly requested deep scans.
-pub const MAX_SCAN_BYTES: u64 = 256 * 1024 * 1024;
 
 pub const DEFAULT_LARGE_SCAN_THRESHOLD: u64 = 10 * 1024 * 1024 * 1024; // 10GB
 
@@ -23,10 +25,12 @@ pub enum Confidence {
 
 impl Confidence {
     pub fn from_binwalk(value: u8) -> Self {
-        match value {
-            0..=1 => Self::Low,
-            2 => Self::Medium,
-            _ => Self::High,
+        if value >= binwalk::signatures::common::CONFIDENCE_HIGH {
+            Self::High
+        } else if value >= binwalk::signatures::common::CONFIDENCE_MEDIUM {
+            Self::Medium
+        } else {
+            Self::Low
         }
     }
 }
@@ -36,7 +40,7 @@ impl Confidence {
 pub enum ScanMode {
     /// Scan only up to the configured limit. Suitable for default GUI usage.
     Fast,
-    /// Search signatures thoroughly within the bounded scan window.
+    /// Search signatures thoroughly, including short signatures inside a file.
     Deep,
 }
 
@@ -105,33 +109,60 @@ impl EmbeddedScanner {
     }
 
     /// Scan a byte slice that is already loaded by the caller.
-    pub fn scan_limit(&self) -> u64 {
-        self.config
-            .max_scan_bytes
-            .unwrap_or(DEFAULT_SCAN_BYTES)
-            .min(MAX_SCAN_BYTES)
+    pub fn scan_limit(&self) -> Option<u64> {
+        self.config.max_scan_bytes
     }
 
     pub fn scan_bytes(&self, data: &[u8]) -> Vec<EmbeddedArchiveFinding> {
-        let data = &data[..data.len().min(self.scan_limit() as usize)];
+        let scan_len = self.scan_limit().map_or(data.len(), |limit| {
+            usize::try_from(limit).unwrap_or(usize::MAX).min(data.len())
+        });
+        let data = &data[..scan_len];
+        if self.scan_limit().is_none() && self.config.mode == ScanMode::Deep {
+            return self.scan_windows(data, DEFAULT_SCAN_BYTES as usize);
+        }
         self.binwalk
             .scan(data)
             .into_iter()
-            .filter_map(map_signature_result)
+            .filter_map(|result| map_signature_result(result, data))
             .filter(|finding| self.config.include_formats.contains(&finding.format))
             .filter(|finding| finding.confidence >= self.config.min_confidence)
             .take(self.config.max_findings)
             .collect()
     }
 
-    /// Read a bounded amount of data from disk and scan it.
+    /// Make complete root archive data available to parsers; nested scans may cap IO.
     pub fn scan_path(
         &self,
         path: impl AsRef<Path>,
     ) -> std::io::Result<Vec<EmbeddedArchiveFinding>> {
-        let file = fs::File::open(path)?;
+        let mut file = fs::File::open(path)?;
         let mut data = Vec::new();
-        file.take(self.scan_limit()).read_to_end(&mut data)?;
+        if self.scan_limit().is_none() && self.config.mode == ScanMode::Deep {
+            let overlap = self
+                .binwalk
+                .patterns
+                .iter()
+                .map(Vec::len)
+                .max()
+                .unwrap_or(1)
+                - 1;
+            (&mut file)
+                .take(DEFAULT_SCAN_BYTES + overlap as u64)
+                .read_to_end(&mut data)?;
+            let matcher = aho_corasick::AhoCorasick::new(&self.binwalk.patterns)
+                .map_err(std::io::Error::other)?;
+            if !matcher
+                .find_iter(&data)
+                .any(|magic| magic.start() < DEFAULT_SCAN_BYTES as usize)
+            {
+                return Ok(Vec::new());
+            }
+            file.read_to_end(&mut data)?;
+        } else {
+            file.take(self.scan_limit().unwrap_or(u64::MAX))
+                .read_to_end(&mut data)?;
+        }
         Ok(self.scan_bytes(&data))
     }
 
@@ -167,13 +198,41 @@ pub fn default_include_formats() -> Vec<ArchiveFormat> {
 
 fn map_signature_result(
     result: binwalk::signatures::common::SignatureResult,
+    data: &[u8],
 ) -> Option<EmbeddedArchiveFinding> {
+    let format = binwalk_name_to_format(&result.name)?;
+    let mut confidence = Confidence::from_binwalk(result.confidence);
+    let mut size = (result.size > 0).then_some(result.size as u64);
+    let mut description = result.description;
+    if format == ArchiveFormat::Rar {
+        let archive = data.get(result.offset..)?;
+        if !rar::has_checked_initial_header(archive) {
+            return None;
+        }
+        size = rar::checked_size(archive).map(|size| size as u64);
+        confidence = Confidence::Medium;
+        description = match size {
+            Some(size) => {
+                format!("RAR archive; checked block boundaries; total size: {size} bytes")
+            }
+            None => "RAR archive; initial header checksum verified; archive size unknown".into(),
+        };
+    } else if format == ArchiveFormat::Zip {
+        size = zip::checked_size(data.get(result.offset..)?).map(|size| size as u64);
+        if let Some(size) = size {
+            description =
+                format!("ZIP archive; checked central directory; total size: {size} bytes");
+        } else {
+            confidence = Confidence::Medium;
+            description = "ZIP archive; directory boundary unknown".into();
+        }
+    }
     Some(EmbeddedArchiveFinding {
         offset: result.offset as u64,
-        size: (result.size > 0).then_some(result.size as u64),
-        format: binwalk_name_to_format(&result.name)?,
-        confidence: Confidence::from_binwalk(result.confidence),
-        description: result.description,
+        size,
+        format,
+        confidence,
+        description,
     })
 }
 
@@ -221,17 +280,17 @@ mod tests {
     use std::fs;
 
     #[test]
-    fn deep_scan_is_bounded_even_without_an_explicit_limit() {
+    fn unlimited_scan_has_no_implicit_window_or_hard_cap() {
         let scanner = EmbeddedScanner::new(ScannerConfig {
             max_scan_bytes: None,
             ..Default::default()
         });
-        assert_eq!(scanner.scan_limit(), DEFAULT_SCAN_BYTES);
+        assert_eq!(scanner.scan_limit(), None);
         let scanner = EmbeddedScanner::new(ScannerConfig {
             max_scan_bytes: Some(u64::MAX),
             ..Default::default()
         });
-        assert_eq!(scanner.scan_limit(), MAX_SCAN_BYTES);
+        assert_eq!(scanner.scan_limit(), Some(u64::MAX));
         let root = std::env::temp_dir().join(format!("smartzip-sparse-{}", std::process::id()));
         let file = fs::File::create(&root).unwrap();
         file.set_len(16 * 1024 * 1024 * 1024).unwrap();
@@ -240,6 +299,12 @@ mod tests {
             ..Default::default()
         });
         assert!(scanner.scan_path(&root).unwrap().is_empty());
+        let root_scanner = EmbeddedScanner::new(ScannerConfig {
+            mode: ScanMode::Deep,
+            max_scan_bytes: None,
+            ..Default::default()
+        });
+        assert!(root_scanner.scan_path(&root).unwrap().is_empty());
         fs::remove_file(root).unwrap();
     }
 
@@ -251,6 +316,68 @@ mod tests {
             Some(ArchiveFormat::SevenZip)
         );
         assert_eq!(binwalk_name_to_format("unknown"), None);
+    }
+
+    #[test]
+    fn confidence_uses_binwalk_constants() {
+        use binwalk::signatures::common::*;
+        assert_eq!(Confidence::from_binwalk(CONFIDENCE_LOW), Confidence::Low);
+        assert_eq!(
+            Confidence::from_binwalk(CONFIDENCE_MEDIUM),
+            Confidence::Medium
+        );
+        assert_eq!(Confidence::from_binwalk(CONFIDENCE_HIGH), Confidence::High);
+    }
+
+    #[test]
+    fn rar_beyond_scan_window_keeps_checked_header_without_inventing_size() {
+        use std::io::Write;
+        // Main headers with valid checksums; EOF is outside the 1 KiB window.
+        let mut rar5 = b"Rar!\x1a\x07\x01\x00".to_vec();
+        let main = [3, 1, 0, 0]; // size, type, header flags, archive flags
+        rar5.extend_from_slice(&crc32fast::hash(&main).to_le_bytes());
+        rar5.extend_from_slice(&main);
+        let mut rar4 = b"Rar!\x1a\x07\x00".to_vec();
+        let main = [0x73, 0, 0, 13, 0, 0, 0, 0, 0, 0, 0];
+        rar4.extend_from_slice(&(crc32fast::hash(&main) as u16).to_le_bytes());
+        rar4.extend_from_slice(&main);
+
+        for (header, end, crc_offset) in [
+            (rar5, b"\x1d\x77\x56\x51\x03\x05\x04\x00".as_slice(), 8),
+            (rar4, b"\xc4\x3d\x7b\x00\x40\x07\x00".as_slice(), 7),
+        ] {
+            let mut bytes = vec![0x42; 128];
+            bytes.extend_from_slice(&header);
+            bytes.resize(8192, 0);
+            bytes.extend_from_slice(end);
+            let mut file = tempfile::NamedTempFile::new().unwrap();
+            file.write_all(&bytes).unwrap();
+            let scanner = EmbeddedScanner::new(ScannerConfig {
+                max_scan_bytes: Some(1024),
+                ..ScannerConfig::default()
+            });
+            let findings = scanner.scan_path(file.path()).unwrap();
+            let rar = findings
+                .iter()
+                .find(|f| f.format == ArchiveFormat::Rar)
+                .unwrap();
+            assert_eq!(rar.offset, 128);
+            assert_eq!(rar.size, None, "the scan window is not archive EOF");
+            assert_eq!(rar.confidence, Confidence::Medium);
+            assert_eq!(scanner.scan_bytes(&bytes), findings);
+
+            let full = EmbeddedScanner::default().scan_bytes(&bytes);
+            assert_eq!(
+                full[0].size, None,
+                "padding with EOF bytes is not a valid block chain"
+            );
+
+            bytes[128 + crc_offset] ^= 1;
+            assert!(
+                scanner.scan_bytes(&bytes).is_empty(),
+                "bad header CRC cannot restore confidence"
+            );
+        }
     }
 
     #[test]

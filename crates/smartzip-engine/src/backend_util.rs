@@ -6,37 +6,6 @@ use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::path::Path;
 
-/// Adapt a retained failed test report for existing extraction callers, which
-/// use errors to track unsuccessful candidates and emit their final event.
-pub(crate) fn failed_test_error(
-    result: &smartzip_archive::TestResult,
-    path: &Path,
-) -> smartzip_core::SmartZipError {
-    use smartzip_archive::integrity::TestFailure;
-    use smartzip_core::SmartZipError;
-    match result.diagnostics.failure {
-        Some(TestFailure::PasswordRequired) => {
-            SmartZipError::PasswordRequired { path: path.into() }
-        }
-        Some(TestFailure::PasswordRejected) => SmartZipError::WrongPassword { path: path.into() },
-        Some(TestFailure::PasswordIndeterminate) => SmartZipError::CorruptedArchive {
-            path: path.into(),
-            detail: "wrong password or damaged encrypted data; test could not distinguish them"
-                .into(),
-        },
-        Some(TestFailure::Corruption) => SmartZipError::CorruptedArchive {
-            path: path.into(),
-            detail: "archive integrity test failed".into(),
-        },
-        Some(TestFailure::Cancelled) => SmartZipError::Cancelled,
-        _ => SmartZipError::BackendFailed {
-            backend: result.diagnostics.adapter_id.clone(),
-            exit_code: result.diagnostics.exit_code,
-            stderr: format!("archive test failed: {}", result.diagnostics.stderr),
-        },
-    }
-}
-
 pub(crate) fn map_detect_error(
     error: smartzip_core::SmartZipError,
     path: &Path,

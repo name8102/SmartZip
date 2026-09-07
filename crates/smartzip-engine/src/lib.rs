@@ -113,7 +113,6 @@ impl SmartZipEngine {
         history: Option<&dyn history::TaskHistoryRecorder>,
     ) -> smartzip_core::Result<FileAwareDetectResult> {
         workflow::inspect_file_with_listener(
-            self.min_embedded_size_bytes,
             self.cancellation.clone(),
             backend,
             passwords,
@@ -135,7 +134,6 @@ impl SmartZipEngine {
         history: Option<&dyn history::TaskHistoryRecorder>,
     ) -> smartzip_core::Result<ListArchiveResult> {
         workflow::list_archive_with_listener_interactive(
-            self.min_embedded_size_bytes,
             self.cancellation.clone(),
             backend,
             passwords,

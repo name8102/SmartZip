@@ -6,7 +6,6 @@ use std::path::Path;
 /// Hash size plus fixed-size samples around head/25%/50%/75%/tail.
 /// Exact sample block size is an internal constant, not a product setting. Do not read full volume solely for duplicate detection.
 const SAMPLE_BLOCK: usize = 8192;
-const SAMPLE_HEAD: u64 = 0;
 
 pub fn sampled_fingerprint(path: &Path) -> std::io::Result<blake3::Hash> {
     let mut file = File::open(path)?;

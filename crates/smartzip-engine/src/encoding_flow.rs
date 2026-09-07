@@ -61,11 +61,6 @@ pub(crate) struct ZipEncodingAssessment {
     pub(crate) should_confirm: bool,
 }
 
-pub(crate) fn assess_unencrypted_zip(path: &Path) -> Option<ZipEncodingAssessment> {
-    let entries = NativeZipBackend::new().unencrypted_entries(path).ok()??;
-    assess_raw_names(entries.iter().map(|entry| entry.raw_name.as_slice()))
-}
-
 pub(crate) async fn assess_zip_encoding(
     archive_path: &Path,
     _password: Option<String>,

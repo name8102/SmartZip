@@ -1,6 +1,6 @@
 use smartzip_core::{Result, SmartZipError};
 use std::fs::File;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use zip::ZipArchive;
 
 /// Raw ZIP entry as stored in central directory, without SmartZip decoding.
@@ -59,16 +59,6 @@ impl NativeZipBackend {
     /// Returns the exact filename bytes (`name_raw`) for every entry, plus
     /// `is_dir`. No decoding, no extraction, no materialization.
     pub fn raw_entries(&self, path: &Path) -> Result<Vec<ZipRawEntry>> {
-        Ok(self.read_entries(path, false)?.unwrap_or_default())
-    }
-
-    /// Read names for automatic encoding detection in one pass. Stop at the
-    /// first encrypted entry, preserving the cheap encrypted-archive path.
-    pub fn unencrypted_entries(&self, path: &Path) -> Result<Option<Vec<ZipRawEntry>>> {
-        self.read_entries(path, true)
-    }
-
-    fn read_entries(&self, path: &Path, skip_encrypted: bool) -> Result<Option<Vec<ZipRawEntry>>> {
         let mut archive =
             Self::open_archive_read(path).map_err(|e| with_backend_identity(e, &self.id))?;
         let mut entries = Vec::with_capacity(archive.len());
@@ -77,9 +67,6 @@ impl NativeZipBackend {
                 .by_index_raw(i)
                 .map_err(|source| map_zip_error(source, path))
                 .map_err(|e| with_backend_identity(e, &self.id))?;
-            if skip_encrypted && entry.encrypted() {
-                return Ok(None);
-            }
             entries.push(ZipRawEntry {
                 raw_name: entry.name_raw().to_vec(),
                 is_dir: entry.is_dir(),
@@ -87,7 +74,7 @@ impl NativeZipBackend {
                 uncompressed_size: entry.size(),
             });
         }
-        Ok(Some(entries))
+        Ok(entries)
     }
 
     /// Check whether any entry in the ZIP is encrypted (without decrypting).
@@ -157,6 +144,7 @@ fn map_zip_error(source: zip::result::ZipError, path: &Path) -> SmartZipError {
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::path::PathBuf;
     use zip::write::SimpleFileOptions;
     use zip::ZipWriter;
 

@@ -375,7 +375,7 @@ async fn history_write_failure_does_not_change_integrity_or_exit_code() {
 }
 
 #[tokio::test]
-async fn indeterminate_failure_does_not_search_more_passwords() {
+async fn exhausted_indeterminate_passwords_preserve_uncertainty_without_penalties() {
     let dir = canonical_tempdir();
     let path = dir.path().join("a.7z");
     std::fs::write(&path, b"unknown archive").unwrap();
@@ -383,15 +383,27 @@ async fn indeterminate_failure_does_not_search_more_passwords() {
     let backend = BackendRouter::from_adapters(vec![registration]);
     let db = SmartZipDb::in_memory().unwrap();
     let service = PasswordService::new(PasswordRepository::new(db.connection()));
+    let wrong_id = service.add_password("wrong", "manual", false).unwrap();
+    let correct_id = service.add_password("correct", "manual", false).unwrap();
     let mut req = request(vec![path]);
     req.diagnose = DiagnoseMode::Off;
-    req.password_candidates.manual = vec!["wrong".into(), "correct".into()];
     let result = engine()
         .test_archives(&backend, &service, req, None, None, None)
         .await
         .unwrap();
     assert_eq!(result.exit_code, 1);
-    assert_eq!(calls.lock().unwrap().len(), 1);
+    assert_eq!(calls.lock().unwrap().len(), 3);
+    assert_eq!(result.files[0].integrity, Integrity::Unknown);
+    assert_eq!(
+        result.files[0].password_status,
+        PasswordStatus::Indeterminate
+    );
+    let repo = PasswordRepository::new(db.connection());
+    for id in [wrong_id, correct_id] {
+        let password = repo.get_by_id(id).unwrap().unwrap();
+        assert_eq!(password.failure_count, 0);
+        assert_eq!(password.success_count, 0);
+    }
 }
 
 // VolumeSet deliberately canonicalizes parent directories. macOS TMPDIR

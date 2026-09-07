@@ -7,6 +7,12 @@ authors.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+aho-corasick.workspace = true
 binwalk.workspace = true
+crc32fast.workspace = true
 serde.workspace = true
 smartzip-core = { path = "../smartzip-core" }
+
+[dev-dependencies]
+zip.workspace = true
+tempfile.workspace = true

@@ -5748,7 +5748,6 @@ dependencies = [
  "async-trait",
  "crc32fast",
  "flate2",
- "infer",
  "libc",
  "lzma-rust2",
  "process-wrap",
@@ -5825,7 +5824,6 @@ dependencies = [
  "encoding_rs",
  "rstest",
  "serde",
- "smartzip-core",
 ]
 
 [[package]]
@@ -5892,9 +5890,13 @@ dependencies = [
 name = "smartzip-scanner"
 version = "0.1.0"
 dependencies = [
+ "aho-corasick",
  "binwalk",
+ "crc32fast",
  "serde",
  "smartzip-core",
+ "tempfile",
+ "zip",
 ]
 
 [[package]]
