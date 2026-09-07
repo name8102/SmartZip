@@ -53,6 +53,22 @@ pub use types::{
     ListArchiveRequest, ListArchiveResult, SmartZipEngine,
 };
 
+/// Interactive choices for one extraction; absent callbacks retain existing defaults.
+#[derive(Default)]
+pub struct ExtractInteraction<'a> {
+    pub password: Option<&'a dyn InteractivePasswordPrompter>,
+    pub output: Option<&'a dyn InteractiveOutputPrompter>,
+    pub embedded: Option<&'a dyn InteractiveEmbeddedPrompter>,
+    pub encoding: Option<&'a dyn InteractiveEncodingPrompter>,
+}
+
+/// Observers for one extraction. History remains best-effort and caller-owned.
+#[derive(Default)]
+pub struct ExtractObserver<'a> {
+    pub listener: Option<TaskEventListener>,
+    pub history: Option<&'a dyn history::TaskHistoryRecorder>,
+}
+
 impl SmartZipEngine {
     pub async fn test_archives<B: ArchiveExecutor>(
         &self,
@@ -116,6 +132,17 @@ impl SmartZipEngine {
         &self,
         backend: &B,
         _passwords: &PasswordService<'_>,
+        request: InspectRequest,
+        listener: Option<TaskEventListener>,
+        history: Option<&dyn history::TaskHistoryRecorder>,
+    ) -> smartzip_core::Result<FileAwareDetectResult> {
+        self.inspect(backend, request, listener, history).await
+    }
+
+    /// Inspect an archive without constructing a password service.
+    pub async fn inspect<B: ArchiveExecutor>(
+        &self,
+        backend: &B,
         request: InspectRequest,
         listener: Option<TaskEventListener>,
         history: Option<&dyn history::TaskHistoryRecorder>,
@@ -236,6 +263,30 @@ impl SmartZipEngine {
         listener: Option<TaskEventListener>,
         history: Option<&dyn history::TaskHistoryRecorder>,
     ) -> smartzip_core::Result<ExtractWorkflowResult> {
+        self.extract(
+            backend,
+            passwords,
+            request,
+            ExtractInteraction {
+                password: password_prompter,
+                output: output_prompter,
+                embedded: embedded_prompter,
+                encoding: encoding_prompter,
+            },
+            ExtractObserver { listener, history },
+        )
+        .await
+    }
+
+    /// Canonical extraction entrypoint. Legacy overloads remain source-compatible.
+    pub async fn extract<B: ArchiveExecutor>(
+        &self,
+        backend: &B,
+        passwords: &PasswordService<'_>,
+        request: ExtractWorkflowRequest,
+        interaction: ExtractInteraction<'_>,
+        observer: ExtractObserver<'_>,
+    ) -> smartzip_core::Result<ExtractWorkflowResult> {
         workflow::extract_recursive_with_listener_interactive(
             &self.scanner,
             self.run_policy.as_deref(),
@@ -245,12 +296,12 @@ impl SmartZipEngine {
             backend,
             passwords,
             request,
-            password_prompter,
-            output_prompter,
-            embedded_prompter,
-            encoding_prompter,
-            listener,
-            history,
+            interaction.password,
+            interaction.output,
+            interaction.embedded,
+            interaction.encoding,
+            observer.listener,
+            observer.history,
         )
         .await
     }

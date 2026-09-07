@@ -1,9 +1,16 @@
+mod render;
+use render::*;
+mod commands;
+use commands::*;
+mod bootstrap;
+use bootstrap::*;
+mod command_requests;
 use async_trait::async_trait;
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
+use command_requests::{DetectCommand, ExtractCommand, ListCommand, TestCommand};
 use smartzip_archive::{ArchiveExecutor, BackendRouter};
 use smartzip_core::{EncodingMode, TaskEvent, TaskEventSink, TaskId};
 use smartzip_db::{password::PasswordRepository, SmartZipDb};
-use smartzip_engine::name_score;
 use smartzip_engine::{
     EmbeddedSelectionChoice, EncodingConfirmationChoice, ExtractWorkflowRequest,
     FileAwareDetectResult, InspectRequest, InteractiveEmbeddedPrompter,
@@ -166,176 +173,19 @@ enum Command {
     },
     /// Inspect archive format, encoding, embedded findings, and password requirements.
     #[command(visible_alias = "d")]
-    Detect {
-        path: PathBuf,
-
-        #[arg(long)]
-        deep: bool,
-
-        #[arg(long)]
-        json: bool,
-
-        /// Nested scan byte limit (0 = unlimited); explicit root archives are parsed in full.
-        #[arg(long)]
-        max_scan_bytes: Option<u64>,
-
-        #[arg(long, value_enum, default_value_t = ConfidenceArg::Medium)]
-        min_confidence: ConfidenceArg,
-    },
+    Detect(DetectCommand),
 
     /// List archive entries using shared password and encoding resolution.
     #[command(visible_alias = "l")]
-    List {
-        path: PathBuf,
-
-        /// Password to try first. May be repeated.
-        #[arg(short = 'p', long)]
-        password: Vec<String>,
-
-        /// Skip empty password attempt.
-        #[arg(long)]
-        no_empty: bool,
-
-        /// Encoding for entry names: "auto", "UTF-8", "GB18030", "GBK", "Big5", "Shift_JIS", "EUC-JP", "EUC-KR".
-        #[arg(long, default_value = "auto")]
-        encoding: String,
-
-        /// Print several candidate encodings, then prompt once for one to use.
-        #[arg(long)]
-        pick_encoding: bool,
-
-        #[arg(long)]
-        json: bool,
-
-        #[arg(long)]
-        deep: bool,
-
-        /// Nested scan byte limit (0 = unlimited); explicit root archives are parsed in full.
-        #[arg(long)]
-        max_scan_bytes: Option<u64>,
-
-        #[arg(long, value_enum, default_value_t = ConfidenceArg::Medium)]
-        min_confidence: ConfidenceArg,
-    },
+    List(ListCommand),
 
     /// Test archive groups and diagnose damaged volumes (exit: 0 all intact, 1 none, 2 mixed, 130 cancelled; argument errors also use 2).
     #[command(visible_alias = "t")]
-    Test {
-        #[arg(required = true)]
-        paths: Vec<PathBuf>,
-
-        /// Additional read-only diagnosis after a failed test.
-        #[arg(long, value_enum, default_value_t = DiagnoseArg::Auto)]
-        diagnose: DiagnoseArg,
-
-        /// Time budget in seconds for additional diagnosis only.
-        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
-        diagnostic_timeout: Option<u64>,
-
-        /// Do not save this test in task history.
-        #[arg(long)]
-        no_history: bool,
-
-        /// Password to try first. May be repeated.
-        #[arg(short = 'p', long)]
-        password: Vec<String>,
-
-        /// Read password from clipboard (platform-dependent placeholder).
-        #[arg(long)]
-        use_clipboard: bool,
-
-        /// Skip empty password attempt.
-        #[arg(long)]
-        no_empty: bool,
-
-        /// Encoding for entry names: "auto", "UTF-8", "GB18030", "GBK", "Big5", "Shift_JIS", "EUC-JP", "EUC-KR".
-        #[arg(long, default_value = "auto")]
-        encoding: String,
-
-        #[arg(long)]
-        json: bool,
-
-        #[arg(long)]
-        deep: bool,
-
-        /// Nested scan byte limit (0 = unlimited); explicit root archives are parsed in full.
-        #[arg(long)]
-        max_scan_bytes: Option<u64>,
-
-        #[arg(long, value_enum, default_value_t = ConfidenceArg::Medium)]
-        min_confidence: ConfidenceArg,
-    },
+    Test(TestCommand),
 
     /// Extract archives, optionally with nested scanning.
     #[command(visible_alias = "x")]
-    Extract {
-        paths: Vec<PathBuf>,
-
-        /// Output directory. Defaults to first archive's parent directory.
-        #[arg(short, long)]
-        output: Option<PathBuf>,
-
-        /// Maximum nested archive depth.
-        #[arg(long, default_value_t = DEFAULT_RECURSION_LIMIT)]
-        recursion_limit: u8,
-
-        /// Password to try first. May be repeated.
-        #[arg(short = 'p', long)]
-        password: Vec<String>,
-
-        /// Skip empty password attempt.
-        #[arg(long)]
-        no_empty: bool,
-
-        /// Use deep scan for nested archives.
-        #[arg(long)]
-        deep: bool,
-
-        /// Nested scan byte limit (0 = unlimited); explicit root archives are parsed in full.
-        #[arg(long)]
-        max_scan_bytes: Option<u64>,
-
-        /// Encoding for entry names: "auto", "UTF-8", "GB18030", "GBK", "Big5", "Shift_JIS", "EUC-JP", "EUC-KR".
-        #[arg(long, default_value = "auto")]
-        encoding: String,
-
-        #[arg(long)]
-        json: bool,
-
-        /// Output layout policy: "conservative", "smart", "raw", "flat-single".
-        #[arg(long, default_value = "conservative", value_enum)]
-        layout: LayoutPolicyArg,
-
-        /// Single root name policy: "auto", "archive", "inner", "preserve-both".
-        #[arg(long, default_value = "auto", value_enum)]
-        single_root_name: SingleRootNameArg,
-
-        /// Show planned output without extracting.
-        #[arg(long)]
-        dry_run: bool,
-
-        /// Embedded scan mode: "auto", "ask", "largest", "aggressive", "all", "ignore".
-        #[arg(long, default_value = "auto")]
-        embedded: EmbeddedModeArg,
-
-        /// Minimum ratio for a finding to be considered dominant (0.0-1.0).
-        #[arg(long, default_value_t = 0.70)]
-        dominant_min_ratio: f32,
-
-        /// Auto-confirm large file scans (>10GB).
-        #[arg(long)]
-        confirm_large_scan: bool,
-
-        /// Do not record this extraction in the task history tables.
-        /// Password statistics are still updated.
-        #[arg(long)]
-        no_history: bool,
-
-        /// Re-extract even if this file was already extracted recently,
-        /// bypassing the known_files dedup window.
-        #[arg(long)]
-        force: bool,
-    },
+    Extract(ExtractCommand),
 
     /// Preview archive entry names under several encodings.
     #[command(name = "enc", alias = "encoding-preview")]
@@ -360,6 +210,19 @@ enum Command {
         #[command(subcommand)]
         command: Option<HistoryCmd>,
     },
+}
+
+impl Command {
+    fn json_output(&self) -> bool {
+        match self {
+            Self::Doctor { json } | Self::EncodingPreview { json, .. } => *json,
+            Self::Detect(request) => request.json,
+            Self::List(request) => request.json,
+            Self::Test(request) => request.json,
+            Self::Extract(request) => request.json,
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -549,15 +412,7 @@ impl From<SingleRootNameArg> for smartzip_engine::layout::SingleRootNamePolicy {
 async fn main() -> std::process::ExitCode {
     let matches = Cli::command().get_matches();
     let cli = Cli::from_arg_matches(&matches).expect("clap validated arguments");
-    let json = matches!(
-        &cli.command,
-        Command::Doctor { json: true }
-            | Command::Detect { json: true, .. }
-            | Command::List { json: true, .. }
-            | Command::Test { json: true, .. }
-            | Command::Extract { json: true, .. }
-            | Command::EncodingPreview { json: true, .. }
-    );
+    let json = cli.command.json_output();
     if let Err(error) = run(cli, &matches).await {
         if let Some(exit) = error.downcast_ref::<CommandExit>() {
             return std::process::ExitCode::from(exit.0 as u8);
@@ -591,9 +446,9 @@ async fn run(mut cli: Cli, matches: &clap::ArgMatches) -> Result<(), Box<dyn std
     let policy = smartzip_engine::CompiledRunPolicy::compile(resolved)?;
     let c = policy.values();
     match &mut cli.command {
-        Command::List { encoding, .. }
-        | Command::Test { encoding, .. }
-        | Command::Extract { encoding, .. } => *encoding = c.extraction.encoding.mode.clone(),
+        Command::List(request) => request.encoding = c.extraction.encoding.mode.clone(),
+        Command::Test(request) => request.encoding = c.extraction.encoding.mode.clone(),
+        Command::Extract(request) => request.encoding = c.extraction.encoding.mode.clone(),
         _ => {}
     }
     cli.safety.defaults = c.limits.clone();
@@ -610,7 +465,7 @@ async fn run(mut cli: Cli, matches: &clap::ArgMatches) -> Result<(), Box<dyn std
         smartzip_config::SuspiciousEncoding::Skip => SuspiciousEncodingArg::Skip,
         smartzip_config::SuspiciousEncoding::Accept => SuspiciousEncodingArg::Accept,
     };
-    if cli.explain || matches!(cli.command, Command::Extract { dry_run: true, .. }) {
+    if cli.explain || matches!(&cli.command, Command::Extract(request) if request.dry_run) {
         println!(
             "{}",
             serde_json::to_string_pretty(
@@ -719,161 +574,48 @@ async fn run(mut cli: Cli, matches: &clap::ArgMatches) -> Result<(), Box<dyn std
             }
             command_exit(if healthy { 0 } else { 1 })
         }
-        Command::Detect {
-            path,
-            deep,
-            json,
-            max_scan_bytes,
-            min_confidence,
-        } => {
-            let db = if policy.needs_database() {
-                Some(open_state_db(cli.db, policy.values().state.mode)?)
-            } else {
-                None
-            };
+        Command::Detect(request) => {
+            let db = open_task_db(cli.db, policy)?;
             detect(
                 &backend,
                 db.as_ref(),
-                path,
-                deep,
-                json,
-                max_scan_bytes,
-                min_confidence,
+                request,
                 verbose_routing,
                 &cli.safety,
                 cancellation.clone(),
             )
             .await
         }
-        Command::List {
-            path,
-            password: manual_passwords,
-            no_empty,
-            encoding,
-            pick_encoding,
-            json,
-            deep,
-            max_scan_bytes,
-            min_confidence,
-        } => {
-            let db = if policy.needs_database() {
-                Some(open_state_db(cli.db, policy.values().state.mode)?)
-            } else {
-                None
-            };
+        Command::List(request) => {
+            let db = open_task_db(cli.db, policy)?;
             list_archive(
                 &backend,
                 db.as_ref(),
-                path,
-                manual_passwords,
-                no_empty,
-                &encoding,
-                pick_encoding,
-                json,
-                deep,
-                max_scan_bytes,
-                min_confidence,
+                request,
                 verbose_routing,
                 &cli.safety,
                 cancellation.clone(),
             )
             .await
         }
-        Command::Test {
-            paths,
-            password,
-            use_clipboard: _use_clipboard,
-            no_empty,
-            encoding,
-            json,
-            deep,
-            max_scan_bytes,
-            min_confidence,
-            diagnose,
-            diagnostic_timeout,
-            no_history,
-        } => {
-            let db = if policy.needs_database() {
-                Some(open_state_db(cli.db, policy.values().state.mode)?)
-            } else {
-                None
-            };
+        Command::Test(request) => {
+            let db = open_task_db(cli.db, policy)?;
             test_archives(
                 &backend,
                 db.as_ref(),
-                smartzip_engine::TestWorkflowRequest {
-                    paths,
-                    encoding: parse_encoding_mode(&encoding),
-                    scanner: ScannerConfig {
-                        min_confidence: min_confidence.into(),
-                        ..scanner_config(deep, max_scan_bytes)
-                    },
-                    password_candidates: PasswordCandidateRequest {
-                        manual: password,
-                        clipboard: None,
-                        include_empty: !no_empty,
-                        limit: cli.safety.password_limit,
-                    },
-                    diagnose: match diagnose {
-                        DiagnoseArg::Auto => smartzip_engine::DiagnoseMode::Auto,
-                        DiagnoseArg::Off => smartzip_engine::DiagnoseMode::Off,
-                    },
-                    diagnostic_timeout: diagnostic_timeout.map(std::time::Duration::from_secs),
-                    control: smartzip_archive::diagnostic::DiagnosticControl::with_cancellation(
-                        cancellation.clone(),
-                    ),
-                },
-                json,
-                no_history,
+                request,
                 verbose_routing,
                 &cli.safety,
                 cancellation.clone(),
             )
             .await
         }
-        Command::Extract {
-            paths,
-            output,
-            recursion_limit,
-            password: manual_passwords,
-            no_empty,
-            deep,
-            max_scan_bytes,
-            encoding,
-            json,
-            layout,
-            single_root_name,
-            dry_run,
-            embedded,
-            dominant_min_ratio,
-            confirm_large_scan,
-            force,
-            no_history: _,
-        } => {
-            let db = if policy.needs_database() {
-                Some(open_state_db(cli.db, policy.values().state.mode)?)
-            } else {
-                None
-            };
+        Command::Extract(request) => {
+            let db = open_task_db(cli.db, policy)?;
             extract(
                 &backend,
                 db.as_ref(),
-                paths,
-                output,
-                recursion_limit,
-                manual_passwords,
-                no_empty,
-                deep,
-                max_scan_bytes,
-                &encoding,
-                json,
-                layout.into(),
-                single_root_name.into(),
-                dry_run,
-                embedded,
-                dominant_min_ratio,
-                confirm_large_scan,
-                force,
+                request,
                 verbose_routing,
                 &cli.safety,
                 cancellation.clone(),
@@ -901,876 +643,6 @@ async fn run(mut cli: Cli, matches: &clap::ArgMatches) -> Result<(), Box<dyn std
     };
     signal.abort();
     result
-}
-
-fn config_selection(
-    cli: &Cli,
-) -> Result<(Option<PathBuf>, PathBuf, Vec<String>), Box<dyn std::error::Error>> {
-    if cli.no_config && !matches!(cli.command, Command::Config(_)) {
-        return Ok((None, PathBuf::new(), Vec::new()));
-    }
-    let environment = std::env::var_os("SMARTZIP_CONFIG").map(PathBuf::from);
-    if let Some(path) = cli
-        .config
-        .as_ref()
-        .or(environment.as_ref())
-        .filter(|_| !cli.no_config)
-    {
-        return Ok((Some(path.clone()), path.clone(), Vec::new()));
-    }
-    let paths = PlatformPaths::try_new()?;
-    let legacy = PlatformPaths::legacy()?;
-    let default = paths.config_path();
-    let (selected, warnings) = smartzip_config::selected_config(
-        None,
-        cli.no_config,
-        None,
-        &default,
-        &legacy.config_path(),
-    )?;
-    Ok((selected, default, warnings))
-}
-
-fn config_command(
-    command: &ConfigCmd,
-    selected: Option<&Path>,
-    default: &Path,
-    diagnostics: &[String],
-) -> Result<(), Box<dyn std::error::Error>> {
-    let path = selected.unwrap_or(default);
-    match command {
-        ConfigCmd::Path => println!(
-            "{}",
-            serde_json::json!({"selected": selected, "default": default, "diagnostics": diagnostics, "managed": std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink() || m.permissions().readonly())})
-        ),
-        ConfigCmd::Init { full } => {
-            smartzip_config::init_config(path, *full)?;
-            println!("created {}", path.display());
-        }
-        ConfigCmd::Set { key, value } => smartzip_config::edit_config(path, key, Some(value))?,
-        ConfigCmd::Unset { key } => smartzip_config::edit_config(path, key, None)?,
-        ConfigCmd::Migrate { apply, .. } => {
-            println!("{}", smartzip_config::migrate_config(path, *apply)?)
-        }
-        _ => {
-            let defaults = matches!(command, ConfigCmd::Show { defaults: true, .. });
-            let mut resolved =
-                smartzip_config::ResolvedConfig::load(if defaults { None } else { selected })?;
-            if !defaults {
-                resolved.diagnostics.extend_from_slice(diagnostics);
-            }
-            match command {
-                ConfigCmd::Show { sources: true, .. } => println!(
-                    "{}",
-                    serde_json::to_string_pretty(
-                        &serde_json::json!({"values": resolved.values, "origins": resolved.origins, "inactive": resolved.explanation(), "diagnostics": resolved.diagnostics})
-                    )?
-                ),
-                ConfigCmd::Show { .. } => println!("{}", toml::to_string_pretty(&resolved.values)?),
-                ConfigCmd::Get { key, sources } => {
-                    let value = toml::Value::try_from(&resolved.values)?;
-                    let value = smartzip_config::value_at(&value, key)
-                        .ok_or_else(|| format!("unknown or unset configuration key: {key}"))?;
-                    if *sources {
-                        println!(
-                            "{}",
-                            serde_json::json!({"key": key, "value": value, "source": resolved.origins.get(key), "inactive": resolved.explanation().get(key)})
-                        );
-                    } else {
-                        println!("{value}");
-                    }
-                }
-                ConfigCmd::Check => println!(
-                    "configuration valid (schema/defaults {}/{})",
-                    resolved.values.schema_version, resolved.values.defaults_version
-                ),
-                _ => unreachable!(),
-            }
-        }
-    }
-    Ok(())
-}
-
-fn apply_cli_overrides(
-    cli: &Cli,
-    matches: &clap::ArgMatches,
-    resolved: &mut smartzip_config::ResolvedConfig,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let sub = matches.subcommand().map(|(_, m)| m).unwrap_or(matches);
-    let explicit = |id: &str| -> Option<String> {
-        [sub, matches]
-            .into_iter()
-            .find(|m| {
-                m.try_contains_id(id).unwrap_or(false)
-                    && m.value_source(id) == Some(clap::parser::ValueSource::CommandLine)
-            })
-            .and_then(|m| m.get_raw(id))
-            .and_then(|mut values| values.next().map(|v| v.to_string_lossy().into_owned()))
-    };
-    let mut patches: Vec<(String, toml::Value)> = Vec::new();
-    for (id, key) in [
-        ("password_limit", "passwords.database_limit"),
-        ("recursion_limit", "extraction.recursion.max_depth"),
-        ("max_files", "limits.max_files"),
-        ("max_output_bytes", "limits.max_output_bytes"),
-        ("min_free_bytes", "limits.min_free_bytes"),
-        ("max_nested_candidates", "limits.max_nested_candidates"),
-    ] {
-        if let Some(value) = explicit(id) {
-            patches.push((key.into(), toml::Value::Integer(value.parse()?)));
-        }
-    }
-    for (id, key) in [
-        ("layout", "extraction.output.layout"),
-        ("single_root_name", "extraction.output.single_root_name"),
-        ("encoding", "extraction.encoding.mode"),
-        ("on_conflict", "extraction.output.on_conflict"),
-        ("suspicious_encoding", "extraction.encoding.on_suspicious"),
-    ] {
-        if let Some(value) = explicit(id) {
-            patches.push((key.into(), value.into()));
-        }
-    }
-    if let Some(value) = explicit("dominant_min_ratio") {
-        patches.push((
-            "extraction.embedded.dominant_min_ratio".into(),
-            toml::Value::Float(value.parse()?),
-        ));
-    }
-    for (id, key, value) in [
-        ("stateless", "state.mode", toml::Value::String("off".into())),
-        ("non_interactive", "interaction.mode", "never".into()),
-        ("no_recursive", "extraction.recursion.enabled", false.into()),
-        ("no_history", "state.history", false.into()),
-        ("force", "extraction.reuse.skip_completed", false.into()),
-    ] {
-        if explicit(id).is_some() {
-            patches.push((key.into(), value));
-        }
-    }
-    if explicit("verbose_routing").is_some() {
-        patches.push(("logging.level".into(), "debug".into()));
-    }
-    if let Some(value) = explicit("embedded") {
-        let root = match value.as_str() {
-            "ignore" => "off",
-            "aggressive" => "all",
-            other => other,
-        };
-        patches.push(("extraction.embedded.root".into(), root.into()));
-        patches.push((
-            "extraction.embedded.nested".into(),
-            if value == "ignore" {
-                "off".into()
-            } else {
-                value.into()
-            },
-        ));
-    }
-    if explicit("no_empty").is_some() {
-        let sources: Vec<_> = resolved
-            .values
-            .passwords
-            .sources
-            .iter()
-            .filter(|s| **s != smartzip_config::PasswordSource::Empty)
-            .collect();
-        patches.push(("passwords.sources".into(), toml::Value::try_from(sources)?));
-    }
-    if let Some(value) = explicit("output") {
-        patches.push(("extraction.output.destination".into(), "directory".into()));
-        patches.push((
-            "extraction.output.directory".into(),
-            std::path::absolute(value)?
-                .to_string_lossy()
-                .into_owned()
-                .into(),
-        ));
-    }
-    if let Some(path) = &cli.db {
-        patches.push((
-            "state.database".into(),
-            std::path::absolute(path)?
-                .to_string_lossy()
-                .into_owned()
-                .into(),
-        ));
-    }
-    for assignment in &cli.runtime_set {
-        let (key, value) = assignment
-            .split_once('=')
-            .ok_or("--set requires KEY=TOML_VALUE")?;
-        let parsed: toml::Value = format!("value = {value}").parse()?;
-        if parsed.as_table().is_none_or(|t| t.len() != 1) {
-            return Err("--set requires one TOML literal".into());
-        }
-        patches.push((key.trim().into(), parsed["value"].clone()));
-    }
-    if explicit("use_clipboard").is_some() {
-        return Err("unsupported_option: clipboard source is not implemented".into());
-    }
-    resolved.apply(&patches)?;
-    if resolved.values.passwords.mode == smartzip_config::PasswordMode::Off
-        && explicit("password").is_some()
-    {
-        return Err("explicit password conflicts with passwords.mode=off".into());
-    }
-    if let Some(adapter) = &cli.backend {
-        if resolved
-            .values
-            .backends
-            .installations
-            .iter()
-            .any(|b| &b.id == adapter && !b.enabled)
-        {
-            return Err(format!("forced backend {adapter} is disabled").into());
-        }
-    }
-    Ok(())
-}
-
-fn task_passwords<'a>(db: Option<&'a SmartZipDb>, safety: &SafetyOptions) -> PasswordService<'a> {
-    let c = safety.policy.as_ref().unwrap().values();
-    PasswordService::configured(
-        db.map(|db| PasswordRepository::new(db.connection())),
-        c.passwords.clone(),
-        c.state.mode,
-    )
-}
-fn task_stores<'a>(
-    db: Option<&'a SmartZipDb>,
-    safety: &SafetyOptions,
-) -> (
-    Option<smartzip_engine::history::DbTaskHistoryRecorder<'a>>,
-    Option<smartzip_engine::history::DbKnownFileStore<'a>>,
-) {
-    use smartzip_config::StateMode;
-    let c = safety.policy.as_ref().unwrap().values();
-    let history = db
-        .filter(|_| c.state.mode == StateMode::ReadWrite && c.state.history)
-        .map(|db| smartzip_engine::history::DbTaskHistoryRecorder::new(db.connection()));
-    let known = db
-        .filter(|_| c.state.mode != StateMode::Off && c.state.known_files != StateMode::Off)
-        .map(|db| smartzip_engine::history::DbKnownFileStore {
-            connection: db.connection(),
-            writable: c.state.mode == StateMode::ReadWrite
-                && c.state.known_files == StateMode::ReadWrite,
-            password_hint: c.extraction.reuse.password_hint
-                && c.passwords.mode == smartzip_config::PasswordMode::Auto
-                && c.passwords
-                    .sources
-                    .contains(&smartzip_config::PasswordSource::Known),
-            encoding_hint: c.extraction.reuse.encoding_hint && c.extraction.encoding.mode == "auto",
-        });
-    (history, known)
-}
-fn run_stores<'a>(
-    history: &'a Option<smartzip_engine::history::DbTaskHistoryRecorder<'_>>,
-    known: &'a Option<smartzip_engine::history::DbKnownFileStore<'_>>,
-) -> smartzip_engine::history::RunStores<'a> {
-    smartzip_engine::history::RunStores {
-        history: history
-            .as_ref()
-            .map(|s| s as &dyn smartzip_engine::history::TaskHistoryRecorder),
-        known_files: known
-            .as_ref()
-            .map(|s| s as &dyn smartzip_engine::history::KnownFileStore),
-    }
-}
-
-fn build_backend(
-    config: &smartzip_config::BackendConfig,
-    forced_adapter: Option<&str>,
-    verbose_routing: bool,
-) -> Result<BackendRouter, Box<dyn std::error::Error>> {
-    let mut backend = BackendRouter::from_config(config)?;
-    if let Some(adapter) = forced_adapter {
-        backend = backend.with_forced_adapter(adapter);
-    }
-    if verbose_routing {
-        for warning in backend.warnings() {
-            eprintln!("routing warning: {warning}");
-        }
-        eprintln!("routing adapters: {}", backend.adapter_ids().join(", "));
-    }
-    Ok(backend)
-}
-
-fn open_state_db(
-    path: Option<PathBuf>,
-    mode: smartzip_config::StateMode,
-) -> Result<SmartZipDb, Box<dyn std::error::Error>> {
-    let path = if let Some(path) = path {
-        path
-    } else {
-        let (path, diagnostic) =
-            PlatformPaths::try_new()?.select_database(&PlatformPaths::legacy()?)?;
-        if let Some(message) = diagnostic {
-            eprintln!("{message}");
-        }
-        path
-    };
-    let db = if mode == smartzip_config::StateMode::ReadOnly {
-        SmartZipDb::open_read_only(&path)?
-    } else {
-        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            std::fs::create_dir_all(parent)?;
-        }
-        SmartZipDb::open(&path)?
-    };
-
-    Ok(db)
-}
-
-fn scanner_config(deep: bool, max_scan_bytes: Option<u64>) -> ScannerConfig {
-    let mut config = ScannerConfig {
-        mode: if deep { ScanMode::Deep } else { ScanMode::Fast },
-        ..ScannerConfig::default()
-    };
-    config.max_scan_bytes = match max_scan_bytes {
-        Some(0) => None,
-        Some(value) => Some(value),
-        None if deep => None,
-        None => config.max_scan_bytes,
-    };
-    config
-}
-
-async fn detect(
-    backend: &BackendRouter,
-    db: Option<&SmartZipDb>,
-    path: PathBuf,
-    deep: bool,
-    json: bool,
-    max_scan_bytes: Option<u64>,
-    min_confidence: ConfidenceArg,
-    verbose_routing: bool,
-    safety: &SafetyOptions,
-    cancellation: tokio_util::sync::CancellationToken,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let config = ScannerConfig {
-        min_confidence: min_confidence.into(),
-        ..scanner_config(deep, max_scan_bytes)
-    };
-    let service = task_passwords(db, safety);
-    let engine = SmartZipEngine::with_scanner_config(config.clone())
-        .with_cancellation_token(cancellation.clone())
-        .with_run_policy(safety.policy.as_ref().unwrap().as_ref().clone());
-    let (history_store, known_store) = task_stores(db, safety);
-    let recorder = run_stores(&history_store, &known_store);
-    let result = engine
-        .inspect_file_with_listener(
-            backend,
-            &service,
-            InspectRequest {
-                path,
-                scanner: config,
-            },
-            task_listener(json, verbose_routing, safety),
-            (history_store.is_some() || known_store.is_some())
-                .then_some(&recorder as &dyn smartzip_engine::history::TaskHistoryRecorder),
-        )
-        .await?;
-
-    print_detect_result(&result, json)?;
-    command_exit(if result.status == "unreadable" { 1 } else { 0 })
-}
-
-async fn test_archives(
-    backend: &BackendRouter,
-    db: Option<&SmartZipDb>,
-    request: smartzip_engine::TestWorkflowRequest,
-    json: bool,
-    no_history: bool,
-    verbose_routing: bool,
-    safety: &SafetyOptions,
-    cancellation: tokio_util::sync::CancellationToken,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let service = task_passwords(db, safety);
-    let engine = SmartZipEngine::with_scanner_config(request.scanner.clone())
-        .with_run_policy(safety.policy.as_ref().unwrap().as_ref().clone());
-    let (history_store, known_store) = task_stores(db, safety);
-    let recorder = run_stores(&history_store, &known_store);
-    let prompter = StdinPrompter {
-        lock: StdinLock::configured(cancellation.clone(), safety, json),
-    };
-    let level = safety.policy.as_ref().unwrap().values().logging.level;
-    let listener = (!json && level != smartzip_config::LogLevel::Off).then(|| {
-        Arc::new(move |event: &TaskEvent| match &event.kind {
-            smartzip_core::TaskEventKind::TestPhase { path, phase, .. }
-                if matches!(
-                    level,
-                    smartzip_config::LogLevel::Info | smartzip_config::LogLevel::Debug
-                ) =>
-            {
-                eprintln!("{}: {}", safe_text(&path.to_string_lossy()), phase)
-            }
-            smartzip_core::TaskEventKind::Warning { message }
-                if level != smartzip_config::LogLevel::Error =>
-            {
-                eprintln!("warning: {}", safe_text(message))
-            }
-            smartzip_core::TaskEventKind::Route(route) if verbose_routing => {
-                render_route_event(route, false)
-            }
-            _ => {}
-        }) as smartzip_engine::TaskEventListener
-    });
-    let result = engine
-        .test_archives(
-            backend,
-            &service,
-            request,
-            if prompter.lock.interactive {
-                Some(&prompter)
-            } else {
-                None
-            },
-            listener,
-            if no_history { None } else { Some(&recorder) },
-        )
-        .await;
-    let result = result?;
-    if json {
-        println!("{}", serde_json::to_string_pretty(&result)?);
-    } else {
-        for report in &result.files {
-            print_test_report(report);
-        }
-        println!("task-id: {}", result.task_id);
-    }
-    command_exit(result.exit_code)
-}
-
-fn safe_text(value: &str) -> String {
-    value
-        .chars()
-        .flat_map(|c| {
-            if c.is_control() {
-                c.escape_default().collect::<Vec<_>>()
-            } else {
-                vec![c]
-            }
-        })
-        .collect()
-}
-
-fn print_test_report(report: &smartzip_archive::integrity::TestArchiveReport) {
-    use smartzip_archive::integrity::{Integrity, SuspectRelation};
-    println!(
-        "{}: {} (coverage={}, localization={}, password={})",
-        safe_text(&report.entrypoint.to_string_lossy()),
-        enum_text(&report.integrity),
-        enum_text(&report.coverage),
-        enum_text(&report.localization),
-        enum_text(&report.password_status)
-    );
-    for volume in &report.confirmed_volumes {
-        println!(
-            "  Confirmed damaged: {}",
-            safe_text(&volume.path.to_string_lossy())
-        );
-        for evidence in report
-            .evidence
-            .iter()
-            .filter(|e| volume.evidence_ids.contains(&e.id))
-        {
-            println!(
-                "    {} [{}]",
-                safe_text(&evidence.summary),
-                safe_text(&evidence.source)
-            );
-        }
-    }
-    for (index, group) in report.suspect_groups.iter().enumerate() {
-        println!(
-            "  Suspected group {} ({}): {}",
-            index + 1,
-            match group.relation {
-                SuspectRelation::OneOrMore => "one or more may be damaged",
-                SuspectRelation::Possible => "possible; exact range unknown",
-            },
-            group
-                .members
-                .iter()
-                .map(|p| safe_text(&p.to_string_lossy()))
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-        for evidence in report
-            .evidence
-            .iter()
-            .filter(|e| group.evidence_ids.contains(&e.id))
-        {
-            println!(
-                "    {} [{}]",
-                safe_text(&evidence.summary),
-                safe_text(&evidence.source)
-            );
-        }
-    }
-    for (label, paths) in [
-        ("Missing", &report.missing_volumes),
-        ("Unreadable", &report.unreadable_volumes),
-    ] {
-        for path in paths {
-            println!("  {label}: {}", safe_text(&path.to_string_lossy()));
-        }
-    }
-    if !report.unchecked_volumes.is_empty() {
-        println!(
-            "  Full-volume health unchecked: {} volume(s)",
-            report.unchecked_volumes.len()
-        );
-    }
-    for reason in &report.stop_reasons {
-        println!("  Note: {}", safe_text(reason));
-    }
-    if report.integrity != Integrity::Intact {
-        println!("  Next: restore missing/unreadable volumes, replace confirmed damaged volumes, then test again; suspected members need further checking.");
-    }
-}
-
-fn enum_text(value: &impl std::fmt::Debug) -> String {
-    format!("{value:?}")
-        .chars()
-        .enumerate()
-        .flat_map(|(index, c)| {
-            if c.is_uppercase() && index > 0 {
-                vec!['_', c.to_ascii_lowercase()]
-            } else {
-                vec![c.to_ascii_lowercase()]
-            }
-        })
-        .collect()
-}
-
-async fn list_archive(
-    backend: &BackendRouter,
-    db: Option<&SmartZipDb>,
-    path: PathBuf,
-    manual_passwords: Vec<String>,
-    no_empty: bool,
-    encoding: &str,
-    pick_encoding: bool,
-    json: bool,
-    deep: bool,
-    max_scan_bytes: Option<u64>,
-    min_confidence: ConfidenceArg,
-    verbose_routing: bool,
-    safety: &SafetyOptions,
-    cancellation: tokio_util::sync::CancellationToken,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let config = ScannerConfig {
-        min_confidence: min_confidence.into(),
-        ..scanner_config(deep, max_scan_bytes)
-    };
-    let service = task_passwords(db, safety);
-    let engine = SmartZipEngine::with_scanner_config(config.clone())
-        .with_cancellation_token(cancellation.clone())
-        .with_run_policy(safety.policy.as_ref().unwrap().as_ref().clone());
-    let (history_store, known_store) = task_stores(db, safety);
-    let recorder = run_stores(&history_store, &known_store);
-    let stdin_lock = StdinLock::configured(cancellation.clone(), safety, json);
-    let password_prompter = StdinPrompter {
-        lock: stdin_lock.clone(),
-    };
-    let encoding_mode =
-        select_list_encoding(path.clone(), encoding, pick_encoding, stdin_lock.clone()).await?;
-    let result = engine
-        .list_archive_with_listener_interactive(
-            backend,
-            &service,
-            ListArchiveRequest {
-                path,
-                scanner: config,
-                encoding_mode,
-                password_candidates: PasswordCandidateRequest {
-                    manual: manual_passwords,
-                    clipboard: None,
-                    include_empty: !no_empty,
-                    limit: safety.password_limit,
-                },
-            },
-            if stdin_lock.interactive {
-                Some(&password_prompter)
-            } else {
-                None
-            },
-            Some(&StdinEncodingPrompter { lock: stdin_lock }),
-            task_listener(json, verbose_routing, safety),
-            (history_store.is_some() || known_store.is_some())
-                .then_some(&recorder as &dyn smartzip_engine::history::TaskHistoryRecorder),
-        )
-        .await?;
-
-    if json {
-        println!("{}", serde_json::to_string_pretty(&result)?);
-    } else {
-        println!(
-            "{} [{}] enc={} password={} task-id={}",
-            result.path.display(),
-            result
-                .detected_format
-                .as_ref()
-                .map(|fmt| fmt.as_str())
-                .unwrap_or("unknown"),
-            result.encoding,
-            if result.used_password { "yes" } else { "no" },
-            result.task_id,
-        );
-        for entry in &result.entries {
-            let suffix = if entry.is_dir {
-                "/"
-            } else {
-                Default::default()
-            };
-            println!("{}{}", entry.path.display(), suffix);
-        }
-    }
-    Ok(())
-}
-
-fn print_detect_result(
-    result: &FileAwareDetectResult,
-    json: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    if json {
-        println!("{}", serde_json::to_string_pretty(result)?);
-        return Ok(());
-    }
-
-    println!(
-        "{} [{}] status={} embedded={} encrypted={} task-id={}",
-        result.path.display(),
-        result
-            .detected_format
-            .as_ref()
-            .map(|fmt| fmt.as_str())
-            .unwrap_or("unknown"),
-        result.status,
-        result.embedded_count,
-        match result.encrypted {
-            Some(true) => "yes",
-            Some(false) => "no",
-            None => "unknown",
-        },
-        result.task_id,
-    );
-    if let Some(encoding) = &result.encoding {
-        if let Some(confidence) = result.encoding_confidence {
-            println!("encoding: {encoding} ({:.0}%)", confidence * 100.0);
-        } else {
-            println!("encoding: {encoding}");
-        }
-    }
-    if let Some(reason) = &result.reason {
-        println!("reason: {reason}");
-    }
-    if result.needs_password {
-        println!("password: required to continue");
-    }
-    if result.known_password {
-        println!("known password: available");
-    }
-    if let Some(known_encoding) = &result.known_encoding {
-        println!("known encoding: {known_encoding}");
-    }
-    if !result.embedded_findings.is_empty() {
-        println!("embedded findings:");
-        for finding in &result.embedded_findings {
-            println!(
-                "  - {} @ 0x{:X} size={} confidence={:?} {}",
-                finding.format.as_str(),
-                finding.offset,
-                finding
-                    .size
-                    .map(|size| size.to_string())
-                    .unwrap_or_else(|| "unknown".into()),
-                finding.confidence,
-                finding.description,
-            );
-        }
-    }
-    Ok(())
-}
-
-fn parse_encoding_mode(encoding: &str) -> EncodingMode {
-    if encoding.eq_ignore_ascii_case("auto") || encoding.eq_ignore_ascii_case("backend") {
-        EncodingMode::Auto
-    } else {
-        EncodingMode::Override(encoding.to_string())
-    }
-}
-
-async fn select_list_encoding(
-    path: PathBuf,
-    encoding: &str,
-    pick_encoding: bool,
-    control: StdinLock,
-) -> Result<EncodingMode, Box<dyn std::error::Error>> {
-    if !pick_encoding || !control.interactive {
-        return Ok(parse_encoding_mode(encoding));
-    }
-    let choice = tokio::task::spawn_blocking(move || {
-        use std::io::Write;
-        let _guard = control.gate.lock().unwrap();
-        let candidates = encoding_preview_candidates();
-        eprintln!("\n  Candidate encodings for {}:", path.display());
-        for (idx, candidate) in candidates.iter().enumerate() {
-            eprintln!("  [{}] {}", idx + 1, candidate);
-        }
-        eprint!("  Pick encoding number (Enter for auto): ");
-        let _ = std::io::stderr().flush();
-        terminal_line(&control, false)
-    })
-    .await?;
-    let Some(choice) = choice else {
-        return Err(smartzip_core::SmartZipError::Cancelled.into());
-    };
-    let trimmed = choice.trim();
-    if trimmed.is_empty() {
-        return Ok(EncodingMode::Auto);
-    }
-    let idx: usize = trimmed.parse()?;
-    let selected = encoding_preview_candidates()
-        .get(idx.checked_sub(1).ok_or("invalid encoding choice")?)
-        .copied()
-        .ok_or_else(|| format!("invalid encoding choice: {trimmed}"))?;
-    Ok(parse_encoding_mode(selected))
-}
-
-async fn extract(
-    backend: &BackendRouter,
-    db: Option<&SmartZipDb>,
-    paths: Vec<PathBuf>,
-    output: Option<PathBuf>,
-    recursion_limit: u8,
-    manual_passwords: Vec<String>,
-    no_empty: bool,
-    deep: bool,
-    max_scan_bytes: Option<u64>,
-    encoding: &str,
-    json: bool,
-    layout_policy: smartzip_engine::layout::OutputLayoutPolicy,
-    single_root_name_policy: smartzip_engine::layout::SingleRootNamePolicy,
-    dry_run: bool,
-    embedded: EmbeddedModeArg,
-    dominant_min_ratio: f32,
-    confirm_large_scan: bool,
-    force: bool,
-    verbose_routing: bool,
-    safety: &SafetyOptions,
-    cancellation: tokio_util::sync::CancellationToken,
-) -> Result<(), Box<dyn std::error::Error>> {
-    if paths.is_empty() {
-        return Err("no paths provided".into());
-    }
-
-    if dry_run {
-        let output_dir = output.unwrap_or_else(|| default_output_dir(paths.first().unwrap()));
-        let archive_stem = name_score::archive_display_stem(paths.first().unwrap());
-        println!("Archive: {}", paths.first().unwrap().display());
-        println!("Archive stem: {archive_stem}");
-        println!("Layout policy: {layout_policy:?}");
-        println!("Note: --dry-run shows initial candidate path. Final layout depends on extracted content.");
-        println!(
-            "Planned output: {}",
-            output_dir.join(&archive_stem).display()
-        );
-        return Ok(());
-    }
-
-    let encoding_mode =
-        if encoding.eq_ignore_ascii_case("auto") || encoding.eq_ignore_ascii_case("backend") {
-            EncodingMode::Auto
-        } else {
-            EncodingMode::Override(encoding.to_string())
-        };
-
-    let output_dir = output.unwrap_or_else(|| default_output_dir(paths.first().unwrap()));
-
-    let service = task_passwords(db, safety);
-
-    let stdin_lock = StdinLock::configured(cancellation.clone(), safety, json);
-    let password_prompter = StdinPrompter {
-        lock: stdin_lock.clone(),
-    };
-    let engine = SmartZipEngine::default()
-        .with_cancellation_token(cancellation.clone())
-        .with_run_policy(safety.policy.as_ref().unwrap().as_ref().clone());
-    let event_listener = task_listener(json, verbose_routing, safety);
-
-    let (history_store, known_store) = task_stores(db, safety);
-    let recorder = run_stores(&history_store, &known_store);
-    let recorder_ref = (history_store.is_some() || known_store.is_some())
-        .then_some(&recorder as &dyn smartzip_engine::history::TaskHistoryRecorder);
-
-    let result = engine
-        .extract_recursive_with_listener_interactive(
-            backend,
-            &service,
-            ExtractWorkflowRequest {
-                inputs: paths,
-                output_dir,
-                recursion_limit,
-                scanner: scanner_config(deep, max_scan_bytes),
-                encoding_mode,
-                password_candidates: PasswordCandidateRequest {
-                    manual: manual_passwords,
-                    clipboard: None,
-                    include_empty: !no_empty,
-                    limit: safety.password_limit,
-                },
-                layout_policy,
-                single_root_name_policy,
-                embedded_scan_mode: embedded.into(),
-                dominant_min_ratio,
-                confirm_large_scan,
-                force,
-                limits: safety.limits(),
-            },
-            if stdin_lock.interactive {
-                Some(&password_prompter)
-            } else {
-                None
-            },
-            Some(&StdinOutputPrompter {
-                lock: stdin_lock.clone(),
-            }),
-            Some(&StdinEmbeddedPrompter {
-                lock: stdin_lock.clone(),
-            }),
-            Some(&StdinEncodingPrompter { lock: stdin_lock }),
-            event_listener,
-            recorder_ref,
-        )
-        .await?;
-
-    let exit_code = result.status.exit_code() as i32;
-    if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&build_extract_json_output(&result))?
-        );
-    } else {
-        let processed_count = result.processed.len();
-        let skipped_count = result.skipped.len();
-        if processed_count > 0 {
-            println!("processed {} archive(s)", processed_count);
-        }
-        if skipped_count > 0 {
-            println!("skipped {} candidate(s)", skipped_count);
-            for skipped in &result.skipped {
-                println!("  - {} (depth {})", skipped.path.display(), skipped.depth);
-            }
-        }
-        if recorder_ref.is_some() {
-            println!("task-id: {}", result.task_id);
-        }
-    }
-
-    command_exit(exit_code)
 }
 
 struct SilentSink;
@@ -1830,117 +702,6 @@ fn routing_listener(
             render_extract_event(event, verbose_routing)
         }) as smartzip_engine::TaskEventListener
     })
-}
-
-fn render_extract_event(event: &smartzip_core::TaskEvent, verbose_routing: bool) {
-    match &event.kind {
-        smartzip_core::TaskEventKind::Decision {
-            stage,
-            action,
-            reason,
-            policy_key,
-            source,
-            ..
-        } if stage != "task_policy" && (*action == "skip" || verbose_routing) => {
-            eprintln!("{stage}: {action} ({reason}; {policy_key}, {source})")
-        }
-        smartzip_core::TaskEventKind::Progress(progress) => match progress.percent {
-            Some(percent) => println!("  {percent:>3.0}%  {}", progress.message),
-            None => println!("  {}", progress.message),
-        },
-        smartzip_core::TaskEventKind::EncodingDetected(detection) => {
-            let encoding = match &detection.selected {
-                smartzip_core::EncodingMode::Auto => "auto",
-                smartzip_core::EncodingMode::Override(s) => s.as_str(),
-            };
-            println!(
-                "  encoding: {encoding} (confidence: {:.0}%)",
-                detection.confidence * 100.0
-            );
-        }
-        smartzip_core::TaskEventKind::EmbeddedArchiveSelectionRequired {
-            path,
-            findings_count,
-        } => {
-            println!(
-                "  embedded selection required: {} ({} finding(s))",
-                path.display(),
-                findings_count
-            );
-        }
-        smartzip_core::TaskEventKind::LargeEmbeddedScanConfirmationRequired {
-            path,
-            file_size,
-            threshold,
-        } => {
-            eprintln!(
-                "  large embedded scan skipped without confirmation: {} ({} bytes > {} bytes)",
-                path.display(),
-                file_size,
-                threshold
-            );
-        }
-        smartzip_core::TaskEventKind::BusinessContainerSkipped { path, kind } => {
-            println!("  skipped business container {kind}: {}", path.display());
-        }
-        smartzip_core::TaskEventKind::OutputCreated { path } => {
-            println!("  -> {}", path.display());
-        }
-        smartzip_core::TaskEventKind::Route(route) if verbose_routing => {
-            render_route_event(route, false);
-        }
-        smartzip_core::TaskEventKind::Failed { error } => eprintln!("  FAILED: {error}"),
-        smartzip_core::TaskEventKind::Warning { message } => {
-            eprintln!("  warning: {message}")
-        }
-        _ => {}
-    }
-}
-
-fn render_route_event(route: &smartzip_core::RouteEvent, stderr: bool) {
-    macro_rules! output {
-        ($($args:tt)*) => {
-            if stderr {
-                eprintln!($($args)*);
-            } else {
-                println!($($args)*);
-            }
-        };
-    }
-
-    match route {
-        smartzip_core::RouteEvent::RoutePlanned { plan } => {
-            output!("  route: {:?}", plan.operation);
-            for candidate in &plan.candidates {
-                output!("    candidate: {}", candidate.adapter_id);
-                for note in &candidate.notes {
-                    output!("      note: {note}");
-                }
-            }
-            for rejected in &plan.rejected {
-                output!(
-                    "    rejected: {} ({})",
-                    rejected.adapter_id,
-                    rejected.reasons.join("; ")
-                );
-            }
-        }
-        smartzip_core::RouteEvent::BackendAttemptStarted { adapter_id } => {
-            output!("  route: trying {adapter_id}")
-        }
-        smartzip_core::RouteEvent::BackendAttemptFailed { adapter_id, class } => {
-            output!("  route: {adapter_id} failed ({class})")
-        }
-        smartzip_core::RouteEvent::BackendAttemptCleaned { adapter_id } => {
-            output!("  route: cleaned {adapter_id} output")
-        }
-        smartzip_core::RouteEvent::BackendSelected { adapter_id } => {
-            output!("  route: selected {adapter_id}")
-        }
-        smartzip_core::RouteEvent::RouteExhausted { attempted } => {
-            output!("  route: exhausted [{}]", attempted.join(", "))
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -2062,22 +823,6 @@ fn encoding_preview_candidates() -> &'static [&'static str] {
         "EUC-JP",
         "EUC-KR",
     ]
-}
-
-fn build_extract_json_output(result: &smartzip_engine::ExtractWorkflowResult) -> serde_json::Value {
-    serde_json::json!({
-        "task_id": result.task_id,
-        "status": result.status,
-        "failed_count": result.failed_count,
-        "processed_count": result.processed.len(),
-        "skipped_count": result.skipped.len(),
-        "enqueued_count": result.enqueued.len(),
-        "processed": result.processed,
-        "skipped": result.skipped,
-        "enqueued": result.enqueued,
-        "events": result.events,
-        "exit_code": result.status.exit_code(),
-    })
 }
 
 fn password(db: &SmartZipDb, cmd: PasswordCmd) -> Result<(), Box<dyn std::error::Error>> {
@@ -2314,22 +1059,6 @@ fn history(db: &SmartZipDb, cmd: HistoryCmd) -> Result<(), Box<dyn std::error::E
     }
 
     Ok(())
-}
-
-fn print_history_test_report(json: Option<&str>) {
-    if let Some(json) = json {
-        match serde_json::from_str::<smartzip_archive::integrity::TestArchiveReport>(json) {
-            Ok(report) => print_test_report(&report),
-            Err(_) => eprintln!("  test report has an unsupported or invalid schema"),
-        }
-    }
-}
-
-fn default_output_dir(first_path: &Path) -> PathBuf {
-    first_path
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .to_path_buf()
 }
 
 // ── Interactive password prompt via stdin ────────────────────────────────
@@ -2705,9 +1434,9 @@ mod tests {
         for name in ["test", "t"] {
             let cli =
                 Cli::try_parse_from(["smartzip", name, "a.part2.rar", "b.zip", "--json"]).unwrap();
-            assert!(matches!(cli.command, Command::Test {
+            assert!(matches!(cli.command, Command::Test(super::TestCommand {
                 paths, diagnose: super::DiagnoseArg::Auto, diagnostic_timeout: None, json: true, ..
-            } if paths.len() == 2));
+            }) if paths.len() == 2));
             assert!(
                 Cli::try_parse_from(["smartzip", name, "a.zip", "--diagnostic-timeout", "0"])
                     .is_err()
@@ -2726,12 +1455,12 @@ mod tests {
         .unwrap();
         assert!(matches!(
             cli.command,
-            Command::Test {
+            Command::Test(super::TestCommand {
                 diagnose: super::DiagnoseArg::Off,
                 diagnostic_timeout: Some(5),
                 no_history: true,
                 ..
-            }
+            })
         ));
     }
 

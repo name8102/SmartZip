@@ -25,3 +25,11 @@ PreparedArchive 统一 list/inspect/extract 的 carved/canonical 输入 guard、
 nested 使用同一 classify_nested_file；单文件输出与目录枚举的相对路径规则保留。审查未指出的真实差异也保留：单文件输出不进入无后缀内容扫描；目录候选可以。新增 matrix 在重构前后均通过，覆盖头部优先、关闭头部扫描后的后缀回退、业务容器排除、offset/size 和目录 symlink 不跟随。
 
 完整门槛通过，日志 target/ponytail-validation/02-preparation/；release beta 23 项通过。清理移动代码后遗留的 unused import，再次通过 all-targets check/fmt/diff check。
+
+### Commit 3：CLI orchestration 与 facade
+
+Detect/List/Test/Extract 使用各自 clap Args 请求，保留字段顺序、帮助文本和参数名字。bootstrap.rs 集中配置/依赖创建，commands.rs 接收命令请求并执行，render.rs 负责结果与事件输出；main 保留分派与退出码。不创建通用 service container。Command::json_output 是唯一对应命令集合的 JSON 判断。删除已被 bootstrap explain/dry-run 提前返回覆盖的旧私有 dry-run 分支。
+
+engine 新增 extract(request, ExtractInteraction, ExtractObserver) 和不依赖 PasswordService 的 inspect 入口；旧公开重载转发保留，CLI 使用新入口，GUI 未修改。现有管理命令先于 backend、DB 按需创建的行为保持。
+
+完整门槛通过，日志 target/ponytail-validation/03-cli/；help/事件 characterization 与 release beta 23 项通过。
