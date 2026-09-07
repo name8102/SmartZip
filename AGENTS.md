@@ -1,13 +1,8 @@
-## Agent skills
+# SmartZip 协作原则
 
-### Issue tracker
-
-Planning and implementation tasks are tracked under `.trellis/tasks/`. Use each task directory's `prd.md`, optional `design.md`, and optional `implement.md` as the primary workflow artifacts. See `docs/agents/issue-tracker.md`.
-
-### Triage labels
-
-Use the default five-label triage vocabulary. See `docs/agents/triage-labels.md`.
-
-### Domain docs
-
-This is a single-context repo with root `CONTEXT.md`. Architecture decisions currently live in the `Architecture Decisions` section inside `CONTEXT.md`; `docs/adr/` is optional and is not currently split out. See `docs/agents/domain.md`.
+- 根据当前请求推进工作；明确的小改动可直接完成，只有影响范围、正确性或不可逆操作的歧义才需要澄清。
+- 按需阅读上下文：`CONTEXT.md` 提供领域术语与架构决策，`README.md` 提供使用和构建入口，相关任务记录保存在 `.trellis/tasks/`。历史方案与当前源码不一致时，说明差异。
+- 延续现有模块职责和术语。调整架构时说明理由与影响；避免为假设的未来需求提前增加抽象。
+- 保护用户数据：关注归档路径安全、资源预算、失败清理和提交回滚；密码不进入日志或事件。
+- 验证与改动风险相称，优先检查受影响行为。报告实际验证范围和未解决问题，区分单元测试、真实后端验收与性能证据。
+- 记录有助于后续接手的决策和结果，避免在多个文件重复维护同一事实。任务记录方式见 `docs/agents/issue-tracker.md`；需要分类时参考 `docs/agents/triage-labels.md`。

@@ -1,37 +1,8 @@
-# Issue Tracker: Trellis Tasks
+# 任务记录
 
-Planning and implementation work for this repo lives under `.trellis/tasks/`.
+`.trellis/tasks/` 是本地任务资料目录，不依赖 Trellis 运行时。
 
-## Conventions
-
-- One task per directory: `.trellis/tasks/<MM-DD-slug>/`
-- Required task metadata lives in `task.json`
-- The primary planning artifact is `prd.md`
-- Complex tasks may also include `design.md` and `implement.md`
-- Context manifests may exist as `implement.jsonl` and `check.jsonl`
-- Parent/child relationships are tracked in `task.json` and managed through `task.py`
-
-## When a skill says "publish to the issue tracker"
-
-Create a new Trellis task with:
-
-```bash
-python3 ./.trellis/scripts/task.py create "<title>" --slug <slug>
-```
-
-If the work belongs under an existing planning umbrella, use `--parent <task-dir>`.
-
-## When a skill says "fetch the relevant ticket"
-
-Read the task directory referenced by the user, usually:
-
-- `.trellis/tasks/<task>/prd.md`
-- `.trellis/tasks/<task>/design.md`
-- `.trellis/tasks/<task>/implement.md`
-- `.trellis/tasks/<task>/task.json`
-
-## Status and Flow
-
-- Task lifecycle is managed through `python3 ./.trellis/scripts/task.py ...`
-- Planning stays in the task directory until reviewed
-- Implementation begins only after the task is started and moved out of planning
+- 优先续写相关任务。需要跨会话跟踪的工作可新建 `<MM-DD-slug>/`；小改动无需额外建档。
+- `prd.md` 记录目标、范围和验收依据；有必要时再添加 `design.md` 或 `implement.md`，分别记录设计取舍与实施、验证结果。
+- `task.json` 可沿用已有的标题、状态和标签结构。直接编辑即可，不要求脚本、启动步骤或审批阶段。
+- 旧任务、上下文清单和 journal 是按需查阅的历史资料，不是每轮必读项；其中的阶段顺序与待办不自动成为当前任务要求。
