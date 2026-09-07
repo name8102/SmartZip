@@ -7,6 +7,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 /// Execution seam injected into the engine. Routers implement this trait.
+/// Legacy methods remain required for source compatibility with external executors.
+/// Built-in implementations forward those entries to their context-aware execution;
+/// the defaults here intentionally still support legacy-only implementors.
 #[async_trait]
 pub trait ArchiveExecutor: Send + Sync {
     /// Reset task-local routing observations before a new top-level workflow.

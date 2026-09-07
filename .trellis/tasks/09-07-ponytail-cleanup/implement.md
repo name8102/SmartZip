@@ -33,3 +33,11 @@ Detect/List/Test/Extract 使用各自 clap Args 请求，保留字段顺序、�
 engine 新增 extract(request, ExtractInteraction, ExtractObserver) 和不依赖 PasswordService 的 inspect 入口；旧公开重载转发保留，CLI 使用新入口，GUI 未修改。现有管理命令先于 backend、DB 按需创建的行为保持。
 
 完整门槛通过，日志 target/ponytail-validation/03-cli/；help/事件 characterization 与 release beta 23 项通过。
+
+### Commit 4：backend 单实现与兼容 API
+
+SevenZip/Unrar 的 list/extract（及 SevenZip compress）无 context 方法转为 detached context 薄包装，参数构造、协议解析、错误归约和 observer 在 context 实现中只执行一次。probe 统一准备/结果组装，但显式保留旧入口与 context 入口的诊断差异：7z 原有两种 test 协议、Unrar password diagnostics 的 supported 判定不被静默改写。
+
+ArchiveExecutor/ArchiveAdapter 仍保留旧 required 方法和 context 默认转发方向，避免破坏外部 trait 实现者或形成互递归。Router 的 canonical facts/context 与 fallback 未修改。新增 3 项 fake-process 合同测试，锁定命令参数、返回值、observer 单次交付与 probe 差异；这类注入测试不是实际 unrar 验收。
+
+完整门槛通过，日志 target/ponytail-validation/04-adapters/；release beta 23 项通过。
