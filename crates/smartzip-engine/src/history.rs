@@ -105,6 +105,94 @@ pub struct FileExtractionRow<'a> {
     pub test_report_json: Option<&'a str>,
 }
 
+impl<'a> FileExtractionRow<'a> {
+    pub(crate) fn tested(
+        report: &'a smartzip_archive::integrity::TestArchiveReport,
+        password_id: Option<i64>,
+        encoding: &'a EncodingMode,
+        confirmed: Option<&'a str>,
+        serialized: Option<&'a str>,
+    ) -> Self {
+        use smartzip_archive::integrity::{Integrity, PasswordStatus};
+        let (status, reason) = match report.integrity {
+            Integrity::Intact => ("intact", None),
+            Integrity::Corrupt => ("corrupt", Some("integrity_failed")),
+            Integrity::Incomplete => ("partial", Some("incomplete")),
+            Integrity::Unknown if report.password_status == PasswordStatus::Required => {
+                ("skipped", Some("password_required"))
+            }
+            Integrity::Unknown => ("failed", Some("unknown")),
+        };
+        Self {
+            input_path: Path::new(&report.entrypoint),
+            sample_hash: None,
+            file_size: report
+                .volumes
+                .byte_len()
+                .and_then(|n| i64::try_from(n).ok()),
+            offset: None,
+            output_path: None,
+            has_password: report.password_status == PasswordStatus::Verified,
+            password_id,
+            status,
+            reason,
+            encoding: match encoding {
+                EncodingMode::Auto => None,
+                EncodingMode::Override(name) => Some(name),
+            },
+            encoding_corrected: false,
+            damaged_volumes_json: confirmed,
+            test_report_json: serialized,
+        }
+    }
+
+    fn action(
+        input_path: &'a Path,
+        offset: Option<u64>,
+        status: &'static str,
+        reason: Option<&'a str>,
+    ) -> Self {
+        Self {
+            input_path,
+            sample_hash: None,
+            file_size: None,
+            offset: offset.map(|n| n as i64),
+            output_path: None,
+            has_password: false,
+            password_id: None,
+            status,
+            reason,
+            encoding: None,
+            encoding_corrected: false,
+            damaged_volumes_json: None,
+            test_report_json: None,
+        }
+    }
+
+    pub(crate) fn skipped(input_path: &'a Path, offset: Option<u64>, reason: &'a str) -> Self {
+        Self::action(input_path, offset, "skipped", Some(reason))
+    }
+
+    pub(crate) fn failed(input_path: &'a Path, offset: Option<u64>, reason: &'a str) -> Self {
+        Self::action(input_path, offset, "failed", Some(reason))
+    }
+
+    pub(crate) fn unreadable(input_path: &'a Path, reason: &'a str) -> Self {
+        Self::action(input_path, None, "unreadable", Some(reason))
+    }
+
+    pub(crate) fn detected(input_path: &'a Path, offset: Option<u64>) -> Self {
+        Self::action(input_path, offset, "detected", None)
+    }
+
+    pub(crate) fn extracted(input_path: &'a Path, offset: Option<u64>, output: &'a Path) -> Self {
+        Self {
+            output_path: Some(output),
+            ..Self::action(input_path, offset, "extracted", None)
+        }
+    }
+}
+
 /// Reuse hints returned by [`TaskHistoryRecorder::lookup_known_file`].
 #[derive(Debug, Clone, Default)]
 pub struct KnownFileHit {

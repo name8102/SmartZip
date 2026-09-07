@@ -14,7 +14,7 @@ use smartzip_passwords::{
     PasswordCandidate, PasswordCandidateRequest, PasswordService, PasswordSource,
 };
 use smartzip_scanner::{EmbeddedScanner, ScannerConfig};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -617,37 +617,14 @@ fn record_file(
             .collect::<Vec<_>>(),
     )
     .ok();
-    let (status, reason) = match report.integrity {
-        Integrity::Intact => ("intact", None),
-        Integrity::Corrupt => ("corrupt", Some("integrity_failed")),
-        Integrity::Incomplete => ("partial", Some("incomplete")),
-        Integrity::Unknown if report.password_status == PasswordStatus::Required => {
-            ("skipped", Some("password_required"))
-        }
-        Integrity::Unknown => ("failed", Some("unknown")),
-    };
     history.record_file_extraction(
         task_id,
-        FileExtractionRow {
-            input_path: Path::new(&report.entrypoint),
-            sample_hash: None,
-            file_size: report
-                .volumes
-                .byte_len()
-                .and_then(|n| i64::try_from(n).ok()),
-            offset: None,
-            output_path: None,
-            has_password: report.password_status == PasswordStatus::Verified,
+        FileExtractionRow::tested(
+            report,
             password_id,
-            status,
-            reason,
-            encoding: match encoding {
-                EncodingMode::Auto => None,
-                EncodingMode::Override(name) => Some(name),
-            },
-            encoding_corrected: false,
-            damaged_volumes_json: confirmed.as_deref(),
-            test_report_json: serialized.as_deref(),
-        },
+            encoding,
+            confirmed.as_deref(),
+            serialized.as_deref(),
+        ),
     );
 }

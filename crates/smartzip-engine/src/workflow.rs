@@ -141,16 +141,15 @@ pub(crate) async fn inspect_file_with_listener<B: ArchiveExecutor>(
         reason = Some("business_container".to_string());
         detected_format = Some(ArchiveFormat::Zip);
     } else if let Some(candidate) = candidate {
-        let resolved = prepare_resolved_archive(
-            &candidate,
-            None,
-            EncodingMode::Auto,
-            history,
-            &events,
-            &task_id,
-            run_policy,
-        )
-        .await?;
+        let resolved =
+            prepare_resolved_archive(&candidate, None, EncodingMode::Auto, history, run_policy)
+                .await?;
+        if let Some(assessment) = &resolved.zip_encoding_assessment {
+            events.push(TaskEvent {
+                task_id: task_id.clone(),
+                kind: TaskEventKind::EncodingDetected(assessment.context.detected.clone()),
+            });
+        }
         known_password = resolved
             .known_hit
             .as_ref()
@@ -186,19 +185,14 @@ pub(crate) async fn inspect_file_with_listener<B: ArchiveExecutor>(
             recorder.record_file_extraction(
                 &task_id,
                 crate::history::FileExtractionRow {
-                    input_path: &candidate.path,
                     sample_hash: resolved.sample_hash.as_deref(),
                     file_size: resolved.sample_size,
-                    offset: candidate.embedded_offset.map(|o| o as i64),
-                    output_path: None,
-                    has_password: false,
-                    password_id: None,
-                    status: "detected",
-                    reason: None,
                     encoding: encoding.as_deref(),
                     encoding_corrected: resolved.reused_confirmed_encoding,
-                    damaged_volumes_json: None,
-                    test_report_json: None,
+                    ..crate::history::FileExtractionRow::detected(
+                        &candidate.path,
+                        candidate.embedded_offset,
+                    )
                 },
             );
         }
@@ -207,21 +201,7 @@ pub(crate) async fn inspect_file_with_listener<B: ArchiveExecutor>(
         if let Some(recorder) = history {
             recorder.record_file_extraction(
                 &task_id,
-                crate::history::FileExtractionRow {
-                    input_path: &request.path,
-                    sample_hash: None,
-                    file_size: None,
-                    offset: None,
-                    output_path: None,
-                    has_password: false,
-                    password_id: None,
-                    status: "unreadable",
-                    reason: Some("not_found"),
-                    encoding: None,
-                    encoding_corrected: false,
-                    damaged_volumes_json: None,
-                    test_report_json: None,
-                },
+                crate::history::FileExtractionRow::unreadable(&request.path, "not_found"),
             );
         }
     }
@@ -336,8 +316,8 @@ pub(crate) async fn list_archive_with_listener_interactive<B: ArchiveExecutor>(
     } else {
         volume_resolver.prepare(candidate)
     };
-    let (candidate, backend_path_override, _volume_keep) = match preparation {
-        crate::volumes::VolumePreparation::Single(candidate) => (candidate, None, None),
+    let (candidate, volume_input) = match preparation {
+        crate::volumes::VolumePreparation::Single(candidate) => (candidate, None),
         crate::volumes::VolumePreparation::Resolved {
             candidate,
             archive_path,
@@ -353,7 +333,7 @@ pub(crate) async fn list_archive_with_listener_interactive<B: ArchiveExecutor>(
                     },
                 });
             }
-            (candidate, Some(archive_path), Some(materialized))
+            (candidate, Some((archive_path, materialized)))
         }
         crate::volumes::VolumePreparation::Incomplete { candidate, problem } => {
             return Err(smartzip_core::SmartZipError::CorruptedArchive {
@@ -380,14 +360,18 @@ pub(crate) async fn list_archive_with_listener_interactive<B: ArchiveExecutor>(
 
     let resolved = prepare_resolved_archive(
         &candidate,
-        backend_path_override,
+        volume_input,
         request.encoding_mode.clone(),
         history,
-        &events,
-        &task_id,
         run_policy,
     )
     .await?;
+    if let Some(assessment) = &resolved.zip_encoding_assessment {
+        events.push(TaskEvent {
+            task_id: task_id.clone(),
+            kind: TaskEventKind::EncodingDetected(assessment.context.detected.clone()),
+        });
+    }
     let password_candidates =
         load_password_candidates(passwords, request.password_candidates.clone())?;
     let outcome = access_archive_with_password(
@@ -412,20 +396,17 @@ pub(crate) async fn list_archive_with_listener_interactive<B: ArchiveExecutor>(
         recorder.record_file_extraction(
             &task_id,
             crate::history::FileExtractionRow {
-                input_path: history_input_path,
                 sample_hash: resolved.sample_hash.as_deref(),
                 file_size: resolved.sample_size,
-                offset: candidate.embedded_offset.map(|o| o as i64),
-                output_path: None,
                 has_password: outcome.has_password,
                 password_id: outcome.password_id,
-                status: "detected",
-                reason: None,
                 encoding: Some(encoding_mode_label(&outcome.encoding_mode).as_str()),
                 encoding_corrected: resolved.reused_confirmed_encoding
                     || matches!(request.encoding_mode, EncodingMode::Override(_)),
-                damaged_volumes_json: None,
-                test_report_json: None,
+                ..crate::history::FileExtractionRow::detected(
+                    history_input_path,
+                    candidate.embedded_offset,
+                )
             },
         );
         if let (Some(hash), Some(size), EncodingMode::Override(encoding)) = (

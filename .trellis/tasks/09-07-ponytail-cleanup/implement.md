@@ -17,3 +17,11 @@
 删除 layout 子分支中不可达的 Raw 分支、私有 MaterializeResult 的无意义 Option、extract 第二次未消费的 candidate key、DB recorder 与 trait 相同的 start override，以及 inspect 私有 workflow 的 PasswordService 参数。外部 inspect 签名保留。VolumeResolution 增加统一借用/归约入口，归约用 Result 保留未解析诊断，既有公开 variant 不删除。
 
 完整门槛通过，日志 target/ponytail-validation/01-dead-structure/；release beta 23 项通过。随后清理一个不再使用的 import 并再次通过 all-targets check、fmt、diff check。未触碰输出事务算法。
+
+### Commit 2：准备、分类与历史行
+
+PreparedArchive 统一 list/inspect/extract 的 carved/canonical 输入 guard、采样、known-file、确认编码、ZIP assessment 和 recorder name。preparation 不发事件；调用者在原位置发事件。FileExtractionRow 使用语义构造器固定 detected/extracted/skipped/failed/unreadable/tested 的默认字段；test 证据归约不变。
+
+nested 使用同一 classify_nested_file；单文件输出与目录枚举的相对路径规则保留。审查未指出的真实差异也保留：单文件输出不进入无后缀内容扫描；目录候选可以。新增 matrix 在重构前后均通过，覆盖头部优先、关闭头部扫描后的后缀回退、业务容器排除、offset/size 和目录 symlink 不跟随。
+
+完整门槛通过，日志 target/ponytail-validation/02-preparation/；release beta 23 项通过。清理移动代码后遗留的 unused import，再次通过 all-targets check/fmt/diff check。

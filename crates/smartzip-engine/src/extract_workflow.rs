@@ -7,8 +7,9 @@ use smartzip_scanner::{Confidence, EmbeddedArchiveFinding, EmbeddedScanner};
 use std::collections::{HashSet, VecDeque};
 use std::io::Read;
 
+use crate::access::prepare_resolved_archive;
 use crate::backend_util::{backend_call, confidence_score};
-use crate::encoding_flow::{assess_zip_encoding, encoding_mode_label, resolve_encoding_mode};
+use crate::encoding_flow::{encoding_mode_label, resolve_encoding_mode};
 use crate::events::{EventSink, TaskEventListener};
 use crate::interactive::{
     EmbeddedSelectionChoice, InteractiveEmbeddedPrompter, InteractiveEncodingPrompter,
@@ -17,9 +18,9 @@ use crate::interactive::{
 use crate::materialize::{self, CommitPolicy, MaterializeRequest, OutputMaterializer};
 use crate::nested::{
     archive_output_name, archive_stem, candidate_key, candidate_output_relative_path,
-    discover_nested_candidates, make_collision_resolver, materialize_archive_input,
-    output_dir_for_candidate, output_relative_path_for, record_skip,
-    recyclable_nested_archive_path, recycle_archive, root_embedded_candidates,
+    discover_nested_candidates, make_collision_resolver, output_dir_for_candidate,
+    output_relative_path_for, record_skip, recyclable_nested_archive_path, recycle_archive,
+    root_embedded_candidates,
 };
 use crate::password_order::password_source_label;
 use crate::policy::{
@@ -291,21 +292,11 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                 if let Some(recorder) = history {
                     recorder.record_file_extraction(
                         &task_id,
-                        crate::history::FileExtractionRow {
-                            input_path: &original_input_path,
-                            sample_hash: None,
-                            file_size: None,
-                            offset: failed.embedded_offset.map(|o| o as i64),
-                            output_path: None,
-                            has_password: false,
-                            password_id: None,
-                            status: "failed",
-                            reason: Some("incomplete_volume"),
-                            encoding: None,
-                            encoding_corrected: false,
-                            damaged_volumes_json: None,
-                            test_report_json: None,
-                        },
+                        crate::history::FileExtractionRow::failed(
+                            &original_input_path,
+                            failed.embedded_offset,
+                            "incomplete_volume",
+                        ),
                     );
                 }
                 skipped.push(failed);
@@ -329,21 +320,11 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                 if let Some(recorder) = history {
                     recorder.record_file_extraction(
                         &task_id,
-                        crate::history::FileExtractionRow {
-                            input_path: &original_input_path,
-                            sample_hash: None,
-                            file_size: None,
-                            offset: failed.embedded_offset.map(|o| o as i64),
-                            output_path: None,
-                            has_password: false,
-                            password_id: None,
-                            status: "failed",
-                            reason: Some("grouping_ambiguous"),
-                            encoding: None,
-                            encoding_corrected: false,
-                            damaged_volumes_json: None,
-                            test_report_json: None,
-                        },
+                        crate::history::FileExtractionRow::failed(
+                            &original_input_path,
+                            failed.embedded_offset,
+                            "grouping_ambiguous",
+                        ),
                     );
                 }
                 skipped.push(failed);
@@ -366,21 +347,11 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                 if let Some(recorder) = history {
                     recorder.record_file_extraction(
                         &task_id,
-                        crate::history::FileExtractionRow {
-                            input_path: &original_input_path,
-                            sample_hash: None,
-                            file_size: None,
-                            offset: failed.embedded_offset.map(|o| o as i64),
-                            output_path: None,
-                            has_password: false,
-                            password_id: None,
-                            status: "failed",
-                            reason: Some("materialize_failed"),
-                            encoding: None,
-                            encoding_corrected: false,
-                            damaged_volumes_json: None,
-                            test_report_json: None,
-                        },
+                        crate::history::FileExtractionRow::failed(
+                            &original_input_path,
+                            failed.embedded_offset,
+                            "materialize_failed",
+                        ),
                     );
                 }
                 skipped.push(failed);
@@ -706,78 +677,32 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
             }
         }
 
-        // For volume sets, preparation already supplied the canonical backend
-        // entrypoint; candidate.path remains the logical input identity.
-        let (archive_path, _archive_temp, _volume_materialized_keep) =
-            if let Some(path) = volume_archive_path {
-                (path, None, volume_materialized)
-            } else {
-                let inp = match materialize_archive_input(&candidate) {
-                    Ok(input) => input,
-                    Err(error) => {
-                        failed_count += 1;
-                        events.push(TaskEvent::failed(task_id.clone(), &error));
-                        record_skip(history, &task_id, &candidate, &error.to_string());
-                        skipped.push(candidate);
-                        continue;
-                    }
-                };
-                let p = inp.path.clone();
-                (p, inp._temp, None)
-            };
-        // Shadow the earlier volume_materialized binding with the kept handle so it lives through the rest of the iteration.
-        let _volume_keep = _volume_materialized_keep;
-
-        // File-grain history: identify this physical file by content
-        // sampling so we can dedup, reuse a confirmed encoding, and reuse a
-        // known password. Carve candidates hash their [offset, offset+size)
-        // segment; a size-unknown carve yields no hash and skips dedup.
-        let (sample_hash, sample_size) = if history.is_none() {
-            (None, None)
-        } else {
-            match candidate.embedded_offset {
-                Some(offset) if offset > 0 => smartzip_db::sample_hash::sample_hash_segment(
-                    &candidate.path,
-                    offset,
-                    candidate.embedded_size,
-                )
-                .map(|(h, s)| (Some(h), Some(s as i64)))
-                .unwrap_or((None, None)),
-                _ => smartzip_db::sample_hash::sample_hash(&archive_path)
-                    .map(|(h, s)| (Some(h), Some(s as i64)))
-                    .unwrap_or((None, None)),
+        // Preparation owns carved/canonical input guards and returns facts only.
+        let prepared = match prepare_resolved_archive(
+            &candidate,
+            volume_archive_path.zip(volume_materialized),
+            request.encoding_mode.clone(),
+            history,
+            run_policy,
+        )
+        .await
+        {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                failed_count += 1;
+                events.push(TaskEvent::failed(task_id.clone(), &error));
+                record_skip(history, &task_id, &candidate, &error.to_string());
+                skipped.push(candidate);
+                continue;
             }
         };
-        let known_hit = match (history, sample_hash.as_deref(), sample_size) {
-            (Some(recorder), Some(hash), Some(size)) => recorder.lookup_known_file(hash, size),
-            _ => None,
-        };
-
-        // Dedup: a prior successful extract inside the window means skip,
-        // unless --force. Emit a hint event and log a skipped row.
-        // Historical fingerprints remember credentials and encoding. Extraction
-        // itself always checks this invocation's actual output collision.
-
-        // Confirmed-encoding reuse: a user-confirmed encoding for this exact
-        // file beats auto-detection, but never a command-line override.
-        // Detect-time guesses are recomputed each run, so only a confirmed
-        // encoding (written by the future `list` command) is reused here.
-        let candidate_encoding_mode = match (
-            &request.encoding_mode,
-            known_hit
-                .as_ref()
-                .and_then(|h| h.confirmed_encoding.clone()),
-        ) {
-            (EncodingMode::Auto, Some(enc)) => EncodingMode::Override(enc),
-            _ => request.encoding_mode.clone(),
-        };
-        // True when the encoding above came from a reused user-confirmed
-        // choice; recorded on the file_extractions row as encoding_corrected.
-        let reused_confirmed_encoding = request.encoding_mode == EncodingMode::Auto
-            && known_hit
-                .as_ref()
-                .map(|h| h.confirmed_encoding.is_some())
-                .unwrap_or(false);
+        let archive_path = &prepared.archive_path;
+        let sample_hash = &prepared.sample_hash;
+        let sample_size = prepared.sample_size;
+        let known_hit = &prepared.known_hit;
+        let candidate_encoding_mode = &prepared.encoding_mode;
+        let reused_confirmed_encoding = prepared.reused_confirmed_encoding;
+        let zip_encoding_assessment = &prepared.zip_encoding_assessment;
 
         // Password try order: command-line/manual > exact known-file hit >
         // passwords accepted earlier in this batch > empty/database
@@ -823,16 +748,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
             ))),
         });
 
-        // Skip auto-detection entirely when a user-confirmed encoding was
-        // reused from known_files — that choice already beat auto once.
-        let mut zip_encoding_assessment = None;
-        if config.is_none_or(|c| c.extraction.encoding.mode == "auto")
-            && candidate_encoding_mode == EncodingMode::Auto
-            && candidate.detected_format == Some(ArchiveFormat::Zip)
-        {
-            zip_encoding_assessment = assess_zip_encoding(&archive_path).await;
-        }
-        if let Some(assessment) = &zip_encoding_assessment {
+        if let Some(assessment) = zip_encoding_assessment {
             events.push(TaskEvent {
                 task_id: task_id.clone(),
                 kind: TaskEventKind::EncodingDetected(assessment.context.detected.clone()),
@@ -1099,30 +1015,33 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                     recorder.record_file_extraction(
                         &task_id,
                         crate::history::FileExtractionRow {
-                            input_path: &original_input_path,
                             sample_hash: sample_hash.as_deref(),
                             file_size: sample_size,
-                            offset: candidate.embedded_offset.map(|o| o as i64),
-                            output_path: None,
-                            has_password: false,
-                            password_id: None,
-                            status: if password_prompter.is_none() {
-                                "failed"
-                            } else {
-                                "skipped"
-                            },
-                            reason: Some(if saw_password_indeterminate {
-                                "password_indeterminate"
-                            } else if saw_wrong_password {
-                                "wrong_password"
-                            } else {
-                                "password_required"
-                            }),
                             encoding: candidate_encoding_used.as_deref(),
                             encoding_corrected: reused_confirmed_encoding
                                 || matches!(request.encoding_mode, EncodingMode::Override(_)),
-                            damaged_volumes_json: None,
-                            test_report_json: None,
+                            ..{
+                                let reason = if saw_password_indeterminate {
+                                    "password_indeterminate"
+                                } else if saw_wrong_password {
+                                    "wrong_password"
+                                } else {
+                                    "password_required"
+                                };
+                                if password_prompter.is_none() {
+                                    crate::history::FileExtractionRow::failed(
+                                        &original_input_path,
+                                        candidate.embedded_offset,
+                                        reason,
+                                    )
+                                } else {
+                                    crate::history::FileExtractionRow::skipped(
+                                        &original_input_path,
+                                        candidate.embedded_offset,
+                                        reason,
+                                    )
+                                }
+                            }
                         },
                     );
                 }
@@ -1148,20 +1067,18 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                     recorder.record_file_extraction(
                         &task_id,
                         crate::history::FileExtractionRow {
-                            input_path: &original_input_path,
                             sample_hash: sample_hash.as_deref(),
                             file_size: sample_size,
-                            offset: candidate.embedded_offset.map(|o| o as i64),
-                            output_path: None,
                             has_password: candidate_has_password,
                             password_id: candidate_password_id,
-                            status: "failed",
-                            reason: Some(reason),
                             encoding: candidate_encoding_used.as_deref(),
                             encoding_corrected: reused_confirmed_encoding
                                 || matches!(request.encoding_mode, EncodingMode::Override(_)),
-                            damaged_volumes_json: None,
-                            test_report_json: None,
+                            ..crate::history::FileExtractionRow::failed(
+                                &original_input_path,
+                                candidate.embedded_offset,
+                                reason,
+                            )
                         },
                     );
                 }
@@ -1174,20 +1091,18 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                 recorder.record_file_extraction(
                     &task_id,
                     crate::history::FileExtractionRow {
-                        input_path: &original_input_path,
                         sample_hash: sample_hash.as_deref(),
                         file_size: sample_size,
-                        offset: candidate.embedded_offset.map(|o| o as i64),
-                        output_path: None,
                         has_password: candidate_has_password,
                         password_id: candidate_password_id,
-                        status: "skipped",
-                        reason: Some("password_required"),
                         encoding: candidate_encoding_used.as_deref(),
                         encoding_corrected: reused_confirmed_encoding
                             || matches!(request.encoding_mode, EncodingMode::Override(_)),
-                        damaged_volumes_json: None,
-                        test_report_json: None,
+                        ..crate::history::FileExtractionRow::skipped(
+                            &original_input_path,
+                            candidate.embedded_offset,
+                            "password_required",
+                        )
                     },
                 );
             }
@@ -1242,27 +1157,22 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
             recorder.record_file_extraction(
                 &task_id,
                 crate::history::FileExtractionRow {
-                    input_path: &original_input_path,
                     sample_hash: sample_hash.as_deref(),
                     file_size: sample_size,
-                    offset: candidate.embedded_offset.map(|o| o as i64),
-                    output_path: Some(&actual_output_dir),
                     has_password: candidate_has_password,
                     password_id: candidate_password_id,
-                    status: "extracted",
-                    reason: None,
                     encoding: candidate_encoding_used.as_deref(),
                     encoding_corrected: reused_confirmed_encoding
                         || matches!(request.encoding_mode, EncodingMode::Override(_)),
-                    damaged_volumes_json: None,
-                    test_report_json: None,
+                    ..crate::history::FileExtractionRow::extracted(
+                        &original_input_path,
+                        candidate.embedded_offset,
+                        &actual_output_dir,
+                    )
                 },
             );
             if let (Some(hash), Some(size)) = (sample_hash.as_deref(), sample_size) {
-                let name = candidate
-                    .path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned());
+                let name = &prepared.recorder_name;
                 recorder.upsert_known_file_extract(crate::history::KnownFileUpsert {
                     sample_hash: hash,
                     size,

@@ -21,21 +21,11 @@ pub(crate) fn record_skip(
     if let Some(recorder) = history {
         recorder.record_file_extraction(
             task_id,
-            crate::history::FileExtractionRow {
-                input_path: &candidate.path,
-                sample_hash: None,
-                file_size: None,
-                offset: candidate.embedded_offset.map(|o| o as i64),
-                output_path: None,
-                has_password: false,
-                password_id: None,
-                status: "skipped",
-                reason: Some(reason),
-                encoding: None,
-                encoding_corrected: false,
-                damaged_volumes_json: None,
-                test_report_json: None,
-            },
+            crate::history::FileExtractionRow::skipped(
+                &candidate.path,
+                candidate.embedded_offset,
+                reason,
+            ),
         );
     }
 }
@@ -264,6 +254,13 @@ pub(crate) fn carve_embedded_archive(
     Ok(output)
 }
 
+#[derive(Clone, Copy)]
+struct NestedDiscoveryPolicy<'a> {
+    embedded: &'a smartzip_core::EmbeddedScanPolicy,
+    nested_embedded_enabled: bool,
+    scan_unrecognized: bool,
+}
+
 pub(crate) fn discover_nested_candidates(
     scanner: &EmbeddedScanner,
     root: &Path,
@@ -273,169 +270,154 @@ pub(crate) fn discover_nested_candidates(
     nested_embedded_enabled: bool,
     scan_unrecognized: bool,
 ) -> Vec<ExtractionCandidate> {
-    let mut candidates = Vec::new();
-
-    // Handle single-file roots directly when a candidate resolves to one file.
+    let policy = NestedDiscoveryPolicy {
+        embedded: policy,
+        nested_embedded_enabled,
+        scan_unrecognized,
+    };
+    // Preserve the collapsed single-output contract: header/extension only.
     if root.is_file() {
-        let header_result = (nested_embedded_enabled
-            && (scan_unrecognized || format_from_extension(root).is_some()))
-        .then(|| crate::detect::probe_file_header(root))
-        .flatten();
-        if let Some((fmt, offset)) = header_result {
-            if is_business_container(root) || crate::container::classify_zip_path(root).is_some() {
-                return candidates;
-            }
-            candidates.push(ExtractionCandidate {
-                path: root.to_path_buf(),
-                relative_path: prefix.join(archive_stem(root)),
-                depth,
-                source: CandidateSource::ExtractedFile,
-                detected_format: Some(fmt),
-                embedded_offset: if offset > 0 { Some(offset) } else { None },
-                embedded_size: None,
-            });
-            return candidates;
-        }
-
-        if let Some(format) = format_from_extension(root) {
-            if is_business_container(root) || crate::container::classify_zip_path(root).is_some() {
-                return candidates;
-            }
-            candidates.push(ExtractionCandidate {
-                path: root.to_path_buf(),
-                relative_path: prefix.join(archive_stem(root)),
-                depth,
-                source: CandidateSource::ExtractedFile,
-                detected_format: Some(format),
-                embedded_offset: None,
-                embedded_size: None,
-            });
-            return candidates;
-        }
-        return candidates;
+        return classify_nested_file(None, root, prefix.join(archive_stem(root)), depth, &policy);
     }
-
-    // Use `walkdir` for robust recursion: handles symlink loops, FD limits,
-    // and does not follow symlinks by default (unlike `Path::is_dir()`).
+    let mut candidates = Vec::new();
     for entry in walkdir::WalkDir::new(root)
         .follow_links(false)
         .min_depth(1)
         .into_iter()
         .filter_map(|entry| entry.ok())
     {
-        // Only process regular files; directories are traversed by WalkDir itself.
-        // Symlinks are not followed and not treated as archives (safer for untrusted output).
         if !entry.file_type().is_file() {
             continue;
         }
-        let path = entry.path().to_path_buf();
+        let path = entry.path();
+        let mut relative_path = prefix.join(path.strip_prefix(root).unwrap_or(path));
+        relative_path.set_file_name(archive_stem(path));
+        candidates.extend(classify_nested_file(
+            Some(scanner),
+            path,
+            relative_path,
+            depth,
+            &policy,
+        ));
+    }
+    candidates
+}
 
-        let detected_format = format_from_extension(&path);
-        let mut relative_path = prefix.to_path_buf();
-        relative_path.push(path.strip_prefix(root).unwrap_or(path.as_path()));
-        relative_path.set_file_name(archive_stem(&path));
-
-        let header_result = (nested_embedded_enabled
-            && (scan_unrecognized || detected_format.is_some()))
-        .then(|| crate::detect::probe_file_header(&path))
-        .flatten();
-        if let Some((fmt, offset)) = header_result {
-            if is_business_container(&path) || crate::container::classify_zip_path(&path).is_some()
-            {
-                continue;
-            }
-            candidates.push(ExtractionCandidate {
-                path: path.clone(),
-                relative_path,
-                depth,
-                source: CandidateSource::ExtractedFile,
-                detected_format: Some(fmt),
-                embedded_offset: if offset > 0 { Some(offset) } else { None },
-                embedded_size: None,
-            });
-            continue;
+fn classify_nested_file(
+    scanner: Option<&EmbeddedScanner>,
+    path: &Path,
+    relative_path: PathBuf,
+    depth: u8,
+    discovery: &NestedDiscoveryPolicy<'_>,
+) -> Vec<ExtractionCandidate> {
+    let NestedDiscoveryPolicy {
+        embedded: policy,
+        nested_embedded_enabled,
+        scan_unrecognized,
+    } = *discovery;
+    let path = path.to_path_buf();
+    let detected_format = format_from_extension(&path);
+    let mut candidates = Vec::new();
+    let header_result = (nested_embedded_enabled
+        && (scan_unrecognized || detected_format.is_some()))
+    .then(|| crate::detect::probe_file_header(&path))
+    .flatten();
+    if let Some((fmt, offset)) = header_result {
+        if is_business_container(&path) || crate::container::classify_zip_path(&path).is_some() {
+            return candidates;
         }
-
-        if detected_format.is_some() {
-            if is_business_container(&path) || crate::container::classify_zip_path(&path).is_some()
-            {
-                continue;
-            }
-            candidates.push(ExtractionCandidate {
-                path: path.clone(),
-                relative_path,
-                depth,
-                source: CandidateSource::ExtractedFile,
-                detected_format,
-                embedded_offset: None,
-                embedded_size: None,
-            });
-            continue;
-        }
-
-        if !nested_embedded_enabled || !scan_unrecognized {
-            continue;
-        }
-        let file_size = std::fs::metadata(&path)
-            .map(|metadata| metadata.len())
-            .unwrap_or(0);
-        if policy
-            .inner_scan_max_bytes
-            .is_some_and(|max_bytes| file_size > max_bytes)
-        {
-            continue;
-        }
-        let findings: Vec<_> = scanner
-            .scan_path(&path)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|finding| finding_meets_min_size(finding, policy))
-            .collect();
-        if findings.is_empty() {
-            continue;
-        }
-        if matches!(
-            policy.mode,
-            smartzip_core::EmbeddedScanMode::Auto
-                | smartzip_core::EmbeddedScanMode::Ask
-                | smartzip_core::EmbeddedScanMode::Aggressive
-                | smartzip_core::EmbeddedScanMode::All
-        ) {
-            for finding in findings {
-                candidates.push(ExtractionCandidate {
-                    path: path.clone(),
-                    relative_path: relative_path.clone(),
-                    depth,
-                    source: CandidateSource::EmbeddedFinding,
-                    detected_format: Some(finding.format),
-                    embedded_offset: Some(finding.offset),
-                    embedded_size: finding.size,
-                });
-            }
-            continue;
-        }
-
-        let decision = crate::embedded::select_embedded_action(file_size, &findings, policy, false);
-        if let Some(idx) = decision.selected_index {
-            let finding = &findings[idx];
-            if matches!(
-                decision.action,
-                smartzip_core::DetectionAction::ExtractDirect
-                    | smartzip_core::DetectionAction::CarveAndExtract
-            ) {
-                candidates.push(ExtractionCandidate {
-                    path: path.clone(),
-                    relative_path: relative_path.clone(),
-                    depth,
-                    source: CandidateSource::EmbeddedFinding,
-                    detected_format: Some(finding.format.clone()),
-                    embedded_offset: Some(finding.offset),
-                    embedded_size: finding.size,
-                });
-            }
-        }
+        candidates.push(ExtractionCandidate {
+            path: path.clone(),
+            relative_path,
+            depth,
+            source: CandidateSource::ExtractedFile,
+            detected_format: Some(fmt),
+            embedded_offset: if offset > 0 { Some(offset) } else { None },
+            embedded_size: None,
+        });
+        return candidates;
     }
 
+    if detected_format.is_some() {
+        if is_business_container(&path) || crate::container::classify_zip_path(&path).is_some() {
+            return candidates;
+        }
+        candidates.push(ExtractionCandidate {
+            path: path.clone(),
+            relative_path,
+            depth,
+            source: CandidateSource::ExtractedFile,
+            detected_format,
+            embedded_offset: None,
+            embedded_size: None,
+        });
+        return candidates;
+    }
+
+    let Some(scanner) = scanner else {
+        return candidates;
+    };
+    if !nested_embedded_enabled || !scan_unrecognized {
+        return candidates;
+    }
+    let file_size = std::fs::metadata(&path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    if policy
+        .inner_scan_max_bytes
+        .is_some_and(|max_bytes| file_size > max_bytes)
+    {
+        return candidates;
+    }
+    let findings: Vec<_> = scanner
+        .scan_path(&path)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|finding| finding_meets_min_size(finding, policy))
+        .collect();
+    if findings.is_empty() {
+        return candidates;
+    }
+    if matches!(
+        policy.mode,
+        smartzip_core::EmbeddedScanMode::Auto
+            | smartzip_core::EmbeddedScanMode::Ask
+            | smartzip_core::EmbeddedScanMode::Aggressive
+            | smartzip_core::EmbeddedScanMode::All
+    ) {
+        for finding in findings {
+            candidates.push(ExtractionCandidate {
+                path: path.clone(),
+                relative_path: relative_path.clone(),
+                depth,
+                source: CandidateSource::EmbeddedFinding,
+                detected_format: Some(finding.format),
+                embedded_offset: Some(finding.offset),
+                embedded_size: finding.size,
+            });
+        }
+        return candidates;
+    }
+
+    let decision = crate::embedded::select_embedded_action(file_size, &findings, policy, false);
+    if let Some(idx) = decision.selected_index {
+        let finding = &findings[idx];
+        if matches!(
+            decision.action,
+            smartzip_core::DetectionAction::ExtractDirect
+                | smartzip_core::DetectionAction::CarveAndExtract
+        ) {
+            candidates.push(ExtractionCandidate {
+                path: path.clone(),
+                relative_path: relative_path.clone(),
+                depth,
+                source: CandidateSource::EmbeddedFinding,
+                detected_format: Some(finding.format.clone()),
+                embedded_offset: Some(finding.offset),
+                embedded_size: finding.size,
+            });
+        }
+    }
     candidates
 }
 

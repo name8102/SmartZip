@@ -15,7 +15,7 @@ use crate::interactive::{InteractiveEncodingPrompter, InteractivePasswordPrompte
 use crate::nested::{archive_output_name, materialize_archive_input};
 use crate::password_order::password_source_label;
 use crate::policy::full_root_scanner_config;
-use crate::types::{ArchiveAccessOutcome, CandidateSource, ExtractionCandidate, ResolvedArchive};
+use crate::types::{ArchiveAccessOutcome, CandidateSource, ExtractionCandidate, PreparedArchive};
 
 pub(crate) fn scan_embedded_findings(
     path: &Path,
@@ -90,18 +90,16 @@ pub(crate) fn resolve_root_candidate(
 
 pub(crate) async fn prepare_resolved_archive(
     candidate: &ExtractionCandidate,
-    archive_path_override: Option<PathBuf>,
+    volume_input: Option<(PathBuf, crate::volumes::materialize::MaterializedVolumeSet)>,
     requested_encoding: EncodingMode,
     history: Option<&dyn crate::history::TaskHistoryRecorder>,
-    events: &EventSink,
-    task_id: &TaskId,
     run_policy: Option<&crate::CompiledRunPolicy>,
-) -> smartzip_core::Result<ResolvedArchive> {
-    let (archive_path, archive_temp) = if let Some(path) = archive_path_override {
-        (path, None)
+) -> smartzip_core::Result<PreparedArchive> {
+    let (archive_path, archive_temp, volume_keep) = if let Some((path, guard)) = volume_input {
+        (path, None, Some(guard))
     } else {
         let archive_input = materialize_archive_input(candidate)?;
-        (archive_input.path, archive_input._temp)
+        (archive_input.path, archive_input._temp, None)
     };
     let (sample_hash, sample_size) = if history.is_none() {
         (None, None)
@@ -148,16 +146,11 @@ pub(crate) async fn prepare_resolved_archive(
     {
         zip_encoding_assessment = assess_zip_encoding(&archive_path).await;
     }
-    if let Some(assessment) = &zip_encoding_assessment {
-        events.push(TaskEvent {
-            task_id: task_id.clone(),
-            kind: TaskEventKind::EncodingDetected(assessment.context.detected.clone()),
-        });
-    }
-    Ok(ResolvedArchive {
+    Ok(PreparedArchive {
         candidate: candidate.clone(),
         archive_path,
         _archive_temp: archive_temp,
+        _volume_keep: volume_keep,
         sample_hash,
         sample_size,
         known_hit,
@@ -173,7 +166,7 @@ pub(crate) async fn access_archive_with_password<B: ArchiveExecutor>(
     backend: &B,
     task_context: std::sync::Arc<TaskExecutionContext>,
     passwords: &PasswordService<'_>,
-    resolved: &ResolvedArchive,
+    resolved: &PreparedArchive,
     password_candidates: &[PasswordCandidate],
     password_prompter: Option<&dyn InteractivePasswordPrompter>,
     encoding_prompter: Option<&dyn InteractiveEncodingPrompter>,

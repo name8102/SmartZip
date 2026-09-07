@@ -1478,3 +1478,79 @@ async fn configured_cleanup_keep_never_calls_recycler_and_policy_is_a_snapshot()
     assert!(input.exists());
     assert!(root.path().join("out/root/nested.zip").exists());
 }
+
+#[test]
+fn nested_classification_keeps_header_precedence_and_single_output_scan_boundary() {
+    let root = tempfile::tempdir().unwrap();
+    let scanner = EmbeddedScanner::new(ScannerConfig::default());
+    let policy = EmbeddedScanPolicy {
+        min_finding_size_bytes: 0,
+        mode: EmbeddedScanMode::All,
+        ..Default::default()
+    };
+    let zip = std::fs::read(fixture_path("enc_utf8.zip")).unwrap();
+    for (name, scan, expected) in [
+        ("mislabeled.7z", true, Some(ArchiveFormat::Zip)),
+        ("mislabeled.7z", false, Some(ArchiveFormat::SevenZip)),
+        ("document.docx", true, None),
+    ] {
+        let dir = root.path().join(format!("case-{name}-{scan}"));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, &zip).unwrap();
+        let single = discover_nested_candidates(
+            &scanner,
+            &path,
+            2,
+            Path::new("parent"),
+            &policy,
+            scan,
+            true,
+        );
+        let walked =
+            discover_nested_candidates(&scanner, &dir, 2, Path::new("parent"), &policy, scan, true);
+        assert_eq!(single, walked);
+        assert_eq!(
+            single.first().and_then(|c| c.detected_format.clone()),
+            expected
+        );
+    }
+    let dir = root.path().join("carrier");
+    std::fs::create_dir(&dir).unwrap();
+    let path = dir.join("image.bin");
+    let mut payload = vec![0; 512];
+    payload.extend_from_slice(&zip);
+    std::fs::write(&path, payload).unwrap();
+    // A collapsed single output only uses header/extension recognition in the baseline.
+    assert!(discover_nested_candidates(
+        &scanner,
+        &path,
+        2,
+        Path::new("parent"),
+        &policy,
+        true,
+        true
+    )
+    .is_empty());
+    let walked =
+        discover_nested_candidates(&scanner, &dir, 2, Path::new("parent"), &policy, true, true);
+    assert_eq!(walked.len(), 1);
+    assert_eq!(walked[0].embedded_offset, Some(512));
+    assert_eq!(walked[0].embedded_size, Some(zip.len() as u64));
+    #[cfg(unix)]
+    {
+        let links = root.path().join("links");
+        std::fs::create_dir(&links).unwrap();
+        std::os::unix::fs::symlink(&path, links.join("linked.zip")).unwrap();
+        assert!(discover_nested_candidates(
+            &scanner,
+            &links,
+            2,
+            Path::new("parent"),
+            &policy,
+            true,
+            true
+        )
+        .is_empty());
+    }
+}

@@ -70,10 +70,11 @@ pub struct ListArchiveResult {
     pub events: Vec<TaskEvent>,
 }
 
-pub(crate) struct ResolvedArchive {
+pub(crate) struct PreparedArchive {
     pub(crate) candidate: ExtractionCandidate,
     pub(crate) archive_path: PathBuf,
     pub(crate) _archive_temp: Option<tempfile::NamedTempFile>,
+    pub(crate) _volume_keep: Option<crate::volumes::materialize::MaterializedVolumeSet>,
     pub(crate) sample_hash: Option<String>,
     pub(crate) sample_size: Option<i64>,
     pub(crate) known_hit: Option<crate::history::KnownFileHit>,
