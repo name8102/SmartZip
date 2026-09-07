@@ -4,29 +4,6 @@ use crate::integrity::{BackendTestDiagnostics, Coverage, TestFailure};
 use crate::{BackendCommandOutput, TestResult};
 use smartzip_core::{Result, SmartZipError};
 use std::path::Path;
-use std::process::Stdio;
-use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::process::Command;
-
-pub(crate) const MAX_OUTPUT: usize = 16 * 1024 * 1024;
-
-pub(crate) async fn bounded_read(
-    mut stream: impl AsyncRead + Unpin,
-) -> std::io::Result<(Vec<u8>, bool)> {
-    let mut retained = Vec::new();
-    let mut buffer = [0; 16 * 1024];
-    let mut truncated = false;
-    loop {
-        let size = stream.read(&mut buffer).await?;
-        if size == 0 {
-            break;
-        }
-        let keep = size.min(MAX_OUTPUT.saturating_sub(retained.len()));
-        retained.extend_from_slice(&buffer[..keep]);
-        truncated |= keep < size;
-    }
-    Ok((retained, truncated))
-}
 
 pub(crate) async fn run(
     executable: &Path,
@@ -34,64 +11,14 @@ pub(crate) async fn run(
     args: &[String],
     token: &tokio_util::sync::CancellationToken,
 ) -> Result<(BackendCommandOutput, bool)> {
-    if token.is_cancelled() {
-        return Err(SmartZipError::Cancelled);
-    }
-    let mut command = Command::new(executable);
-    #[cfg(unix)]
-    command.process_group(0);
-    let mut child = command
-        .args(args)
-        .env("LC_ALL", "C")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|source| {
-            if source.kind() == std::io::ErrorKind::NotFound {
-                SmartZipError::BackendUnavailable { backend: id.into() }
-            } else {
-                SmartZipError::io(Some(executable.to_path_buf()), source)
-            }
-        })?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| SmartZipError::BackendProtocolError {
-            backend: id.into(),
-            detail: "missing test stdout pipe".into(),
-        })?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| SmartZipError::BackendProtocolError {
-            backend: id.into(),
-            detail: "missing test stderr pipe".into(),
-        })?;
-    // Dropping this future drops the child and both readers. No detached pipe
-    // task can keep the process or an unbounded output buffer alive.
-    let pid = child.id();
-    let output = tokio::select! {
-        result = async { tokio::try_join!(child.wait(), bounded_read(stdout), bounded_read(stderr)) } => result,
-        _ = token.cancelled() => {
-            #[cfg(unix)]
-            if let Some(pid) = pid { unsafe { libc::kill(-(pid as i32), libc::SIGKILL); } }
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            return Err(SmartZipError::Cancelled);
-        }
-    };
-    let (status, (stdout, cut_out), (stderr, cut_err)) =
-        output.map_err(|source| SmartZipError::io(Some(executable.to_path_buf()), source))?;
-    Ok((
-        BackendCommandOutput {
-            status: status.code(),
-            stdout: String::from_utf8_lossy(&stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&stderr).into_owned(),
-        },
-        cut_out || cut_err,
-    ))
+    crate::process::run_bounded(
+        executable,
+        id,
+        args,
+        token,
+        crate::process::Mode::Diagnostic,
+    )
+    .await
 }
 
 /// Only diagnostic lines participate in classification, never displayed names.
@@ -469,22 +396,4 @@ mod tests {
         .await
         .expect("cancelled test subprocess was not reaped");
     }
-}
-
-pub(crate) async fn collect_bounded_output(
-    task: Option<tokio::task::JoinHandle<std::io::Result<(Vec<u8>, bool)>>>,
-) -> Result<Vec<u8>> {
-    let Some(task) = task else {
-        return Ok(Vec::new());
-    };
-    let (bytes, truncated) = task
-        .await
-        .map_err(|e| SmartZipError::io(None, std::io::Error::other(e)))?
-        .map_err(|e| SmartZipError::io(None, e))?;
-    if truncated {
-        return Err(SmartZipError::ResourceLimit {
-            detail: "backend output exceeded 16 MiB; incomplete output was rejected".into(),
-        });
-    }
-    Ok(bytes)
 }

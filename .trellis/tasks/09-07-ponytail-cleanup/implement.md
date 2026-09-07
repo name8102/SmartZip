@@ -41,3 +41,32 @@ SevenZip/Unrar 的 list/extract（及 SevenZip compress）无 context 方法转�
 ArchiveExecutor/ArchiveAdapter 仍保留旧 required 方法和 context 默认转发方向，避免破坏外部 trait 实现者或形成互递归。Router 的 canonical facts/context 与 fallback 未修改。新增 3 项 fake-process 合同测试，锁定命令参数、返回值、observer 单次交付与 probe 差异；这类注入测试不是实际 unrar 验收。
 
 完整门槛通过，日志 target/ponytail-validation/04-adapters/；release beta 23 项通过。
+
+### Commit 5：私有进程生命周期
+
+archive::process 统一 spawn/stdin/pipes、有限捕获、wait/cancel/kill 和 reader 生命周期；7z 的 record framing/进度解析与 7z/unrar/test 诊断仍在原模块。Ordinary 超过每管道 16 MiB 拒绝；Streaming 截断原文但继续解析记录；Diagnostic 返回截断标记、固定 LC_ALL=C，并保留启动前取消检查和 read/wait 并发错误语义。Reader 有 abort-on-drop guard，取消分支显式 abort + await。
+
+保留两种既有进程等待语义：普通/streaming 使用 process-wrap ProcessGroup/JobObject；diagnostic 继续直接等待父进程，Unix 取消杀原进程组，Windows 仍是原先的仅父进程取消。没有把加强 Windows 子树终止伪装成等价清理。kill 失败后仍调用 wait；ordinary/streaming 传播取消后的 wait 错误，diagnostic 保持返回 Cancelled。
+
+新增故障合同：三种 >16 MiB 输出策略、双管道同时写满、程序缺失/启动 IO 错误、启动前与管道 EOF 后取消、diagnostic 后代停止且父进程回收。复用既有超长无换行 record、运行中取消、后代进程和实时 observer 测试。以 process-wrap 现有 ChildWrapper 注入 kill/wait 错误，不增加新生产 trait，验证 kill→wait 与两个 reader 结束。
+
+只读独立复核发现新 runner 初版取消时重新读取 PID 的回归：父进程已退出、后代持有管道时 Tokio id() 为 None。新增专用用例先失败，再恢复旧实现的启动时 PID 快照后通过；测试自带进程组清理，不残留注入进程。证据：05-pid-regression-before.log / after.log。最终完整门槛重新运行，使用 05-process-final/，不以修复前的绿色旧门槛代替。
+
+## 最终验证与边界
+
+本轮各阶段均执行 fmt、routing guards、all-targets workspace check、workspace tests（排除 GUI）、release CLI build、真实 beta 与 diff check。对应日志均在本地忽略目录 target/ponytail-validation/，未提交二进制/覆盖率数据。
+
+| 阶段 | 工作区测试通过数 | Release beta |
+| --- | ---: | ---: |
+| 00-characterization | 454 | 23 |
+| 01-dead-structure | 454 | 23 |
+| 02-preparation | 455 | 23 |
+| 03-cli | 455 | 23 |
+| 04-adapters | 458 | 23 |
+| 05-process-final | 465 | 23 |
+
+`scripts/crap-scan.sh --quick --top 30` 和带 LLVM coverage 的完整扫描均完成；完整 coverage 465 项测试通过。另导出排除 process_contract_tests/engine_tests 的 production functions.json。整体行覆盖率 51.58%；共享 preparation 的报告覆盖率 91.80%、CC 14，nested classifier 78.64%、CC 18，run_child 95.35%、CC 12。这些是当前工具报告，不是归档处理性能测量。高复杂度 extract workflow、分卷和诊断仍在热点表中；不因 CRAP 超阈而删减产品判定逻辑。
+
+公开源码 API 保留；不执行可选 Commit 6。两套 volumes 继续分别承担模糊命名智能解压与物理成员完整性归责，没有合并命名规则/成员推导/证据模型。没有修改 OutputMaterializer 提交回滚算法、Router fallback、依赖、默认值或 GUI。当前证据来自 Linux 本地；本轮未运行 macOS/Windows 真实验收，GitHub CI 尚未因本轮提交触发。工具链仍提示既有 proc-macro-error2 2.0.1 future-incompatibility。
+
+用户最新要求为“实施并提交”，本轮创建独立本地提交，未推送。

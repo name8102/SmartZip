@@ -1,15 +1,8 @@
 use crate::backend::ArchiveAdapter;
-use crate::test_output::collect_bounded_output;
 use crate::types::*;
 use async_trait::async_trait;
-#[cfg(windows)]
-use process_wrap::tokio::JobObject;
-#[cfg(unix)]
-use process_wrap::tokio::ProcessGroup;
-use process_wrap::tokio::{CommandWrap, KillOnDrop};
 use smartzip_core::{ArchiveFormat, Result, SmartZipError, TaskExecutionContext};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone)]
@@ -157,52 +150,15 @@ impl UnrarBackend {
         args: &[String],
         token: &CancellationToken,
     ) -> Result<BackendCommandOutput> {
-        let mut wrap = CommandWrap::with_new(&self.executable, |command| {
-            command.args(args);
-            command.stdin(Stdio::null());
-            command.stdout(Stdio::piped());
-            command.stderr(Stdio::piped());
-        });
-        #[cfg(unix)]
-        wrap.wrap(ProcessGroup::leader());
-        #[cfg(windows)]
-        wrap.wrap(JobObject);
-        wrap.wrap(KillOnDrop);
-
-        let mut child = wrap.spawn().map_err(|source| {
-            if source.kind() == std::io::ErrorKind::NotFound {
-                SmartZipError::BackendUnavailable {
-                    backend: self.id.clone(),
-                }
-            } else {
-                SmartZipError::io(Some(self.executable.clone()), source)
-            }
-        })?;
-        // Keep pipes for reading; on cancel we kill the whole group and wait.
-        let stdout = child.stdout().take();
-        let stderr = child.stderr().take();
-        let stdout_task =
-            stdout.map(|stream| tokio::spawn(crate::test_output::bounded_read(stream)));
-        let stderr_task =
-            stderr.map(|stream| tokio::spawn(crate::test_output::bounded_read(stream)));
-        let status = tokio::select! {
-            res = child.wait() => res.map_err(|source| SmartZipError::io(Some(self.executable.clone()), source))?,
-            _ = token.cancelled() => {
-                let _ = child.start_kill();
-                let status = child.wait().await.map_err(|source| SmartZipError::io(Some(self.executable.clone()), source))?;
-                if let Some(t) = stdout_task { t.abort(); let _ = t.await; }
-                if let Some(t) = stderr_task { t.abort(); let _ = t.await; }
-                let _ = status;
-                return Err(SmartZipError::Cancelled);
-            }
-        };
-        let stdout = collect_bounded_output(stdout_task).await?;
-        let stderr = collect_bounded_output(stderr_task).await?;
-        Ok(BackendCommandOutput {
-            status: status.code(),
-            stdout: String::from_utf8_lossy(&stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&stderr).into_owned(),
-        })
+        crate::process::run_bounded(
+            &self.executable,
+            &self.id,
+            args,
+            token,
+            crate::process::Mode::Ordinary,
+        )
+        .await
+        .map(|(output, _)| output)
     }
 
     fn password_arg(password: &Option<String>) -> String {

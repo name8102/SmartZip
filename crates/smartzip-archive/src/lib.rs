@@ -4,6 +4,7 @@ pub mod backend;
 pub mod diagnostic;
 pub mod integrity;
 pub mod native_zip;
+mod process;
 pub mod router;
 pub mod safety;
 pub mod sevenzz;
@@ -22,3 +23,6 @@ pub use sevenzz::{
 };
 pub use types::*;
 pub use unrar::{UnrarBackend, UnrarLocator};
+
+#[cfg(all(test, unix))]
+mod process_contract_tests;
