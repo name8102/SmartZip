@@ -83,49 +83,63 @@ pub fn init_config(path: &Path, full: bool) -> io::Result<()> {
 }
 
 pub fn edit_config(path: &Path, key: &str, value: Option<&str>) -> io::Result<()> {
+    edit_config_fields(path, &[(key.to_owned(), value.map(str::to_owned))])
+}
+
+/// Apply related TOML field changes together, validating only the final configuration.
+/// `None` removes a field so it inherits its default. The file must already exist.
+/// Failed edits leave the file untouched; comments and unrelated fields are preserved.
+pub fn edit_config_fields(path: &Path, patches: &[(String, Option<String>)]) -> io::Result<()> {
     editable(path)?;
     let original = std::fs::read_to_string(path)?;
     let mut doc = original.parse::<DocumentMut>().map_err(invalid)?;
     if doc.get("schema_version").is_none() {
         return Err(invalid("migrate legacy configuration before editing"));
     }
-    if key == "schema_version" || key == "defaults_version" {
-        return Err(invalid(
-            "version fields cannot be edited with config set/unset",
-        ));
-    }
     let defaults = toml::Value::try_from(SmartZipConfig::default()).map_err(invalid)?;
-    if crate::value_at(&defaults, key).is_none()
-        && !["state.database", "extraction.output.directory"].contains(&key)
-    {
-        return Err(invalid(format!("unknown editable key: {key}")));
-    }
-    let keys: Vec<_> = key.split('.').collect();
-    let mut table: &mut dyn TableLike = doc.as_table_mut();
-    for part in &keys[..keys.len() - 1] {
-        if !table.contains_key(part) {
-            table.insert(part, Item::Table(toml_edit::Table::new()));
+    let mut seen = std::collections::HashSet::new();
+    for (key, value) in patches {
+        let key = key.as_str();
+        if !seen.insert(key) {
+            return Err(invalid(format!("duplicate editable key: {key}")));
         }
-        table = table
-            .get_mut(part)
-            .and_then(Item::as_table_like_mut)
-            .ok_or_else(|| invalid(format!("not a table: {part}")))?;
-    }
-    let leaf = keys[keys.len() - 1];
-    if let Some(value) = value {
-        let parsed = format!("value = {value}")
-            .parse::<DocumentMut>()
-            .map_err(invalid)?;
-        let mut item = parsed["value"].clone();
-        if let (Some(old), Some(new)) = (
-            table.get(leaf).and_then(Item::as_value),
-            item.as_value_mut(),
-        ) {
-            *new.decor_mut() = old.decor().clone();
+        if key == "schema_version" || key == "defaults_version" {
+            return Err(invalid(
+                "version fields cannot be edited with config set/unset",
+            ));
         }
-        table.insert(leaf, item);
-    } else {
-        table.remove(leaf);
+        if crate::value_at(&defaults, key).is_none()
+            && !["state.database", "extraction.output.directory"].contains(&key)
+        {
+            return Err(invalid(format!("unknown editable key: {key}")));
+        }
+        let keys: Vec<_> = key.split('.').collect();
+        let mut table: &mut dyn TableLike = doc.as_table_mut();
+        for part in &keys[..keys.len() - 1] {
+            if !table.contains_key(part) {
+                table.insert(part, Item::Table(toml_edit::Table::new()));
+            }
+            table = table
+                .get_mut(part)
+                .and_then(Item::as_table_like_mut)
+                .ok_or_else(|| invalid(format!("not a table: {part}")))?;
+        }
+        let leaf = keys[keys.len() - 1];
+        if let Some(value) = value {
+            let parsed = format!("value = {value}")
+                .parse::<DocumentMut>()
+                .map_err(invalid)?;
+            let mut item = parsed["value"].clone();
+            if let (Some(old), Some(new)) = (
+                table.get(leaf).and_then(Item::as_value),
+                item.as_value_mut(),
+            ) {
+                *new.decor_mut() = old.decor().clone();
+            }
+            table.insert(leaf, item);
+        } else {
+            table.remove(leaf);
+        }
     }
     let content = doc.to_string();
     let config: SmartZipConfig = toml::from_str(&content).map_err(invalid)?;

@@ -10,6 +10,15 @@ rust-version.workspace = true
 serde.workspace = true
 directories.workspace = true
 trash.workspace = true
+serde_json.workspace = true
+plist = "1"
+tempfile.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10"
+objc2-app-kit = { version = "0.2.2", default-features = false, features = ["std", "NSWorkspace", "block2"] }
+objc2-foundation = { version = "0.2.2", default-features = false, features = ["std", "NSString", "NSURL", "NSError"] }
+block2 = "0.5"

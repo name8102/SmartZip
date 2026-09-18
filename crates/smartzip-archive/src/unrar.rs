@@ -1,4 +1,5 @@
 use crate::backend::ArchiveAdapter;
+use crate::locator;
 use crate::test_output::collect_bounded_output;
 use crate::types::*;
 use async_trait::async_trait;
@@ -505,17 +506,26 @@ impl ArchiveAdapter for UnrarBackend {
 
 fn locate_executable(bundled: Option<&PathBuf>, candidates: &[String]) -> Option<PathBuf> {
     if let Some(path) = bundled {
-        if path.exists() {
-            return Some(std::fs::canonicalize(path).unwrap_or_else(|_| path.clone()));
+        if let Some(path) = locator::usable_executable(path) {
+            return Some(path);
         }
     }
 
+    let mut path_candidates = Vec::new();
     for candidate in candidates {
         if let Ok(found) = which::which(candidate) {
-            return Some(std::fs::canonicalize(&found).unwrap_or(found));
+            path_candidates.push(found);
         }
     }
-    None
+    let mut fallback_candidates = Vec::new();
+    for candidate in candidates {
+        for found in locator::known_macos_executables(candidate) {
+            fallback_candidates.push(found);
+        }
+    }
+    locator::ordered_executables(path_candidates, fallback_candidates)
+        .into_iter()
+        .next()
 }
 
 // Technical listing exposes the original paths and link entry types before

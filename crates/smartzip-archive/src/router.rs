@@ -14,6 +14,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 
 #[derive(Clone)]
 pub struct AdapterRegistration {
@@ -60,6 +61,27 @@ pub struct BackendRouter {
 }
 
 impl BackendRouter {
+    /// Read one validated member through the configured 7-Zip adapter.
+    pub async fn read_member(
+        &self,
+        adapter_id: &str,
+        request: crate::member::MemberReadRequest,
+        token: CancellationToken,
+    ) -> Result<Vec<u8>> {
+        let registration =
+            self.registration(adapter_id)
+                .ok_or_else(|| SmartZipError::BackendUnavailable {
+                    backend: adapter_id.to_owned(),
+                })?;
+        if registration.adapter.diagnostic_family() != Some("7z") {
+            return Err(SmartZipError::UnsupportedContainer {
+                backend: adapter_id.to_owned(),
+                path: request.archive,
+                container: Some("single-member-read requires 7-Zip".into()),
+            });
+        }
+        crate::member::read_member(registration.adapter.as_ref(), request, token).await
+    }
     pub fn diagnostics(&self) -> Vec<serde_json::Value> {
         self.adapters.iter().map(|registration| {
             let adapter = &registration.adapter;
@@ -146,6 +168,13 @@ impl BackendRouter {
                     ));
                 }
             }
+        }
+        if adapters.is_empty() {
+            warnings.push(if config.auto_discover {
+                "No archive backends were discovered or enabled. Install 7-Zip (7zz/7z), or configure its executable path in backends.installations. Explicitly disabled installations are excluded from discovery."
+            } else {
+                "No archive backends are enabled and backends.auto_discover is false. Enable automatic discovery or configure an enabled installation in backends.installations."
+            }.into());
         }
         let mut router = Self::from_adapters(adapters);
         router.warnings = warnings;
@@ -992,6 +1021,11 @@ fn error_class(error: &SmartZipError) -> &'static str {
 }
 
 fn no_compatible_backend(operation: ArchiveOperation, plan: &RoutePlan) -> SmartZipError {
+    let explanation = if plan.rejected.is_empty() {
+        "No archive backend is registered. Install 7-Zip (7zz/7z), enable backends.auto_discover, or set an enabled executable path in backends.installations."
+    } else {
+        "Registered archive backends do not meet this operation's requirements. Check the rejection reasons below and configure a compatible backend."
+    };
     let requirements = format!(
         "password={}, charset_override={}, codecs={:?}",
         plan.requirements.password, plan.requirements.charset_override, plan.requirements.codecs
@@ -1004,7 +1038,8 @@ fn no_compatible_backend(operation: ArchiveOperation, plan: &RoutePlan) -> Smart
         .join("; ");
     SmartZipError::BackendUnavailable {
         backend: format!(
-            "archive-router:{operation:?} (requirements: [{requirements}]; rejected: [{rejected}])"
+            "{explanation} No backend was attempted for this route; this does not establish archive corruption. archive-router:{operation:?} (container: {:?}; forced_adapter: {:?}; requirements: [{requirements}]; rejected: [{rejected}])",
+            plan.container, plan.forced_adapter
         ),
     }
 }
@@ -1228,6 +1263,55 @@ mod tests {
             password: Some("secret".into()),
             encoding: EncodingMode::Auto,
         }
+    }
+
+    #[tokio::test]
+    async fn empty_registry_explains_missing_backend_without_claiming_corruption() {
+        let router = BackendRouter::from_adapters(vec![]);
+        let output = tempfile::tempdir().unwrap();
+        let error = router
+            .extract(extract_request(output.path().join("out")))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, SmartZipError::BackendUnavailable { .. }));
+        let message = error.to_string();
+        assert!(message.contains("No archive backend is registered"));
+        assert!(message.contains("backends.installations"));
+        assert!(message.contains("No backend was attempted"));
+        assert!(message.contains("does not establish archive corruption"));
+    }
+
+    #[test]
+    fn incompatible_registry_explains_rejections_instead_of_missing_installation() {
+        let router = BackendRouter::from_adapters(vec![AdapterRegistration::new(
+            FakeAdapter::new("rar-only", None),
+            unrar_capabilities(),
+            20,
+        )]);
+        let plan = router.plan(
+            ArchiveOperation::Extract,
+            Some(&ArchiveFormat::Zip),
+            ArchiveRequirements::default(),
+        );
+        let message = no_compatible_backend(ArchiveOperation::Extract, &plan).to_string();
+        assert!(message.contains("do not meet this operation's requirements"));
+        assert!(message.contains("rar-only"));
+        assert!(message.contains("unsupported"));
+        assert!(!message.contains("No archive backend is registered"));
+    }
+
+    #[test]
+    fn disabled_discovery_without_installations_reports_configuration_remedy() {
+        let router = BackendRouter::from_config(&BackendConfig {
+            auto_discover: false,
+            installations: vec![],
+        })
+        .unwrap();
+        assert!(router.adapter_ids().is_empty());
+        assert!(router
+            .warnings()
+            .iter()
+            .any(|warning| warning.contains("backends.auto_discover is false")));
     }
 
     #[test]

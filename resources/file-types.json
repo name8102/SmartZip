@@ -1,0 +1,10 @@
+[
+  {"label":"ZIP", "extension":"zip", "uti":"public.zip-archive", "mime":"application/zip"},
+  {"label":"7-Zip", "extension":"7z", "uti":"org.7-zip.7-zip-archive", "mime":"application/x-7z-compressed"},
+  {"label":"RAR", "extension":"rar", "uti":"com.rarlab.rar-archive", "mime":"application/vnd.rar"},
+  {"label":"TAR", "extension":"tar", "uti":"public.tar-archive", "mime":"application/x-tar"},
+  {"label":"GZip", "extension":"gz", "uti":"org.gnu.gnu-zip-archive", "mime":"application/gzip"},
+  {"label":"BZip2", "extension":"bz2", "uti":"public.bzip2-archive", "mime":"application/x-bzip2"},
+  {"label":"XZ", "extension":"xz", "uti":"org.tukaani.xz-archive", "mime":"application/x-xz"},
+  {"label":"Zstandard", "extension":"zst", "uti":"org.zstandard.zstd-archive", "mime":"application/zstd"}
+]

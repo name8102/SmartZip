@@ -1,0 +1,33 @@
+{
+  "id": "gui-design",
+  "name": "gui-design",
+  "title": "GUI 双窗口设计与原生实施",
+  "description": "双窗口设计、核心能力覆盖与组件选型已完成；原生双窗口、真实工作流和管理入口实施中。",
+  "status": "in_progress",
+  "package": "smartzip-gui",
+  "priority": "P1",
+  "creator": "charl",
+  "createdAt": "2026-09-12",
+  "completedAt": null,
+  "relatedFiles": [
+    "crates/smartzip-gui/src/main.rs",
+    ".trellis/tasks/09-12-gui-design/design.md",
+    ".trellis/tasks/09-12-gui-design/core-audit.md",
+    ".trellis/tasks/09-12-gui-design/gpui-component.md",
+    ".trellis/tasks/09-12-gui-design/gui-mockup.html",
+    "crates/smartzip-gui/src/ui.rs",
+    "crates/smartzip-gui/src/runtime.rs",
+    "crates/smartzip-gui/src/model.rs",
+    "crates/smartzip-gui/src/library.rs",
+    ".trellis/tasks/09-12-gui-design/implement.md"
+  ],
+  "notes": "用户允许子代理协作和依赖升级，并要求开始原生实现。已接入真实工作流及组件库 Sidebar；设计完成，完整能力覆盖、视觉验收及其余实施项仍未完成。",
+  "meta": {
+    "baseline_commit": "06efceb",
+    "design_status": "complete",
+    "native_implementation_status": "in_progress",
+    "dependency_upgrade_allowed": true,
+    "component_version": "0.6.1",
+    "gpui_pre_locked_version": "0.3.4"
+  }
+}
