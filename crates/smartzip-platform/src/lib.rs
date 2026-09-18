@@ -1,5 +1,8 @@
 //! Platform-level paths and utilities (Linux, macOS, Windows).
 
+pub mod system_integration;
+pub mod finder_service;
+
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 

@@ -27,7 +27,7 @@ binwalk = "3.1.0"
 blake3 = "1.5"
 clap = { version = "4.5", features = ["derive"] }
 directories = "6"
-gpui = { version = "0.2", features = ["macos-blade"] }
+gpui = { package = "gpui-kit", version = "0.6.1" }
 rusqlite = { version = "0.40", features = ["bundled"] }
 rusqlite_migration = "2.6"
 process-wrap = { version = "9.1", features = ["tokio1"] }

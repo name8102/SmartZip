@@ -1,4 +1,5 @@
 use crate::backend::ArchiveAdapter;
+use crate::locator;
 use crate::types::*;
 use async_trait::async_trait;
 use smartzip_core::{ArchiveFormat, Result, SmartZipError, TaskExecutionContext};
@@ -116,23 +117,23 @@ impl SevenZipLocator {
     /// `PATH`, `PATHEXT` on Windows, and executable permission) instead of a
     /// manual `split_paths` + `exists` traversal.
     pub fn locate_all(&self) -> Vec<PathBuf> {
-        let mut paths = Vec::new();
-        if let Some(path) = &self.bundled {
-            if path.exists() {
-                paths.push(normalize_executable_path(path));
-            }
-        }
+        let bundled_candidates = self.bundled.iter().cloned().collect::<Vec<_>>();
+        let mut path_candidates = Vec::new();
         for candidate in &self.candidates {
             if let Ok(iter) = which::which_all(candidate) {
-                for found in iter {
-                    let found = normalize_executable_path(&found);
-                    if !paths.contains(&found) {
-                        paths.push(found);
-                    }
-                }
+                path_candidates.extend(iter);
             }
         }
-        paths
+        let mut fallback_candidates = Vec::new();
+        for candidate in &self.candidates {
+            for found in locator::known_macos_executables(candidate) {
+                fallback_candidates.push(found);
+            }
+        }
+        locator::ordered_executables(
+            bundled_candidates,
+            path_candidates.into_iter().chain(fallback_candidates),
+        )
     }
 }
 
@@ -287,7 +288,7 @@ impl SevenZipBackend {
         .map(|(output, _)| output)
     }
 
-    fn encoding_arg(encoding: &smartzip_core::EncodingMode) -> Option<String> {
+    pub(crate) fn encoding_arg(encoding: &smartzip_core::EncodingMode) -> Option<String> {
         match encoding {
             smartzip_core::EncodingMode::Override(s) => {
                 let normalized = s.trim().replace('-', "_").to_ascii_lowercase();
@@ -716,7 +717,7 @@ fn extract_unsupported_method(output: &str) -> Option<String> {
     })
 }
 
-fn validate_extraction_listing(stdout: &str) -> Result<()> {
+pub(crate) fn validate_extraction_listing(stdout: &str) -> Result<()> {
     for entry in parse_entries(stdout) {
         // TAR writers commonly include `.` or `./` for the extraction root.
         // Only a directory made entirely of current-directory components is
@@ -759,7 +760,7 @@ fn validate_extraction_listing(stdout: &str) -> Result<()> {
     Ok(())
 }
 
-fn parse_entries(stdout: &str) -> Vec<ArchiveEntry> {
+pub(crate) fn parse_entries(stdout: &str) -> Vec<ArchiveEntry> {
     let mut entries = Vec::new();
     let mut current_path: Option<PathBuf> = None;
     let mut current_size: Option<u64> = None;

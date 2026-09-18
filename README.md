@@ -19,7 +19,8 @@ SmartZip 是一个用 Rust 重写的跨平台压缩包辅助工具，目标是�
 - 能力路由整合已落地：后端按能力、配置与归档要求选择，CLI 与 engine 使用统一执行入口；文件级历史与密码/编码记忆保留。
 - `test` 已接通后端、自动诊断、JSON 和历史报告；[分卷定位说明](.trellis/tasks/2026-07/07-03-test-command-backend-split/design.md) 记录证据规则与格式边界。压缩命令与 GUI 不在 CLI beta 范围。
 - CLI beta 已加入可恢复覆盖提交、扫描与产出预算、Ctrl+C、非交互策略和 `doctor`。安装、平台范围、退出码、JSON 与限制见 [CLI beta 指南](docs/cli-beta.md)。设计草案中超出本轮的交互能力仍待实现。
-- CLI 已接入[统一配置](docs/configuration.md)：自动加载、来源解释、功能策略与无状态运行；GUI 暂未接入。
+- CLI 与 GUI 已接入[统一配置](docs/configuration.md)；GUI 提供全局与单任务快速配置，以及共享校验的分组设置表单。
+- GUI 已有共享单并发解压队列的快速/详细双窗口、拖放解压、进度与后端显示、检测/列出/校验，以及历史和密码管理入口；原生实施与完整能力验收仍在进行，见 [GUI 实施记录](.trellis/tasks/09-12-gui-design/implement.md)。
 - 当前核对结果与已知缺口见 [实现进度](docs/implementation-progress.md)。
 
 ## 快速开始
@@ -84,6 +85,42 @@ cargo run -p smartzip-cli -- --db ./smartzip.db extract <path>
 
 当前 `--use-clipboard` 尚未接线，显式使用会报错；`list --pick-encoding` 只显示编码名称。需要文件名对照时先使用 `enc`，再通过 `--encoding` 指定。
 
+启动原生 GUI：
+
+```bash
+cargo run -p smartzip-gui
+# 打开归档，默认预览内容
+cargo run -p smartzip-gui -- /path/to/archive.zip
+```
+
+macOS 一键构建、打包并安装（macOS 12+）：
+
+```bash
+just install-gui                      # release，安装到 ~/Applications/SmartZip.app
+just install-gui debug                # 安装 debug 版
+just install-gui release /Applications/SmartZip.app  # 自定义安装位置，需有写入权限
+# 不使用 just：
+python3 scripts/install-macos.py
+```
+
+脚本校验签名后替换同标识的旧应用，替换失败会恢复旧版；不会覆盖其他应用，也不会自动更改默认程序或右键菜单。已有 `just install` 仍用于安装 CLI。
+
+仅打包、不安装：
+
+```bash
+cargo build -p smartzip-gui --release
+python3 scripts/package-macos.py --profile release
+```
+
+把生成的 `target/release/bundle/SmartZip.app` 放到固定位置（例如 `/Applications`），从该应用启动后进入“系统集成”：
+
+- “注册打开方式”将 SmartZip 加入系统候选程序；按格式点击“设为默认”可配置 ZIP、7z、RAR、TAR、GZ、BZ2、XZ、ZST。
+- “安装右键菜单”添加 Finder → 快速操作 → SmartZip 快速解压，支持多选；同页可移除。若系统未显示该项，可在系统设置的扩展/快速操作中启用。
+- 普通启动进入任务中心；系统打开归档进入预览；右键快速解压进入快速窗口，沿用当前队列暂停状态和快速配置。
+- 归档预览按内部目录浏览，支持面包屑和返回上级；点击文件可预览受支持的文本或图片。密码管理用于持久密码库，临时密码在排队任务详情中设置。
+
+打包与启动不会自动更改默认程序。右键菜单绑定应用当前位置，移动应用后需重新安装该菜单。当前系统集成实现针对 macOS；Windows/Linux 尚未接入。
+
 ## 工作区结构
 
 - `crates/smartzip-cli`：命令行入口
@@ -132,6 +169,7 @@ scripts/crap-scan.sh
 - `docs/implementation-plan.md`
 - `docs/implementation-progress.md`
 - [CLI 交互设计草案](.trellis/tasks/09-05-cli-interaction-design/design.md)
+- [GUI 双窗口设计与组件调查](.trellis/tasks/09-12-gui-design/prd.md)（设计已完成，原生实施进行中）
 - `docs/agents/`
 - `docs/compose/plans/`
 - `docs/research/`

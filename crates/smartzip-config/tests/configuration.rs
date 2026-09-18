@@ -200,3 +200,80 @@ fn legacy_migration_is_explicit_and_keeps_a_backup() {
             .auto_discover
     );
 }
+
+#[test]
+fn batch_edit_validates_combined_output_and_preserves_unrelated_comments() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("config.toml");
+    let original = "# user heading\nschema_version=1\n[state]\nhistory=false # keep history comment\n[extraction.recursion]\nenabled=true # keep recursion comment\n";
+    fs::write(&path, original).unwrap();
+    let patches = vec![
+        (
+            "extraction.output.destination".into(),
+            Some("'directory'".into()),
+        ),
+        (
+            "extraction.output.directory".into(),
+            Some("'output'".into()),
+        ),
+        ("extraction.recursion.enabled".into(), Some("false".into())),
+    ];
+    edit_config_fields(&path, &patches).unwrap();
+    let resolved = ResolvedConfig::load(Some(&path)).unwrap();
+    assert_eq!(
+        resolved.values.extraction.output.destination,
+        Destination::Directory
+    );
+    assert_eq!(
+        resolved.values.extraction.output.directory,
+        Some(root.path().join("output"))
+    );
+    assert!(!resolved.values.extraction.recursion.enabled);
+    let edited = fs::read_to_string(&path).unwrap();
+    assert!(edited.starts_with(
+        "# user heading\nschema_version=1\n[state]\nhistory=false # keep history comment\n"
+    ));
+    assert!(edited.contains("# keep recursion comment"));
+    edit_config_fields(
+        &path,
+        &[
+            ("extraction.output.directory".into(), None),
+            ("extraction.output.destination".into(), None),
+        ],
+    )
+    .unwrap();
+    let resolved = ResolvedConfig::load(Some(&path)).unwrap();
+    assert_eq!(
+        resolved.values.extraction.output.destination,
+        Destination::FirstInputParent
+    );
+    assert_eq!(resolved.values.extraction.output.directory, None);
+}
+
+#[test]
+fn failed_batch_edits_preserve_entire_file_and_missing_file_stays_absent() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("config.toml");
+    let valid = ("state.history".into(), Some("false".into()));
+    assert!(edit_config_fields(&path, &[valid.clone()]).is_err());
+    assert!(!path.exists());
+    init_config(&path, false).unwrap();
+    let original = fs::read(&path).unwrap();
+    for invalid_patch in [
+        (
+            "extraction.output.destination".into(),
+            Some("'directory'".into()),
+        ),
+        ("state.mode".into(), Some("'invalid'".into())),
+        ("limits.max_files".into(), Some("[".into())),
+        ("state.unknown".into(), Some("false".into())),
+        ("schema_version".into(), Some("2".into())),
+        valid.clone(),
+    ] {
+        assert!(edit_config_fields(&path, &[valid.clone(), invalid_patch]).is_err());
+        assert_eq!(fs::read(&path).unwrap(), original);
+    }
+    fs::write(path.with_extension("toml.lock"), "another writer").unwrap();
+    assert!(edit_config_fields(&path, &[valid]).is_err());
+    assert_eq!(fs::read(&path).unwrap(), original);
+}

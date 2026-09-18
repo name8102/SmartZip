@@ -3,6 +3,8 @@
 pub mod backend;
 pub mod diagnostic;
 pub mod integrity;
+mod locator;
+pub mod member;
 pub mod native_zip;
 mod process;
 pub mod router;
@@ -15,6 +17,7 @@ pub mod volume_probe;
 pub mod volumes;
 
 pub use backend::{ArchiveAdapter, ArchiveExecutor};
+pub use member::MemberReadRequest;
 pub use native_zip::NativeZipBackend;
 pub use router::{AdapterRegistration, BackendRouter};
 pub use sevenzz::{
