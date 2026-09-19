@@ -50,7 +50,16 @@ fn config_with_database(path: &Path) -> smartzip_config::ResolvedConfig {
 fn fixture(directory: &Path, encrypted: bool) -> std::path::PathBuf {
     std::fs::write(directory.join("hello.txt"), b"GUI runtime acceptance\n").unwrap();
     let archive = directory.join("fixture.zip");
-    let mut command = std::process::Command::new("7zz");
+    let seven = ["7zz", "7z"]
+        .into_iter()
+        .find(|name| {
+            std::process::Command::new(name)
+                .arg("i")
+                .output()
+                .is_ok_and(|output| output.status.success())
+        })
+        .expect("7zz or 7z required for backend acceptance");
+    let mut command = std::process::Command::new(seven);
     command.current_dir(directory).args(["a", "-tzip"]);
     if encrypted {
         command.arg("-pRuntimeFixtureOnly");
@@ -59,7 +68,7 @@ fn fixture(directory: &Path, encrypted: bool) -> std::path::PathBuf {
         .arg(&archive)
         .arg("hello.txt")
         .output()
-        .expect("7zz required for backend acceptance");
+        .expect("7zz or 7z required for backend acceptance");
     assert!(output.status.success(), "fixture creation failed");
     archive
 }
@@ -80,7 +89,7 @@ fn finish(handle: &JobHandle) -> (JobOutcome, Vec<smartzip_core::TaskEvent>) {
     }
 }
 #[test]
-#[ignore = "requires installed 7zz; run with --include-ignored for backend acceptance"]
+#[ignore = "requires installed 7zz or 7z; run with --include-ignored for backend acceptance"]
 fn real_backend_detect_list_test_extract_preserve_source() {
     let temp = tempfile::tempdir().unwrap();
     let archive = fixture(temp.path(), false);
@@ -120,7 +129,7 @@ fn real_backend_detect_list_test_extract_preserve_source() {
     );
 }
 #[test]
-#[ignore = "requires installed 7zz; run with --include-ignored for backend acceptance"]
+#[ignore = "requires installed 7zz or 7z; run with --include-ignored for backend acceptance"]
 fn real_backend_password_wait_cancels_without_output_or_source_deletion() {
     let temp = tempfile::tempdir().unwrap();
     let archive = fixture(temp.path(), true);
@@ -163,7 +172,7 @@ fn real_backend_password_wait_cancels_without_output_or_source_deletion() {
 }
 
 #[test]
-#[ignore = "requires installed 7zz; run with --include-ignored for backend acceptance"]
+#[ignore = "requires installed 7zz or 7z; run with --include-ignored for backend acceptance"]
 fn real_backend_success_recycles_only_explicit_source() {
     let temp = tempfile::tempdir().unwrap();
     let archive = fixture(temp.path(), false);
@@ -193,7 +202,7 @@ fn real_backend_success_recycles_only_explicit_source() {
 }
 
 #[test]
-#[ignore = "requires installed 7zz; run with --include-ignored for backend acceptance"]
+#[ignore = "requires installed 7zz or 7z; run with --include-ignored for backend acceptance"]
 fn changed_source_is_kept_after_successful_password_response() {
     let temp = tempfile::tempdir().unwrap();
     let archive = fixture(temp.path(), true);
@@ -245,7 +254,7 @@ fn changed_source_is_kept_after_successful_password_response() {
 }
 
 #[test]
-#[ignore = "requires installed 7zz; run with --include-ignored for backend acceptance"]
+#[ignore = "requires installed 7zz or 7z; run with --include-ignored for backend acceptance"]
 fn real_backend_temporary_password_is_not_persisted() {
     let temp = tempfile::tempdir().unwrap();
     let archive = fixture(temp.path(), true);
