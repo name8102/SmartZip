@@ -56,11 +56,13 @@ pub fn current_bundle() -> io::Result<Option<PathBuf>> {
     }
     Ok(None)
 }
+#[cfg(target_os = "macos")]
 fn required_bundle() -> io::Result<PathBuf> {
     current_bundle()?.ok_or_else(|| {
         io::Error::other("请使用打包后的 SmartZip.app，并将它放在固定位置后配置系统集成")
     })
 }
+#[cfg(any(target_os = "macos", test))]
 fn supported(extension: &str) -> io::Result<()> {
     if archive_types()
         .iter()

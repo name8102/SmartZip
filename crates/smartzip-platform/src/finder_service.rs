@@ -1,13 +1,19 @@
 //! Installation of the macOS Finder Quick Action for extracting archives.
 
+#[cfg(any(target_os = "macos", test))]
 use plist::Value;
+#[cfg(any(target_os = "macos", test))]
+use std::fs;
 use std::{
-    fs, io,
+    io,
     path::{Path, PathBuf},
 };
 
+#[cfg(any(target_os = "macos", test))]
 const SERVICE_NAME: &str = "SmartZip 快速解压.workflow";
+#[cfg(any(target_os = "macos", test))]
 const OWNER_MARKER: &str = ".smartzip-owner";
+#[cfg(any(target_os = "macos", test))]
 const OWNER_VALUE: &str = "SmartZip Finder Quick Action";
 
 #[cfg(not(target_os = "macos"))]
@@ -113,6 +119,7 @@ pub fn remove() -> io::Result<()> {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn owns_service(path: &Path) -> bool {
     if !path.is_dir() || path.is_symlink() {
         return false;
@@ -158,6 +165,7 @@ fn owns_service(path: &Path) -> bool {
     marker == expected
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn content_hash(path: &Path) -> String {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
@@ -171,6 +179,7 @@ fn content_hash(path: &Path) -> String {
     format!("{hash:016x}")
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn owner_manifest(document: &Path, info: &Path) -> io::Result<String> {
     let document_hash = content_hash(document);
     let info_hash = content_hash(info);
@@ -182,11 +191,13 @@ fn owner_manifest(document: &Path, info: &Path) -> io::Result<String> {
     ))
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn write_plist(path: &Path, value: Value) -> io::Result<()> {
     let mut file = fs::File::create(path)?;
     plist::to_writer_xml(&mut file, &value).map_err(io::Error::other)
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn dict(entries: impl IntoIterator<Item = (&'static str, Value)>) -> Value {
     Value::Dictionary(
         entries
@@ -196,11 +207,13 @@ fn dict(entries: impl IntoIterator<Item = (&'static str, Value)>) -> Value {
     )
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn shell_quote(value: &Path) -> String {
     let value = value.to_string_lossy();
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn workflow_document(bundle: &Path) -> Value {
     let executable = bundle.join("Contents/MacOS/smartzip-gui");
     let command = format!(
@@ -257,6 +270,7 @@ fn workflow_document(bundle: &Path) -> Value {
     ])
 }
 
+#[cfg(target_os = "macos")]
 fn info_plist() -> Value {
     dict([(
         "NSServices",
