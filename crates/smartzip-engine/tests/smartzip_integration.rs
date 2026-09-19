@@ -1502,3 +1502,132 @@ fn find_file(dir: &Path, filename: &str) -> Option<PathBuf> {
     }
     None
 }
+
+/// Two numeric filename dimensions define two structurally complete groups.
+/// Only actual extraction can distinguish equally sized raw continuation data.
+#[tokio::test]
+async fn ambiguous_volume_groups_use_first_successful_extraction() {
+    for (first_good, second_good, prompt, limited) in [
+        (false, true, false, false),
+        (true, true, false, false),
+        (false, false, false, false),
+        (true, false, true, false),
+        (true, true, false, true),
+    ] {
+        let root = TempDir::new().unwrap();
+        let input = root.path().join("payload.bin");
+        let payload: Vec<u8> = (0..30_000u32)
+            .flat_map(|n| n.wrapping_mul(2654435761).to_le_bytes())
+            .collect();
+        std::fs::write(&input, &payload).unwrap();
+        let status = std::process::Command::new("7z")
+            .args(["a", "-t7z", "-mx=0", "-psecret", "-mhe=on", "-v80k"])
+            .arg(root.path().join("original.7z"))
+            .arg(&input)
+            .output()
+            .expect("7z is required for volume extraction integration tests");
+        assert!(status.status.success());
+        let volumes = root.path().join("volumes");
+        std::fs::create_dir(&volumes).unwrap();
+        let seed = volumes.join("a1b1.bin");
+        std::fs::copy(root.path().join("original.7z.001"), &seed).unwrap();
+        let tail = std::fs::read(root.path().join("original.7z.002")).unwrap();
+        for (name, good) in [("a2b1.bin", first_good), ("a1b2.bin", second_good)] {
+            std::fs::write(
+                volumes.join(name),
+                if good {
+                    tail.clone()
+                } else {
+                    vec![0; tail.len()]
+                },
+            )
+            .unwrap();
+        }
+        let mut resolver = smartzip_engine::volumes::VolumeResolver::new();
+        let resolution =
+            resolver.resolve(&smartzip_engine::ExtractionCandidate::root(seed.clone()));
+        assert!(matches!(
+            resolution,
+            smartzip_engine::volumes::VolumeResolution::GroupingAmbiguous { .. }
+        ));
+        let db = SmartZipDb::in_memory().unwrap();
+        let service = PasswordService::new(PasswordRepository::new(db.connection()));
+        let output = TempDir::new().unwrap();
+        let prompter = StaticPasswordPrompter {
+            password: "secret".into(),
+        };
+        let result = SmartZipEngine::default()
+            .extract_recursive_interactive(
+                &router(),
+                &service,
+                ExtractWorkflowRequest {
+                    inputs: vec![seed],
+                    output_dir: output.path().to_path_buf(),
+                    recursion_limit: 0,
+                    encoding_mode: EncodingMode::Auto,
+                    scanner: ScannerConfig::default(),
+                    password_candidates: PasswordCandidateRequest {
+                        manual: if prompt {
+                            vec![]
+                        } else {
+                            vec!["secret".into()]
+                        },
+                        clipboard: None,
+                        include_empty: prompt,
+                        limit: 0,
+                    },
+                    layout_policy: Default::default(),
+                    single_root_name_policy: Default::default(),
+                    embedded_scan_mode: Default::default(),
+                    dominant_min_ratio: 0.7,
+                    confirm_large_scan: false,
+                    force: false,
+                    limits: smartzip_config::ExtractionLimits {
+                        max_output_bytes: if limited { 1 } else { 20 * 1024 * 1024 },
+                        ..Default::default()
+                    },
+                },
+                if prompt { Some(&prompter) } else { None },
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let warnings: Vec<_> = result
+            .events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                smartzip_core::TaskEventKind::Warning { message } => Some(message.as_str()),
+                _ => None,
+            })
+            .collect();
+        if (first_good || second_good) && !limited {
+            assert_eq!(result.failed_count, 0, "{:?}", result.events);
+            assert_eq!(result.processed.len(), 1, "{warnings:?}");
+            let extracted = find_file(output.path(), "payload.bin").unwrap();
+            assert_eq!(std::fs::read(extracted).unwrap(), payload);
+            let expected = if prompt {
+                "attempt 3 succeeded"
+            } else if first_good {
+                "attempt 1 succeeded"
+            } else {
+                "attempt 2 succeeded"
+            };
+            assert!(
+                warnings.iter().any(|w| w.contains(expected)),
+                "{warnings:?}"
+            );
+            assert_eq!(std::fs::read_dir(output.path()).unwrap().count(), 1);
+        } else {
+            assert_eq!(result.failed_count, 1);
+            if limited {
+                assert!(!warnings.iter().any(|w| w.contains("trying next grouping")));
+            }
+            assert!(result.processed.is_empty());
+            assert_eq!(std::fs::read_dir(output.path()).unwrap().count(), 0);
+        }
+        // Canonical input copies and failed output staging are both gone.
+        assert_eq!(std::fs::read_dir(&volumes).unwrap().count(), 3);
+    }
+}

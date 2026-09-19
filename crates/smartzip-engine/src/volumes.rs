@@ -49,6 +49,8 @@ pub struct VolumeSet {
 
 #[derive(Debug, Clone)]
 pub struct VolumeSetHypothesis {
+    /// A complete, structurally plausible grouping available for extraction trials.
+    pub trial_set: Option<VolumeSet>,
     pub format: ArchiveFormat,
     pub members: Vec<VolumeMember>,
     pub warnings: Vec<VolumeWarning>,
@@ -272,6 +274,7 @@ impl VolumeResolver {
             let mut hypos = ambiguous_hypotheses;
             for (set, warnings) in resolved_hypotheses {
                 hypos.push(VolumeSetHypothesis {
+                    trial_set: Some(set.clone()),
                     format: set.format.clone(),
                     members: set.members.clone(),
                     warnings,
@@ -280,6 +283,7 @@ impl VolumeResolver {
             for prob in incomplete_reasons {
                 // Represent incomplete as a hypothesis with empty members but with problem as warning for debugging
                 hypos.push(VolumeSetHypothesis {
+                    trial_set: None,
                     format: prob
                         .format
                         .clone()
@@ -314,6 +318,7 @@ impl VolumeResolver {
             let hypos: Vec<VolumeSetHypothesis> = resolved_hypotheses
                 .into_iter()
                 .map(|(set, warnings)| VolumeSetHypothesis {
+                    trial_set: Some(set.clone()),
                     format: set.format.clone(),
                     members: set.members.clone(),
                     warnings,
@@ -725,6 +730,7 @@ fn resolve_hypothesis_inner(
         // Multiple distinct candidates remain plausible -> GroupingAmbiguous for this hypothesis
         // Build hypothesis view for ambiguity reporting
         let hypo = VolumeSetHypothesis {
+            trial_set: None,
             format: format.clone(),
             members: final_members.clone(),
             warnings: warnings.clone(),
@@ -777,6 +783,7 @@ fn resolve_hypothesis_inner(
     }
     if evidence_conflict {
         return HypothesisOutcome::Ambiguous(VolumeSetHypothesis {
+            trial_set: None,
             format: format.clone(),
             members: final_members.clone(),
             warnings: warnings.clone(),
@@ -792,6 +799,7 @@ fn resolve_hypothesis_inner(
         if (final_members.len() as u32) > exp {
             // More members than expected -> possible overfull, treat as ambiguous if not exact
             return HypothesisOutcome::Ambiguous(VolumeSetHypothesis {
+                trial_set: None,
                 format: format.clone(),
                 members: final_members.clone(),
                 warnings: warnings.clone(),
@@ -824,6 +832,7 @@ fn resolve_hypothesis_inner(
                     break;
                 } else if cumulative > exp_size {
                     return HypothesisOutcome::Ambiguous(VolumeSetHypothesis {
+                        trial_set: None,
                         format: format.clone(),
                         members: final_members.clone(),
                         warnings: warnings.clone(),
@@ -890,6 +899,7 @@ fn resolve_hypothesis_inner(
         for m in &final_members {
             if !seen.insert(m.logical_index.unwrap()) {
                 return HypothesisOutcome::Ambiguous(VolumeSetHypothesis {
+                    trial_set: None,
                     format: format.clone(),
                     members: final_members.clone(),
                     warnings: warnings.clone(),
@@ -967,6 +977,7 @@ fn resolve_hypothesis_inner(
     };
     if zip_kind == Some(ZipSplitKind::Unknown) && final_members.len() > 1 {
         return HypothesisOutcome::Ambiguous(VolumeSetHypothesis {
+            trial_set: None,
             format: format.clone(),
             members: final_members.clone(),
             warnings: warnings.clone(),
@@ -1024,6 +1035,7 @@ fn compute_clip_indices(
                         if let Some(prev) = start {
                             if prev != *ord {
                                 return Err(HypothesisOutcome::Ambiguous(VolumeSetHypothesis {
+                                    trial_set: None,
                                     format: format.clone(),
                                     members: Vec::new(),
                                     warnings: Vec::new(),
@@ -1037,6 +1049,7 @@ fn compute_clip_indices(
                         if let Some(prev) = end {
                             if prev != *ord {
                                 return Err(HypothesisOutcome::Ambiguous(VolumeSetHypothesis {
+                                    trial_set: None,
                                     format: format.clone(),
                                     members: Vec::new(),
                                     warnings: Vec::new(),
@@ -1058,6 +1071,7 @@ fn compute_clip_indices(
                         if let Some(prev) = end {
                             if prev != *ord {
                                 return Err(HypothesisOutcome::Ambiguous(VolumeSetHypothesis {
+                                    trial_set: None,
                                     format: format.clone(),
                                     members: Vec::new(),
                                     warnings: Vec::new(),
@@ -1075,6 +1089,7 @@ fn compute_clip_indices(
                     if let Some(prev) = start {
                         if prev != *ord {
                             return Err(HypothesisOutcome::Ambiguous(VolumeSetHypothesis {
+                                trial_set: None,
                                 format: format.clone(),
                                 members: Vec::new(),
                                 warnings: Vec::new(),
@@ -1926,6 +1941,40 @@ mod tests {
             set_first.members.iter().map(|m| &m.path).collect();
         assert_eq!(mid_paths, first_paths);
     }
+    #[test]
+    fn standard_seven_zip_split_resolves_from_every_member() {
+        for extension in ["7z", "7Z"] {
+            let dir = TempDir::new().unwrap();
+            let paths: Vec<_> = (1..=3)
+                .map(|n| dir.path().join(format!("archive.{extension}.{n:03}")))
+                .collect();
+            // A valid start header declares 168 logical bytes across 132/18/18.
+            let mut first = vec![0u8; 132];
+            first[..6].copy_from_slice(b"\x37\x7a\xbc\xaf\x27\x1c");
+            first[12..20].copy_from_slice(&100u64.to_le_bytes());
+            first[20..28].copy_from_slice(&36u64.to_le_bytes());
+            let crc = crc32fast::hash(&first[12..32]);
+            first[8..12].copy_from_slice(&crc.to_le_bytes());
+            fs::write(&paths[0], first).unwrap();
+            for path in &paths[1..] {
+                create_raw_file(path, b"raw continuation!!");
+            }
+            for path in &paths {
+                let mut resolver = VolumeResolver::new();
+                let set = match resolver.resolve(&make_candidate(path.clone())) {
+                    VolumeResolution::Resolved(set)
+                    | VolumeResolution::ResolvedWithWarnings { set, .. } => set,
+                    other => panic!("{} should resolve, got {other:?}", path.display()),
+                };
+                assert_eq!(set.format, ArchiveFormat::SevenZip);
+                assert_eq!(
+                    set.members.iter().map(|m| &m.path).collect::<Vec<_>>(),
+                    paths.iter().collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+
     #[test]
     fn definite_missing_single_member_is_incomplete() {
         let dir = TempDir::new().unwrap();

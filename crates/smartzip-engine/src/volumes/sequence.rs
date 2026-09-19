@@ -23,6 +23,19 @@ pub fn parse_ordinal_tokens(normalized: &str) -> Vec<OrdinalToken> {
     // NFKC converts ０-９ to 0-9 and ①-⑳ to 1-20 etc., so regex suffices.
     let re = digit_regex();
     for m in re.find_iter(normalized) {
+        // The digit in the .7z extension is a format name, not a volume
+        // ordinal. Keeping it creates a competing singleton hypothesis for
+        // archive.7z.001 even when .001/.002/... form a complete archive.
+        let suffix = &normalized[m.end()..];
+        if m.as_str() == "7"
+            && normalized[..m.start()].ends_with('.')
+            && (suffix.eq_ignore_ascii_case("z")
+                || suffix
+                    .get(..2)
+                    .is_some_and(|s| s.eq_ignore_ascii_case("z.")))
+        {
+            continue;
+        }
         let raw = m.as_str().to_string();
         // Do not interpret fractions: if digits contain '.' or '/' we skip – but our regex only captures \d+, so fraction like "1/2" yields two tokens "1" and "2" independently. Design says do not interpret fractions as volume numbers, so we should not combine them. Keeping them separate is safe.
         if let Ok(v) = raw.parse::<u64>() {
@@ -300,6 +313,31 @@ fn check_gap(
 mod tests {
     use super::*;
     use crate::volumes::directory::DirectoryVolumeIndex;
+
+    #[test]
+    fn seven_zip_extension_is_not_an_ordinal_but_filename_numbers_remain() {
+        for name in ["archive.7z.001", "archive.7Z.001", "archive.7z"] {
+            let values: Vec<_> = parse_ordinal_tokens(name)
+                .into_iter()
+                .map(|t| t.value)
+                .collect();
+            assert_eq!(
+                values,
+                if name.ends_with("001") {
+                    vec![1]
+                } else {
+                    vec![]
+                }
+            );
+        }
+        for name in ["archive7z.001", "archive.7zip.001", "archive.7.001"] {
+            let values: Vec<_> = parse_ordinal_tokens(name)
+                .into_iter()
+                .map(|t| t.value)
+                .collect();
+            assert_eq!(values, vec![7, 1], "{name}");
+        }
+    }
 
     #[test]
     fn hypotheses_borrow_members_and_preserve_clipped_roman_tokens() {

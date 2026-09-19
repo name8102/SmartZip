@@ -324,6 +324,7 @@ impl SevenZipBackend {
             }
         } else if lower.contains("crc failed")
             || lower.contains("data error")
+            || lower.contains("headers error")
             || lower.contains("unexpected end of data")
             || lower.contains("unexpected end of archive")
         {
@@ -1313,6 +1314,10 @@ mod tests {
         ));
         assert!(matches!(
             backend.map_failure(&output(2, "ERROR: CRC Failed"), path),
+            SmartZipError::CorruptedArchive { .. }
+        ));
+        assert!(matches!(
+            backend.map_failure(&output(2, "ERRORS:\nHeaders Error"), path),
             SmartZipError::CorruptedArchive { .. }
         ));
         assert!(matches!(
