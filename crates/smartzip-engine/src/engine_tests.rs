@@ -705,6 +705,678 @@ impl ArchiveExecutor for FailingExtractBackend {
     }
 }
 
+#[derive(Default)]
+struct FailFirstExtractBackend {
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl ArchiveExecutor for FailFirstExtractBackend {
+    async fn probe(&self, path: &Path) -> smartzip_core::Result<ArchiveProbe> {
+        Ok(ArchiveProbe {
+            path: path.to_path_buf(),
+            format: Some(ArchiveFormat::Zip),
+            encrypted: Some(false),
+            supported: true,
+        })
+    }
+
+    async fn list(&self, _request: ListRequest) -> smartzip_core::Result<ArchiveListing> {
+        Ok(ArchiveListing {
+            format: Some(ArchiveFormat::Zip),
+            entries: Vec::new(),
+        })
+    }
+
+    async fn test(&self, _request: TestRequest) -> smartzip_core::Result<TestResult> {
+        unreachable!("extraction does not run a full test pass")
+    }
+
+    async fn extract(
+        &self,
+        request: ExtractArchiveRequest,
+    ) -> smartzip_core::Result<ExtractArchiveResult> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        if call == 0 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            return Err(smartzip_core::SmartZipError::BackendFailed {
+                backend: "fail-first".into(),
+                exit_code: Some(2),
+                stderr: "first root failed".into(),
+            });
+        }
+        std::fs::create_dir_all(&request.output_dir)
+            .map_err(|error| smartzip_core::SmartZipError::io(None, error))?;
+        std::fs::write(request.output_dir.join("unexpected"), b"unexpected")
+            .map_err(|error| smartzip_core::SmartZipError::io(None, error))?;
+        Ok(ExtractArchiveResult {
+            output_dir: request.output_dir,
+            encrypted: Some(false),
+        })
+    }
+
+    async fn compress(
+        &self,
+        request: CompressArchiveRequest,
+    ) -> smartzip_core::Result<CompressArchiveResult> {
+        Ok(CompressArchiveResult {
+            output: request.output,
+        })
+    }
+}
+
+struct NestedThenFailBackend {
+    calls: Mutex<Vec<String>>,
+    stage_entered: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl ArchiveExecutor for NestedThenFailBackend {
+    async fn probe(&self, path: &Path) -> smartzip_core::Result<ArchiveProbe> {
+        Ok(ArchiveProbe {
+            path: path.to_path_buf(),
+            format: Some(ArchiveFormat::Zip),
+            encrypted: Some(false),
+            supported: true,
+        })
+    }
+
+    async fn list(&self, _request: ListRequest) -> smartzip_core::Result<ArchiveListing> {
+        Ok(ArchiveListing {
+            format: Some(ArchiveFormat::Zip),
+            entries: Vec::new(),
+        })
+    }
+
+    async fn test(&self, _request: TestRequest) -> smartzip_core::Result<TestResult> {
+        unreachable!("extraction does not run a full test pass")
+    }
+
+    async fn extract(
+        &self,
+        request: ExtractArchiveRequest,
+    ) -> smartzip_core::Result<ExtractArchiveResult> {
+        let name = request
+            .archive
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        self.calls.lock().unwrap().push(name.clone());
+        match name.as_str() {
+            "first.zip" => {
+                tokio::task::yield_now().await;
+                std::fs::create_dir_all(&request.output_dir)
+                    .map_err(|error| smartzip_core::SmartZipError::io(None, error))?;
+                std::fs::write(request.output_dir.join("nested.zip"), b"nested")
+                    .map_err(|error| smartzip_core::SmartZipError::io(None, error))?;
+                Ok(ExtractArchiveResult {
+                    output_dir: request.output_dir,
+                    encrypted: Some(false),
+                })
+            }
+            "second.zip" => {
+                tokio::time::timeout(Duration::from_secs(2), self.stage_entered.notified())
+                    .await
+                    .expect("nested node should enter its execution stage");
+                Err(smartzip_core::SmartZipError::BackendFailed {
+                    backend: "nested-then-fail".into(),
+                    exit_code: Some(2),
+                    stderr: "second root failed".into(),
+                })
+            }
+            "nested.zip" => {
+                std::fs::create_dir_all(&request.output_dir)
+                    .map_err(|error| smartzip_core::SmartZipError::io(None, error))?;
+                std::fs::write(request.output_dir.join("unexpected"), b"unexpected")
+                    .map_err(|error| smartzip_core::SmartZipError::io(None, error))?;
+                Ok(ExtractArchiveResult {
+                    output_dir: request.output_dir,
+                    encrypted: Some(false),
+                })
+            }
+            other => panic!("unexpected archive {other}"),
+        }
+    }
+
+    async fn compress(
+        &self,
+        request: CompressArchiveRequest,
+    ) -> smartzip_core::Result<CompressArchiveResult> {
+        Ok(CompressArchiveResult {
+            output: request.output,
+        })
+    }
+}
+
+struct ScanThenFailBackend {
+    stage_entered: Arc<tokio::sync::Notify>,
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl ArchiveExecutor for ScanThenFailBackend {
+    async fn probe(&self, path: &Path) -> smartzip_core::Result<ArchiveProbe> {
+        Ok(ArchiveProbe {
+            path: path.to_path_buf(),
+            format: Some(ArchiveFormat::Zip),
+            encrypted: Some(false),
+            supported: true,
+        })
+    }
+
+    async fn list(&self, _request: ListRequest) -> smartzip_core::Result<ArchiveListing> {
+        Ok(ArchiveListing {
+            format: Some(ArchiveFormat::Zip),
+            entries: Vec::new(),
+        })
+    }
+
+    async fn test(&self, _request: TestRequest) -> smartzip_core::Result<TestResult> {
+        unreachable!("extraction does not run a full test pass")
+    }
+
+    async fn extract(
+        &self,
+        request: ExtractArchiveRequest,
+    ) -> smartzip_core::Result<ExtractArchiveResult> {
+        assert_eq!(request.archive.file_name().unwrap(), "fail.zip");
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(2), self.stage_entered.notified())
+            .await
+            .expect("the other root should start its scan");
+        Err(smartzip_core::SmartZipError::BackendFailed {
+            backend: "scan-then-fail".into(),
+            exit_code: Some(2),
+            stderr: "root failed while its sibling was scanning".into(),
+        })
+    }
+
+    async fn compress(
+        &self,
+        request: CompressArchiveRequest,
+    ) -> smartzip_core::Result<CompressArchiveResult> {
+        Ok(CompressArchiveResult {
+            output: request.output,
+        })
+    }
+}
+
+struct StageWaitRecorder {
+    wait_node: Mutex<Option<NodeId>>,
+    wait_stage: crate::coordinator::Stage,
+    block_at_stage: bool,
+    stage_entered: Arc<tokio::sync::Notify>,
+    outcomes: Mutex<Vec<(NodeId, crate::NodeOutcome)>>,
+}
+
+#[async_trait(?Send)]
+impl crate::ExecutionStateRecorder for StageWaitRecorder {
+    async fn enqueue_child(
+        &self,
+        _task_id: &TaskId,
+        node_id: &NodeId,
+        _parent_id: &NodeId,
+        _root_id: &NodeId,
+        _candidate: &crate::ExtractionCandidate,
+        _generation: u64,
+    ) -> smartzip_core::Result<bool> {
+        let mut wait_node = self.wait_node.lock().unwrap();
+        if wait_node.is_none() {
+            *wait_node = Some(node_id.clone());
+        }
+        Ok(true)
+    }
+
+    async fn transition(
+        &self,
+        _task_id: &TaskId,
+        node_id: &NodeId,
+        _generation: u64,
+        _from: &str,
+        _to: &str,
+        stage: crate::coordinator::Stage,
+        _attempt_id: Option<&AttemptId>,
+        cancellation: &tokio_util::sync::CancellationToken,
+    ) -> smartzip_core::Result<bool> {
+        let is_wait_node = self.wait_node.lock().unwrap().as_ref() == Some(node_id);
+        if is_wait_node && stage == self.wait_stage {
+            self.stage_entered.notify_one();
+            if self.block_at_stage {
+                cancellation.cancelled().await;
+                return Err(smartzip_core::SmartZipError::Cancelled);
+            }
+        }
+        Ok(true)
+    }
+
+    fn release_stage(&self, _task_id: &TaskId, _node_id: &NodeId) {}
+
+    async fn record_staging(
+        &self,
+        _task_id: &TaskId,
+        _node_id: &NodeId,
+        _generation: u64,
+        _path: &Path,
+    ) -> smartzip_core::Result<bool> {
+        Ok(true)
+    }
+
+    async fn wait_for_decision(
+        &self,
+        _task_id: &TaskId,
+        _node_id: &NodeId,
+        _generation: u64,
+        _stage: crate::coordinator::Stage,
+        _decision_id: &DecisionId,
+        _kind: &str,
+        _evidence: &str,
+    ) -> smartzip_core::Result<bool> {
+        Ok(true)
+    }
+
+    async fn accept_decision(
+        &self,
+        _task_id: &TaskId,
+        _node_id: &NodeId,
+        _generation: u64,
+        _decision_id: &DecisionId,
+    ) -> smartzip_core::Result<bool> {
+        Ok(true)
+    }
+
+    async fn begin_commit(
+        &self,
+        _task_id: &TaskId,
+        _node_id: &NodeId,
+        _generation: u64,
+        _intent: &crate::CommitIntent,
+    ) -> smartzip_core::Result<bool> {
+        Ok(true)
+    }
+
+    async fn commit_published(
+        &self,
+        _task_id: &TaskId,
+        _node_id: &NodeId,
+        _generation: u64,
+        _intent: &crate::CommitIntent,
+    ) -> smartzip_core::Result<bool> {
+        Ok(true)
+    }
+
+    async fn abort_commit(
+        &self,
+        _task_id: &TaskId,
+        _node_id: &NodeId,
+        _generation: u64,
+    ) -> smartzip_core::Result<bool> {
+        Ok(true)
+    }
+
+    async fn finish_node(
+        &self,
+        _task_id: &TaskId,
+        node_id: &NodeId,
+        _generation: u64,
+        outcome: crate::NodeOutcome,
+    ) -> smartzip_core::Result<bool> {
+        self.outcomes
+            .lock()
+            .unwrap()
+            .push((node_id.clone(), outcome));
+        Ok(true)
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn stop_on_error_cancels_other_roots_waiting_for_backend_capacity() {
+    let root = tempfile::tempdir().unwrap();
+    let inputs = vec![
+        root.path().join("first.zip"),
+        root.path().join("second.zip"),
+    ];
+    for input in &inputs {
+        std::fs::write(input, b"archive").unwrap();
+    }
+    let mut config = smartzip_config::SmartZipConfig::default();
+    config.extraction.on_error = smartzip_config::OnError::Stop;
+    config.extraction.recursion.enabled = false;
+    config.extraction.embedded.root = smartzip_config::RootScan::Off;
+    config.extraction.embedded.nested = smartzip_config::NestedScan::Off;
+    let policy = crate::CompiledRunPolicy::compile(smartzip_config::ResolvedConfig {
+        values: config,
+        origins: Default::default(),
+        path: None,
+        diagnostics: Vec::new(),
+    })
+    .unwrap();
+    let request = policy
+        .resolve_request(ExtractWorkflowRequest {
+            inputs: inputs.clone(),
+            output_dir: root.path().join("out"),
+            recursion_limit: 0,
+            encoding_mode: EncodingMode::Auto,
+            scanner: ScannerConfig::default(),
+            password_candidates: PasswordCandidateRequest {
+                manual: Vec::new(),
+                clipboard: None,
+                include_empty: true,
+                limit: 8,
+            },
+            layout_policy: Default::default(),
+            single_root_name_policy: Default::default(),
+            embedded_scan_mode: smartzip_core::EmbeddedScanMode::default(),
+            dominant_min_ratio: 0.7,
+            confirm_large_scan: false,
+            force: false,
+            limits: Default::default(),
+        })
+        .unwrap();
+    let identity = crate::ExtractTaskIdentity::new(&inputs);
+    let execution_db = root.path().join("execution.db");
+    let store = Arc::new(crate::state_store::StateStore::start(&execution_db).unwrap());
+    let execution = crate::execution_runtime::ExecutionCoordinator::new(
+        store,
+        crate::coordinator::ResourceCapacity {
+            cpu_units: 2,
+            backend_processes: 1,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    execution
+        .submit(crate::state_store::TaskSubmission {
+            task_id: identity.task_id.clone(),
+            kind: "extract".into(),
+            output_path: Some(request.output_dir.clone()),
+            started_at: smartzip_db::timestamp::now_utc_iso8601(),
+            inputs_json: serde_json::to_string(&inputs).unwrap(),
+            config_snapshot_json: serde_json::to_string(
+                &crate::state_store::PersistedExtractPlan::new(
+                    policy.values().clone(),
+                    request.clone(),
+                ),
+            )
+            .unwrap(),
+            priority: smartzip_db::task_execution::Priority::Normal,
+            queue_position: 0,
+            recoverable: true,
+            roots: identity
+                .roots
+                .iter()
+                .map(|root| crate::state_store::NodeSubmission {
+                    node_id: root.node_id.clone(),
+                    parent_id: None,
+                    root_id: root.root_id.clone(),
+                    input_path: root.candidate.path.clone(),
+                    input_ref_json: serde_json::to_string(&root.candidate).unwrap(),
+                    config_revision: 0,
+                    generation: 0,
+                })
+                .collect(),
+        })
+        .await
+        .unwrap();
+    let backend = FailFirstExtractBackend::default();
+    let db = SmartZipDb::in_memory().unwrap();
+    let passwords = PasswordService::new(PasswordRepository::new(db.connection()));
+
+    let result = SmartZipEngine::default()
+        .with_run_policy(policy)
+        .extract_task(
+            identity.clone(),
+            &backend,
+            &passwords,
+            request,
+            crate::ExtractInteraction::default(),
+            crate::ExtractObserver {
+                listener: None,
+                history: None,
+                execution: Some(&execution),
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(result.status, crate::history::TaskCompletionStatus::Failed);
+    assert_eq!(result.status.exit_code(), 1);
+    assert_eq!(result.failed_count, 1);
+    assert!(!root.path().join("out").join("unexpected").exists());
+
+    let persisted = SmartZipDb::open_read_only(&execution_db).unwrap();
+    let task_status: String = persisted
+        .connection()
+        .query_row(
+            "SELECT status FROM tasks WHERE id=?1",
+            [&identity.task_id.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let failed: i64 = persisted
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM file_extractions WHERE task_id=?1 AND status='failed'",
+            [&identity.task_id.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let skipped: i64 = persisted
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM file_extractions WHERE task_id=?1 AND status='skipped'",
+            [&identity.task_id.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(task_status, "failed");
+    assert_eq!((failed, skipped), (1, 1));
+    execution.release_task(&identity.task_id);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn stop_on_error_finishes_waiting_nested_node_without_rewriting_its_root() {
+    let root = tempfile::tempdir().unwrap();
+    let inputs = vec![
+        root.path().join("first.zip"),
+        root.path().join("second.zip"),
+    ];
+    for input in &inputs {
+        std::fs::write(input, b"archive").unwrap();
+    }
+    let mut config = smartzip_config::SmartZipConfig::default();
+    config.extraction.on_error = smartzip_config::OnError::Stop;
+    config.extraction.recursion.enabled = true;
+    config.extraction.recursion.max_depth = 1;
+    config.extraction.embedded.root = smartzip_config::RootScan::Off;
+    config.extraction.embedded.nested = smartzip_config::NestedScan::Off;
+    let policy = crate::CompiledRunPolicy::compile(smartzip_config::ResolvedConfig {
+        values: config,
+        origins: Default::default(),
+        path: None,
+        diagnostics: Vec::new(),
+    })
+    .unwrap();
+    let request = policy
+        .resolve_request(ExtractWorkflowRequest {
+            inputs: inputs.clone(),
+            output_dir: root.path().join("out"),
+            recursion_limit: 1,
+            encoding_mode: EncodingMode::Auto,
+            scanner: ScannerConfig::default(),
+            password_candidates: PasswordCandidateRequest {
+                manual: Vec::new(),
+                clipboard: None,
+                include_empty: true,
+                limit: 8,
+            },
+            layout_policy: Default::default(),
+            single_root_name_policy: Default::default(),
+            embedded_scan_mode: smartzip_core::EmbeddedScanMode::default(),
+            dominant_min_ratio: 0.7,
+            confirm_large_scan: false,
+            force: false,
+            limits: Default::default(),
+        })
+        .unwrap();
+    let identity = crate::ExtractTaskIdentity::new(&inputs);
+    let stage_entered = Arc::new(tokio::sync::Notify::new());
+    let execution = StageWaitRecorder {
+        wait_node: Mutex::new(None),
+        wait_stage: crate::coordinator::Stage::ResolveInputs,
+        block_at_stage: true,
+        stage_entered: stage_entered.clone(),
+        outcomes: Mutex::new(Vec::new()),
+    };
+    let backend = NestedThenFailBackend {
+        calls: Mutex::new(Vec::new()),
+        stage_entered,
+    };
+    let db = SmartZipDb::in_memory().unwrap();
+    let passwords = PasswordService::new(PasswordRepository::new(db.connection()));
+
+    let result = SmartZipEngine::default()
+        .with_run_policy(policy)
+        .extract_task(
+            identity.clone(),
+            &backend,
+            &passwords,
+            request,
+            crate::ExtractInteraction::default(),
+            crate::ExtractObserver {
+                listener: None,
+                history: None,
+                execution: Some(&execution),
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result.status, crate::history::TaskCompletionStatus::Partial);
+    assert_eq!(result.failed_count, 1);
+    assert_eq!(
+        backend.calls.lock().unwrap().as_slice(),
+        ["first.zip", "second.zip"]
+    );
+    let wait_node = execution.wait_node.lock().unwrap().clone().unwrap();
+    let outcomes = execution.outcomes.lock().unwrap();
+    assert_eq!(outcomes.len(), 3);
+    let first_root = outcomes
+        .iter()
+        .find(|(node_id, _)| node_id == &identity.roots[0].node_id)
+        .unwrap();
+    let second_root = outcomes
+        .iter()
+        .find(|(node_id, _)| node_id == &identity.roots[1].node_id)
+        .unwrap();
+    let nested = outcomes
+        .iter()
+        .find(|(node_id, _)| node_id == &wait_node)
+        .unwrap();
+    assert_eq!(first_root.1.status, "extracted");
+    assert!(first_root.1.committed);
+    assert_eq!(second_root.1.status, "failed");
+    assert_eq!(nested.1.status, "skipped");
+    assert_eq!(nested.1.reason.as_deref(), Some("task_stopped"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn stop_on_error_finishes_a_root_whose_scan_is_running() {
+    let root = tempfile::tempdir().unwrap();
+    let scanning = root.path().join("scan.bin");
+    let failing = root.path().join("fail.zip");
+    std::fs::File::create(&scanning)
+        .unwrap()
+        .set_len(256 * 1024 * 1024)
+        .unwrap();
+    std::fs::write(&failing, b"archive").unwrap();
+    let inputs = vec![scanning, failing];
+    let mut config = smartzip_config::SmartZipConfig::default();
+    config.extraction.on_error = smartzip_config::OnError::Stop;
+    config.extraction.recursion.enabled = false;
+    config.extraction.embedded.root = smartzip_config::RootScan::All;
+    config.extraction.embedded.nested = smartzip_config::NestedScan::Off;
+    let policy = crate::CompiledRunPolicy::compile(smartzip_config::ResolvedConfig {
+        values: config,
+        origins: Default::default(),
+        path: None,
+        diagnostics: Vec::new(),
+    })
+    .unwrap();
+    let request = policy
+        .resolve_request(ExtractWorkflowRequest {
+            inputs: inputs.clone(),
+            output_dir: root.path().join("out"),
+            recursion_limit: 0,
+            encoding_mode: EncodingMode::Auto,
+            scanner: ScannerConfig::default(),
+            password_candidates: PasswordCandidateRequest {
+                manual: Vec::new(),
+                clipboard: None,
+                include_empty: true,
+                limit: 8,
+            },
+            layout_policy: Default::default(),
+            single_root_name_policy: Default::default(),
+            embedded_scan_mode: smartzip_core::EmbeddedScanMode::default(),
+            dominant_min_ratio: 0.7,
+            confirm_large_scan: false,
+            force: false,
+            limits: Default::default(),
+        })
+        .unwrap();
+    let identity = crate::ExtractTaskIdentity::new(&inputs);
+    let stage_entered = Arc::new(tokio::sync::Notify::new());
+    let execution = StageWaitRecorder {
+        wait_node: Mutex::new(Some(identity.roots[0].node_id.clone())),
+        wait_stage: crate::coordinator::Stage::ScanEmbedded,
+        block_at_stage: false,
+        stage_entered: stage_entered.clone(),
+        outcomes: Mutex::new(Vec::new()),
+    };
+    let backend = ScanThenFailBackend {
+        stage_entered,
+        calls: AtomicUsize::new(0),
+    };
+    let db = SmartZipDb::in_memory().unwrap();
+    let passwords = PasswordService::new(PasswordRepository::new(db.connection()));
+
+    let result = SmartZipEngine::default()
+        .with_run_policy(policy)
+        .extract_task(
+            identity.clone(),
+            &backend,
+            &passwords,
+            request,
+            crate::ExtractInteraction::default(),
+            crate::ExtractObserver {
+                listener: None,
+                history: None,
+                execution: Some(&execution),
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(result.status, crate::history::TaskCompletionStatus::Failed);
+    assert_eq!(result.failed_count, 1);
+    let outcomes = execution.outcomes.lock().unwrap();
+    assert_eq!(outcomes.len(), 2);
+    let scan = outcomes
+        .iter()
+        .find(|(node_id, _)| node_id == &identity.roots[0].node_id)
+        .unwrap();
+    let failure = outcomes
+        .iter()
+        .find(|(node_id, _)| node_id == &identity.roots[1].node_id)
+        .unwrap();
+    assert_eq!(scan.1.status, "skipped");
+    assert_eq!(scan.1.reason.as_deref(), Some("task_stopped"));
+    assert_eq!(failure.1.status, "failed");
+}
+
 #[tokio::test]
 async fn backend_failures_do_not_record_password_failures() {
     let root = std::env::temp_dir().join(format!(
@@ -774,6 +1446,121 @@ async fn backend_failures_do_not_record_password_failures() {
 #[derive(Default, Clone)]
 struct FakeBackend {
     calls: Arc<Mutex<Vec<String>>>,
+}
+
+struct CancelAfterPublish {
+    cancellation: tokio_util::sync::CancellationToken,
+    intents: Mutex<Vec<crate::CommitIntent>>,
+    outcomes: Mutex<Vec<crate::NodeOutcome>>,
+}
+
+#[async_trait(?Send)]
+impl crate::ExecutionStateRecorder for CancelAfterPublish {
+    async fn enqueue_child(
+        &self,
+        _task_id: &TaskId,
+        _node_id: &NodeId,
+        _parent_id: &NodeId,
+        _root_id: &NodeId,
+        _candidate: &crate::ExtractionCandidate,
+        _generation: u64,
+    ) -> smartzip_core::Result<bool> {
+        Ok(true)
+    }
+
+    async fn transition(
+        &self,
+        _task_id: &TaskId,
+        _node_id: &NodeId,
+        _generation: u64,
+        _from: &str,
+        _to: &str,
+        stage: crate::coordinator::Stage,
+        _attempt_id: Option<&AttemptId>,
+        cancellation: &tokio_util::sync::CancellationToken,
+    ) -> smartzip_core::Result<bool> {
+        if stage == crate::coordinator::Stage::DiscoverChildren && cancellation.is_cancelled() {
+            return Err(smartzip_core::SmartZipError::Cancelled);
+        }
+        Ok(true)
+    }
+
+    fn release_stage(&self, _task_id: &TaskId, _node_id: &NodeId) {}
+
+    async fn record_staging(
+        &self,
+        _task_id: &TaskId,
+        _node_id: &NodeId,
+        _generation: u64,
+        _path: &Path,
+    ) -> smartzip_core::Result<bool> {
+        Ok(true)
+    }
+
+    async fn wait_for_decision(
+        &self,
+        _task_id: &TaskId,
+        _node_id: &NodeId,
+        _generation: u64,
+        _stage: crate::coordinator::Stage,
+        _decision_id: &DecisionId,
+        _kind: &str,
+        _evidence: &str,
+    ) -> smartzip_core::Result<bool> {
+        Ok(true)
+    }
+
+    async fn accept_decision(
+        &self,
+        _task_id: &TaskId,
+        _node_id: &NodeId,
+        _generation: u64,
+        _decision_id: &DecisionId,
+    ) -> smartzip_core::Result<bool> {
+        Ok(true)
+    }
+
+    async fn begin_commit(
+        &self,
+        _task_id: &TaskId,
+        _node_id: &NodeId,
+        _generation: u64,
+        intent: &crate::CommitIntent,
+    ) -> smartzip_core::Result<bool> {
+        self.intents.lock().unwrap().push(intent.clone());
+        Ok(true)
+    }
+
+    async fn commit_published(
+        &self,
+        _task_id: &TaskId,
+        _node_id: &NodeId,
+        _generation: u64,
+        _intent: &crate::CommitIntent,
+    ) -> smartzip_core::Result<bool> {
+        self.cancellation.cancel();
+        Ok(true)
+    }
+
+    async fn abort_commit(
+        &self,
+        _task_id: &TaskId,
+        _node_id: &NodeId,
+        _generation: u64,
+    ) -> smartzip_core::Result<bool> {
+        Ok(true)
+    }
+
+    async fn finish_node(
+        &self,
+        _task_id: &TaskId,
+        _node_id: &NodeId,
+        _generation: u64,
+        outcome: crate::NodeOutcome,
+    ) -> smartzip_core::Result<bool> {
+        self.outcomes.lock().unwrap().push(outcome);
+        Ok(true)
+    }
 }
 
 #[derive(Default, Clone)]
@@ -850,8 +1637,15 @@ struct CountingPasswordPrompter {
 #[async_trait]
 impl InteractivePasswordPrompter for CountingPasswordPrompter {
     async fn prompt(&self, _archive_path: &Path) -> Option<String> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        Some("batch-secret".to_string())
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        Some(
+            if call == 0 {
+                "wrong-first"
+            } else {
+                "batch-secret"
+            }
+            .to_string(),
+        )
     }
 }
 
@@ -905,12 +1699,13 @@ async fn interactive_password_is_reused_for_later_files_in_same_batch() {
     assert_eq!(result.processed.len(), 2);
     assert_eq!(
         prompter.calls.load(Ordering::SeqCst),
-        1,
+        2,
         "the password accepted for the first file should be reused in-memory for the second",
     );
     assert_eq!(
         backend.attempted_passwords.lock().unwrap().as_slice(),
         &[
+            Some("wrong-first".to_string()),
             Some("batch-secret".to_string()),
             Some("batch-secret".to_string())
         ],
@@ -982,6 +1777,67 @@ impl ArchiveExecutor for FakeBackend {
             output: request.output,
         })
     }
+}
+
+#[tokio::test]
+async fn cancellation_after_publish_keeps_committed_success() {
+    let root = tempfile::tempdir().unwrap();
+    let archive = root.path().join("archive.zip");
+    let output = root.path().join("out");
+    std::fs::write(&archive, b"archive").unwrap();
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let recorder = CancelAfterPublish {
+        cancellation: cancellation.clone(),
+        intents: Mutex::new(Vec::new()),
+        outcomes: Mutex::new(Vec::new()),
+    };
+    let db = SmartZipDb::in_memory().unwrap();
+    let passwords = PasswordService::new(PasswordRepository::new(db.connection()));
+    let request = ExtractWorkflowRequest {
+        inputs: vec![archive],
+        output_dir: output,
+        recursion_limit: 0,
+        encoding_mode: EncodingMode::Auto,
+        scanner: ScannerConfig::default(),
+        password_candidates: PasswordCandidateRequest {
+            manual: vec!["secret".into()],
+            ..PasswordCandidateRequest::default()
+        },
+        layout_policy: Default::default(),
+        single_root_name_policy: Default::default(),
+        embedded_scan_mode: smartzip_core::EmbeddedScanMode::default(),
+        dominant_min_ratio: 0.70,
+        confirm_large_scan: false,
+        force: false,
+        limits: Default::default(),
+    };
+    let identity = crate::ExtractTaskIdentity::new(&request.inputs);
+    let result = SmartZipEngine::default()
+        .with_cancellation_token(cancellation)
+        .extract_task(
+            identity,
+            &FakeBackend::default(),
+            &passwords,
+            request,
+            crate::ExtractInteraction::default(),
+            crate::ExtractObserver {
+                listener: None,
+                history: None,
+                execution: Some(&recorder),
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result.processed.len(), 1);
+    let outcomes = recorder.outcomes.lock().unwrap();
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(outcomes[0].status, "extracted");
+    assert!(outcomes[0].committed);
+    assert!(outcomes[0].output_path.as_ref().unwrap().exists());
+    let intents = recorder.intents.lock().unwrap();
+    assert_eq!(intents.len(), 1);
+    assert!(intents[0].success.has_password);
 }
 
 #[tokio::test]
@@ -1300,12 +2156,12 @@ impl ArchiveExecutor for PasswordListingBackend {
     }
 }
 
-struct ListingPasswordPrompt(Option<&'static str>);
+struct ListingPasswordPrompt(Mutex<Option<&'static str>>);
 
 #[async_trait]
 impl InteractivePasswordPrompter for ListingPasswordPrompt {
     async fn prompt(&self, _: &Path) -> Option<String> {
-        self.0.map(str::to_string)
+        self.0.lock().unwrap().take().map(str::to_string)
     }
 }
 
@@ -1313,7 +2169,7 @@ impl InteractivePasswordPrompter for ListingPasswordPrompt {
 #[case(true, None, None)]
 #[case(false, Some("correct"), None)]
 #[case(false, None, Some("password_required"))]
-#[case(false, Some("still-wrong"), Some("wrong_password"))]
+#[case(false, Some("still-wrong"), Some("password_required"))]
 #[tokio::test]
 async fn listing_retries_in_order_and_preserves_prompt_outcomes(
     #[case] stored_success: bool,
@@ -1348,7 +2204,7 @@ async fn listing_retries_in_order_and_preserves_prompt_outcomes(
                     ..Default::default()
                 },
             },
-            Some(&ListingPasswordPrompt(prompted)),
+            Some(&ListingPasswordPrompt(Mutex::new(prompted))),
             None,
             Some(Arc::new(move |event| {
                 listener_events.lock().unwrap().push(event.clone())
@@ -1359,8 +2215,8 @@ async fn listing_retries_in_order_and_preserves_prompt_outcomes(
     match expected_error {
         None => {
             let result = result.unwrap();
-            assert!(result.used_password);
-            assert!(result.password_id.is_some());
+            assert!(!result.used_password);
+            assert!(result.password_id.is_none());
             assert_eq!(result.encoding, "UTF-8");
             assert_eq!(result.events, *observed.lock().unwrap());
         }
@@ -1506,9 +2362,18 @@ fn nested_classification_keeps_header_precedence_and_single_output_scan_boundary
             &policy,
             scan,
             true,
+            &tokio_util::sync::CancellationToken::new(),
         );
-        let walked =
-            discover_nested_candidates(&scanner, &dir, 2, Path::new("parent"), &policy, scan, true);
+        let walked = discover_nested_candidates(
+            &scanner,
+            &dir,
+            2,
+            Path::new("parent"),
+            &policy,
+            scan,
+            true,
+            &tokio_util::sync::CancellationToken::new(),
+        );
         assert_eq!(single, walked);
         assert_eq!(
             single.first().and_then(|c| c.detected_format.clone()),
@@ -1529,11 +2394,20 @@ fn nested_classification_keeps_header_precedence_and_single_output_scan_boundary
         Path::new("parent"),
         &policy,
         true,
-        true
+        true,
+        &tokio_util::sync::CancellationToken::new()
     )
     .is_empty());
-    let walked =
-        discover_nested_candidates(&scanner, &dir, 2, Path::new("parent"), &policy, true, true);
+    let walked = discover_nested_candidates(
+        &scanner,
+        &dir,
+        2,
+        Path::new("parent"),
+        &policy,
+        true,
+        true,
+        &tokio_util::sync::CancellationToken::new(),
+    );
     assert_eq!(walked.len(), 1);
     assert_eq!(walked[0].embedded_offset, Some(512));
     assert_eq!(walked[0].embedded_size, Some(zip.len() as u64));
@@ -1549,7 +2423,8 @@ fn nested_classification_keeps_header_precedence_and_single_output_scan_boundary
             Path::new("parent"),
             &policy,
             true,
-            true
+            true,
+            &tokio_util::sync::CancellationToken::new()
         )
         .is_empty());
     }

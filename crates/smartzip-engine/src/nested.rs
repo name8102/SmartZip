@@ -6,8 +6,6 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use crate::interactive::{InteractiveOutputPrompter, OutputCollisionStrategy};
-use crate::materialize::{CollisionAction, CollisionResolver};
 use crate::name_score;
 use crate::policy::{finding_meets_min_size, is_business_container};
 use crate::types::{ArchiveRecycleHandler, CandidateSource, ExtractionCandidate};
@@ -182,22 +180,6 @@ pub(crate) fn output_relative_path_for(base: &Path, output_dir: &Path) -> PathBu
         })
 }
 
-pub(crate) fn make_collision_resolver<'a>(
-    prompter: &'a dyn InteractiveOutputPrompter,
-) -> CollisionResolver<'a> {
-    Box::new(move |archive_path, target_path, _plan| {
-        let prompter = prompter;
-        Box::pin(async move {
-            let strategy = prompter.prompt(archive_path, target_path).await;
-            match strategy {
-                OutputCollisionStrategy::Skip => CollisionAction::Skip,
-                OutputCollisionStrategy::Overwrite => CollisionAction::Overwrite,
-                OutputCollisionStrategy::Rename => CollisionAction::Rename,
-            }
-        })
-    })
-}
-
 pub(crate) fn carve_embedded_archive(
     source: &Path,
     offset: u64,
@@ -256,6 +238,7 @@ pub(crate) fn carve_embedded_archive(
 
 #[derive(Clone, Copy)]
 struct NestedDiscoveryPolicy<'a> {
+    cancellation: &'a tokio_util::sync::CancellationToken,
     embedded: &'a smartzip_core::EmbeddedScanPolicy,
     nested_embedded_enabled: bool,
     scan_unrecognized: bool,
@@ -269,8 +252,10 @@ pub(crate) fn discover_nested_candidates(
     policy: &smartzip_core::EmbeddedScanPolicy,
     nested_embedded_enabled: bool,
     scan_unrecognized: bool,
+    cancellation: &tokio_util::sync::CancellationToken,
 ) -> Vec<ExtractionCandidate> {
     let policy = NestedDiscoveryPolicy {
+        cancellation,
         embedded: policy,
         nested_embedded_enabled,
         scan_unrecognized,
@@ -286,6 +271,9 @@ pub(crate) fn discover_nested_candidates(
         .into_iter()
         .filter_map(|entry| entry.ok())
     {
+        if cancellation.is_cancelled() {
+            break;
+        }
         if !entry.file_type().is_file() {
             continue;
         }
@@ -314,6 +302,7 @@ fn classify_nested_file(
         embedded: policy,
         nested_embedded_enabled,
         scan_unrecognized,
+        cancellation,
     } = *discovery;
     let path = path.to_path_buf();
     let detected_format = format_from_extension(&path);
@@ -370,7 +359,7 @@ fn classify_nested_file(
         return candidates;
     }
     let findings: Vec<_> = scanner
-        .scan_path(&path)
+        .scan_path_cancellable(&path, &|| cancellation.is_cancelled())
         .unwrap_or_default()
         .into_iter()
         .filter(|finding| finding_meets_min_size(finding, policy))

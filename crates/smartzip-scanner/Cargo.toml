@@ -7,6 +7,9 @@ authors.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+flate2 = "1"
+bzip2 = "0.6"
+xz2 = "0.1"
 aho-corasick.workspace = true
 binwalk.workspace = true
 crc32fast.workspace = true

@@ -104,6 +104,8 @@ impl Failure {
 }
 
 fn spawn(executable: &Path, args: &[String], mode: Mode) -> io::Result<Box<dyn ChildWrapper>> {
+    #[cfg(target_os = "linux")]
+    let parent_pid = unsafe { libc::getpid() };
     let mut command = CommandWrap::with_new(executable, |command| {
         command
             .args(args)
@@ -114,6 +116,21 @@ fn spawn(executable: &Path, args: &[String], mode: Mode) -> io::Result<Box<dyn C
             command.env("LC_ALL", "C");
             #[cfg(unix)]
             command.process_group(0);
+        }
+        #[cfg(target_os = "linux")]
+        unsafe {
+            command.pre_exec(move || {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if libc::getppid() != parent_pid {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "SmartZip parent exited before backend startup",
+                    ));
+                }
+                Ok(())
+            });
         }
     });
     // Preserve the existing diagnostic parent-wait semantics (and Windows
@@ -346,6 +363,64 @@ mod tests {
             let _guard = guard;
             std::future::pending::<io::Result<Capture>>().await
         })
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore]
+    fn parent_death_helper() {
+        let Some(pid_path) = std::env::var_os("SMARTZIP_PDEATH_PID") else {
+            return;
+        };
+        let output_path = std::env::var("SMARTZIP_PDEATH_OUTPUT").unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _runtime = runtime.enter();
+        let child = spawn(
+            Path::new("/bin/sh"),
+            &[
+                "-c".into(),
+                format!("while :; do printf x >> '{output_path}'; sleep 0.01; done"),
+            ],
+            Mode::Ordinary,
+        )
+        .unwrap();
+        std::fs::write(pid_path, child.id().unwrap().to_string()).unwrap();
+        std::mem::forget(child);
+        unsafe { libc::_exit(99) }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parent_exit_kills_backend_before_recovery_can_start() {
+        let root = tempfile::tempdir().unwrap();
+        let pid_path = root.path().join("backend.pid");
+        let output_path = root.path().join("backend-output");
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("process::tests::parent_death_helper")
+            .arg("--ignored")
+            .env("SMARTZIP_PDEATH_PID", &pid_path)
+            .env("SMARTZIP_PDEATH_OUTPUT", &output_path)
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(99));
+        let pid: i32 = std::fs::read_to_string(&pid_path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while unsafe { libc::kill(pid, 0) } == 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_ne!(
+            unsafe { libc::kill(pid, 0) },
+            0,
+            "backend survived its parent"
+        );
     }
 
     #[tokio::test]

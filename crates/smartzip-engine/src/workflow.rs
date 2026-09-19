@@ -107,7 +107,12 @@ pub(crate) async fn inspect_file_with_listener<B: ArchiveExecutor>(
     let scan_root = run_policy
         .is_none_or(|p| p.values().extraction.embedded.root != smartzip_config::RootScan::Off);
     let findings = if scan_root {
-        scan_embedded_findings(&request.path, &request.scanner)
+        scan_embedded_findings(
+            &request.path,
+            &request.scanner,
+            task_context.cancellation_token(),
+        )
+        .await?
     } else {
         Vec::new()
     };
@@ -295,7 +300,12 @@ pub(crate) async fn list_archive_with_listener_interactive<B: ArchiveExecutor>(
     let scan_root = run_policy
         .is_none_or(|p| p.values().extraction.embedded.root != smartzip_config::RootScan::Off);
     let findings = if scan_root {
-        scan_embedded_findings(&request.path, &request.scanner)
+        scan_embedded_findings(
+            &request.path,
+            &request.scanner,
+            task_context.cancellation_token(),
+        )
+        .await?
     } else {
         Vec::new()
     };
@@ -423,19 +433,6 @@ pub(crate) async fn list_archive_with_listener_interactive<B: ArchiveExecutor>(
                     encoding,
                 },
             );
-        }
-        if let (Some(hash), Some(size), Some(password_id)) = (
-            resolved.sample_hash.as_deref(),
-            resolved.sample_size,
-            outcome.password_id,
-        ) {
-            recorder.upsert_known_file_extract(crate::history::KnownFileUpsert {
-                sample_hash: hash,
-                size,
-                name: resolved.recorder_name.as_deref(),
-                offset: candidate.embedded_offset.map(|o| o as i64),
-                password_id: Some(password_id),
-            });
         }
     }
 

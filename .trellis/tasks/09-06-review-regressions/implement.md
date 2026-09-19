@@ -72,3 +72,23 @@ recognition and metadata verification do not claim plaintext extraction success.
 GUI dependencies still report future incompatibilities in block 0.1.6 and
 proc-macro-error2 2.0.1 via GPUI 0.2.2; no lint suppression or vendoring was added.
 No commit, push, or remote publication is part of this repair.
+
+
+## 2026-09-08: Continue root scans after empty windows
+
+Supersedes the empty-window stop rule above; the current contract is in
+`CONTEXT.md`. A ZIP at offset 605752472 in `Downloads/1.mp4` was recorded as
+`not_found`. Root scans now continue through empty windows to EOF, preserving
+signature overlap and checked archive-end jumps. A bounded streaming signature
+prefilter replaces the first-window early return; complete carrier loading after
+a possible signature remains a memory limitation.
+
+Validation: both new regression expectations failed before the fix; scanner
+15 tests and engine 197 unit tests passed after it. Release build, formatting,
+and diff checks passed. Stateless default detect on the real MP4 found one
+high-confidence ZIP at offset 605752472, size 1336124885; the real payload was
+not extracted. A synthetic MP4 with a 128 MiB prefix and a stored ZIP was
+extracted by the real backend, with exact payload comparison and source retained.
+An earlier tiny ZIP fixture with a zero-filled prefix triggered a separate
+volume classification path and failed as unsupported-container; this repair
+makes no claim about that separate case.

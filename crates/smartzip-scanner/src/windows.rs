@@ -1,4 +1,4 @@
-//! Search windows bound the gap between archives, not the archives themselves.
+//! Search windows cover the entire input; parsers see complete archive data.
 
 use aho_corasick::AhoCorasick;
 
@@ -75,10 +75,7 @@ impl EmbeddedScanner {
                 findings.push(finding);
                 break;
             }
-            let Some(next) = next_cursor else {
-                break; // No validated finding in this search window.
-            };
-            cursor = next;
+            cursor = next_cursor.unwrap_or(window_end);
         }
         findings
     }
@@ -119,16 +116,33 @@ mod tests {
         let mut data = rar(8192);
         data.extend_from_slice(&[0; 100]);
         data.extend_from_slice(&rar(4096));
-        // A whole window with no finding terminates this scan chain.
+        // Empty windows between archives must not hide later findings.
         data.extend_from_slice(&[0; 2048]);
         data.extend_from_slice(&rar(200));
 
         let findings = scanner().scan_windows(&data, 1024);
-        assert_eq!(findings.len(), 2);
+        assert_eq!(findings.len(), 3);
         assert_eq!(findings[0].offset, 0);
         assert_eq!(findings[0].size, Some(8192));
         assert_eq!(findings[1].offset, 8292);
         assert_eq!(findings[1].size, Some(4096));
+        assert_eq!(findings[2].offset, 14436);
+        assert_eq!(findings[2].size, Some(200));
+    }
+
+    #[test]
+    fn file_scan_finds_archive_after_empty_prefix_windows() {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        let offset = crate::DEFAULT_SCAN_BYTES * 2 - 2;
+        file.seek(SeekFrom::Start(offset)).unwrap();
+        file.write_all(&rar(4096)).unwrap();
+        let findings = scanner().scan_path(file.path()).unwrap();
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].offset, offset);
+        assert_eq!(findings[0].size, Some(4096));
+        let bounded = EmbeddedScanner::new(ScannerConfig::default());
+        assert!(bounded.scan_path(file.path()).unwrap().is_empty());
     }
 
     #[test]

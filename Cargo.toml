@@ -34,6 +34,7 @@ process-wrap = { version = "9.1", features = ["tokio1"] }
 which = "8.0"
 walkdir = "2.5"
 tokio-util = "0.7"
+uuid = { version = "1", features = ["v4"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 smartzip-archive = { path = "crates/smartzip-archive" }

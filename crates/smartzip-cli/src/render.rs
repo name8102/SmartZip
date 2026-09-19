@@ -181,15 +181,15 @@ pub(super) fn render_extract_event(event: &smartzip_core::TaskEvent, verbose_rou
             eprintln!("{stage}: {action} ({reason}; {policy_key}, {source})")
         }
         smartzip_core::TaskEventKind::Progress(progress) => match progress.percent {
-            Some(percent) => println!("  {percent:>3.0}%  {}", progress.message),
-            None => println!("  {}", progress.message),
+            Some(percent) => eprintln!("  {percent:>3.0}%  {}", progress.message),
+            None => eprintln!("  {}", progress.message),
         },
         smartzip_core::TaskEventKind::EncodingDetected(detection) => {
             let encoding = match &detection.selected {
                 smartzip_core::EncodingMode::Auto => "auto",
                 smartzip_core::EncodingMode::Override(s) => s.as_str(),
             };
-            println!(
+            eprintln!(
                 "  encoding: {encoding} (confidence: {:.0}%)",
                 detection.confidence * 100.0
             );
@@ -198,7 +198,7 @@ pub(super) fn render_extract_event(event: &smartzip_core::TaskEvent, verbose_rou
             path,
             findings_count,
         } => {
-            println!(
+            eprintln!(
                 "  embedded selection required: {} ({} finding(s))",
                 path.display(),
                 findings_count
@@ -217,13 +217,13 @@ pub(super) fn render_extract_event(event: &smartzip_core::TaskEvent, verbose_rou
             );
         }
         smartzip_core::TaskEventKind::BusinessContainerSkipped { path, kind } => {
-            println!("  skipped business container {kind}: {}", path.display());
+            eprintln!("  skipped business container {kind}: {}", path.display());
         }
         smartzip_core::TaskEventKind::OutputCreated { path } => {
-            println!("  -> {}", path.display());
+            eprintln!("  -> {}", path.display());
         }
         smartzip_core::TaskEventKind::Route(route) if verbose_routing => {
-            render_route_event(route, false);
+            render_route_event(route, true);
         }
         smartzip_core::TaskEventKind::Failed { error } => eprintln!("  FAILED: {error}"),
         smartzip_core::TaskEventKind::Warning { message } => {

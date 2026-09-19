@@ -134,6 +134,21 @@ pub struct ExtractionCandidate {
     pub embedded_size: Option<u64>,
 }
 
+impl ExtractionCandidate {
+    pub fn root(path: PathBuf) -> Self {
+        let relative_path = crate::nested::archive_output_name(&path);
+        Self {
+            path,
+            relative_path,
+            depth: 0,
+            source: CandidateSource::RootInput,
+            detected_format: None,
+            embedded_offset: None,
+            embedded_size: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CandidateSource {
     RootInput,

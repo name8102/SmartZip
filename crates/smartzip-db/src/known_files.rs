@@ -1,19 +1,6 @@
-//! Persistence for the `known_files` dedup/reuse index (v3).
-//!
-//! Exactly one row per `(sample_hash, size)` (UPSERT). This is the mutable
-//! counterpart to the append-only `file_extractions` log: the log keeps every
-//! action (answering "why did this fail last time?"), while this index keeps a
-//! single up-to-date entry per physical file and serves only the matching hot
-//! path — dedup skip, confirmed-encoding reuse, and password reuse.
-//!
-//! Two write paths with different merge rules:
-//! - [`KnownFileRepository::upsert_extract`] (called after a successful
-//!   extract) writes `last_extract_at` + `password_id` and appends the
-//!   observed name/offset pair, but never touches `confirmed_encoding`.
-//! - [`KnownFileRepository::upsert_confirmed_encoding`] (called when the user
-//!   manually confirms an encoding) overwrites `confirmed_encoding` and appends
-//!   the name/offset pair, but never writes `last_extract_at` — a detect-time
-//!   guess must not register as a successful extraction.
+//! Password and confirmed-encoding hints keyed by file identity.
+//! Successful extraction and deduplication use `file_extractions` history.
+//! The legacy `last_extract_at` column is retained for database compatibility only.
 
 use crate::Result;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -70,17 +57,13 @@ impl<'a> KnownFileRepository<'a> {
             .map_err(Into::into)
     }
 
-    /// Record a successful extraction: write `last_extract_at` and (when
-    /// known) `password_id`, and append the observed name/offset pair.
-    /// Leaves `confirmed_encoding` untouched — an extract never overrides a
-    /// user-confirmed encoding.
-    pub fn upsert_extract(
+    /// Remember verified password and observed name without recording completion.
+    pub fn upsert_password_hint(
         &self,
         sample_hash: &str,
         size: i64,
         name_offset: Option<NameOffset>,
         password_id: Option<i64>,
-        last_extract_at: &str,
     ) -> Result<()> {
         let existing = self.find(sample_hash, size)?;
         let names = merge_name_offset(existing.as_ref(), name_offset);
@@ -90,14 +73,13 @@ impl<'a> KnownFileRepository<'a> {
         self.conn.execute(
             r#"
             INSERT INTO known_files(
-                sample_hash, size, names_offsets_json, password_id, last_extract_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5)
+                sample_hash, size, names_offsets_json, password_id
+            ) VALUES (?1, ?2, ?3, ?4)
             ON CONFLICT(sample_hash, size) DO UPDATE SET
                 names_offsets_json = excluded.names_offsets_json,
-                password_id = COALESCE(excluded.password_id, known_files.password_id),
-                last_extract_at = excluded.last_extract_at
+                password_id = COALESCE(excluded.password_id, known_files.password_id)
             "#,
-            params![sample_hash, size, names_json, password_id, last_extract_at],
+            params![sample_hash, size, names_json, password_id],
         )?;
         Ok(())
     }
@@ -127,28 +109,6 @@ impl<'a> KnownFileRepository<'a> {
             params![sample_hash, size, names_json, confirmed_encoding],
         )?;
         Ok(())
-    }
-
-    /// Whether this file counts as a dedup hit: it was extracted before
-    /// (`last_extract_at` non-null) and that time is at or after
-    /// `window_start` (an ISO-8601 lower bound the caller computes from the
-    /// configured window). Comparison is lexicographic, which is correct for
-    /// zero-padded UTC ISO-8601.
-    pub fn dedup_hit(&self, sample_hash: &str, size: i64, window_start: &str) -> Result<bool> {
-        let hit: Option<i64> = self
-            .conn
-            .query_row(
-                r#"
-                SELECT 1 FROM known_files
-                WHERE sample_hash = ?1 AND size = ?2
-                  AND last_extract_at IS NOT NULL
-                  AND last_extract_at >= ?3
-                "#,
-                params![sample_hash, size, window_start],
-                |row| row.get(0),
-            )
-            .optional()?;
-        Ok(hit.is_some())
     }
 }
 
@@ -205,26 +165,14 @@ mod tests {
     }
 
     #[test]
-    fn upsert_extract_creates_then_appends_names() {
+    fn upsert_password_hint_creates_then_appends_names() {
         let db = SmartZipDb::in_memory().unwrap();
         let pw = seed_password(&db, "pw-1");
         let repo = KnownFileRepository::new(db.connection());
-        repo.upsert_extract(
-            "h",
-            100,
-            Some(no("a.zip", None)),
-            Some(pw),
-            "2026-07-02T00:00:00Z",
-        )
-        .unwrap();
-        repo.upsert_extract(
-            "h",
-            100,
-            Some(no("inner", Some(2048))),
-            None,
-            "2026-07-03T00:00:00Z",
-        )
-        .unwrap();
+        repo.upsert_password_hint("h", 100, Some(no("a.zip", None)), Some(pw))
+            .unwrap();
+        repo.upsert_password_hint("h", 100, Some(no("inner", Some(2048))), None)
+            .unwrap();
 
         let got = repo.find("h", 100).unwrap().unwrap();
         assert_eq!(
@@ -233,16 +181,16 @@ mod tests {
         );
         // password_id is preserved from the first write via COALESCE.
         assert_eq!(got.password_id, Some(1));
-        assert_eq!(got.last_extract_at.as_deref(), Some("2026-07-03T00:00:00Z"));
+        assert!(got.last_extract_at.is_none());
     }
 
     #[test]
     fn duplicate_name_offset_not_appended_twice() {
         let db = SmartZipDb::in_memory().unwrap();
         let repo = KnownFileRepository::new(db.connection());
-        repo.upsert_extract("h", 1, Some(no("a", None)), None, "2026-07-02T00:00:00Z")
+        repo.upsert_password_hint("h", 1, Some(no("a", None)), None)
             .unwrap();
-        repo.upsert_extract("h", 1, Some(no("a", None)), None, "2026-07-02T00:00:01Z")
+        repo.upsert_password_hint("h", 1, Some(no("a", None)), None)
             .unwrap();
         let got = repo.find("h", 1).unwrap().unwrap();
         assert_eq!(got.names_offsets.len(), 1);
@@ -255,11 +203,10 @@ mod tests {
         let repo = KnownFileRepository::new(db.connection());
         repo.upsert_confirmed_encoding("h", 1, Some(no("a", None)), "gb18030")
             .unwrap();
-        repo.upsert_extract("h", 1, None, Some(pw), "2026-07-02T00:00:00Z")
-            .unwrap();
+        repo.upsert_password_hint("h", 1, None, Some(pw)).unwrap();
         let got = repo.find("h", 1).unwrap().unwrap();
         assert_eq!(got.confirmed_encoding.as_deref(), Some("gb18030"));
-        assert_eq!(got.last_extract_at.as_deref(), Some("2026-07-02T00:00:00Z"));
+        assert!(got.last_extract_at.is_none());
         assert_eq!(got.password_id, Some(pw));
     }
 
@@ -281,26 +228,5 @@ mod tests {
         repo.upsert_confirmed_encoding("h", 1, None, "gbk").unwrap();
         let got = repo.find("h", 1).unwrap().unwrap();
         assert!(got.last_extract_at.is_none());
-    }
-
-    #[test]
-    fn dedup_hit_respects_window() {
-        let db = SmartZipDb::in_memory().unwrap();
-        let repo = KnownFileRepository::new(db.connection());
-        repo.upsert_extract("h", 1, None, None, "2026-06-15T00:00:00Z")
-            .unwrap();
-        // Window starting 2026-06-01: the extract is inside → hit.
-        assert!(repo.dedup_hit("h", 1, "2026-06-01T00:00:00Z").unwrap());
-        // Window starting 2026-07-01: the extract is older → miss.
-        assert!(!repo.dedup_hit("h", 1, "2026-07-01T00:00:00Z").unwrap());
-    }
-
-    #[test]
-    fn dedup_miss_when_only_encoding_confirmed() {
-        let db = SmartZipDb::in_memory().unwrap();
-        let repo = KnownFileRepository::new(db.connection());
-        // Confirmed encoding but never extracted → not a dedup hit.
-        repo.upsert_confirmed_encoding("h", 1, None, "gbk").unwrap();
-        assert!(!repo.dedup_hit("h", 1, "2000-01-01T00:00:00Z").unwrap());
     }
 }

@@ -237,12 +237,10 @@ impl<'a> PasswordService<'a> {
         &self,
         candidate: &PasswordCandidate,
     ) -> smartzip_db::Result<Option<i64>> {
-        // A successful listing does not authenticate encrypted file contents.
-        if self.policy.is_some() {
-            Ok(candidate.id)
-        } else {
-            self.record_success(candidate)
-        }
+        // Directory access cannot authenticate file contents, including when
+        // the supplied candidate was already present in the password database.
+        let _ = candidate;
+        Ok(None)
     }
 
     pub fn record_success(

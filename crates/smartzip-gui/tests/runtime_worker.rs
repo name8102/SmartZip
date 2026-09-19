@@ -8,6 +8,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+fn spawn_job(request: JobRequest) -> Result<JobHandle, String> {
+    spawn_job_at(request, 0)
+}
+
 fn config() -> smartzip_config::ResolvedConfig {
     let mut config = smartzip_config::ResolvedConfig::load(None).unwrap();
     config

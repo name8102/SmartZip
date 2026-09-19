@@ -157,3 +157,54 @@ async fn unsafe_member_path_is_rejected_before_backend() {
         Err(smartzip_core::SmartZipError::UnsafeArchivePath { .. })
     ));
 }
+
+#[tokio::test]
+async fn leading_dot_member_selector_is_preserved_for_zip_and_tar() {
+    let Some(seven) = seven_zip() else { return };
+    let root = tempfile::tempdir().unwrap();
+    let zip = root.path().join("dot.zip");
+    {
+        use std::io::Write;
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(&zip).unwrap());
+        writer
+            .start_file(
+                "./folder/file.txt",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        writer.write_all(b"exact member contents").unwrap();
+        writer.finish().unwrap();
+    }
+    let tar = root.path().join("dot.tar");
+    // Construct a minimal POSIX TAR with an exact './' member name.
+    let mut header = [0u8; 512];
+    let name = b"./folder/file.txt";
+    header[..name.len()].copy_from_slice(name);
+    header[100..108].copy_from_slice(b"0000644\0");
+    header[124..136].copy_from_slice(b"00000000025\0");
+    header[148..156].fill(b' ');
+    header[156] = b'0';
+    header[257..263].copy_from_slice(b"ustar\0");
+    header[263..265].copy_from_slice(b"00");
+    let sum: u64 = header.iter().map(|b| *b as u64).sum();
+    header[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+    let mut bytes = header.to_vec();
+    bytes.extend_from_slice(b"exact member contents");
+    bytes.resize(2048, 0);
+    std::fs::write(&tar, bytes).unwrap();
+    let router = BackendRouter::from_adapters(vec![AdapterRegistration::from_adapter(
+        SevenZipBackend::new(seven).with_id("dot"),
+        10,
+    )]);
+    for archive in [zip, tar] {
+        let bytes = router
+            .read_member(
+                "dot",
+                request(&archive, "./folder/file.txt", None, 1024),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bytes, b"exact member contents");
+    }
+}

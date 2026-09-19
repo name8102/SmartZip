@@ -1,7 +1,10 @@
 //! Recursive extraction workflow implementation.
 
 use smartzip_archive::{ArchiveExecutor, ExtractArchiveRequest, NativeZipBackend};
-use smartzip_core::{ArchiveFacts, ArchiveFormat, EncodingMode, TaskEvent, TaskEventKind, TaskId};
+use smartzip_core::{
+    ArchiveFacts, ArchiveFormat, AttemptId, DecisionId, EncodingMode, NodeId, TaskEvent,
+    TaskEventKind, TaskId,
+};
 use smartzip_passwords::{PasswordCandidate, PasswordService};
 use smartzip_scanner::{Confidence, EmbeddedArchiveFinding, EmbeddedScanner};
 use std::collections::{HashSet, VecDeque};
@@ -15,12 +18,13 @@ use crate::interactive::{
     EmbeddedSelectionChoice, InteractiveEmbeddedPrompter, InteractiveEncodingPrompter,
     InteractiveOutputPrompter, InteractivePasswordPrompter,
 };
-use crate::materialize::{self, CommitPolicy, MaterializeRequest, OutputMaterializer};
+use crate::materialize::{
+    self, CollisionAction, CommitPolicy, MaterializeRequest, OutputMaterializer,
+};
 use crate::nested::{
-    archive_output_name, archive_stem, candidate_key, candidate_output_relative_path,
-    discover_nested_candidates, make_collision_resolver, output_dir_for_candidate,
-    output_relative_path_for, record_skip, recyclable_nested_archive_path, recycle_archive,
-    root_embedded_candidates,
+    archive_stem, candidate_key, candidate_output_relative_path, discover_nested_candidates,
+    output_dir_for_candidate, output_relative_path_for, record_skip,
+    recyclable_nested_archive_path, recycle_archive, root_embedded_candidates,
 };
 use crate::password_order::password_source_label;
 use crate::policy::{
@@ -33,30 +37,62 @@ use crate::types::{
 };
 use crate::volumes::VolumeResolver;
 
+struct ExecutionNode {
+    id: NodeId,
+    root_id: NodeId,
+    generation: u64,
+    candidate: ExtractionCandidate,
+}
+
+struct StageLeaseGuard<'a> {
+    execution: Option<&'a dyn crate::ExecutionStateRecorder>,
+    task_id: TaskId,
+    node_id: NodeId,
+}
+
+impl Drop for StageLeaseGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(execution) = self.execution {
+            execution.release_stage(&self.task_id, &self.node_id);
+        }
+    }
+}
+
+fn record_failure(
+    failed_count: &mut usize,
+    config: Option<&smartzip_config::SmartZipConfig>,
+    cancellation: &crate::TaskCancellation,
+) {
+    *failed_count += 1;
+    if config.is_some_and(|config| config.extraction.on_error == smartzip_config::OnError::Stop) {
+        cancellation.stop_on_error();
+    }
+}
+
 /// Override how successfully processed nested archives are recycled.
 ///
 /// This is primarily useful for deterministic tests and platform hosts
 /// that provide their own recycle-bin integration.
-
 pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecutor>(
     engine_scanner: &EmbeddedScanner,
     run_policy: Option<&crate::CompiledRunPolicy>,
     min_embedded_size_bytes: u64,
     archive_recycler: &ArchiveRecycleHandler,
-    cancellation: tokio_util::sync::CancellationToken,
+    cancellation: crate::TaskCancellation,
     backend: &B,
     passwords: &PasswordService<'_>,
-    mut request: ExtractWorkflowRequest,
+    request: ExtractWorkflowRequest,
     password_prompter: Option<&dyn InteractivePasswordPrompter>,
     output_prompter: Option<&dyn InteractiveOutputPrompter>,
     embedded_prompter: Option<&dyn InteractiveEmbeddedPrompter>,
     encoding_prompter: Option<&dyn InteractiveEncodingPrompter>,
     listener: Option<TaskEventListener>,
     history: Option<&dyn crate::history::TaskHistoryRecorder>,
+    execution: Option<&dyn crate::ExecutionStateRecorder>,
+    identity: crate::ExtractTaskIdentity,
+    batch_passwords: std::rc::Rc<std::cell::RefCell<Vec<PasswordCandidate>>>,
+    task_budget: std::sync::Arc<crate::budget::TaskBudget>,
 ) -> smartzip_core::Result<ExtractWorkflowResult> {
-    if let Some(policy) = run_policy {
-        policy.apply_request(&mut request);
-    }
     let config = run_policy.map(crate::CompiledRunPolicy::values);
     let may_prompt =
         config.is_none_or(|c| c.interaction.mode != smartzip_config::InteractionMode::Never);
@@ -86,12 +122,13 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
     } else {
         archive_recycler
     };
-    let task_id = TaskId::new();
+    let task_id = identity.task_id;
+    let legacy_history = if execution.is_none() { history } else { None };
     let events = EventSink::new(listener);
     let task_context = backend.begin_task_with_cancellation(
         task_id.clone(),
         std::sync::Arc::new(events.clone()),
-        cancellation.child_token(),
+        cancellation.token().child_token(),
     );
     let nested_scanner = if request.scanner == *engine_scanner.config() {
         None
@@ -126,16 +163,22 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
     );
     let mut embedded_extract_all = false;
 
-    for input in &request.inputs {
-        let relative_path = archive_output_name(input);
-        queue.push_back(ExtractionCandidate {
-            detected_format: None,
-            path: input.clone(),
-            relative_path,
-            depth: 0,
-            source: CandidateSource::RootInput,
-            embedded_offset: None,
-            embedded_size: None,
+    if identity.roots.len() != request.inputs.len() {
+        return Err(smartzip_core::SmartZipError::ResourceLimit {
+            detail: "task root identity count does not match input count".into(),
+        });
+    }
+    for (input, root) in request.inputs.iter().zip(identity.roots) {
+        if root.candidate.path != *input {
+            return Err(smartzip_core::SmartZipError::ResourceLimit {
+                detail: "task root identity does not match its input".into(),
+            });
+        }
+        queue.push_back(ExecutionNode {
+            id: root.node_id,
+            root_id: root.root_id,
+            generation: root.generation,
+            candidate: root.candidate,
         });
     }
     // C6: Cache password candidates once before the extraction loop.
@@ -146,33 +189,25 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
             exit_code: None,
             stderr: error.to_string(),
         })?;
-    // Passwords entered interactively and accepted during this invocation.
-    // Keep them in-memory as well as in SQLite so later files in the same
-    // batch can use them without rebuilding the task-wide DB snapshot.
-    let mut batch_passwords: Vec<PasswordCandidate> = Vec::new();
-
-    let collision_resolver = output_prompter.map(|p| make_collision_resolver(p));
-
     // History: register the task up-front and accumulate metrics as the
     // loop runs. All history writes are best-effort — a repo error becomes
     // a Warning event through the recorder and never aborts extraction.
-    if let Some(recorder) = history {
+    if let Some(recorder) = legacy_history {
         recorder.start_extract(&task_id, Some(&request.output_dir));
     }
     let mut completion = crate::history::CompletionGuard::new(
-        history,
+        legacy_history,
         task_id.clone(),
         events.clone(),
-        cancellation.clone(),
+        cancellation.user_token(),
     );
     let mut failed_count = 0usize;
     let mut was_cancelled = false;
-    let mut committed_usage = crate::budget::Usage::default();
     let mut volume_resolver = VolumeResolver::new();
     let mut processed_volume_keys = HashSet::new();
     let mut consumed_volume_members = HashSet::new();
 
-    loop {
+    'nodes: loop {
         if failed_count > 0
             && config.is_some_and(|c| c.extraction.on_error == smartzip_config::OnError::Stop)
         {
@@ -189,15 +224,47 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
             break;
         }
         if cancellation.is_cancelled() {
-            was_cancelled = true;
+            was_cancelled = cancellation.is_user_cancelled();
             break;
         }
         if task_context.is_cancelled() {
+            was_cancelled = cancellation.is_user_cancelled();
             break;
         }
-        let Some(mut candidate) = queue.pop_front() else {
+        let Some(node) = queue.pop_front() else {
             break;
         };
+        let _stage_lease = StageLeaseGuard {
+            execution,
+            task_id: task_id.clone(),
+            node_id: node.id.clone(),
+        };
+        let mut candidate = node.candidate;
+        let attempt_id = AttemptId::new();
+        if !enter_stage(
+            execution,
+            &task_id,
+            &node.id,
+            node.generation,
+            "ready",
+            crate::coordinator::Stage::ResolveInputs,
+            Some(&attempt_id),
+            &cancellation,
+        )
+        .await?
+        {
+            was_cancelled |= cancellation.is_user_cancelled();
+            finish_interrupted_node(
+                execution,
+                &task_id,
+                &node.id,
+                node.generation,
+                &cancellation,
+            )
+            .await?;
+            skipped.push(candidate);
+            break 'nodes;
+        }
         let original_input_path = candidate.path.clone();
         let key = candidate_key(&candidate);
         let is_new = seen.insert(key);
@@ -205,12 +272,34 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
         // row (duplicate within this run / over recursion limit / a non-first
         // volume of a split set).
         if !is_new {
-            record_skip(history, &task_id, &candidate, "duplicate");
+            record_skip(legacy_history, &task_id, &candidate, "duplicate");
+            finish_execution(
+                execution,
+                &task_id,
+                &node.id,
+                node.generation,
+                "skipped",
+                Some("duplicate"),
+                None,
+                false,
+            )
+            .await?;
             skipped.push(candidate);
             continue;
         }
         if candidate.depth > request.recursion_limit {
-            record_skip(history, &task_id, &candidate, "recursion_limit");
+            record_skip(legacy_history, &task_id, &candidate, "recursion_limit");
+            finish_execution(
+                execution,
+                &task_id,
+                &node.id,
+                node.generation,
+                "skipped",
+                Some("recursion_limit"),
+                None,
+                false,
+            )
+            .await?;
             skipped.push(candidate);
             continue;
         }
@@ -219,7 +308,18 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
         if candidate.source != CandidateSource::EmbeddedFinding
             && consumed_volume_members.contains(&absolute_input)
         {
-            record_skip(history, &task_id, &candidate, "duplicate");
+            record_skip(legacy_history, &task_id, &candidate, "duplicate");
+            finish_execution(
+                execution,
+                &task_id,
+                &node.id,
+                node.generation,
+                "skipped",
+                Some("duplicate"),
+                None,
+                false,
+            )
+            .await?;
             skipped.push(candidate);
             continue;
         }
@@ -236,6 +336,19 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
             if let Some(set) = resolution.resolved_set() {
                 let key = volume_set_key(set);
                 if processed_volume_keys.contains(&key) {
+                    record_skip(legacy_history, &task_id, &candidate, "duplicate");
+                    finish_execution(
+                        execution,
+                        &task_id,
+                        &node.id,
+                        node.generation,
+                        "skipped",
+                        Some("duplicate"),
+                        None,
+                        false,
+                    )
+                    .await?;
+                    skipped.push(candidate);
                     continue;
                 }
                 processed_volume_keys.insert(key);
@@ -278,7 +391,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                 candidate: failed,
                 problem,
             } => {
-                failed_count += 1;
+                record_failure(&mut failed_count, config, &cancellation);
                 events.push(TaskEvent {
                     task_id: task_id.clone(),
                     kind: TaskEventKind::Failed {
@@ -289,7 +402,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                         ),
                     },
                 });
-                if let Some(recorder) = history {
+                if let Some(recorder) = legacy_history {
                     recorder.record_file_extraction(
                         &task_id,
                         crate::history::FileExtractionRow::failed(
@@ -299,6 +412,17 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                         ),
                     );
                 }
+                finish_execution(
+                    execution,
+                    &task_id,
+                    &node.id,
+                    node.generation,
+                    "failed",
+                    Some("incomplete_volume"),
+                    None,
+                    false,
+                )
+                .await?;
                 skipped.push(failed);
                 continue;
             }
@@ -306,7 +430,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                 candidate: failed,
                 hypotheses,
             } => {
-                failed_count += 1;
+                record_failure(&mut failed_count, config, &cancellation);
                 events.push(TaskEvent {
                     task_id: task_id.clone(),
                     kind: TaskEventKind::Failed {
@@ -317,7 +441,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                         ),
                     },
                 });
-                if let Some(recorder) = history {
+                if let Some(recorder) = legacy_history {
                     recorder.record_file_extraction(
                         &task_id,
                         crate::history::FileExtractionRow::failed(
@@ -327,6 +451,17 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                         ),
                     );
                 }
+                finish_execution(
+                    execution,
+                    &task_id,
+                    &node.id,
+                    node.generation,
+                    "failed",
+                    Some("grouping_ambiguous"),
+                    None,
+                    false,
+                )
+                .await?;
                 skipped.push(failed);
                 continue;
             }
@@ -334,7 +469,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                 candidate: failed,
                 error,
             } => {
-                failed_count += 1;
+                record_failure(&mut failed_count, config, &cancellation);
                 events.push(TaskEvent {
                     task_id: task_id.clone(),
                     kind: TaskEventKind::Failed {
@@ -344,7 +479,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                         ),
                     },
                 });
-                if let Some(recorder) = history {
+                if let Some(recorder) = legacy_history {
                     recorder.record_file_extraction(
                         &task_id,
                         crate::history::FileExtractionRow::failed(
@@ -354,6 +489,17 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                         ),
                     );
                 }
+                finish_execution(
+                    execution,
+                    &task_id,
+                    &node.id,
+                    node.generation,
+                    "failed",
+                    Some("materialize_failed"),
+                    None,
+                    false,
+                )
+                .await?;
                 skipped.push(failed);
                 continue;
             }
@@ -374,8 +520,19 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
             let mut file = match std::fs::File::open(&candidate.path) {
                 Ok(f) => f,
                 Err(_) => {
-                    failed_count += 1;
-                    record_skip(history, &task_id, &candidate, "not_found");
+                    record_failure(&mut failed_count, config, &cancellation);
+                    record_skip(legacy_history, &task_id, &candidate, "not_found");
+                    finish_execution(
+                        execution,
+                        &task_id,
+                        &node.id,
+                        node.generation,
+                        "failed",
+                        Some("not_found"),
+                        None,
+                        false,
+                    )
+                    .await?;
                     skipped.push(candidate);
                     continue;
                 }
@@ -421,7 +578,45 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                 },
             });
             let selection = if let Some(prompter) = embedded_prompter {
-                Some(prompter.prompt(&candidate.path, &decision).await)
+                let decision_id = begin_decision(
+                    execution,
+                    &task_id,
+                    &node.id,
+                    node.generation,
+                    crate::coordinator::Stage::ResolveInputs,
+                    "embedded_selection",
+                    &candidate.path.display().to_string(),
+                )
+                .await?;
+                let selection = tokio::select! {
+                    _ = cancellation.cancelled() => None,
+                    value = prompter.prompt(&candidate.path, &decision) => Some(value),
+                };
+                if !finish_decision(
+                    execution,
+                    &task_id,
+                    &node.id,
+                    node.generation,
+                    crate::coordinator::Stage::ResolveInputs,
+                    &decision_id,
+                    &cancellation,
+                )
+                .await?
+                    || cancellation.is_cancelled()
+                {
+                    was_cancelled |= cancellation.is_user_cancelled();
+                    finish_interrupted_node(
+                        execution,
+                        &task_id,
+                        &node.id,
+                        node.generation,
+                        &cancellation,
+                    )
+                    .await?;
+                    skipped.push(candidate);
+                    break 'nodes;
+                }
+                selection
             } else {
                 None
             };
@@ -429,7 +624,18 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                 Some(EmbeddedSelectionChoice::Extract) => {}
                 Some(EmbeddedSelectionChoice::ExtractAll) => embedded_extract_all = true,
                 Some(EmbeddedSelectionChoice::Skip) | None => {
-                    record_skip(history, &task_id, &candidate, "not_found");
+                    record_skip(legacy_history, &task_id, &candidate, "not_found");
+                    finish_execution(
+                        execution,
+                        &task_id,
+                        &node.id,
+                        node.generation,
+                        "skipped",
+                        Some("not_found"),
+                        None,
+                        false,
+                    )
+                    .await?;
                     skipped.push(candidate);
                     continue;
                 }
@@ -458,6 +664,30 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                 embedded_policy.mode,
                 smartzip_core::EmbeddedScanMode::All | smartzip_core::EmbeddedScanMode::Aggressive
             );
+        if !enter_stage(
+            execution,
+            &task_id,
+            &node.id,
+            node.generation,
+            "running",
+            crate::coordinator::Stage::ScanEmbedded,
+            Some(&attempt_id),
+            &cancellation,
+        )
+        .await?
+        {
+            was_cancelled |= cancellation.is_user_cancelled();
+            finish_interrupted_node(
+                execution,
+                &task_id,
+                &node.id,
+                node.generation,
+                &cancellation,
+            )
+            .await?;
+            skipped.push(candidate);
+            break 'nodes;
+        }
         let findings: Vec<_> = if volume_set_for_candidate.is_none()
             && (candidate.source == CandidateSource::RootInput || !header_archive || explicit_scan)
             && should_scan_candidate_for_embedded(
@@ -480,9 +710,30 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                     },
                 });
             }
-            scan_with
-                .scan_path(&candidate.path)
-                .unwrap_or_default()
+            let scan = crate::access::scan_file(
+                &candidate.path,
+                scan_with.config().clone(),
+                cancellation.token().clone(),
+            )
+            .await;
+            let findings = match scan {
+                Ok(findings) => findings,
+                Err(smartzip_core::SmartZipError::Cancelled) if cancellation.is_cancelled() => {
+                    was_cancelled |= cancellation.is_user_cancelled();
+                    finish_interrupted_node(
+                        execution,
+                        &task_id,
+                        &node.id,
+                        node.generation,
+                        &cancellation,
+                    )
+                    .await?;
+                    skipped.push(candidate);
+                    break 'nodes;
+                }
+                Err(error) => return Err(error),
+            };
+            findings
                 .into_iter()
                 .filter(|finding| {
                     candidate.source == CandidateSource::RootInput
@@ -506,6 +757,26 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
         };
         if !root_findings.is_empty() {
             for embedded_candidate in root_findings {
+                if !task_budget.reserve_nested(request.limits.max_nested_candidates) {
+                    record_failure(&mut failed_count, config, &cancellation);
+                    events.push(TaskEvent::failed(
+                        task_id.clone(),
+                        &crate::budget::exceeded("nested candidate limit exceeded"),
+                    ));
+                    finish_execution(
+                        execution,
+                        &task_id,
+                        &node.id,
+                        node.generation,
+                        "failed",
+                        Some("nested_candidate_limit"),
+                        None,
+                        false,
+                    )
+                    .await?;
+                    skipped.push(candidate);
+                    break 'nodes;
+                }
                 if let (Some(offset), Some(format)) = (
                     embedded_candidate.embedded_offset,
                     embedded_candidate.detected_format.clone(),
@@ -521,9 +792,42 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                         },
                     });
                 }
-                enqueued.push(embedded_candidate.clone());
-                queue.push_back(embedded_candidate);
+                let child_id = NodeId::new();
+                let inserted = if let Some(execution) = execution {
+                    execution
+                        .enqueue_child(
+                            &task_id,
+                            &child_id,
+                            &node.id,
+                            &node.root_id,
+                            &embedded_candidate,
+                            0,
+                        )
+                        .await?
+                        || cancellation.is_cancelled()
+                } else {
+                    true
+                };
+                if inserted {
+                    enqueued.push(embedded_candidate.clone());
+                    queue.push_back(ExecutionNode {
+                        id: child_id,
+                        root_id: node.root_id.clone(),
+                        generation: 0,
+                        candidate: embedded_candidate,
+                    });
+                } else {
+                    task_budget.release_nested();
+                }
             }
+            finish_execution_outcome(
+                execution,
+                &task_id,
+                &node.id,
+                node.generation,
+                crate::NodeOutcome::terminal("skipped", Some("expanded_to_embedded"), None, false),
+            )
+            .await?;
             continue;
         }
 
@@ -577,7 +881,45 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                     let selection = if embedded_extract_all {
                         Some(EmbeddedSelectionChoice::Extract)
                     } else if let Some(prompter) = embedded_prompter {
-                        Some(prompter.prompt(&candidate.path, &decision).await)
+                        let decision_id = begin_decision(
+                            execution,
+                            &task_id,
+                            &node.id,
+                            node.generation,
+                            crate::coordinator::Stage::ScanEmbedded,
+                            "embedded_selection",
+                            &candidate.path.display().to_string(),
+                        )
+                        .await?;
+                        let selection = tokio::select! {
+                            _ = cancellation.cancelled() => None,
+                            value = prompter.prompt(&candidate.path, &decision) => Some(value),
+                        };
+                        if !finish_decision(
+                            execution,
+                            &task_id,
+                            &node.id,
+                            node.generation,
+                            crate::coordinator::Stage::ScanEmbedded,
+                            &decision_id,
+                            &cancellation,
+                        )
+                        .await?
+                            || cancellation.is_cancelled()
+                        {
+                            was_cancelled |= cancellation.is_user_cancelled();
+                            finish_interrupted_node(
+                                execution,
+                                &task_id,
+                                &node.id,
+                                node.generation,
+                                &cancellation,
+                            )
+                            .await?;
+                            skipped.push(candidate);
+                            break 'nodes;
+                        }
+                        selection
                     } else {
                         None
                     };
@@ -620,20 +962,53 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                                 }
                             }
                             EmbeddedSelectionChoice::Skip => {
-                                record_skip(history, &task_id, &candidate, "not_found");
+                                record_skip(legacy_history, &task_id, &candidate, "not_found");
+                                finish_execution(
+                                    execution,
+                                    &task_id,
+                                    &node.id,
+                                    node.generation,
+                                    "skipped",
+                                    Some("not_found"),
+                                    None,
+                                    false,
+                                )
+                                .await?;
                                 skipped.push(candidate);
                                 continue;
                             }
                         },
                         None => {
-                            record_skip(history, &task_id, &candidate, "not_found");
+                            record_skip(legacy_history, &task_id, &candidate, "not_found");
+                            finish_execution(
+                                execution,
+                                &task_id,
+                                &node.id,
+                                node.generation,
+                                "skipped",
+                                Some("not_found"),
+                                None,
+                                false,
+                            )
+                            .await?;
                             skipped.push(candidate);
                             continue;
                         }
                     }
                 }
                 _ => {
-                    record_skip(history, &task_id, &candidate, "not_found");
+                    record_skip(legacy_history, &task_id, &candidate, "not_found");
+                    finish_execution(
+                        execution,
+                        &task_id,
+                        &node.id,
+                        node.generation,
+                        "skipped",
+                        Some("not_found"),
+                        None,
+                        false,
+                    )
+                    .await?;
                     skipped.push(candidate);
                     continue;
                 }
@@ -651,7 +1026,15 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
         }
 
         if candidate.detected_format.is_none() {
-            record_skip(history, &task_id, &candidate, "not_found");
+            record_skip(legacy_history, &task_id, &candidate, "not_found");
+            finish_execution_outcome(
+                execution,
+                &task_id,
+                &node.id,
+                node.generation,
+                crate::NodeOutcome::terminal("skipped", Some("not_found"), None, false),
+            )
+            .await?;
             skipped.push(candidate);
             continue;
         }
@@ -671,13 +1054,50 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                         kind: format!("{kind:?}"),
                     },
                 });
-                record_skip(history, &task_id, &candidate, "business_container");
+                record_skip(legacy_history, &task_id, &candidate, "business_container");
+                finish_execution_outcome(
+                    execution,
+                    &task_id,
+                    &node.id,
+                    node.generation,
+                    crate::NodeOutcome::terminal(
+                        "skipped",
+                        Some("business_container"),
+                        None,
+                        false,
+                    ),
+                )
+                .await?;
                 skipped.push(candidate);
                 continue;
             }
         }
 
         // Preparation owns carved/canonical input guards and returns facts only.
+        if !enter_stage(
+            execution,
+            &task_id,
+            &node.id,
+            node.generation,
+            "running",
+            crate::coordinator::Stage::PrepareAccess,
+            Some(&attempt_id),
+            &cancellation,
+        )
+        .await?
+        {
+            was_cancelled |= cancellation.is_user_cancelled();
+            finish_interrupted_node(
+                execution,
+                &task_id,
+                &node.id,
+                node.generation,
+                &cancellation,
+            )
+            .await?;
+            skipped.push(candidate);
+            break 'nodes;
+        }
         let prepared = match prepare_resolved_archive(
             &candidate,
             volume_archive_path.zip(volume_materialized),
@@ -689,9 +1109,22 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
         {
             Ok(prepared) => prepared,
             Err(error) => {
-                failed_count += 1;
+                record_failure(&mut failed_count, config, &cancellation);
                 events.push(TaskEvent::failed(task_id.clone(), &error));
-                record_skip(history, &task_id, &candidate, &error.to_string());
+                record_skip(legacy_history, &task_id, &candidate, &error.to_string());
+                finish_execution_outcome(
+                    execution,
+                    &task_id,
+                    &node.id,
+                    node.generation,
+                    crate::NodeOutcome::terminal(
+                        "failed",
+                        Some("prepare_access_failed"),
+                        None,
+                        false,
+                    ),
+                )
+                .await?;
                 skipped.push(candidate);
                 continue;
             }
@@ -704,6 +1137,37 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
         let reused_confirmed_encoding = prepared.reused_confirmed_encoding;
         let zip_encoding_assessment = &prepared.zip_encoding_assessment;
 
+        if !request.force
+            && config.is_some_and(|c| c.extraction.reuse.skip_completed)
+            && history
+                .zip(sample_hash.as_deref())
+                .zip(sample_size)
+                .is_some_and(|((h, hash), size)| h.was_extracted(hash, size))
+        {
+            record_skip(legacy_history, &task_id, &candidate, "already_extracted");
+            events.push(TaskEvent {
+                task_id: task_id.clone(),
+                kind: TaskEventKind::Decision {
+                    stage: "reuse".into(),
+                    action: "skip".into(),
+                    reason: "already_extracted".into(),
+                    policy_key: "extraction.reuse.skip_completed".into(),
+                    source: "history".into(),
+                    detail: Some(candidate.path.display().to_string()),
+                },
+            });
+            finish_execution_outcome(
+                execution,
+                &task_id,
+                &node.id,
+                node.generation,
+                crate::NodeOutcome::terminal("skipped", Some("already_extracted"), None, false),
+            )
+            .await?;
+            skipped.push(candidate);
+            continue;
+        }
+
         // Password try order: command-line/manual > exact known-file hit >
         // passwords accepted earlier in this batch > empty/database
         // fallback. Values are deduplicated while preserving that order.
@@ -711,11 +1175,14 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
             .as_ref()
             .and_then(|h| h.password_id)
             .and_then(|id| passwords.candidate_by_id(id).ok().flatten());
-        let candidate_passwords = passwords.order_candidates(
-            &password_candidates,
-            known_password.as_ref(),
-            &batch_passwords,
-        );
+        let candidate_passwords = {
+            let batch_passwords = batch_passwords.borrow();
+            passwords.order_candidates(
+                &password_candidates,
+                known_password.as_ref(),
+                &batch_passwords,
+            )
+        };
 
         if candidate.source == CandidateSource::RootInput {
             root_input_started += 1;
@@ -773,10 +1240,80 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
         let mut candidate_has_password = false;
         let mut candidate_encoding_used: Option<String> = None;
         // Resolve encoding once per node. A deliberate skip is a node outcome.
+        if !enter_stage(
+            execution,
+            &task_id,
+            &node.id,
+            node.generation,
+            "running",
+            crate::coordinator::Stage::AnalyzeEncoding,
+            Some(&attempt_id),
+            &cancellation,
+        )
+        .await?
+        {
+            was_cancelled |= cancellation.is_user_cancelled();
+            finish_interrupted_node(
+                execution,
+                &task_id,
+                &node.id,
+                node.generation,
+                &cancellation,
+            )
+            .await?;
+            skipped.push(candidate);
+            break 'nodes;
+        }
+        let encoding_decision = if zip_encoding_assessment
+            .as_ref()
+            .is_some_and(|assessment| assessment.should_confirm)
+            && encoding_prompter.is_some()
+        {
+            Some(
+                begin_decision(
+                    execution,
+                    &task_id,
+                    &node.id,
+                    node.generation,
+                    crate::coordinator::Stage::AnalyzeEncoding,
+                    "encoding",
+                    &candidate.path.display().to_string(),
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
         let encoding_choice = tokio::select! {
             _ = cancellation.cancelled() => { None }
             result = resolve_encoding_mode(&archive_path, candidate_encoding_mode.clone(), zip_encoding_assessment.as_ref(), encoding_prompter) => result?,
         };
+        if let Some(decision_id) = encoding_decision {
+            if !finish_decision(
+                execution,
+                &task_id,
+                &node.id,
+                node.generation,
+                crate::coordinator::Stage::AnalyzeEncoding,
+                &decision_id,
+                &cancellation,
+            )
+            .await?
+                || cancellation.is_cancelled()
+            {
+                was_cancelled |= cancellation.is_user_cancelled();
+                finish_interrupted_node(
+                    execution,
+                    &task_id,
+                    &node.id,
+                    node.generation,
+                    &cancellation,
+                )
+                .await?;
+                skipped.push(candidate);
+                break 'nodes;
+            }
+        }
         let mut skip_reason = "target_exists";
         if encoding_choice.is_none() {
             terminal_skip = true;
@@ -785,20 +1322,78 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
         let total_attempts = candidate_passwords.len();
         let mut attempt_index = 0;
         let mut attempts: VecDeque<_> = candidate_passwords.into_iter().collect();
-        let mut prompted = false;
         let mut saw_password_required = false;
+        let committed_output_usage = std::cell::Cell::new(crate::budget::Usage::default());
         while !terminal_skip && !cancellation.is_cancelled() {
+            let extraction_attempt_id = AttemptId::new();
+            if !enter_stage(
+                execution,
+                &task_id,
+                &node.id,
+                node.generation,
+                "running",
+                crate::coordinator::Stage::ExtractAttempt,
+                Some(&extraction_attempt_id),
+                &cancellation,
+            )
+            .await?
+            {
+                was_cancelled |= cancellation.is_user_cancelled();
+                finish_interrupted_node(
+                    execution,
+                    &task_id,
+                    &node.id,
+                    node.generation,
+                    &cancellation,
+                )
+                .await?;
+                skipped.push(candidate);
+                break 'nodes;
+            }
             let password = if let Some(password) = attempts.pop_front() {
                 password
-            } else if !prompted
-                && (saw_wrong_password
-                    || saw_password_required
-                    || saw_password_indeterminate
-                    || last_error.is_none())
+            } else if saw_wrong_password
+                || saw_password_required
+                || saw_password_indeterminate
+                || last_error.is_none()
             {
-                prompted = true;
                 let input = if let Some(prompter) = password_prompter {
-                    tokio::select! { _ = cancellation.cancelled() => None, value = prompter.prompt(&candidate.path) => value }
+                    let decision_id = begin_decision(
+                        execution,
+                        &task_id,
+                        &node.id,
+                        node.generation,
+                        crate::coordinator::Stage::ExtractAttempt,
+                        "password",
+                        &candidate.path.display().to_string(),
+                    )
+                    .await?;
+                    let input = tokio::select! { _ = cancellation.cancelled() => None, value = prompter.prompt(&candidate.path) => value };
+                    if !finish_decision(
+                        execution,
+                        &task_id,
+                        &node.id,
+                        node.generation,
+                        crate::coordinator::Stage::ExtractAttempt,
+                        &decision_id,
+                        &cancellation,
+                    )
+                    .await?
+                        || cancellation.is_cancelled()
+                    {
+                        was_cancelled |= cancellation.is_user_cancelled();
+                        finish_interrupted_node(
+                            execution,
+                            &task_id,
+                            &node.id,
+                            node.generation,
+                            &cancellation,
+                        )
+                        .await?;
+                        skipped.push(candidate);
+                        break 'nodes;
+                    }
+                    input
                 } else {
                     None
                 };
@@ -841,10 +1436,13 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                 .clone()
                 .expect("encoding skip exits before attempts");
             candidate_encoding_used = Some(encoding_mode_label(&encoding));
-            let staged_usage = std::cell::Cell::new(committed_usage);
+            let mut budget_reservation = task_budget.reserve_attempt();
+            let attempt_output_usage = std::cell::Cell::new(crate::budget::Usage::default());
             let extracted_encrypted = std::cell::Cell::new(None);
+            let committed_has_password = std::cell::Cell::new(false);
+            let committed_password_id = std::cell::Cell::new(None);
             let result = output_materializer
-                .materialize(
+                .prepare(
                     MaterializeRequest {
                         output_dir: output_dir.clone(),
                         archive_path: candidate.path.clone(),
@@ -873,13 +1471,36 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                         let context = task_context.clone();
                         let facts = &archive_facts;
                         let limits = &request.limits;
-                        let staged_usage = &staged_usage;
+                        let budget_reservation = &budget_reservation;
                         let extracted_encrypted = &extracted_encrypted;
+                        let attempt_output_usage = &attempt_output_usage;
+                        let task_id = task_id.clone();
+                        let node_id = node.id.clone();
+                        let generation = node.generation;
                         async move {
-                            let (extracted, usage) = crate::budget::monitor(
+                            if let Some(execution) = execution {
+                                if !execution
+                                    .record_staging(
+                                        &task_id,
+                                        &node_id,
+                                        generation,
+                                        &temp_output_dir,
+                                    )
+                                    .await?
+                                {
+                                    return Err(smartzip_core::SmartZipError::BackendFailed {
+                                        backend: "state-store".into(),
+                                        exit_code: None,
+                                        stderr: format!(
+                                            "could not persist staging ownership for node {node_id}"
+                                        ),
+                                    });
+                                }
+                            }
+                            let (extracted, usage) = crate::budget::monitor_task(
                                 &temp_output_dir,
                                 limits,
-                                committed_usage,
+                                budget_reservation,
                                 context.clone(),
                                 backend_call(
                                     "archive-backend",
@@ -899,17 +1520,227 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                                 ),
                             )
                             .await?;
+                            attempt_output_usage.set(usage);
                             extracted_encrypted.set(extracted.encrypted);
-                            staged_usage.set(usage);
                             Ok(())
                         }
                     },
-                    collision_resolver.as_ref(),
                 )
                 .await;
+            let result = match result {
+                Ok(staged) => {
+                    if !enter_stage(
+                        execution,
+                        &task_id,
+                        &node.id,
+                        node.generation,
+                        "running",
+                        crate::coordinator::Stage::InspectAndPlan,
+                        Some(&extraction_attempt_id),
+                        &cancellation,
+                    )
+                    .await?
+                    {
+                        was_cancelled |= cancellation.is_user_cancelled();
+                        finish_interrupted_node(
+                            execution,
+                            &task_id,
+                            &node.id,
+                            node.generation,
+                            &cancellation,
+                        )
+                        .await?;
+                        skipped.push(candidate);
+                        break 'nodes;
+                    }
+                    match staged.collision_request() {
+                        Ok(collision) => {
+                            let decision = if let (Some(prompter), Some(collision)) =
+                                (output_prompter, collision)
+                            {
+                                let decision_id = begin_decision(
+                                    execution,
+                                    &task_id,
+                                    &node.id,
+                                    node.generation,
+                                    crate::coordinator::Stage::InspectAndPlan,
+                                    "output_collision",
+                                    &collision.target_path.display().to_string(),
+                                )
+                                .await?;
+                                let action = tokio::select! {
+                                    _ = cancellation.cancelled() => None,
+                                    value = prompter.prompt(
+                                        collision.archive_path.clone(),
+                                        collision.target_path.clone(),
+                                    ) => Some(match value {
+                                        crate::interactive::OutputCollisionStrategy::Skip => CollisionAction::Skip,
+                                        crate::interactive::OutputCollisionStrategy::Overwrite => CollisionAction::Overwrite,
+                                        crate::interactive::OutputCollisionStrategy::Rename => CollisionAction::Rename,
+                                    }),
+                                };
+                                if !finish_decision(
+                                    execution,
+                                    &task_id,
+                                    &node.id,
+                                    node.generation,
+                                    crate::coordinator::Stage::InspectAndPlan,
+                                    &decision_id,
+                                    &cancellation,
+                                )
+                                .await?
+                                    || cancellation.is_cancelled()
+                                {
+                                    was_cancelled |= cancellation.is_user_cancelled();
+                                    finish_interrupted_node(
+                                        execution,
+                                        &task_id,
+                                        &node.id,
+                                        node.generation,
+                                        &cancellation,
+                                    )
+                                    .await?;
+                                    skipped.push(candidate);
+                                    break 'nodes;
+                                }
+                                action.map(|action| (collision, action))
+                            } else {
+                                None
+                            };
+                            if !enter_stage(
+                                execution,
+                                &task_id,
+                                &node.id,
+                                node.generation,
+                                "running",
+                                crate::coordinator::Stage::Commit,
+                                Some(&extraction_attempt_id),
+                                &cancellation,
+                            )
+                            .await?
+                            {
+                                was_cancelled |= cancellation.is_user_cancelled();
+                                finish_interrupted_node(
+                                    execution,
+                                    &task_id,
+                                    &node.id,
+                                    node.generation,
+                                    &cancellation,
+                                )
+                                .await?;
+                                skipped.push(candidate);
+                                break 'nodes;
+                            }
+                            let has_password = pw_value.as_deref().is_some_and(|p| !p.is_empty())
+                                && (extracted_encrypted.get() == Some(true)
+                                    || saw_password_required
+                                    || saw_wrong_password
+                                    || saw_password_indeterminate
+                                    || (candidate.detected_format == Some(ArchiveFormat::Zip)
+                                        && NativeZipBackend::new()
+                                            .has_encrypted_entries(archive_path)
+                                            .unwrap_or(false)));
+                            let password_id = if has_password { password.id } else { None };
+                            committed_has_password.set(has_password);
+                            committed_password_id.set(password_id);
+                            let success = crate::CommitSuccessFacts {
+                                sample_hash: sample_hash.clone(),
+                                file_size: sample_size,
+                                embedded_offset: candidate.embedded_offset,
+                                has_password,
+                                password_id,
+                                encoding: candidate_encoding_used.clone(),
+                                encoding_corrected: reused_confirmed_encoding
+                                    || matches!(request.encoding_mode, EncodingMode::Override(_)),
+                            };
+                            match staged.prepare_commit(decision, success) {
+                                Ok(mut prepared) => {
+                                    prepared.set_output_usage(attempt_output_usage.get());
+                                    let intent = prepared.intent().cloned();
+                                    if let (Some(execution), Some(intent)) =
+                                        (execution, intent.as_ref())
+                                    {
+                                        if !execution
+                                            .begin_commit(
+                                                &task_id,
+                                                &node.id,
+                                                node.generation,
+                                                intent,
+                                            )
+                                            .await?
+                                        {
+                                            return Err(
+                                                smartzip_core::SmartZipError::BackendFailed {
+                                                    backend: "task-coordinator".into(),
+                                                    exit_code: None,
+                                                    stderr: format!(
+                                            "could not persist commit intent for node {}",
+                                            node.id
+                                        ),
+                                                },
+                                            );
+                                        }
+                                    }
+                                    match prepared.commit() {
+                                        Ok(published) => {
+                                            committed_output_usage.set(budget_reservation.commit());
+                                            if let (Some(execution), Some(intent)) =
+                                                (execution, published.intent())
+                                            {
+                                                if !execution
+                                                    .commit_published(
+                                                        &task_id,
+                                                        &node.id,
+                                                        node.generation,
+                                                        intent,
+                                                    )
+                                                    .await?
+                                                {
+                                                    return Err(
+                                                smartzip_core::SmartZipError::BackendFailed {
+                                                    backend: "task-coordinator".into(),
+                                                    exit_code: None,
+                                                    stderr: format!(
+                                                        "could not persist published commit for node {}",
+                                                        node.id
+                                                    ),
+                                                },
+                                            );
+                                                }
+                                            }
+                                            Ok(published.finalize())
+                                        }
+                                        Err(failure) => {
+                                            if intent.as_ref().is_some_and(|intent| {
+                                                std::fs::symlink_metadata(&intent.marker_path)
+                                                    .is_ok()
+                                            }) {
+                                                return Err(failure.error);
+                                            }
+                                            if let (Some(execution), Some(_)) = (execution, intent)
+                                            {
+                                                let _ = execution
+                                                    .abort_commit(
+                                                        &task_id,
+                                                        &node.id,
+                                                        node.generation,
+                                                    )
+                                                    .await?;
+                                            }
+                                            Err(failure)
+                                        }
+                                    }
+                                }
+                                Err(failure) => Err(failure),
+                            }
+                        }
+                        Err(failure) => Err(failure),
+                    }
+                }
+                Err(failure) => Err(failure),
+            };
             match result {
                 Ok(result) => {
-                    committed_usage = staged_usage.get();
                     for message in &result.layout_plan.warnings {
                         events.push(TaskEvent {
                             task_id: task_id.clone(),
@@ -923,20 +1754,14 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                             output_relative_path_for(&request.output_dir, &result.output_dir);
                     }
                     actual_output_dir = result.output_dir;
-                    // Credential success needs evidence that encryption was used.
-                    candidate_has_password = pw_value.as_deref().is_some_and(|p| !p.is_empty())
-                        && (extracted_encrypted.get() == Some(true)
-                            || saw_password_required
-                            || saw_wrong_password
-                            || saw_password_indeterminate
-                            || (candidate.detected_format == Some(ArchiveFormat::Zip)
-                                && NativeZipBackend::new()
-                                    .has_encrypted_entries(&archive_path)
-                                    .unwrap_or(false)));
+                    candidate_has_password = committed_has_password.get();
+                    candidate_password_id = committed_password_id.get();
                     if candidate_has_password {
-                        candidate_password_id = passwords.record_success(&password).ok().flatten();
+                        if let Ok(Some(password_id)) = passwords.record_success(&password) {
+                            candidate_password_id = Some(password_id);
+                        }
                         passwords.remember_batch(
-                            &mut batch_passwords,
+                            &mut batch_passwords.borrow_mut(),
                             &password.value,
                             candidate_password_id,
                         );
@@ -956,6 +1781,10 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                                 message: format!("recovery output retained at {}", path.display()),
                             },
                         });
+                    }
+                    if failure.preserved_temp_dir.is_some() {
+                        last_error = Some(failure.error);
+                        break;
                     }
                     if failure.kind == materialize::MaterializeFailureKind::ExtractFailed {
                         match &failure.error {
@@ -983,19 +1812,67 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                 }
             }
         }
-        if cancellation.is_cancelled()
-            || matches!(last_error, Some(smartzip_core::SmartZipError::Cancelled))
+        if !extracted
+            && cancellation.is_cancelled()
+            && (last_error.is_none()
+                || matches!(
+                    last_error.as_ref(),
+                    Some(smartzip_core::SmartZipError::Cancelled)
+                ))
         {
+            was_cancelled |= cancellation.is_user_cancelled();
+            finish_interrupted_node(
+                execution,
+                &task_id,
+                &node.id,
+                node.generation,
+                &cancellation,
+            )
+            .await?;
+            skipped.push(candidate);
+            break 'nodes;
+        }
+        let cancelled_now = cancellation.is_user_cancelled()
+            || (matches!(last_error, Some(smartzip_core::SmartZipError::Cancelled))
+                && !cancellation.stopped_on_error());
+        if cancelled_now && !extracted {
             was_cancelled = true;
-            record_skip(history, &task_id, &candidate, "cancelled");
+            record_skip(legacy_history, &task_id, &candidate, "cancelled");
+            finish_execution_outcome(
+                execution,
+                &task_id,
+                &node.id,
+                node.generation,
+                crate::NodeOutcome {
+                    sample_hash: sample_hash.clone(),
+                    file_size: sample_size,
+                    embedded_offset: candidate.embedded_offset,
+                    encoding: candidate_encoding_used.clone(),
+                    encoding_corrected: reused_confirmed_encoding
+                        || matches!(request.encoding_mode, EncodingMode::Override(_)),
+                    ..crate::NodeOutcome::terminal("cancelled", Some("cancelled"), None, false)
+                },
+            )
+            .await?;
             skipped.push(candidate);
             break;
         }
+        was_cancelled |= cancelled_now;
 
+        let mut node_terminal_status = "skipped";
+        let mut node_terminal_reason = "password_required";
         if !extracted && !terminal_skip {
             if password_prompt_cancelled {
+                node_terminal_reason = if saw_password_indeterminate {
+                    "password_indeterminate"
+                } else if saw_wrong_password {
+                    "wrong_password"
+                } else {
+                    "password_required"
+                };
                 if password_prompter.is_none() {
-                    failed_count += 1;
+                    node_terminal_status = "failed";
+                    record_failure(&mut failed_count, config, &cancellation);
                     let error = if saw_password_indeterminate {
                         smartzip_core::SmartZipError::PasswordIndeterminate {
                             path: candidate.path.clone(),
@@ -1011,7 +1888,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                     };
                     events.push(TaskEvent::failed(task_id.clone(), &error));
                 }
-                if let Some(recorder) = history {
+                if let Some(recorder) = legacy_history {
                     recorder.record_file_extraction(
                         &task_id,
                         crate::history::FileExtractionRow {
@@ -1050,7 +1927,8 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                     path: candidate.path.clone(),
                 })
             }) {
-                failed_count += 1;
+                node_terminal_status = "failed";
+                record_failure(&mut failed_count, config, &cancellation);
                 // File-grain failure: classify the reason from the error so
                 // `history files --reason` can filter later.
                 let reason = match &error {
@@ -1063,7 +1941,8 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                     smartzip_core::SmartZipError::CorruptedArchive { .. } => "corrupt",
                     _ => "backend_failed",
                 };
-                if let Some(recorder) = history {
+                node_terminal_reason = reason;
+                if let Some(recorder) = legacy_history {
                     recorder.record_file_extraction(
                         &task_id,
                         crate::history::FileExtractionRow {
@@ -1084,7 +1963,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                 }
                 let event = TaskEvent::failed(task_id.clone(), &error);
                 events.push(event);
-            } else if let Some(recorder) = history {
+            } else if let Some(recorder) = legacy_history {
                 // No error and not extracted: candidates were tried but none
                 // opened it (e.g. needed a password we never got). Record a
                 // skip with `password_required` rather than a failure.
@@ -1108,7 +1987,23 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
             }
         }
         if terminal_skip {
-            record_skip(history, &task_id, &candidate, skip_reason);
+            record_skip(legacy_history, &task_id, &candidate, skip_reason);
+            finish_execution_outcome(
+                execution,
+                &task_id,
+                &node.id,
+                node.generation,
+                crate::NodeOutcome {
+                    sample_hash: sample_hash.clone(),
+                    file_size: sample_size,
+                    embedded_offset: candidate.embedded_offset,
+                    encoding: candidate_encoding_used.clone(),
+                    encoding_corrected: reused_confirmed_encoding
+                        || matches!(request.encoding_mode, EncodingMode::Override(_)),
+                    ..crate::NodeOutcome::terminal("skipped", Some(skip_reason), None, false)
+                },
+            )
+            .await?;
             skipped.push(candidate);
             continue;
         }
@@ -1139,6 +2034,29 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                     );
                 }
             }
+            finish_execution_outcome(
+                execution,
+                &task_id,
+                &node.id,
+                node.generation,
+                crate::NodeOutcome {
+                    sample_hash: sample_hash.clone(),
+                    file_size: sample_size,
+                    embedded_offset: candidate.embedded_offset,
+                    has_password: candidate_has_password,
+                    password_id: candidate_password_id,
+                    encoding: candidate_encoding_used.clone(),
+                    encoding_corrected: reused_confirmed_encoding
+                        || matches!(request.encoding_mode, EncodingMode::Override(_)),
+                    ..crate::NodeOutcome::terminal(
+                        node_terminal_status,
+                        Some(node_terminal_reason),
+                        None,
+                        false,
+                    )
+                },
+            )
+            .await?;
             skipped.push(candidate);
             continue;
         }
@@ -1152,8 +2070,8 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
         events.push(output_event);
         // File-grain success record: one file_extractions row for this
         // extracted candidate, and a known_files upsert so future runs can
-        // dedup and reuse its password.
-        if let Some(recorder) = history {
+        // reuse its password; dedup queries the history row above.
+        if let Some(recorder) = legacy_history {
             recorder.record_file_extraction(
                 &task_id,
                 crate::history::FileExtractionRow {
@@ -1171,6 +2089,8 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                     )
                 },
             );
+        }
+        if let Some(recorder) = history {
             if let (Some(hash), Some(size)) = (sample_hash.as_deref(), sample_size) {
                 let name = &prepared.recorder_name;
                 recorder.upsert_known_file_extract(crate::history::KnownFileUpsert {
@@ -1196,13 +2116,51 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
 
         // Staging usage was counted before commit/recycling, including
         // containers which will subsequently be expanded and recycled.
+        let successful_outcome = || crate::NodeOutcome {
+            sample_hash: sample_hash.clone(),
+            file_size: sample_size,
+            embedded_offset: candidate.embedded_offset,
+            has_password: candidate_has_password,
+            password_id: candidate_password_id,
+            encoding: candidate_encoding_used.clone(),
+            encoding_corrected: reused_confirmed_encoding
+                || matches!(request.encoding_mode, EncodingMode::Override(_)),
+            output_files: committed_output_usage.get().files,
+            output_bytes: committed_output_usage.get().bytes,
+            ..crate::NodeOutcome::terminal("extracted", None, Some(&actual_output_dir), true)
+        };
         processed.push(candidate.clone());
+        if !enter_stage(
+            execution,
+            &task_id,
+            &node.id,
+            node.generation,
+            "running",
+            crate::coordinator::Stage::DiscoverChildren,
+            Some(&attempt_id),
+            &cancellation,
+        )
+        .await?
+        {
+            was_cancelled |= cancellation.is_user_cancelled();
+            finish_execution_outcome(
+                execution,
+                &task_id,
+                &node.id,
+                node.generation,
+                successful_outcome(),
+            )
+            .await?;
+            break 'nodes;
+        }
         let output_relative_path = candidate_output_relative_path(&candidate);
         let mut discovery_policy = embedded_policy.clone();
         if let Some(policy) = run_policy {
             discovery_policy.mode = policy.embedded_mode(false);
         }
-        let nested_candidates = if config.is_none() || candidate.depth < request.recursion_limit {
+        let nested_candidates = if !was_cancelled
+            && (config.is_none() || candidate.depth < request.recursion_limit)
+        {
             discover_nested_candidates(
                 nested_scanner,
                 &actual_output_dir,
@@ -1216,77 +2174,133 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                         smartzip_config::NestedScan::Aggressive | smartzip_config::NestedScan::All
                     )
                 }),
+                cancellation.token(),
             )
         } else {
             Vec::new()
         };
         for nested in nested_candidates {
-            if enqueued.len() >= request.limits.max_nested_candidates {
-                failed_count += 1;
+            if !task_budget.reserve_nested(request.limits.max_nested_candidates) {
+                record_failure(&mut failed_count, config, &cancellation);
                 events.push(TaskEvent::failed(
                     task_id.clone(),
                     &crate::budget::exceeded("nested candidate limit exceeded"),
                 ));
-                task_context.cancel();
-                break;
+                finish_execution_outcome(
+                    execution,
+                    &task_id,
+                    &node.id,
+                    node.generation,
+                    successful_outcome(),
+                )
+                .await?;
+                break 'nodes;
             }
-            enqueued.push(nested.clone());
-            queue.push_back(nested);
+            let child_id = NodeId::new();
+            let inserted = if let Some(execution) = execution {
+                execution
+                    .enqueue_child(&task_id, &child_id, &node.id, &node.root_id, &nested, 0)
+                    .await?
+            } else {
+                true
+            };
+            if inserted {
+                enqueued.push(nested.clone());
+                queue.push_back(ExecutionNode {
+                    id: child_id,
+                    root_id: node.root_id.clone(),
+                    generation: 0,
+                    candidate: nested,
+                });
+            } else {
+                task_budget.release_nested();
+            }
         }
 
         // For volume sets, recycle all members that are inside the managed output root; for singles, recycle the single candidate.
-        if candidate.source == CandidateSource::RootInput
-            || config.is_some_and(|c| {
-                c.extraction.cleanup.nested_archives == smartzip_config::Cleanup::Keep
+        if !was_cancelled
+            && candidate.source != CandidateSource::RootInput
+            && config.is_none_or(|c| {
+                c.extraction.cleanup.nested_archives != smartzip_config::Cleanup::Keep
             })
         {
-            continue;
-        }
-        if let Some(set) = volume_set_for_candidate {
-            for member in set.members {
-                let synthetic = ExtractionCandidate {
-                    path: member.path.clone(),
-                    relative_path: member.path.clone(),
-                    depth: candidate.depth,
-                    source: CandidateSource::ExtractedFile,
-                    detected_format: Some(set.format.clone()),
-                    embedded_offset: None,
-                    embedded_size: None,
-                };
-                if let Some(path) = recyclable_nested_archive_path(&synthetic, &request.output_dir)
-                {
-                    if let Err(error) =
-                        recycle_archive(archive_recycler.clone(), path.clone()).await
+            if let Some(set) = volume_set_for_candidate {
+                for member in set.members {
+                    let synthetic = ExtractionCandidate {
+                        path: member.path.clone(),
+                        relative_path: member.path.clone(),
+                        depth: candidate.depth,
+                        source: CandidateSource::ExtractedFile,
+                        detected_format: Some(set.format.clone()),
+                        embedded_offset: None,
+                        embedded_size: None,
+                    };
+                    if let Some(path) =
+                        recyclable_nested_archive_path(&synthetic, &request.output_dir)
                     {
-                        events.push(TaskEvent {
-                            task_id: task_id.clone(),
-                            kind: TaskEventKind::Warning {
-                                message: format!(
-                                    "failed to move processed nested archive {} to trash: {}",
-                                    path.display(),
-                                    error
-                                ),
-                            },
-                        });
+                        if let Err(error) =
+                            recycle_archive(archive_recycler.clone(), path.clone()).await
+                        {
+                            events.push(TaskEvent {
+                                task_id: task_id.clone(),
+                                kind: TaskEventKind::Warning {
+                                    message: format!(
+                                        "failed to move processed nested archive {} to trash: {}",
+                                        path.display(),
+                                        error
+                                    ),
+                                },
+                            });
+                        }
                     }
                 }
-            }
-        } else if let Some(path) = recyclable_nested_archive_path(&candidate, &request.output_dir) {
-            if let Err(error) = recycle_archive(archive_recycler.clone(), path.clone()).await {
-                events.push(TaskEvent {
-                    task_id: task_id.clone(),
-                    kind: TaskEventKind::Warning {
-                        message: format!(
-                            "failed to move processed nested archive {} to trash: {}",
-                            path.display(),
-                            error
-                        ),
-                    },
-                });
+            } else if let Some(path) =
+                recyclable_nested_archive_path(&candidate, &request.output_dir)
+            {
+                if let Err(error) = recycle_archive(archive_recycler.clone(), path.clone()).await {
+                    events.push(TaskEvent {
+                        task_id: task_id.clone(),
+                        kind: TaskEventKind::Warning {
+                            message: format!(
+                                "failed to move processed nested archive {} to trash: {}",
+                                path.display(),
+                                error
+                            ),
+                        },
+                    });
+                }
             }
         }
+        finish_execution_outcome(
+            execution,
+            &task_id,
+            &node.id,
+            node.generation,
+            successful_outcome(),
+        )
+        .await?;
     }
 
+    while let Some(node) = queue.pop_front() {
+        let (status, reason) = if was_cancelled || cancellation.is_user_cancelled() {
+            ("cancelled", "cancelled")
+        } else {
+            ("skipped", "task_stopped")
+        };
+        finish_execution(
+            execution,
+            &task_id,
+            &node.id,
+            node.generation,
+            status,
+            Some(reason),
+            None,
+            false,
+        )
+        .await?;
+    }
+
+    was_cancelled |= cancellation.is_user_cancelled();
     let status = crate::history::TaskCompletionStatus::from_counts(
         processed.len(),
         failed_count,
@@ -1305,7 +2319,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
     // out the task row. Per-file detail (encoding, password, embedded
     // findings) now lives in file_extractions rows written inline above;
     // this final pass only handles task_events + the slim task finish.
-    if let Some(recorder) = history {
+    if let Some(recorder) = legacy_history {
         for event in &snapshot {
             recorder.record_event(&task_id, event);
         }
@@ -1328,6 +2342,180 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
         enqueued,
         events: snapshot,
     })
+}
+
+async fn enter_stage(
+    execution: Option<&dyn crate::ExecutionStateRecorder>,
+    task_id: &TaskId,
+    node_id: &NodeId,
+    generation: u64,
+    from: &str,
+    stage: crate::coordinator::Stage,
+    attempt_id: Option<&AttemptId>,
+    cancellation: &crate::TaskCancellation,
+) -> smartzip_core::Result<bool> {
+    let Some(execution) = execution else {
+        return Ok(!cancellation.is_cancelled());
+    };
+    let entered = execution
+        .transition(
+            task_id,
+            node_id,
+            generation,
+            from,
+            "running",
+            stage,
+            attempt_id,
+            cancellation.token(),
+        )
+        .await;
+    match entered {
+        Ok(true) => Ok(true),
+        Err(smartzip_core::SmartZipError::Cancelled) if cancellation.is_cancelled() => Ok(false),
+        Ok(false) => Err(smartzip_core::SmartZipError::BackendFailed {
+            backend: "task-coordinator".into(),
+            exit_code: None,
+            stderr: format!("stale stage result for node {node_id} generation {generation}"),
+        }),
+        Err(error) => Err(error),
+    }
+}
+
+async fn finish_interrupted_node(
+    execution: Option<&dyn crate::ExecutionStateRecorder>,
+    task_id: &TaskId,
+    node_id: &NodeId,
+    generation: u64,
+    cancellation: &crate::TaskCancellation,
+) -> smartzip_core::Result<()> {
+    let (status, reason) = if cancellation.is_user_cancelled() {
+        ("cancelled", "cancelled")
+    } else {
+        ("skipped", "task_stopped")
+    };
+    finish_execution(
+        execution,
+        task_id,
+        node_id,
+        generation,
+        status,
+        Some(reason),
+        None,
+        false,
+    )
+    .await
+}
+
+async fn finish_execution(
+    execution: Option<&dyn crate::ExecutionStateRecorder>,
+    task_id: &TaskId,
+    node_id: &NodeId,
+    generation: u64,
+    status: &str,
+    reason: Option<&str>,
+    output_path: Option<&std::path::Path>,
+    committed: bool,
+) -> smartzip_core::Result<()> {
+    finish_execution_outcome(
+        execution,
+        task_id,
+        node_id,
+        generation,
+        crate::NodeOutcome::terminal(status, reason, output_path, committed),
+    )
+    .await
+}
+
+async fn finish_execution_outcome(
+    execution: Option<&dyn crate::ExecutionStateRecorder>,
+    task_id: &TaskId,
+    node_id: &NodeId,
+    generation: u64,
+    outcome: crate::NodeOutcome,
+) -> smartzip_core::Result<()> {
+    let Some(execution) = execution else {
+        return Ok(());
+    };
+    if execution
+        .finish_node(task_id, node_id, generation, outcome)
+        .await?
+    {
+        Ok(())
+    } else {
+        Err(smartzip_core::SmartZipError::BackendFailed {
+            backend: "task-coordinator".into(),
+            exit_code: None,
+            stderr: format!("stale terminal result for node {node_id} generation {generation}"),
+        })
+    }
+}
+
+async fn begin_decision(
+    execution: Option<&dyn crate::ExecutionStateRecorder>,
+    task_id: &TaskId,
+    node_id: &NodeId,
+    generation: u64,
+    stage: crate::coordinator::Stage,
+    kind: &str,
+    evidence: &str,
+) -> smartzip_core::Result<DecisionId> {
+    let decision_id = DecisionId::new();
+    if let Some(execution) = execution {
+        if !execution
+            .wait_for_decision(
+                task_id,
+                node_id,
+                generation,
+                stage,
+                &decision_id,
+                kind,
+                evidence,
+            )
+            .await?
+        {
+            return Err(smartzip_core::SmartZipError::BackendFailed {
+                backend: "task-coordinator".into(),
+                exit_code: None,
+                stderr: format!("could not persist decision for node {node_id}"),
+            });
+        }
+    }
+    Ok(decision_id)
+}
+
+async fn finish_decision(
+    execution: Option<&dyn crate::ExecutionStateRecorder>,
+    task_id: &TaskId,
+    node_id: &NodeId,
+    generation: u64,
+    stage: crate::coordinator::Stage,
+    decision_id: &DecisionId,
+    cancellation: &crate::TaskCancellation,
+) -> smartzip_core::Result<bool> {
+    let Some(execution) = execution else {
+        return Ok(true);
+    };
+    if !execution
+        .accept_decision(task_id, node_id, generation, decision_id)
+        .await?
+    {
+        return Err(smartzip_core::SmartZipError::BackendFailed {
+            backend: "task-coordinator".into(),
+            exit_code: None,
+            stderr: format!("stale decision reply for node {node_id}"),
+        });
+    }
+    enter_stage(
+        Some(execution),
+        task_id,
+        node_id,
+        generation,
+        "ready",
+        stage,
+        None,
+        cancellation,
+    )
+    .await
 }
 
 fn volume_set_key(set: &crate::volumes::VolumeSet) -> String {

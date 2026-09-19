@@ -226,6 +226,16 @@ fn history_and_known_files_are_independent_and_read_only_really_stays_read_only(
     );
     assert_eq!(
         db.connection()
+            .query_row(
+                "SELECT COUNT(*) FROM file_extractions WHERE node_id IS NOT NULL",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        db.connection()
             .query_row("SELECT COUNT(*) FROM known_files", [], |r| r
                 .get::<_, i64>(0))
             .unwrap(),

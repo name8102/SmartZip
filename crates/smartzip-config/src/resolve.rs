@@ -245,9 +245,6 @@ impl ResolvedConfig {
                 "inactive: recursion disabled".into(),
             );
         }
-        if self.values.extraction.reuse.skip_completed {
-            inactive.insert("extraction.reuse.skip_completed".into(), "suppressed: legacy cache lacks output and policy completion evidence; archive will be processed".into());
-        }
         if self.values.state.mode != crate::StateMode::ReadWrite {
             for key in [
                 "passwords.save_success",

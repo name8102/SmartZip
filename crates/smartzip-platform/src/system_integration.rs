@@ -79,7 +79,7 @@ mod mac {
     use super::*;
     use core_foundation::{
         base::TCFType,
-        url::{CFURL, CFURLRef},
+        url::{CFURLRef, CFURL},
     };
     use objc2_app_kit::NSWorkspace;
     use objc2_foundation::{NSError, NSString, NSURL};

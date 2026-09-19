@@ -331,9 +331,7 @@ mod tests {
             .unwrap()
             .as_string()
             .unwrap();
-        assert!(
-            command.contains("'/tmp/a path/it'\\''s SmartZip.app/Contents/MacOS/smartzip-gui'")
-        );
+        assert!(command.contains("'/tmp/a path/it'\\''s SmartZip.app/Contents/MacOS/smartzip-gui'"));
         assert!(command.contains("--finder-quick-extract \"$@\""));
     }
 

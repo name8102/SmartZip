@@ -3,6 +3,10 @@
 > 基于 `docs/requirements.md` v2、`docs/design.md` v2 和当前源码。
 > 原则：优先完成复杂网络归档解压，不进行一次性整体重写。
 
+> 以下为早期迁移切片，不是当前功能完成清单。最新交付范围与调度/恢复分层建议见 [需求第 0 节](requirements.md#0-当前产品范围2026-09-19)。
+
+任务系统的新实施顺序统一见 [task-system.md 第 11 节](task-system.md#11-渐进式实施)，以下旧切片不再单独定义调度与恢复的优先级。
+
 ## 当前判断
 
 保留现有 workspace crate 边界。近期不建设通用 `Archive Workflow Runtime`，也不一次性拆分新的 graph、scheduler、events、policy crate。

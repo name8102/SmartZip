@@ -171,7 +171,9 @@ pub(crate) async fn run<B: ArchiveExecutor>(
         }
         if report.volumes.format.is_none() && report.entrypoint.is_file() {
             let scanner = EmbeddedScanner::new(request.scanner.clone());
-            match scanner.scan_path(&report.entrypoint) {
+            match scanner
+                .scan_path_cancellable(&report.entrypoint, &|| request.control.is_cancelled())
+            {
                 Ok(findings) => {
                     report.volumes.format = findings
                         .iter()
@@ -193,30 +195,26 @@ pub(crate) async fn run<B: ArchiveExecutor>(
             && report.entrypoint.is_file()
             && !report.unreadable_volumes.contains(&report.entrypoint)
         {
-            let mut attempts = candidates.clone();
+            let attempts = candidates.clone();
             if attempts.is_empty() {
                 report.password_status = PasswordStatus::Required;
                 report
                     .stop_reasons
                     .push("no password candidates and empty attempt disabled".into());
             }
-            let mut prompted = false;
             let mut index = 0;
             loop {
                 let candidate = if let Some(candidate) = attempts.get(index) {
                     candidate.clone()
-                } else if password_was_required && !prompted && prompter.is_some() {
-                    prompted = true;
+                } else if (password_was_required || attempts.is_empty()) && prompter.is_some() {
                     let Some(prompter) = prompter else { break };
                     let value = tokio::select! { biased; _=cancelled(&request.control)=>None, value=prompter.prompt(&report.entrypoint)=>value };
                     match value.filter(|p| !p.is_empty()) {
-                        Some(value) if !attempts.iter().any(|p| p.value == value) => {
-                            PasswordCandidate {
-                                id: None,
-                                value,
-                                source: PasswordSource::Manual,
-                            }
-                        }
+                        Some(value) => PasswordCandidate {
+                            id: None,
+                            value,
+                            source: PasswordSource::Manual,
+                        },
                         _ => break,
                     }
                 } else {
@@ -293,12 +291,6 @@ pub(crate) async fn run<B: ArchiveExecutor>(
                 }
                 // A corrupt encryption/check field can resemble a rejected
                 // credential. Test never penalizes a library candidate here.
-                if index >= attempts.len() && prompted {
-                    break;
-                }
-                if index > attempts.len() {
-                    attempts.push(candidate);
-                }
             }
         } else {
             report

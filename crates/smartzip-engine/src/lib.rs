@@ -5,6 +5,7 @@
 //! for API compatibility.
 
 pub mod container;
+pub mod coordinator;
 pub mod detect;
 pub mod embedded;
 pub mod embedded_zip;
@@ -18,12 +19,15 @@ mod backend_util;
 pub mod budget;
 mod encoding_flow;
 mod events;
+mod execution;
+pub mod execution_runtime;
 mod extract_workflow;
 pub mod interactive;
 mod nested;
 mod password_order;
 mod policy;
 pub mod run_policy;
+pub mod state_store;
 pub use run_policy::CompiledRunPolicy;
 mod test_reduce;
 mod test_workflow;
@@ -39,7 +43,59 @@ use smartzip_passwords::PasswordService;
 use smartzip_scanner::{EmbeddedScanner, ScannerConfig};
 use std::sync::Arc;
 
+#[derive(Clone)]
+pub(crate) struct TaskCancellation {
+    token: tokio_util::sync::CancellationToken,
+    user: tokio_util::sync::CancellationToken,
+    stopped_on_error: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl TaskCancellation {
+    fn new(user: tokio_util::sync::CancellationToken) -> Self {
+        Self {
+            token: user.child_token(),
+            user,
+            stopped_on_error: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    pub(crate) fn token(&self) -> &tokio_util::sync::CancellationToken {
+        &self.token
+    }
+
+    pub(crate) fn user_token(&self) -> tokio_util::sync::CancellationToken {
+        self.user.clone()
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.token.is_cancelled()
+    }
+
+    pub(crate) fn is_user_cancelled(&self) -> bool {
+        self.user.is_cancelled()
+    }
+
+    pub(crate) fn stopped_on_error(&self) -> bool {
+        self.stopped_on_error
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub(crate) fn stop_on_error(&self) {
+        self.stopped_on_error
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.token.cancel();
+    }
+
+    pub(crate) async fn cancelled(&self) {
+        self.token.cancelled().await;
+    }
+}
+
 pub use events::TaskEventListener;
+pub use execution::{
+    ArtifactIdentity, CommitIntent, CommitRecord, CommitSuccessFacts, ExecutionStateRecorder,
+    ExtractRootIdentity, ExtractTaskIdentity, NodeOutcome, StagingArtifact, TaskBudgetSnapshot,
+};
 pub use interactive::{
     EmbeddedSelectionChoice, EncodingConfirmationChoice, EncodingConfirmationContext,
     InteractiveEmbeddedPrompter, InteractiveEncodingPrompter, InteractiveOutputPrompter,
@@ -67,6 +123,7 @@ pub struct ExtractInteraction<'a> {
 pub struct ExtractObserver<'a> {
     pub listener: Option<TaskEventListener>,
     pub history: Option<&'a dyn history::TaskHistoryRecorder>,
+    pub execution: Option<&'a dyn ExecutionStateRecorder>,
 }
 
 impl SmartZipEngine {
@@ -273,7 +330,11 @@ impl SmartZipEngine {
                 embedded: embedded_prompter,
                 encoding: encoding_prompter,
             },
-            ExtractObserver { listener, history },
+            ExtractObserver {
+                listener,
+                history,
+                execution: None,
+            },
         )
         .await
     }
@@ -287,12 +348,120 @@ impl SmartZipEngine {
         interaction: ExtractInteraction<'_>,
         observer: ExtractObserver<'_>,
     ) -> smartzip_core::Result<ExtractWorkflowResult> {
+        self.extract_task(
+            ExtractTaskIdentity::new(&request.inputs),
+            backend,
+            passwords,
+            request,
+            interaction,
+            observer,
+        )
+        .await
+    }
+
+    pub async fn extract_task<B: ArchiveExecutor>(
+        &self,
+        identity: ExtractTaskIdentity,
+        backend: &B,
+        passwords: &PasswordService<'_>,
+        mut request: ExtractWorkflowRequest,
+        interaction: ExtractInteraction<'_>,
+        observer: ExtractObserver<'_>,
+    ) -> smartzip_core::Result<ExtractWorkflowResult> {
+        if let Some(policy) = self.run_policy.as_deref() {
+            request = policy
+                .resolve_request(request)
+                .map_err(|error| smartzip_core::SmartZipError::io(None, error))?;
+        }
+        let task_budget =
+            std::sync::Arc::new(crate::budget::TaskBudget::from_snapshot(identity.budget));
+        let task_cancellation = TaskCancellation::new(self.cancellation.child_token());
+        if let Some(execution) = observer.execution.filter(|_| request.inputs.len() > 1) {
+            if identity.roots.len() != request.inputs.len() {
+                return Err(smartzip_core::SmartZipError::ResourceLimit {
+                    detail: "task root identity count does not match input count".into(),
+                });
+            }
+            let task_id = identity.task_id.clone();
+            let batch_passwords = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let futures = request
+                .inputs
+                .iter()
+                .cloned()
+                .zip(identity.roots.iter().cloned())
+                .map(|(input, root)| {
+                    let batch_passwords = batch_passwords.clone();
+                    let task_budget = task_budget.clone();
+                    let cancellation = task_cancellation.clone();
+                    let task_id = task_id.clone();
+                    let listener = observer.listener.clone();
+                    let history = observer.history;
+                    let mut root_request = request.clone();
+                    root_request.inputs = vec![input];
+                    async move {
+                        workflow::extract_recursive_with_listener_interactive(
+                            &self.scanner,
+                            self.run_policy.as_deref(),
+                            self.min_embedded_size_bytes,
+                            &self.archive_recycler,
+                            cancellation.clone(),
+                            backend,
+                            passwords,
+                            root_request,
+                            interaction.password,
+                            interaction.output,
+                            interaction.embedded,
+                            interaction.encoding,
+                            listener,
+                            history,
+                            Some(execution),
+                            ExtractTaskIdentity {
+                                task_id: task_id.clone(),
+                                roots: vec![root],
+                                budget: TaskBudgetSnapshot::default(),
+                            },
+                            batch_passwords,
+                            task_budget,
+                        )
+                        .await
+                    }
+                });
+            let results = futures_util::future::join_all(futures).await;
+            let mut processed = Vec::new();
+            let mut skipped = Vec::new();
+            let mut enqueued = Vec::new();
+            let mut events = Vec::new();
+            let mut failed_count = 0;
+            let mut cancelled = false;
+            for result in results {
+                let result = result?;
+                failed_count += result.failed_count;
+                cancelled |= result.status == history::TaskCompletionStatus::Cancelled;
+                processed.extend(result.processed);
+                skipped.extend(result.skipped);
+                enqueued.extend(result.enqueued);
+                events.extend(result.events);
+            }
+            return Ok(ExtractWorkflowResult {
+                status: history::TaskCompletionStatus::from_counts(
+                    processed.len(),
+                    failed_count,
+                    cancelled,
+                ),
+                failed_count,
+                task_id: identity.task_id,
+                processed,
+                skipped,
+                enqueued,
+                events,
+            });
+        }
         workflow::extract_recursive_with_listener_interactive(
             &self.scanner,
             self.run_policy.as_deref(),
             self.min_embedded_size_bytes,
             &self.archive_recycler,
-            self.cancellation.clone(),
+            task_cancellation,
             backend,
             passwords,
             request,
@@ -302,6 +471,10 @@ impl SmartZipEngine {
             interaction.encoding,
             observer.listener,
             observer.history,
+            observer.execution,
+            identity,
+            std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+            task_budget,
         )
         .await
     }

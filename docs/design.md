@@ -6,6 +6,10 @@
 > 交付目标：GUI + CLI 共同交付  
 > 不兼容旧版配置：旧 `SmartZip.ini` 不迁移
 
+> 当前产品范围以 [需求第 0 节](requirements.md#0-当前产品范围2026-09-19) 为准：调度与恢复已纳入目标，压缩创建暂不考虑。下文旧阶段划分不覆盖此决定。
+
+> 任务系统详细设计见 [task-system.md](task-system.md)，按阶段调度、非阻塞决定与统一历史恢复；它覆盖下文旧状态机和密码并行规则。
+
 ## 0. v2 设计基线
 
 本节是 2026-05-31 需求确认后的设计基线，覆盖后文中与其冲突的早期表述。
@@ -180,7 +184,7 @@ extract -> verify -> conservative normalize -> commit
 - 安全预算与事务式输出。
 - 命名密码表导入和智能 / 深度密码尝试。
 
-GUI 第一版聚焦任务工作台。压缩、完整预览、系统集成、John the Ripper / Hashcat 外部深度恢复后端、崩溃恢复和 `resume` 均后置。
+当前交付范围见需求第 0 节。已有浏览/预览继续完善，任务调度与崩溃恢复纳入规划；压缩创建和 John the Ripper / Hashcat 外部密码恢复后端仍后置。任务恢复不等于密码破解。
 
 ## 1. 设计结论
 
@@ -766,9 +770,9 @@ CREATE INDEX idx_file_extractions_dedup  ON file_extractions(sample_hash, file_s
 
 `reason` 枚举：`not_found / wrong_password / corrupt / target_exists / not_first_volume / recursion_limit / duplicate / business_container / password_required`。“需密码但最终没拿到”（候选试穿 + 用户取消）统一记 `status=skipped` + `reason=password_required`，不为加密单设终态。
 
-### 4.6 `known_files` — v3 新增（去重/复用索引）
+### 4.6 `known_files` — v3 新增（密码/编码提示缓存）
 
-每个 `(sample_hash, size)` 恰好一行（UPSERT）。与 4.5 的日志分工：日志保留重复项（同包多次解压 = 多行，回答“上次为什么失败”），索引每个文件一行、只服务匹配热路径（去重跳过、复用确认编码、复用开包密码）。
+每个 `(sample_hash, size)` 恰好一行（UPSERT）。与 4.5 的日志分工：日志保留重复项（同包多次解压 = 多行，回答“上次为什么失败”），缓存每个文件一行，只复用确认编码和已验证密码。成功解压的唯一事实来源是 4.5 的历史，不另存去重状态。
 
 ```sql
 CREATE TABLE known_files (
@@ -777,14 +781,14 @@ CREATE TABLE known_files (
   names_offsets_json TEXT NOT NULL DEFAULT '[]',  -- [{name, offset}] 配对，遇新组合追加
   password_id        INTEGER REFERENCES passwords(id) ON DELETE SET NULL,
   confirmed_encoding TEXT,               -- 仅人工确认写；detect 猜测永不覆盖
-  last_extract_at    TEXT,               -- 仅 extract 写；非空即“成功解压过”（去重唯一判据）
+  last_extract_at    TEXT,               -- 旧版本兼容列；新流程不写、不用于去重
   PRIMARY KEY (sample_hash, size)
 );
 ```
 
 **sample_hash**：`BLAKE3(前 64KB ‖ 后 64KB)` + `file_size` 一起判等；< 128KB 全量哈希；carve 档对 `[offset, offset+size)` 段做同样采样，size 未知时不参与去重。
 
-**去重**（仅 `extract`）：命中 `last_extract_at` 非空且落在时间窗内（默认 1 个月，预留配置接口）→ 跳过 + 显式提示，`--force` 强制重解。不追踪输出是否还在，靠时间窗兜底。
+**去重**（仅 `extract`）：按配置 `extraction.reuse.skip_completed` 查询 `file_extractions` 中同身份的 `status=extracted` 且所属任务 `kind=extract` 的记录 → 跳过并提示；`--force` 强制重解。不检查输出存在或位置，不设隐含时间窗。历史删除后不再命中；关闭历史写入仍可读取已有记录，完全关闭状态则不读写。
 
 **求密码候选顺序**（`extract`）：命令行 `--password` → `known_files.password_id`（hash+size 命中，置顶但不独占）→ 当前批次刚交互成功的密码 → 配置通配符层（将来）→ `passwords` 常规排序。交互成功后立即写库并更新任务内缓存，不等 task 完成。**编码复用**顺序：命令行编码 → `known_files.confirmed_encoding`（人工确认过）→ 当场自动检测；编码与密码走同一次 `WHERE sample_hash=? AND file_size=?` 查询。
 
@@ -1023,10 +1027,10 @@ smartzip extract a.zip b.7z c.rar --output ~/Downloads/out
 smartzip extract archive.zip --encoding auto
 smartzip extract archive.zip --encoding gb18030
 smartzip extract suspicious.bin --deep --embedded ask
-smartzip extract archive.zip --force          # 忽略 known_files 去重跳过，强制重解
+smartzip extract archive.zip --force          # 忽略成功历史，强制重解
 ```
 
-去重：命中 `known_files`（`sample_hash + size`，`last_extract_at` 在时间窗内，默认 1 个月）时**跳过并显式提示**，`--force` 绕过。命中时同时复用 `confirmed_encoding`（人工确认过的）与 `password_id`。
+去重规则见 4.6；`known_files` 仅提供人工确认的编码与已验证密码提示，不充当第二套历史。
 
 ### 8.3 检测 `detect`（已接线）
 
@@ -1119,7 +1123,7 @@ GUI 显示用户友好错误，日志保留详细错误。
 6. 密码不写入普通日志。
 7. 明文密码数据库首次使用时提示用户。
 
-## 11. MVP 范围
+## 11. 早期 MVP 范围（历史记录，当前范围见需求第 0 节）
 
 ### 11.1 MVP 必须完成
 

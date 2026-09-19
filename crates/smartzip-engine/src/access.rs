@@ -17,13 +17,36 @@ use crate::password_order::password_source_label;
 use crate::policy::full_root_scanner_config;
 use crate::types::{ArchiveAccessOutcome, CandidateSource, ExtractionCandidate, PreparedArchive};
 
-pub(crate) fn scan_embedded_findings(
+pub(crate) async fn scan_embedded_findings(
     path: &Path,
     scanner: &ScannerConfig,
-) -> Vec<EmbeddedArchiveFinding> {
-    EmbeddedScanner::new(full_root_scanner_config(scanner))
-        .scan_path(path)
-        .unwrap_or_default()
+    cancellation: tokio_util::sync::CancellationToken,
+) -> smartzip_core::Result<Vec<EmbeddedArchiveFinding>> {
+    scan_file(path, full_root_scanner_config(scanner), cancellation).await
+}
+
+pub(crate) async fn scan_file(
+    path: &Path,
+    config: ScannerConfig,
+    cancellation: tokio_util::sync::CancellationToken,
+) -> smartzip_core::Result<Vec<EmbeddedArchiveFinding>> {
+    let path = path.to_owned();
+    let token = cancellation.child_token();
+    let _cancel_on_drop = token.clone().drop_guard();
+    let result = tokio::task::spawn_blocking(move || {
+        EmbeddedScanner::new(config).scan_path_cancellable(path, &|| token.is_cancelled())
+    })
+    .await
+    .map_err(|e| smartzip_core::SmartZipError::io(None, std::io::Error::other(e)))?;
+    if cancellation.is_cancelled()
+        || result
+            .as_ref()
+            .err()
+            .is_some_and(|e| e.kind() == std::io::ErrorKind::Interrupted)
+    {
+        return Err(smartzip_core::SmartZipError::Cancelled);
+    }
+    Ok(result.unwrap_or_default())
 }
 
 pub(crate) fn resolve_root_candidate(
@@ -247,63 +270,69 @@ pub(crate) async fn access_archive_with_password<B: ArchiveExecutor>(
         }
     }
 
-    if listing.is_none() && used_password.is_none() {
-        if let Some(prompter) = password_prompter {
-            events.push(TaskEvent {
-                task_id: task_id.clone(),
-                kind: TaskEventKind::Progress(smartzip_core::TaskProgress::indeterminate(format!(
-                    "Prompting for password: {}",
-                    resolved.candidate.path.display()
-                ))),
-            });
-            let interactive_password = prompter.prompt(&resolved.candidate.path).await;
-            password_prompt_cancelled = interactive_password.as_deref().is_none_or(str::is_empty);
-            if let Some(interactive_pw) = interactive_password {
-                let pw = interactive_pw;
-                if !pw.is_empty() {
-                    let accepted = PasswordCandidate {
-                        id: None,
-                        value: pw.clone(),
-                        source: smartzip_passwords::PasswordSource::Manual,
-                    };
-                    listing = Some(
-                        backend_call(
-                            "archive-backend",
-                            "list",
-                            &resolved.archive_path,
-                            backend.list_with_context(
-                                ListRequest {
-                                    archive: resolved.archive_path.clone(),
-                                    format: resolved.candidate.detected_format.clone(),
-                                    password: Some(pw.clone()),
-                                    encoding: resolved.encoding_mode.clone(),
-                                },
-                                std::sync::Arc::clone(&task_context),
-                            ),
-                        )
-                        .await
-                        .map_err(|error| {
-                            if matches!(error, smartzip_core::SmartZipError::WrongPassword { .. }) {
-                                smartzip_core::SmartZipError::WrongPassword {
-                                    path: resolved.candidate.path.clone(),
-                                }
-                            } else {
-                                error
-                            }
-                        })?,
-                    );
-                    accepted_password_id =
-                        passwords.record_listing_access(&accepted).ok().flatten();
-                    used_password = Some(pw.clone());
-                    if resolved.detect_encoding
-                        && assessment.is_none()
-                        && resolved.encoding_mode == EncodingMode::Auto
-                        && resolved.candidate.detected_format == Some(ArchiveFormat::Zip)
-                    {
-                        assessment = assess_zip_encoding(&resolved.archive_path).await;
-                    }
+    while listing.is_none() {
+        let Some(prompter) = password_prompter else {
+            break;
+        };
+        events.push(TaskEvent {
+            task_id: task_id.clone(),
+            kind: TaskEventKind::Progress(smartzip_core::TaskProgress::indeterminate(format!(
+                "Prompting for password: {}",
+                resolved.candidate.path.display()
+            ))),
+        });
+        let token = task_context.cancellation_token();
+        let input = tokio::select! { biased;
+            _ = token.cancelled() => return Err(smartzip_core::SmartZipError::Cancelled),
+            input = prompter.prompt(&resolved.candidate.path) => input,
+        };
+        if task_context.is_cancelled() {
+            return Err(smartzip_core::SmartZipError::Cancelled);
+        }
+        let Some(password) = input.filter(|p| !p.is_empty()) else {
+            password_prompt_cancelled = true;
+            break;
+        };
+        match backend_call(
+            "archive-backend",
+            "list",
+            &resolved.archive_path,
+            backend.list_with_context(
+                ListRequest {
+                    archive: resolved.archive_path.clone(),
+                    format: resolved.candidate.detected_format.clone(),
+                    password: Some(password.clone()),
+                    encoding: resolved.encoding_mode.clone(),
+                },
+                std::sync::Arc::clone(&task_context),
+            ),
+        )
+        .await
+        {
+            Ok(result) => {
+                used_password = Some(password);
+                listing = Some(result);
+                if resolved.detect_encoding
+                    && assessment.is_none()
+                    && resolved.encoding_mode == EncodingMode::Auto
+                    && resolved.candidate.detected_format == Some(ArchiveFormat::Zip)
+                {
+                    assessment = assess_zip_encoding(&resolved.archive_path).await;
                 }
             }
+            Err(
+                smartzip_core::SmartZipError::WrongPassword { .. }
+                | smartzip_core::SmartZipError::PasswordRequired { .. },
+            ) => {
+                saw_wrong_password = true;
+                events.push(TaskEvent {
+                    task_id: task_id.clone(),
+                    kind: TaskEventKind::Warning {
+                        message: "Password rejected; try again or skip".into(),
+                    },
+                });
+            }
+            Err(error) => return Err(error),
         }
     }
 
@@ -355,9 +384,8 @@ pub(crate) async fn access_archive_with_password<B: ArchiveExecutor>(
 
     Ok(ArchiveAccessOutcome {
         password_id: accepted_password_id,
-        has_password: used_password
-            .as_deref()
-            .is_some_and(|password| !password.is_empty()),
+        // Listing alone never proves a content password.
+        has_password: false,
         encoding_mode,
         listing,
     })

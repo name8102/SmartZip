@@ -2,6 +2,8 @@
 
 按需查阅术语与架构原则。实现状态以源码和相关验证记录为准；历史方案不自动成为当前任务的执行顺序。
 
+当前产品范围统一记录在 [需求第 0 节](docs/requirements.md#0-当前产品范围2026-09-19)；旧设计中的阶段边界不覆盖最新范围决定。
+
 ## Core Concepts
 
 | Term | Definition |
@@ -18,7 +20,7 @@
 | **ExtractionCandidate** | 待解压候选条目。包含路径、深度、来源类型、检测格式、内嵌偏移等。 |
 | **CandidateAttempt** | 对单个 `ExtractionCandidate` 的核心处理尝试。负责检测决策、内嵌归档材质化、编码检测、密码尝试、后端解压、输出材质化和结果事件；BFS 队列仍由 `SmartZipEngine` 管理。 |
 | **CandidateSource** | 候选来源枚举：`RootInput`（用户直接输入）、`ExtractedFile`（解压产物中找到的）、`EmbeddedFinding`（扫描器在二进制偏移处发现的）。 |
-| **Root scan** | 用户直接输入的文件应尽可能解压。命中归档头后完整解析其范围，再从归档末尾继续搜索，直到窗口无发现；窗口不限制已命中归档的长度。过小载荷、业务容器和嵌套扫描大小等效率门槛仅用于嵌套发现。解压资源预算独立生效。 |
+| **Root scan** | 用户直接输入的文件应尽可能解压。空搜索窗口后继续扫描直到文件末尾；命中归档头后完整解析其范围，再从归档末尾继续搜索。窗口不限制前缀、归档间隔或已命中归档的长度。过小载荷、业务容器和嵌套扫描大小等效率门槛仅用于嵌套发现。解压资源预算独立生效。 |
 | **Recursive extraction** | BFS 队列驱动的递归解压。队列中每个候选经过同一管线：格式检测 → 编码检测 → 有界密码候选直接解压到 `OutputMaterializer` → 输出扫描 → 嵌套候选入队。 |
 | **Collapse single output** | 解压产出唯一条目时的优化：将该条目提到父目录，去掉中间层空目录。现在由 `LayoutPlanKind` 的各种 `Commit*` 变体实现，包括内容上移（`CommitSingleDirContentsAsArchiveName`）和直接重命名（`CommitSingleDirAsInnerName`/`CommitSingleFileAsInnerName`）。 |
 | **ArchiveNode** | 下一阶段动态节点模型。记录父节点、来源、深度、状态、指纹和成功密码。节点在父归档解压后增量产生，不要求预先构造完整 DAG。 |

@@ -3,9 +3,9 @@
 use serde::{Deserialize, Serialize};
 use smartzip_core::ArchiveFormat;
 use std::fs;
-use std::io::Read;
 use std::path::Path;
 
+mod file_scan;
 mod rar;
 mod windows;
 mod zip;
@@ -131,39 +131,20 @@ impl EmbeddedScanner {
             .collect()
     }
 
-    /// Make complete root archive data available to parsers; nested scans may cap IO.
+    /// Search the requested input extent using bounded reads and metadata walks.
     pub fn scan_path(
         &self,
         path: impl AsRef<Path>,
     ) -> std::io::Result<Vec<EmbeddedArchiveFinding>> {
-        let mut file = fs::File::open(path)?;
-        let mut data = Vec::new();
-        if self.scan_limit().is_none() && self.config.mode == ScanMode::Deep {
-            let overlap = self
-                .binwalk
-                .patterns
-                .iter()
-                .map(Vec::len)
-                .max()
-                .unwrap_or(1)
-                - 1;
-            (&mut file)
-                .take(DEFAULT_SCAN_BYTES + overlap as u64)
-                .read_to_end(&mut data)?;
-            let matcher = aho_corasick::AhoCorasick::new(&self.binwalk.patterns)
-                .map_err(std::io::Error::other)?;
-            if !matcher
-                .find_iter(&data)
-                .any(|magic| magic.start() < DEFAULT_SCAN_BYTES as usize)
-            {
-                return Ok(Vec::new());
-            }
-            file.read_to_end(&mut data)?;
-        } else {
-            file.take(self.scan_limit().unwrap_or(u64::MAX))
-                .read_to_end(&mut data)?;
-        }
-        Ok(self.scan_bytes(&data))
+        self.scan_path_cancellable(path, &|| false)
+    }
+
+    pub fn scan_path_cancellable(
+        &self,
+        path: impl AsRef<Path>,
+        cancelled: &dyn Fn() -> bool,
+    ) -> std::io::Result<Vec<EmbeddedArchiveFinding>> {
+        self.scan_file(fs::File::open(path)?, cancelled)
     }
 
     /// Get file size without loading it.
@@ -299,6 +280,9 @@ mod tests {
             ..Default::default()
         });
         assert!(scanner.scan_path(&root).unwrap().is_empty());
+        // Unlimited scanning now reaches EOF; keep that case representative
+        // without making every unit-test run scan 16 GiB of sparse zeros.
+        file.set_len(DEFAULT_SCAN_BYTES * 2 + 1).unwrap();
         let root_scanner = EmbeddedScanner::new(ScannerConfig {
             mode: ScanMode::Deep,
             max_scan_bytes: None,

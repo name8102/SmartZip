@@ -471,6 +471,24 @@ impl SevenZipBackend {
             .stdout
             .lines()
             .any(|line| line.trim_end() == "Encrypted = +");
+        if crate::decoded_zip::extract_if_needed(
+            &request,
+            parse_entries(&listing.stdout).len(),
+            token,
+        )
+        .await?
+        {
+            return Ok(SevenZipResult {
+                value: Some(ExtractArchiveResult {
+                    output_dir: request.output_dir,
+                    encrypted: Some(encrypted),
+                }),
+                report: parse_report(&listing.stdout),
+                status: SevenZipExitStatus::Success,
+                stdout: String::new(),
+                stderr: String::new(),
+            });
+        }
         let mut args: Vec<String> = vec!["x".into(), "-y".into(), "-bsp1".into()];
         if let Some(pw) = Self::password_arg(&request.password) {
             args.push(pw);
@@ -560,10 +578,24 @@ impl ArchiveAdapter for SevenZipBackend {
             return Err(self.map_failure(&output, &request.archive));
         }
         let report = parse_slt_archive_report(&output.stdout);
-        Ok(ArchiveListing {
-            format: report.archive_type.as_deref().map(parse_archive_format),
-            entries: parse_entries(&output.stdout),
-        })
+        let format = report.archive_type.as_deref().map(parse_archive_format);
+        let entries = if format == Some(ArchiveFormat::Zip) {
+            if let smartzip_core::EncodingMode::Override(encoding) = &request.encoding {
+                let entries = crate::decoded_zip::entries(&request.archive, encoding)?.0;
+                if entries.len() != parse_entries(&output.stdout).len() {
+                    return Err(SmartZipError::BackendProtocolError {
+                        backend: self.id().into(),
+                        detail: "ambiguous ZIP directory".into(),
+                    });
+                }
+                entries
+            } else {
+                parse_entries(&output.stdout)
+            }
+        } else {
+            parse_entries(&output.stdout)
+        };
+        Ok(ArchiveListing { format, entries })
     }
 
     async fn test(&self, request: TestRequest) -> Result<TestResult> {

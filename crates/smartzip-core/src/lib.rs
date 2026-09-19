@@ -20,4 +20,6 @@ pub use routing::{
     NegativeCapabilityKey, RejectedAdapter, RouteCandidate, RouteEvent, RoutePlan,
     TaskExecutionContext, TaskRouteContext,
 };
-pub use task::{ArchiveFormat, CompressionLevel, EncodingMode, TaskId};
+pub use task::{
+    ArchiveFormat, AttemptId, CompressionLevel, DecisionId, EncodingMode, NodeId, TaskId,
+};

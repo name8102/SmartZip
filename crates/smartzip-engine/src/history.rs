@@ -4,8 +4,8 @@
 //! [`TaskHistoryRecorder`] is threaded into the workflow, those events are
 //! persisted to the `tasks` and `task_events` tables, and every extraction
 //! *action* (one per input, nested archive, carved embedded archive, or
-//! skip) is logged to `file_extractions`. The `known_files` dedup/reuse index
-//! is consulted before extraction and updated after a success.
+//! skip) is logged to `file_extractions`, the sole source for completed-file reuse.
+//! `known_files` caches only password and confirmed-encoding hints.
 //!
 //! **Best-effort semantics.** History writes never fail extraction. When a
 //! repo call errors, the engine surfaces a `TaskEventKind::Warning` and keeps
@@ -198,7 +198,6 @@ impl<'a> FileExtractionRow<'a> {
 pub struct KnownFileHit {
     pub password_id: Option<i64>,
     pub confirmed_encoding: Option<String>,
-    pub last_extract_at: Option<String>,
 }
 
 /// Arguments for [`TaskHistoryRecorder::upsert_known_file_extract`], recorded
@@ -229,6 +228,11 @@ pub struct KnownFileEncodingUpsert<'a> {
 /// All methods are called synchronously from the engine's async loop; they
 /// should return quickly and swallow storage errors internally.
 pub trait TaskHistoryRecorder {
+    /// Query the canonical history; no output path is required.
+    fn was_extracted(&self, _hash: &str, _size: i64) -> bool {
+        false
+    }
+
     /// Register a new task. `kind` is one of the CLI/engine operation names
     /// (`extract`, `detect`, `list`, `test`, ...). `output_path` is only
     /// meaningful for operations that materialize files.
@@ -260,8 +264,7 @@ pub trait TaskHistoryRecorder {
         None
     }
 
-    /// Record a successful extraction into the `known_files` index (writes
-    /// `last_extract_at` + `password_id`, appends the name/offset pair).
+    /// Remember password hints in `known_files`; completion lives in history.
     /// Defaults to a no-op.
     fn upsert_known_file_extract(&self, _upsert: KnownFileUpsert<'_>) {}
 
@@ -280,11 +283,20 @@ pub trait TaskHistoryRecorder {
 /// propagate.
 pub struct DbTaskHistoryRecorder<'a> {
     conn: &'a rusqlite::Connection,
+    writable: bool,
 }
 
 impl<'a> DbTaskHistoryRecorder<'a> {
     pub fn new(conn: &'a rusqlite::Connection) -> Self {
-        Self { conn }
+        Self {
+            conn,
+            writable: true,
+        }
+    }
+
+    pub fn with_writes(mut self, writable: bool) -> Self {
+        self.writable = writable;
+        self
     }
 
     fn task_repo(&self) -> TaskRepository<'a> {
@@ -302,7 +314,7 @@ impl<'a> DbTaskHistoryRecorder<'a> {
     fn legacy_known_store(&self) -> DbKnownFileStore<'a> {
         DbKnownFileStore {
             connection: self.conn,
-            writable: true,
+            writable: self.writable,
             password_hint: true,
             encoding_hint: true,
         }
@@ -320,7 +332,19 @@ impl<'a> DbTaskHistoryRecorder<'a> {
 }
 
 impl<'a> TaskHistoryRecorder for DbTaskHistoryRecorder<'a> {
+    fn was_extracted(&self, hash: &str, size: i64) -> bool {
+        self.file_repo()
+            .was_extracted(hash, size)
+            .unwrap_or_else(|error| {
+                Self::warn("history reuse lookup", error);
+                false
+            })
+    }
+
     fn start_task(&self, task_id: &TaskId, kind: &str, output_path: Option<&Path>) {
+        if !self.writable {
+            return;
+        }
         let output = output_path.map(|p| p.to_string_lossy().into_owned());
         let started_at = now_utc_iso8601();
         if let Err(error) = self.task_repo().insert(NewTask {
@@ -334,6 +358,9 @@ impl<'a> TaskHistoryRecorder for DbTaskHistoryRecorder<'a> {
     }
 
     fn record_event(&self, task_id: &TaskId, event: &TaskEvent) {
+        if !self.writable {
+            return;
+        }
         let (level, event_type, message, data_json) = describe_event(&event.kind);
         let created_at = now_utc_iso8601();
         if let Err(error) = self.event_repo().insert(NewTaskEvent {
@@ -349,6 +376,9 @@ impl<'a> TaskHistoryRecorder for DbTaskHistoryRecorder<'a> {
     }
 
     fn record_file_extraction(&self, task_id: &TaskId, row: FileExtractionRow<'_>) {
+        if !self.writable {
+            return;
+        }
         let input = row.input_path.to_string_lossy().into_owned();
         let output = row.output_path.map(|p| p.to_string_lossy().into_owned());
         let created_at = now_utc_iso8601();
@@ -384,6 +414,9 @@ impl<'a> TaskHistoryRecorder for DbTaskHistoryRecorder<'a> {
     }
 
     fn finish(&self, task_id: &TaskId, outcome: TaskOutcome<'_>) {
+        if !self.writable {
+            return;
+        }
         let finished_at = now_utc_iso8601();
         let output = outcome
             .output_path
@@ -614,9 +647,6 @@ pub struct DbKnownFileStore<'a> {
 }
 impl KnownFileStore for DbKnownFileStore<'_> {
     fn lookup(&self, sample_hash: &str, size: i64) -> Option<KnownFileHit> {
-        if !self.password_hint && !self.encoding_hint {
-            return None;
-        }
         match KnownFileRepository::new(self.connection).find(sample_hash, size) {
             Ok(Some(known)) => Some(KnownFileHit {
                 password_id: if self.password_hint {
@@ -629,7 +659,6 @@ impl KnownFileStore for DbKnownFileStore<'_> {
                 } else {
                     None
                 },
-                last_extract_at: known.last_extract_at,
             }),
             Ok(None) => None,
             Err(error) => {
@@ -647,13 +676,11 @@ impl KnownFileStore for DbKnownFileStore<'_> {
             name: name.to_string(),
             offset: upsert.offset,
         });
-        let last_extract_at = now_utc_iso8601();
-        if let Err(error) = KnownFileRepository::new(self.connection).upsert_extract(
+        if let Err(error) = KnownFileRepository::new(self.connection).upsert_password_hint(
             upsert.sample_hash,
             upsert.size,
             name_offset,
             upsert.password_id,
-            &last_extract_at,
         ) {
             DbTaskHistoryRecorder::warn("known_file upsert", error);
         }
@@ -685,6 +712,11 @@ pub struct RunStores<'a> {
     pub known_files: Option<&'a dyn KnownFileStore>,
 }
 impl TaskHistoryRecorder for RunStores<'_> {
+    fn was_extracted(&self, hash: &str, size: i64) -> bool {
+        self.history
+            .is_some_and(|history| history.was_extracted(hash, size))
+    }
+
     fn start_task(&self, id: &TaskId, kind: &str, output: Option<&Path>) {
         if let Some(s) = self.history {
             s.start_task(id, kind, output);

@@ -112,7 +112,9 @@ GUI 密码管理页的输入框用于新增密码库条目；列表默认遮罩�
 - `state.known_files="off/read-only/read-write"` 独立控制缓存，仍受全局状态模式约束。
 - `state.database` 可指定数据库路径；数据库仅在当前任务启用的功能需要时打开。只读模式下拒绝修改密码等管理命令。
 
-`extraction.reuse.skip_completed` 默认 `false`。现有缓存缺少目标与策略兼容性的完成证据；即使显式设置 `true`，也会显示被抑制的原因并继续处理归档，不凭历史时间戳跳过任务。
+`extraction.reuse.skip_completed` 默认 `false`。设为 `true` 时，直接查询现有 `file_extractions` 历史：相同采样哈希和大小曾在 `extract` 任务中成功解压，就跳过并提示 `already_extracted`。不要求输出仍存在、不绑定原输出路径；`--force` 强制重解。列目录、测试、失败和跳过记录不算成功解压。去重不另存完成状态，也不设隐含时间窗；清除对应历史后不再跳过。
+
+`state.history=false` 或只读状态禁止写入新历史，但仍可查询既有历史；`state.mode="off"` 不读写状态，因此无法按历史跳过。密码/编码缓存开关不控制历史去重。文件身份使用采样哈希而非全文件摘要，超大文件中段单独修改可能无法区分；需要重新处理时使用 `--force`。
 
 ## 解释与安全编辑
 

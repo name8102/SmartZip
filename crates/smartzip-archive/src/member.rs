@@ -40,10 +40,15 @@ fn safe_member(member: &Path) -> Result<PathBuf> {
         return Err(invalid());
     }
     let path = crate::safety::safe_entry_path(raw.as_bytes()).ok_or_else(invalid)?;
-    if path.as_os_str() != member.as_os_str() {
+    let mut selector = raw;
+    while let Some(rest) = selector.strip_prefix("./") {
+        selector = rest;
+    }
+    if path.as_os_str() != std::ffi::OsStr::new(selector) {
         return Err(invalid());
     }
-    Ok(path)
+    // Preserve the exact archive selector after validating its safe form.
+    Ok(member.to_path_buf())
 }
 async fn bounded_read(
     mut stream: impl AsyncRead + Unpin,
@@ -165,13 +170,26 @@ pub(crate) async fn read_member(
         deadline,
     )
     .await?;
-    let listing =
-        std::str::from_utf8(&listing).map_err(|_| SmartZipError::BackendProtocolError {
-            backend: adapter.id().into(),
-            detail: "invalid UTF-8 member listing".into(),
-        })?;
+    let listing = match std::str::from_utf8(&listing) {
+        Ok(text) => std::borrow::Cow::Borrowed(text),
+        Err(_) if matches!(request.encoding, EncodingMode::Override(_)) => {
+            String::from_utf8_lossy(&listing)
+        }
+        Err(_) => {
+            return Err(SmartZipError::BackendProtocolError {
+                backend: adapter.id().into(),
+                detail: "invalid UTF-8 member listing".into(),
+            })
+        }
+    };
+    let listing = listing.as_ref();
     validate_extraction_listing(listing)?;
     let entries = parse_entries(listing);
+    if let Some(bytes) =
+        crate::decoded_zip::read_member_if_needed(&request, entries.len(), &token, deadline).await?
+    {
+        return Ok(bytes);
+    }
     let matches: Vec<_> = entries
         .iter()
         .filter(|entry| entry.path.as_os_str() == member.as_os_str())
@@ -237,6 +255,10 @@ mod tests {
         ] {
             assert!(safe_member(Path::new(name)).is_err(), "{name}");
         }
+        assert_eq!(
+            safe_member(Path::new("./dir/file.txt")).unwrap(),
+            PathBuf::from("./dir/file.txt")
+        );
         assert_eq!(
             safe_member(Path::new("dir/中文 file.txt")).unwrap(),
             PathBuf::from("dir/中文 file.txt")

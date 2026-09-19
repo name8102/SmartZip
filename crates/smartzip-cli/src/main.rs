@@ -8,8 +8,8 @@ mod command_requests;
 use async_trait::async_trait;
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use command_requests::{DetectCommand, ExtractCommand, ListCommand, TestCommand};
-use smartzip_archive::{ArchiveExecutor, BackendRouter};
-use smartzip_core::{EncodingMode, TaskEvent, TaskEventSink, TaskId};
+use smartzip_archive::BackendRouter;
+use smartzip_core::{EncodingMode, TaskEvent};
 use smartzip_db::{password::PasswordRepository, SmartZipDb};
 use smartzip_engine::{
     EmbeddedSelectionChoice, EncodingConfirmationChoice, ExtractWorkflowRequest,
@@ -553,7 +553,7 @@ async fn run(mut cli: Cli, matches: &clap::ArgMatches) -> Result<(), Box<dyn std
             let result = serde_json::json!({"schema_version": 1, "version": env!("CARGO_PKG_VERSION"), "database": db_path,
                 "backends": adapters, "warnings": backend.warnings(), "status": if healthy { "completed" } else { "failed" },
                 "exit_code": if healthy { 0 } else { 1 }, "extraction_limits": cli.safety.limits(), "scan_default_bytes": smartzip_scanner::DEFAULT_SCAN_BYTES,
-                "scan_hard_limit_bytes": null, "root_scan_strategy": "continue_from_archive_end_until_empty_window"});
+                "scan_hard_limit_bytes": null, "root_scan_strategy": "bounded_metadata_scan_to_eof"});
             if json {
                 println!("{}", serde_json::to_string_pretty(&result)?);
             } else {
@@ -627,8 +627,11 @@ async fn run(mut cli: Cli, matches: &clap::ArgMatches) -> Result<(), Box<dyn std
             password,
             json,
         } => {
+            let db = open_task_db(cli.db, policy)?;
             preview_encodings(
                 &backend,
+                db.as_ref(),
+                &cli.safety,
                 path,
                 password,
                 json,
@@ -643,21 +646,6 @@ async fn run(mut cli: Cli, matches: &clap::ArgMatches) -> Result<(), Box<dyn std
     };
     signal.abort();
     result
-}
-
-struct SilentSink;
-impl TaskEventSink for SilentSink {
-    fn push(&self, _: TaskEvent) {}
-}
-
-struct RoutingPrintSink;
-
-impl TaskEventSink for RoutingPrintSink {
-    fn push(&self, event: TaskEvent) {
-        if let smartzip_core::TaskEventKind::Route(route) = &event.kind {
-            render_route_event(route, true);
-        }
-    }
 }
 
 fn task_listener(
@@ -714,44 +702,85 @@ struct EncodingPreviewEntry {
 
 async fn preview_encodings(
     backend: &BackendRouter,
+    db: Option<&SmartZipDb>,
+    safety: &SafetyOptions,
     path: PathBuf,
     password: Option<String>,
     json: bool,
     verbose_routing: bool,
     cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    struct PreviewPrompter {
+        delegate: StdinPrompter,
+        last: Mutex<Option<String>>,
+    }
+    #[async_trait]
+    impl InteractivePasswordPrompter for PreviewPrompter {
+        async fn prompt(&self, path: &Path) -> Option<String> {
+            let value = self.delegate.prompt(path).await;
+            *self.last.lock().unwrap() = value.clone();
+            value
+        }
+    }
     let candidates = encoding_preview_candidates();
     let mut previews = Vec::new();
+    let service = task_passwords(db, safety);
+    let engine = SmartZipEngine::default()
+        .with_cancellation_token(cancellation.clone())
+        .with_run_policy(safety.policy.as_ref().unwrap().as_ref().clone());
+    let (_, mut known_store) = task_stores(db, safety);
+    if let Some(store) = &mut known_store {
+        store.writable = false;
+    }
+    let history_store = None;
+    let recorder = run_stores(&history_store, &known_store);
+    let control = StdinLock::configured(cancellation.clone(), safety, json);
+    let prompt = PreviewPrompter {
+        delegate: StdinPrompter {
+            lock: control.clone(),
+        },
+        last: Mutex::new(None),
+    };
+    let mut manual: Vec<_> = password.into_iter().collect();
 
     for encoding in candidates {
         let mode = match *encoding {
             "auto" => EncodingMode::Auto,
             other => EncodingMode::Override(other.to_string()),
         };
-        let request = smartzip_archive::ListRequest {
-            archive: path.clone(),
-            format: smartzip_engine::format_from_extension(&path),
-            password: password.clone(),
-            encoding: mode,
-        };
         if cancellation.is_cancelled() {
             return Err(smartzip_core::SmartZipError::Cancelled.into());
         }
-        let listing = if verbose_routing {
-            let context = backend.begin_task_with_cancellation(
-                TaskId::new(),
-                std::sync::Arc::new(RoutingPrintSink),
-                cancellation.clone(),
-            );
-            backend.list_with_context(request, context).await
-        } else {
-            let context = backend.begin_task_with_cancellation(
-                TaskId::new(),
-                std::sync::Arc::new(SilentSink),
-                cancellation.clone(),
-            );
-            backend.list_with_context(request, context).await
-        };
+        let listing = engine
+            .list_archive_with_listener_interactive(
+                backend,
+                &service,
+                ListArchiveRequest {
+                    path: path.clone(),
+                    scanner: ScannerConfig::default(),
+                    encoding_mode: mode,
+                    password_candidates: PasswordCandidateRequest {
+                        manual: manual.clone(),
+                        include_empty: true,
+                        limit: safety.password_limit,
+                        ..Default::default()
+                    },
+                },
+                control
+                    .interactive
+                    .then_some(&prompt as &dyn InteractivePasswordPrompter),
+                None,
+                task_listener(json, verbose_routing, safety),
+                known_store
+                    .as_ref()
+                    .map(|_| &recorder as &dyn smartzip_engine::history::TaskHistoryRecorder),
+            )
+            .await;
+        if listing.is_ok() {
+            if let Some(value) = prompt.last.lock().unwrap().take() {
+                manual.insert(0, value);
+            }
+        }
         match listing {
             Ok(listing) => previews.push(EncodingPreviewEntry {
                 encoding: encoding.to_string(),

@@ -1,6 +1,7 @@
 //! Archive backend abstractions and concrete archive implementations.
 
 pub mod backend;
+mod decoded_zip;
 pub mod diagnostic;
 pub mod integrity;
 mod locator;

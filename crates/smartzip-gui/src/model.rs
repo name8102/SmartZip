@@ -1,6 +1,6 @@
 //! Window-independent queue. A dropped batch remains one engine workflow.
 use crate::runtime::{
-    spawn_job, InteractionRequest, JobHandle, JobMessage, JobOutcome, JobRequest, TaskOperation,
+    spawn_job_at, InteractionRequest, JobHandle, JobMessage, JobOutcome, JobRequest, TaskOperation,
     TaskSettings,
 };
 use smartzip_core::{RouteEvent, TaskEvent, TaskEventKind};
@@ -398,11 +398,15 @@ impl Queue {
                 }
             }
         }
-        // Waiters retain their execution slot and staging ownership.
-        if !self.paused && !self.has_active() {
-            if let Some(job) = self.jobs.iter_mut().find(|j| j.phase == Phase::Queued) {
+        if !self.paused {
+            for (position, job) in self
+                .jobs
+                .iter_mut()
+                .enumerate()
+                .filter(|(_, job)| job.phase == Phase::Queued)
+            {
                 changed = true;
-                match spawn_job(job.request.clone()) {
+                match spawn_job_at(job.request.clone(), position as i64) {
                     Ok(handle) => {
                         job.handle = Some(handle);
                         job.phase = Phase::Running;

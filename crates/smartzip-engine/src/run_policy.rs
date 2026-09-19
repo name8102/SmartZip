@@ -75,6 +75,20 @@ impl CompiledRunPolicy {
             }
         }
     }
+
+    pub fn resolve_request(
+        &self,
+        mut request: ExtractWorkflowRequest,
+    ) -> std::io::Result<ExtractWorkflowRequest> {
+        self.apply_request(&mut request);
+        request.output_dir = std::path::absolute(&request.output_dir)?;
+        request.inputs = request
+            .inputs
+            .into_iter()
+            .map(std::path::absolute)
+            .collect::<std::io::Result<Vec<_>>>()?;
+        Ok(request)
+    }
     pub(crate) fn embedded_mode(&self, root: bool) -> smartzip_core::EmbeddedScanMode {
         use smartzip_core::EmbeddedScanMode as Mode;
         let c = &self.values().extraction.embedded;

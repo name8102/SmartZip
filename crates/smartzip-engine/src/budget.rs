@@ -1,14 +1,127 @@
 //! Dynamic limits for the managed extraction tree. Polling bounds resource use
 //! at checkpoints, not to the last byte a subprocess can write between checks.
 use smartzip_core::{Result, SmartZipError, TaskExecutionContext};
+use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 pub use smartzip_config::ExtractionLimits;
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Usage {
     pub files: u64,
     pub bytes: u64,
+}
+
+#[derive(Debug, Default)]
+struct TaskBudgetState {
+    committed: Usage,
+    in_flight: HashMap<u64, Usage>,
+    next_attempt: u64,
+    nested_candidates: usize,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct TaskBudget {
+    state: Mutex<TaskBudgetState>,
+}
+
+impl TaskBudget {
+    pub(crate) fn from_snapshot(snapshot: crate::TaskBudgetSnapshot) -> Self {
+        Self {
+            state: Mutex::new(TaskBudgetState {
+                committed: Usage {
+                    files: snapshot.output_files,
+                    bytes: snapshot.output_bytes,
+                },
+                nested_candidates: snapshot.nested_candidates,
+                ..TaskBudgetState::default()
+            }),
+        }
+    }
+
+    pub(crate) fn reserve_attempt(self: &Arc<Self>) -> TaskBudgetReservation {
+        let mut state = self.state.lock().unwrap();
+        let id = state.next_attempt;
+        state.next_attempt += 1;
+        state.in_flight.insert(id, Usage::default());
+        TaskBudgetReservation {
+            budget: self.clone(),
+            id,
+            committed: false,
+        }
+    }
+
+    pub(crate) fn reserve_nested(&self, limit: usize) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if state.nested_candidates >= limit {
+            return false;
+        }
+        state.nested_candidates += 1;
+        true
+    }
+
+    pub(crate) fn release_nested(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.nested_candidates -= 1;
+    }
+}
+
+pub(crate) struct TaskBudgetReservation {
+    budget: Arc<TaskBudget>,
+    id: u64,
+    committed: bool,
+}
+
+impl TaskBudgetReservation {
+    fn update(&self, usage: Usage, limits: &ExtractionLimits) -> Result<()> {
+        let mut state = self.budget.state.lock().unwrap();
+        let other = state
+            .in_flight
+            .iter()
+            .filter(|(id, _)| **id != self.id)
+            .fold(state.committed, |total, (_, usage)| Usage {
+                files: total.files.saturating_add(usage.files),
+                bytes: total.bytes.saturating_add(usage.bytes),
+            });
+        let total = Usage {
+            files: other.files.saturating_add(usage.files),
+            bytes: other.bytes.saturating_add(usage.bytes),
+        };
+        if total.files > limits.max_files {
+            return Err(exceeded(format!(
+                "output entry limit {} exceeded",
+                limits.max_files
+            )));
+        }
+        if total.bytes > limits.max_output_bytes {
+            return Err(exceeded(format!(
+                "output byte limit {} exceeded",
+                limits.max_output_bytes
+            )));
+        }
+        state.in_flight.insert(self.id, usage);
+        Ok(())
+    }
+
+    pub(crate) fn commit(&mut self) -> Usage {
+        let mut state = self.budget.state.lock().unwrap();
+        let usage = state
+            .in_flight
+            .remove(&self.id)
+            .expect("budget reservation exists until commit");
+        state.committed.files = state.committed.files.saturating_add(usage.files);
+        state.committed.bytes = state.committed.bytes.saturating_add(usage.bytes);
+        self.committed = true;
+        usage
+    }
+}
+
+impl Drop for TaskBudgetReservation {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.budget.state.lock().unwrap().in_flight.remove(&self.id);
+        }
+    }
 }
 
 pub(crate) fn exceeded(detail: impl Into<String>) -> SmartZipError {
@@ -139,6 +252,7 @@ fn scan_result(
     result.map_err(|error| SmartZipError::io(None, std::io::Error::other(error)))?
 }
 
+#[cfg(test)]
 pub(crate) async fn monitor<T>(
     path: &Path,
     limits: &ExtractionLimits,
@@ -196,9 +310,110 @@ pub(crate) async fn monitor<T>(
     Ok((value, usage))
 }
 
+pub(crate) async fn monitor_task<T>(
+    path: &Path,
+    limits: &ExtractionLimits,
+    reservation: &TaskBudgetReservation,
+    context: Arc<TaskExecutionContext>,
+    operation: impl std::future::Future<Output = Result<T>>,
+) -> Result<(T, Usage)> {
+    use std::time::Duration;
+    use tokio::time::{Instant, MissedTickBehavior};
+
+    let initial = scan_result(scan(path, limits, Usage::default(), true).await)?;
+    reservation.update(initial, limits)?;
+    let mut operation = std::pin::pin!(operation);
+    let period = Duration::from_millis(50);
+    let mut interval = tokio::time::interval_at(Instant::now() + period, period);
+    interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut next_tree = Instant::now() + period;
+    let value = loop {
+        tokio::select! {
+            result = &mut operation => break result?,
+            _ = interval.tick() => {
+                let started = Instant::now();
+                let full = started >= next_tree;
+                let mut pending = scan(path, limits, Usage::default(), full);
+                let result = tokio::select! {
+                    result = &mut operation => {
+                        let checked = scan_result(pending.await);
+                        let value = result?;
+                        let usage = checked?;
+                        if full {
+                            reservation.update(usage, limits)?;
+                        }
+                        break value;
+                    }
+                    result = &mut pending => scan_result(result),
+                };
+                let checked = result.and_then(|usage| {
+                    if full {
+                        reservation.update(usage, limits)
+                    } else {
+                        Ok(())
+                    }
+                });
+                if let Err(error) = checked {
+                        context.cancel();
+                        let _ = operation.await;
+                        return Err(error);
+                }
+                if full {
+                    let delay = (started.elapsed() * 4).clamp(period, Duration::from_secs(1));
+                    next_tree = Instant::now() + delay;
+                }
+            }
+        }
+    };
+    if context.is_cancelled() {
+        return Err(SmartZipError::Cancelled);
+    }
+    let usage = scan_result(scan(path, limits, Usage::default(), true).await)?;
+    reservation.update(usage, limits)?;
+    if context.is_cancelled() {
+        return Err(SmartZipError::Cancelled);
+    }
+    Ok((value, usage))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn task_budget_counts_concurrent_roots_and_nested_candidates_once() {
+        let budget = Arc::new(TaskBudget::default());
+        let limits = ExtractionLimits {
+            max_files: 10,
+            max_output_bytes: 20,
+            min_free_bytes: 0,
+            max_nested_candidates: 2,
+        };
+        let mut first = budget.reserve_attempt();
+        let mut second = budget.reserve_attempt();
+        first
+            .update(
+                Usage {
+                    files: 1,
+                    bytes: 15,
+                },
+                &limits,
+            )
+            .unwrap();
+        assert!(second
+            .update(Usage { files: 1, bytes: 6 }, &limits)
+            .is_err());
+        second
+            .update(Usage { files: 1, bytes: 5 }, &limits)
+            .unwrap();
+        first.commit();
+        second.commit();
+
+        assert!(budget.reserve_nested(limits.max_nested_candidates));
+        assert!(budget.reserve_nested(limits.max_nested_candidates));
+        assert!(!budget.reserve_nested(limits.max_nested_candidates));
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn final_usage_includes_last_backend_write_and_prior_outputs() {
         let root = tempfile::tempdir().unwrap();

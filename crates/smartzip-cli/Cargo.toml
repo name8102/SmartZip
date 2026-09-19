@@ -27,6 +27,7 @@ smartzip-scanner.workspace = true
 tokio.workspace = true
 smartzip-platform.workspace = true
 async-trait.workspace = true
+futures-util.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

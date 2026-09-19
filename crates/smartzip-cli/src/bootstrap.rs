@@ -140,7 +140,6 @@ pub(super) fn apply_cli_overrides(
         ("non_interactive", "interaction.mode", "never".into()),
         ("no_recursive", "extraction.recursion.enabled", false.into()),
         ("no_history", "state.history", false.into()),
-        ("force", "extraction.reuse.skip_completed", false.into()),
     ] {
         if explicit(id).is_some() {
             patches.push((key.into(), value));
@@ -248,9 +247,10 @@ pub(super) fn task_stores<'a>(
 ) {
     use smartzip_config::StateMode;
     let c = safety.policy.as_ref().unwrap().values();
-    let history = db
-        .filter(|_| c.state.mode == StateMode::ReadWrite && c.state.history)
-        .map(|db| smartzip_engine::history::DbTaskHistoryRecorder::new(db.connection()));
+    let history = db.filter(|_| c.state.mode != StateMode::Off).map(|db| {
+        smartzip_engine::history::DbTaskHistoryRecorder::new(db.connection())
+            .with_writes(c.state.mode == StateMode::ReadWrite && c.state.history)
+    });
     let known = db
         .filter(|_| c.state.mode != StateMode::Off && c.state.known_files != StateMode::Off)
         .map(|db| smartzip_engine::history::DbKnownFileStore {

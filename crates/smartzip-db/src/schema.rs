@@ -2,7 +2,7 @@ use rusqlite::Connection;
 use rusqlite_migration::{Migrations, M};
 
 /// Latest schema version this build knows how to produce.
-pub const LATEST_VERSION: u32 = 5;
+pub const LATEST_VERSION: u32 = 7;
 
 const MIGRATIONS_SLICE: &[M<'static>] = &[
     M::up(
@@ -169,6 +169,60 @@ const MIGRATIONS_SLICE: &[M<'static>] = &[
             COALESCE(last_success_at, '') DESC, failure_count ASC, id ASC
         );",
     ),
+    M::up(
+        r#"
+        ALTER TABLE tasks ADD COLUMN inputs_json TEXT;
+        ALTER TABLE tasks ADD COLUMN priority INTEGER NOT NULL DEFAULT 1;
+        ALTER TABLE tasks ADD COLUMN queue_position INTEGER;
+        ALTER TABLE tasks ADD COLUMN config_snapshot_json TEXT;
+        ALTER TABLE tasks ADD COLUMN config_revision INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE tasks ADD COLUMN paused INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE tasks ADD COLUMN owner_epoch INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE tasks ADD COLUMN recoverable INTEGER NOT NULL DEFAULT 0;
+
+        ALTER TABLE file_extractions ADD COLUMN node_id TEXT;
+        ALTER TABLE file_extractions ADD COLUMN parent_node_id TEXT;
+        ALTER TABLE file_extractions ADD COLUMN root_node_id TEXT;
+        ALTER TABLE file_extractions ADD COLUMN generation INTEGER;
+        ALTER TABLE file_extractions ADD COLUMN stage TEXT;
+        ALTER TABLE file_extractions ADD COLUMN execution_state TEXT;
+        ALTER TABLE file_extractions ADD COLUMN input_ref_json TEXT;
+        ALTER TABLE file_extractions ADD COLUMN input_version_json TEXT;
+        ALTER TABLE file_extractions ADD COLUMN artifact_refs_json TEXT;
+        ALTER TABLE file_extractions ADD COLUMN decision_json TEXT;
+        ALTER TABLE file_extractions ADD COLUMN commit_json TEXT;
+        ALTER TABLE file_extractions ADD COLUMN config_revision INTEGER;
+        ALTER TABLE file_extractions ADD COLUMN attempt_id TEXT;
+        CREATE UNIQUE INDEX idx_file_extractions_node_generation
+            ON file_extractions(task_id, node_id, generation)
+            WHERE node_id IS NOT NULL;
+        CREATE INDEX idx_file_extractions_ready
+            ON file_extractions(task_id, execution_state, stage)
+            WHERE node_id IS NOT NULL;
+
+        ALTER TABLE task_events ADD COLUMN node_id TEXT;
+        ALTER TABLE task_events ADD COLUMN stage TEXT;
+        ALTER TABLE task_events ADD COLUMN attempt_id TEXT;
+        ALTER TABLE task_events ADD COLUMN sequence INTEGER;
+        CREATE UNIQUE INDEX idx_task_events_sequence
+            ON task_events(task_id, sequence)
+            WHERE sequence IS NOT NULL;
+
+        CREATE TABLE execution_owner (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            epoch INTEGER NOT NULL,
+            session_id TEXT NOT NULL,
+            acquired_at TEXT NOT NULL
+        );
+        "#,
+    ),
+    M::up(
+        r#"
+        ALTER TABLE tasks ADD COLUMN committed_output_files INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE tasks ADD COLUMN committed_output_bytes INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE tasks ADD COLUMN nested_candidate_count INTEGER NOT NULL DEFAULT 0;
+        "#,
+    ),
 ];
 
 static MIGRATIONS: Migrations<'static> = Migrations::from_slice(MIGRATIONS_SLICE);
@@ -316,7 +370,7 @@ mod tests {
     #[test]
     fn v3_tasks_table_is_slim() {
         let mut conn = Connection::open_in_memory().unwrap();
-        migrate(&mut conn).unwrap();
+        MIGRATIONS.to_version(&mut conn, 3).unwrap();
         let columns: Vec<String> = {
             let mut stmt = conn.prepare("PRAGMA table_info(tasks)").unwrap();
             let rows = stmt
@@ -522,8 +576,8 @@ mod tests {
             .map(|r| r.unwrap())
             .collect();
         assert_eq!(
-            cols,
-            vec![
+            &cols[..6],
+            [
                 "id",
                 "kind",
                 "status",
@@ -532,6 +586,8 @@ mod tests {
                 "finished_at"
             ]
         );
+        assert!(cols.contains(&"inputs_json".to_string()));
+        assert!(cols.contains(&"owner_epoch".to_string()));
     }
 
     #[test]
@@ -605,9 +661,11 @@ mod tests {
             M::up("CREATE TABLE t3 (id INTEGER PRIMARY KEY);"),
             M::up("CREATE TABLE t4 (id INTEGER PRIMARY KEY);"),
             M::up("CREATE TABLE t5 (id INTEGER PRIMARY KEY);"),
+            M::up("CREATE TABLE t6 (id INTEGER PRIMARY KEY);"),
+            M::up("CREATE TABLE t7 (id INTEGER PRIMARY KEY);"),
             M::up("THIS IS NOT VALID SQL"),
         ]);
-        // The DB is at version 5, so the next migration (v6) will fail.
+        // The DB is at version 7, so the next migration (v8) will fail.
         let res = failing.to_latest(&mut conn);
         assert!(res.is_err(), "failing migration should error");
         let after: i64 = conn

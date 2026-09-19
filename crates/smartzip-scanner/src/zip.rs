@@ -2,6 +2,116 @@
 
 use aho_corasick::AhoCorasick;
 
+pub(super) fn checked_file_size(
+    input: &mut crate::file_scan::Input<'_>,
+    start: u64,
+) -> Option<u64> {
+    let end = input.end;
+    input
+        .find(b"PK\x05\x06", start, end, |input, eocd| {
+            check_file_directory(input, start, eocd)
+        })
+        .map(|end| end - start)
+}
+
+fn check_file_directory(
+    input: &mut crate::file_scan::Input<'_>,
+    start: u64,
+    eocd: u64,
+) -> Option<u64> {
+    let header = input.read(eocd, 22)?;
+    if u16_at(&header, 4)? != 0 || u16_at(&header, 6)? != 0 {
+        return None;
+    }
+    let end = eocd.checked_add(22 + u16_at(&header, 20)? as u64)?;
+    if end > input.end {
+        return None;
+    }
+    let mut count = u16_at(&header, 10)? as u64;
+    let mut size = u32_at(&header, 12)? as u64;
+    let mut offset = u32_at(&header, 16)? as u64;
+    let mut directory_end = eocd;
+    if count == u16::MAX as u64 || size == u32::MAX as u64 || offset == u32::MAX as u64 {
+        let locator_position = eocd.checked_sub(20)?;
+        let locator = input.read(locator_position, 20)?;
+        if !locator.starts_with(b"PK\x06\x07") {
+            return None;
+        }
+        let declared = u64_at(&locator, 8)?;
+        let mut record = None;
+        for position in [
+            start.checked_add(declared),
+            Some(declared),
+            locator_position.checked_sub(56),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let Some(header) = input.read(position, 56) else {
+                continue;
+            };
+            if header.starts_with(b"PK\x06\x06")
+                && position.checked_add(u64_at(&header, 4)?)?.checked_add(12)? == locator_position
+            {
+                record = Some((position, header));
+                break;
+            }
+        }
+        let (position, header) = record?;
+        if u32_at(&header, 16)? != 0
+            || u32_at(&header, 20)? != 0
+            || u64_at(&header, 24)? != u64_at(&header, 32)?
+        {
+            return None;
+        }
+        count = u64_at(&header, 32)?;
+        size = u64_at(&header, 40)?;
+        offset = u64_at(&header, 48)?;
+        directory_end = position;
+    } else if u16_at(&header, 8)? as u64 != count {
+        return None;
+    }
+    if count == 0 || count > size / 46 {
+        return None;
+    }
+    let directory_start = directory_end.checked_sub(size)?;
+    if directory_start < start {
+        return None;
+    }
+    let adjustment = directory_start as i128 - offset as i128;
+    let mut cursor = directory_start;
+    let mut references_start = false;
+    for _ in 0..count {
+        let entry = input.read(cursor, 46)?;
+        if !entry.starts_with(b"PK\x01\x02") {
+            return None;
+        }
+        let name_size = u16_at(&entry, 28)? as usize;
+        let extra_size = u16_at(&entry, 30)? as usize;
+        let record_end = cursor
+            .checked_add(46 + name_size as u64 + extra_size as u64 + u16_at(&entry, 32)? as u64)?;
+        if record_end > directory_end {
+            return None;
+        }
+        let name = input.read(cursor + 46, name_size)?;
+        let extra = input.read(cursor + 46 + name_size as u64, extra_size)?;
+        let local = u64::try_from(local_offset(&entry, &extra)? as i128 + adjustment).ok()?;
+        if local < start || local >= directory_start {
+            return None;
+        }
+        let local_header = input.read(local, 30)?;
+        if !local_header.starts_with(b"PK\x03\x04")
+            || u16_at(&local_header, 26)? as usize != name_size
+            || input.read(local + 30, name_size)? != name
+        {
+            return None;
+        }
+        references_start |= local == start;
+        cursor = record_end;
+    }
+    (references_start && cursor == directory_end).then_some(end)
+}
+
 pub(crate) fn checked_size(data: &[u8]) -> Option<usize> {
     let matcher = AhoCorasick::new([b"PK\x05\x06"]).ok()?;
     for eocd in matcher.find_iter(data) {

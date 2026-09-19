@@ -5,7 +5,6 @@ use smartzip_core::{Result, SmartZipError};
 use std::future::Future;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommitPolicy {
@@ -22,18 +21,38 @@ pub enum CollisionAction {
     Rename,
 }
 
-/// Async callback that resolves a collision at `target_path`.
-/// Returns the action to take. Called after layout planning, before commit.
-pub type CollisionResolver<'a> = Box<
-    dyn Fn(
-            PathBuf,
-            PathBuf,
-            LayoutPlan,
-        ) -> Pin<Box<dyn Future<Output = CollisionAction> + Send + 'a>>
-        + Send
-        + Sync
-        + 'a,
->;
+#[derive(Debug, Clone)]
+pub(crate) struct CollisionRequest {
+    pub(crate) archive_path: PathBuf,
+    pub(crate) target_path: PathBuf,
+    version: TargetVersion,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TargetVersion {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+impl TargetVersion {
+    fn read(path: &Path) -> std::io::Result<Self> {
+        let metadata = std::fs::symlink_metadata(path)?;
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        Ok(Self {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+        })
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MaterializeRequest {
@@ -70,6 +89,32 @@ pub struct OutputMaterializer {
     preserve_temp_on_failure: bool,
 }
 
+/// A successful extraction whose output is still private and uncommitted.
+/// The staging directory remains owned until commit or drop.
+#[derive(Debug)]
+pub(crate) struct StagedOutput {
+    request: MaterializeRequest,
+    temp: tempfile::TempDir,
+    layout_plan: LayoutPlan,
+    preserve_temp_on_failure: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct PreparedCommit {
+    request: MaterializeRequest,
+    temp: tempfile::TempDir,
+    layout_plan: LayoutPlan,
+    commit_policy: CommitPolicy,
+    intent: Option<crate::CommitIntent>,
+    preserve_temp_on_failure: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct PublishedOutput {
+    result: MaterializeResult,
+    intent: Option<crate::CommitIntent>,
+}
+
 impl OutputMaterializer {
     pub fn new(preserve_temp_on_failure: bool) -> Self {
         Self {
@@ -77,12 +122,11 @@ impl OutputMaterializer {
         }
     }
 
-    pub async fn materialize<'r, 'a, F, Fut>(
+    pub(crate) async fn prepare<F, Fut>(
         &self,
         request: MaterializeRequest,
         extract_into: F,
-        collision_resolver: Option<&'r CollisionResolver<'a>>,
-    ) -> std::result::Result<MaterializeResult, MaterializeFailure>
+    ) -> std::result::Result<StagedOutput, MaterializeFailure>
     where
         F: FnOnce(PathBuf) -> Fut,
         Fut: Future<Output = Result<()>>,
@@ -118,6 +162,13 @@ impl OutputMaterializer {
                 });
             }
             let preserved_temp_dir = cleanup_staging(temp);
+            let error = match &preserved_temp_dir {
+                Some(path) => SmartZipError::io(
+                    Some(path.clone()),
+                    std::io::Error::other(format!("{error}; temporary output cleanup failed")),
+                ),
+                None => error,
+            };
             return Err(MaterializeFailure {
                 error,
                 preserved_temp_dir,
@@ -127,6 +178,7 @@ impl OutputMaterializer {
 
         let archive_stem = request
             .archive_stem
+            .clone()
             .unwrap_or_else(|| crate::name_score::archive_display_stem(&request.output_dir));
 
         let shape = crate::layout::scan_visible_top_level(&temp_path);
@@ -139,24 +191,77 @@ impl OutputMaterializer {
             single_root_name_policy: request.single_root_name_policy,
         });
 
-        // Empty extraction: nothing to commit, no collision possible.
+        Ok(StagedOutput {
+            request,
+            temp,
+            layout_plan,
+            preserve_temp_on_failure: self.preserve_temp_on_failure,
+        })
+    }
+}
+
+impl StagedOutput {
+    pub(crate) fn collision_request(
+        &self,
+    ) -> std::result::Result<Option<CollisionRequest>, MaterializeFailure> {
+        if self.request.commit_policy != CommitPolicy::FailIfExists {
+            return Ok(None);
+        }
+        match TargetVersion::read(&self.layout_plan.target) {
+            Ok(version) => Ok(Some(CollisionRequest {
+                archive_path: self.request.archive_path.clone(),
+                target_path: self.layout_plan.target.clone(),
+                version,
+            })),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(commit_failure(SmartZipError::io(
+                Some(self.layout_plan.target.clone()),
+                error,
+            ))),
+        }
+    }
+
+    pub(crate) fn prepare_commit(
+        self,
+        collision_decision: Option<(CollisionRequest, CollisionAction)>,
+        success: crate::CommitSuccessFacts,
+    ) -> std::result::Result<PreparedCommit, MaterializeFailure> {
+        let Self {
+            request,
+            temp,
+            layout_plan,
+            preserve_temp_on_failure,
+        } = self;
+
+        // Empty extraction has no filesystem publication to reconcile.
         if matches!(layout_plan.kind, LayoutPlanKind::Empty) {
-            let _ = std::fs::remove_dir_all(temp.path());
-            return Ok(MaterializeResult {
-                output_dir: request.output_dir,
+            return Ok(PreparedCommit {
+                request,
+                temp,
                 layout_plan,
+                commit_policy: CommitPolicy::FailIfExists,
+                intent: None,
+                preserve_temp_on_failure,
             });
         }
 
         let mut commit_policy = request.commit_policy;
         if path_present(&layout_plan.target) && commit_policy == CommitPolicy::FailIfExists {
-            if let Some(resolver) = collision_resolver {
-                let action = resolver(
-                    request.archive_path.clone(),
-                    layout_plan.target.clone(),
-                    layout_plan.clone(),
-                )
-                .await;
+            if let Some((decision, action)) = collision_decision {
+                let current_version =
+                    TargetVersion::read(&layout_plan.target).map_err(|error| {
+                        commit_failure(SmartZipError::io(Some(layout_plan.target.clone()), error))
+                    })?;
+                if decision.target_path != layout_plan.target || current_version != decision.version
+                {
+                    return Err(commit_failure(SmartZipError::io(
+                        Some(layout_plan.target),
+                        std::io::Error::new(
+                            ErrorKind::AlreadyExists,
+                            "output changed after decision",
+                        ),
+                    )));
+                }
                 match action {
                     CollisionAction::Skip => {
                         let _ = std::fs::remove_dir_all(temp.path());
@@ -217,8 +322,109 @@ impl OutputMaterializer {
         };
         let commit_target =
             resolve_commit_target(&layout_plan.target, commit_policy).map_err(commit_failure)?;
+        let commit_id = smartzip_core::AttemptId::new().to_string();
+        let parent = commit_target
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
+        let target_before = match crate::ArtifactIdentity::capture(&commit_target) {
+            Ok(identity) => Some(identity),
+            Err(error) if error.kind() == ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(commit_failure(SmartZipError::io(
+                    Some(commit_target.clone()),
+                    error,
+                )))
+            }
+        };
+        let backup_path = (commit_policy == CommitPolicy::Overwrite && target_before.is_some())
+            .then(|| parent.join(format!(".smartzip-backup-{commit_id}")));
+        let intent = crate::CommitIntent {
+            commit_id: commit_id.clone(),
+            staging_path: temp.path().to_path_buf(),
+            source_path: source.to_path_buf(),
+            target_path: commit_target,
+            marker_path: parent.join(format!(".smartzip-commit-{commit_id}")),
+            backup_path,
+            source_identity: crate::ArtifactIdentity::capture(source).map_err(|error| {
+                commit_failure(SmartZipError::io(Some(source.to_path_buf()), error))
+            })?,
+            target_before,
+            output_files: 0,
+            output_bytes: 0,
+            success,
+        };
+        Ok(PreparedCommit {
+            request,
+            temp,
+            layout_plan,
+            commit_policy,
+            intent: Some(intent),
+            preserve_temp_on_failure,
+        })
+    }
+
+    #[cfg(test)]
+    fn commit(
+        self,
+        collision_decision: Option<(CollisionRequest, CollisionAction)>,
+    ) -> std::result::Result<MaterializeResult, MaterializeFailure> {
+        self.prepare_commit(collision_decision, crate::CommitSuccessFacts::default())?
+            .commit()
+            .map(PublishedOutput::finalize)
+    }
+}
+
+impl PreparedCommit {
+    pub(crate) fn set_output_usage(&mut self, usage: crate::budget::Usage) {
+        if let Some(intent) = &mut self.intent {
+            intent.output_files = usage.files;
+            intent.output_bytes = usage.bytes;
+        }
+    }
+
+    pub(crate) fn intent(&self) -> Option<&crate::CommitIntent> {
+        self.intent.as_ref()
+    }
+
+    pub(crate) fn commit(self) -> std::result::Result<PublishedOutput, MaterializeFailure> {
+        let Self {
+            request,
+            temp,
+            layout_plan,
+            commit_policy,
+            intent,
+            preserve_temp_on_failure,
+        } = self;
+        let Some(intent) = intent else {
+            let _ = std::fs::remove_dir_all(temp.path());
+            return Ok(PublishedOutput {
+                result: MaterializeResult {
+                    output_dir: request.output_dir,
+                    layout_plan,
+                },
+                intent: None,
+            });
+        };
+
+        let marker_result = (|| -> std::io::Result<()> {
+            use std::io::Write;
+            let mut marker = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&intent.marker_path)?;
+            marker.write_all(intent.commit_id.as_bytes())?;
+            marker.sync_all()
+        })();
+        if let Err(error) = marker_result {
+            return Err(commit_failure(SmartZipError::io(
+                Some(intent.marker_path.clone()),
+                error,
+            )));
+        }
+
         let mut layout_plan = layout_plan.clone();
-        match commit_output(source, &commit_target, commit_policy, rename_no_replace) {
+        match commit_output_recoverable(&intent, commit_policy) {
             Ok(residual_backup) => {
                 if let Some(path) = cleanup_staging(temp) {
                     layout_plan
@@ -230,13 +436,29 @@ impl OutputMaterializer {
                         .warnings
                         .push(format!("old output backup retained at {}", path.display()));
                 }
-                Ok(MaterializeResult {
-                    output_dir: commit_target,
-                    layout_plan,
+                Ok(PublishedOutput {
+                    result: MaterializeResult {
+                        output_dir: intent.target_path.clone(),
+                        layout_plan,
+                    },
+                    intent: Some(intent),
                 })
             }
             Err(mut failure) => {
-                if self.preserve_temp_on_failure && failure.preserved_temp_dir.is_none() {
+                if failure.preserved_temp_dir.is_some() {
+                    let staging = temp.keep();
+                    failure.error = SmartZipError::io(
+                        Some(staging.clone()),
+                        std::io::Error::other(format!(
+                            "{}; commit artifacts retained for recovery",
+                            failure.error
+                        )),
+                    );
+                    failure.preserved_temp_dir = Some(staging);
+                    return Err(failure);
+                }
+                let _ = std::fs::remove_file(&intent.marker_path);
+                if preserve_temp_on_failure && failure.preserved_temp_dir.is_none() {
                     failure.preserved_temp_dir = Some(temp.keep());
                 } else if let Some(path) = cleanup_staging(temp) {
                     if failure.preserved_temp_dir.is_none() {
@@ -254,6 +476,34 @@ impl OutputMaterializer {
                 Err(failure)
             }
         }
+    }
+}
+
+impl PublishedOutput {
+    pub(crate) fn intent(&self) -> Option<&crate::CommitIntent> {
+        self.intent.as_ref()
+    }
+
+    pub(crate) fn finalize(mut self) -> MaterializeResult {
+        if let Some(intent) = &self.intent {
+            if let Some(backup) = &intent.backup_path {
+                if path_present(backup) && std::fs::remove_dir_all(backup).is_err() {
+                    self.result.layout_plan.warnings.push(format!(
+                        "old output backup retained at {}",
+                        backup.display()
+                    ));
+                }
+            }
+            if path_present(&intent.marker_path)
+                && std::fs::remove_file(&intent.marker_path).is_err()
+            {
+                self.result.layout_plan.warnings.push(format!(
+                    "commit marker retained at {}",
+                    intent.marker_path.display()
+                ));
+            }
+        }
+        self.result
     }
 }
 
@@ -304,6 +554,7 @@ fn path_present(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok()
 }
 
+#[cfg(test)]
 fn commit_output(
     source: &Path,
     target: &Path,
@@ -352,8 +603,106 @@ fn commit_output(
     Ok(None)
 }
 
+fn commit_output_recoverable(
+    intent: &crate::CommitIntent,
+    policy: CommitPolicy,
+) -> std::result::Result<Option<PathBuf>, MaterializeFailure> {
+    let target_unchanged = match &intent.target_before {
+        Some(identity) => identity
+            .matches_version(&intent.target_path)
+            .map_err(|error| {
+                commit_failure(SmartZipError::io(Some(intent.target_path.clone()), error))
+            })?,
+        None => matches!(
+            std::fs::symlink_metadata(&intent.target_path),
+            Err(error) if error.kind() == ErrorKind::NotFound
+        ),
+    };
+    if !target_unchanged {
+        return Err(commit_failure(SmartZipError::io(
+            Some(intent.target_path.clone()),
+            std::io::Error::new(ErrorKind::AlreadyExists, "output changed before commit"),
+        )));
+    }
+    let mut backup = None;
+    if let (CommitPolicy::Overwrite, Some(expected_target)) =
+        (policy, intent.target_before.as_ref())
+    {
+        let backup_path = intent.backup_path.as_ref().ok_or_else(|| {
+            commit_failure(SmartZipError::io(
+                Some(intent.target_path.clone()),
+                std::io::Error::other("overwrite commit has no backup path"),
+            ))
+        })?;
+        std::fs::create_dir(backup_path)
+            .map_err(|error| commit_failure(SmartZipError::io(Some(backup_path.clone()), error)))?;
+        let old = backup_path.join("original");
+        if let Err(error) = rename_no_replace(&intent.target_path, &old) {
+            let _ = std::fs::remove_dir(backup_path);
+            return Err(commit_failure(SmartZipError::io(
+                Some(intent.target_path.clone()),
+                error,
+            )));
+        }
+        let moved_expected_target = expected_target.matches_version(&old);
+        if !matches!(moved_expected_target, Ok(true)) {
+            if let Err(restore_error) = rename_no_replace(&old, &intent.target_path) {
+                return Err(MaterializeFailure {
+                    error: SmartZipError::io(
+                        Some(intent.target_path.clone()),
+                        std::io::Error::other(format!(
+                            "output changed during commit; restore failed: {restore_error}; changed output retained at {}",
+                            old.display()
+                        )),
+                    ),
+                    preserved_temp_dir: Some(backup_path.clone()),
+                    kind: MaterializeFailureKind::CommitFailed,
+                });
+            }
+            let _ = std::fs::remove_dir(backup_path);
+            let error = match moved_expected_target {
+                Ok(false) => {
+                    std::io::Error::new(ErrorKind::AlreadyExists, "output changed during commit")
+                }
+                Err(error) => error,
+                Ok(true) => unreachable!(),
+            };
+            return Err(commit_failure(SmartZipError::io(
+                Some(intent.target_path.clone()),
+                error,
+            )));
+        }
+        backup = Some(backup_path.clone());
+    }
+
+    if let Err(error) = rename_no_replace(&intent.source_path, &intent.target_path) {
+        if let Some(backup_path) = &backup {
+            let old = backup_path.join("original");
+            if let Err(restore_error) = rename_no_replace(&old, &intent.target_path) {
+                return Err(MaterializeFailure {
+                    error: SmartZipError::io(
+                        Some(intent.target_path.clone()),
+                        std::io::Error::other(format!(
+                            "commit failed: {error}; restore failed: {restore_error}; old output retained at {}",
+                            old.display()
+                        )),
+                    ),
+                    preserved_temp_dir: Some(backup_path.clone()),
+                    kind: MaterializeFailureKind::CommitFailed,
+                });
+            }
+            let _ = std::fs::remove_dir(backup_path);
+        }
+        return Err(commit_failure(SmartZipError::io(
+            Some(intent.target_path.clone()),
+            error,
+        )));
+    }
+    Ok(backup)
+}
+
 /// Atomically refuse an occupied destination, including a dangling symlink.
-fn rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
+pub(crate) fn rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         use std::os::unix::ffi::OsStrExt;
@@ -483,7 +832,7 @@ mod tests {
         let output = root.path().join("archive-d0");
 
         let result = OutputMaterializer::default()
-            .materialize(
+            .prepare(
                 MaterializeRequest {
                     output_dir: output.clone(),
                     archive_path: output.clone(),
@@ -496,9 +845,10 @@ mod tests {
                     std::fs::write(temp_dir.join("hello.txt"), b"hello")
                         .map_err(|source| SmartZipError::io(Some(temp_dir), source))
                 },
-                None,
             )
             .await
+            .unwrap()
+            .commit(None)
             .unwrap();
 
         let plan = &result.layout_plan;
@@ -513,6 +863,113 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn uncommitted_stage_keeps_output_private_and_cleans_on_drop() {
+        let root = tempfile::tempdir().unwrap();
+        let output = root.path().join("archive");
+        let staged = OutputMaterializer::default()
+            .prepare(
+                MaterializeRequest {
+                    output_dir: output.clone(),
+                    archive_path: output.clone(),
+                    commit_policy: CommitPolicy::FailIfExists,
+                    archive_stem: None,
+                    layout_policy: OutputLayoutPolicy::default(),
+                    single_root_name_policy: SingleRootNamePolicy::default(),
+                },
+                |temp_dir| async move {
+                    std::fs::write(temp_dir.join("file"), b"data")
+                        .map_err(|source| SmartZipError::io(Some(temp_dir), source))
+                },
+            )
+            .await
+            .unwrap();
+        let staging_path = staged.temp.path().to_path_buf();
+        assert_eq!(std::fs::read(staging_path.join("file")).unwrap(), b"data");
+        assert!(!output.exists());
+        drop(staged);
+        assert!(!staging_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn collision_reply_cannot_overwrite_a_replaced_target() {
+        let root = tempfile::tempdir().unwrap();
+        let output = root.path().join("archive");
+        std::fs::create_dir(&output).unwrap();
+        let staged = OutputMaterializer::default()
+            .prepare(
+                MaterializeRequest {
+                    output_dir: output.clone(),
+                    archive_path: output.clone(),
+                    commit_policy: CommitPolicy::FailIfExists,
+                    archive_stem: None,
+                    layout_policy: OutputLayoutPolicy::default(),
+                    single_root_name_policy: SingleRootNamePolicy::default(),
+                },
+                |temp_dir| async move {
+                    std::fs::write(temp_dir.join("file"), b"new")
+                        .map_err(|source| SmartZipError::io(Some(temp_dir), source))
+                },
+            )
+            .await
+            .unwrap();
+        let decision = staged.collision_request().unwrap().unwrap();
+        std::fs::rename(&output, root.path().join("old-target")).unwrap();
+        std::fs::create_dir(&output).unwrap();
+        std::fs::write(output.join("other"), b"other").unwrap();
+        let failure = staged
+            .commit(Some((decision, CollisionAction::Overwrite)))
+            .unwrap_err();
+        assert_eq!(failure.kind, MaterializeFailureKind::CommitFailed);
+        assert_eq!(std::fs::read(output.join("other")).unwrap(), b"other");
+    }
+
+    #[tokio::test]
+    async fn prepared_overwrite_rechecks_target_before_rename() {
+        let root = tempfile::tempdir().unwrap();
+        let output = root.path().join("archive");
+        std::fs::create_dir(&output).unwrap();
+        std::fs::write(output.join("old"), b"old").unwrap();
+        let staged = OutputMaterializer::default()
+            .prepare(
+                MaterializeRequest {
+                    output_dir: output.clone(),
+                    archive_path: output.clone(),
+                    commit_policy: CommitPolicy::FailIfExists,
+                    archive_stem: None,
+                    layout_policy: OutputLayoutPolicy::default(),
+                    single_root_name_policy: SingleRootNamePolicy::default(),
+                },
+                |temp_dir| async move {
+                    std::fs::write(temp_dir.join("new-a"), b"new")
+                        .map_err(|source| SmartZipError::io(Some(temp_dir.clone()), source))?;
+                    std::fs::write(temp_dir.join("new-b"), b"new")
+                        .map_err(|source| SmartZipError::io(Some(temp_dir), source))
+                },
+            )
+            .await
+            .unwrap();
+        let decision = staged.collision_request().unwrap().unwrap();
+        let prepared = staged
+            .prepare_commit(
+                Some((decision, CollisionAction::Overwrite)),
+                crate::CommitSuccessFacts::default(),
+            )
+            .unwrap();
+
+        std::fs::rename(&output, root.path().join("old-target")).unwrap();
+        std::fs::create_dir(&output).unwrap();
+        std::fs::write(output.join("concurrent"), b"concurrent").unwrap();
+
+        let failure = prepared.commit().unwrap_err();
+        assert_eq!(failure.kind, MaterializeFailureKind::CommitFailed);
+        assert_eq!(
+            std::fs::read(output.join("concurrent")).unwrap(),
+            b"concurrent"
+        );
+    }
+
+    #[tokio::test]
     async fn overwrite_removes_existing_output_only_after_success() {
         let root = tempfile::tempdir().unwrap();
         let output = root.path().join("archive-d0");
@@ -520,7 +977,7 @@ mod tests {
         std::fs::write(output.join("old.txt"), b"old").unwrap();
 
         let result = OutputMaterializer::default()
-            .materialize(
+            .prepare(
                 MaterializeRequest {
                     output_dir: output.clone(),
                     archive_path: output.clone(),
@@ -535,9 +992,10 @@ mod tests {
                     std::fs::write(temp_dir.join("also.txt"), b"also")
                         .map_err(|source| SmartZipError::io(Some(temp_dir), source))
                 },
-                None,
             )
             .await
+            .unwrap()
+            .commit(None)
             .unwrap();
 
         let plan = &result.layout_plan;
@@ -560,7 +1018,7 @@ mod tests {
         std::fs::write(output.join("old.txt"), b"old").unwrap();
 
         let result = OutputMaterializer::default()
-            .materialize(
+            .prepare(
                 MaterializeRequest {
                     output_dir: output.clone(),
                     archive_path: output.clone(),
@@ -576,7 +1034,6 @@ mod tests {
                         stderr: "failed".into(),
                     })
                 },
-                None,
             )
             .await;
 
@@ -590,7 +1047,7 @@ mod tests {
         let output = root.path().join("archive-d0");
 
         let result = OutputMaterializer::new(true)
-            .materialize(
+            .prepare(
                 MaterializeRequest {
                     output_dir: output.clone(),
                     archive_path: output.clone(),
@@ -608,7 +1065,6 @@ mod tests {
                         stderr: "failed".into(),
                     })
                 },
-                None,
             )
             .await
             .unwrap_err();
@@ -625,7 +1081,7 @@ mod tests {
         let output = root.path().join("my-archive");
 
         let result = OutputMaterializer::default()
-            .materialize(
+            .prepare(
                 MaterializeRequest {
                     output_dir: output.clone(),
                     archive_path: output.clone(),
@@ -641,9 +1097,10 @@ mod tests {
                     std::fs::write(inner.join("a.txt"), b"alpha")
                         .map_err(|source| SmartZipError::io(Some(temp_dir), source))
                 },
-                None,
             )
             .await
+            .unwrap()
+            .commit(None)
             .unwrap();
 
         let plan = &result.layout_plan;
@@ -665,7 +1122,7 @@ mod tests {
         let output = root.path().join("output");
 
         let result = OutputMaterializer::default()
-            .materialize(
+            .prepare(
                 MaterializeRequest {
                     output_dir: output.clone(),
                     archive_path: output.clone(),
@@ -681,9 +1138,10 @@ mod tests {
                     std::fs::write(inner.join("file.txt"), b"hello")
                         .map_err(|source| SmartZipError::io(Some(temp_dir), source))
                 },
-                None,
             )
             .await
+            .unwrap()
+            .commit(None)
             .unwrap();
 
         let plan = &result.layout_plan;
@@ -703,7 +1161,7 @@ mod tests {
         let output = root.path().join("output");
 
         let result = OutputMaterializer::default()
-            .materialize(
+            .prepare(
                 MaterializeRequest {
                     output_dir: output.clone(),
                     archive_path: output.clone(),
@@ -716,9 +1174,10 @@ mod tests {
                     std::fs::write(temp_dir.join("doc.pdf"), b"pdf-content")
                         .map_err(|source| SmartZipError::io(Some(temp_dir), source))
                 },
-                None,
             )
             .await
+            .unwrap()
+            .commit(None)
             .unwrap();
 
         let plan = &result.layout_plan;
@@ -736,7 +1195,7 @@ mod tests {
         std::fs::create_dir_all(&output).unwrap();
 
         let _result = OutputMaterializer::default()
-            .materialize(
+            .prepare(
                 MaterializeRequest {
                     output_dir: output.join("download"),
                     archive_path: output.clone(),
@@ -752,9 +1211,10 @@ mod tests {
                     std::fs::write(inner.join("file.txt"), b"content")
                         .map_err(|e| SmartZipError::io(Some(inner), e))
                 },
-                None,
             )
             .await
+            .unwrap()
+            .commit(None)
             .unwrap();
 
         // Should be output/ProjectName/file.txt, NOT output/download/ProjectName/file.txt

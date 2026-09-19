@@ -93,7 +93,7 @@ fn checked_initial_header(data: &[u8]) -> Option<bool> {
     }
 }
 
-fn vint(data: &[u8], position: &mut usize) -> Option<u64> {
+pub(super) fn vint(data: &[u8], position: &mut usize) -> Option<u64> {
     let mut value = 0u64;
     for shift in (0..64).step_by(7) {
         let byte = *data.get(*position)?;

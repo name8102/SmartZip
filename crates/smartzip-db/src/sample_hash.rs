@@ -4,9 +4,8 @@
 //! this before?" is unacceptable on the extract hot path. Instead we sample
 //! the head and tail and fold the file size into the identity: two files are
 //! treated as the same known file when both their [`sample_hash`] and size
-//! match. Collisions are possible in theory but astronomically unlikely for
-//! real archives, and the cost of a false match is only a skipped re-extract
-//! (guarded by a time window and `--force`), never data loss.
+//! match. Changes confined to the unsampled middle can produce the same identity.
+//! History-based skipping is opt-in, and `--force` bypasses it.
 //!
 //! - `< SMALL_FILE_THRESHOLD` (128 KiB): the whole file is hashed, so the
 //!   result is a true content hash.

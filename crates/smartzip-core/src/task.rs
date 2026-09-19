@@ -1,26 +1,21 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
-
-static NEXT_TASK_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 /// Stable task identifier used by GUI, CLI, logs, and database rows.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct TaskId(String);
 
 impl TaskId {
     pub fn new() -> Self {
-        let millis = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_millis())
-            .unwrap_or_default();
-        let sequence = NEXT_TASK_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        Self(format!("task-{millis}-{sequence}"))
+        Self(format!("task-{}", uuid::Uuid::new_v4()))
     }
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    pub fn from_stored(value: String) -> Self {
+        Self(value)
     }
 }
 
@@ -35,6 +30,43 @@ impl fmt::Display for TaskId {
         f.write_str(&self.0)
     }
 }
+
+macro_rules! random_id {
+    ($name:ident, $prefix:literal) => {
+        #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+        pub struct $name(String);
+
+        impl $name {
+            pub fn new() -> Self {
+                Self(format!(concat!($prefix, "-{}"), uuid::Uuid::new_v4()))
+            }
+
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+
+            pub fn from_stored(value: String) -> Self {
+                Self(value)
+            }
+        }
+
+        impl Default for $name {
+            fn default() -> Self {
+                Self::new()
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(&self.0)
+            }
+        }
+    };
+}
+
+random_id!(NodeId, "node");
+random_id!(AttemptId, "attempt");
+random_id!(DecisionId, "decision");
 
 /// Encoding policy used for archive entry names.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]

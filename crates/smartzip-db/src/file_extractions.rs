@@ -7,8 +7,8 @@
 //! collapses into the `encoding` / `encoding_corrected` columns and carved
 //! archives are ordinary rows disambiguated by `offset`.
 //!
-//! The table is write-once — there is no update path. Reuse/dedup state that
-//! *does* mutate lives in `known_files` instead. Callers treat repo errors as
+//! The table is write-once — there is no update path. Deduplication queries successful actions in this same history.
+//! Password and encoding hints live in `known_files`. Callers treat repo errors as
 //! non-fatal (see the engine's best-effort recorder).
 
 use crate::Result;
@@ -63,6 +63,18 @@ pub struct FileExtractionRepository<'a> {
 impl<'a> FileExtractionRepository<'a> {
     pub fn new(conn: &'a Connection) -> Self {
         Self { conn }
+    }
+
+    /// Whether this identity has a successful extraction in the existing history.
+    /// Listing/testing and the location or existence of outputs do not count.
+    pub fn was_extracted(&self, hash: &str, size: i64) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM file_extractions f JOIN tasks t ON t.id = f.task_id
+             WHERE f.sample_hash = ?1 AND f.file_size = ?2
+             AND f.status = 'extracted' AND t.kind = 'extract')",
+            params![hash, size],
+            |row| row.get(0),
+        )?)
     }
 
     /// Append one extraction action. No update path exists by design.
@@ -243,6 +255,48 @@ mod tests {
             test_report_json: None,
             created_at: "2026-07-02T00:00:01Z",
         }
+    }
+
+    #[test]
+    fn reuse_uses_only_successful_extraction_history_without_output_checks() {
+        let db = SmartZipDb::in_memory().unwrap();
+        seed_task(&db, "extract");
+        TaskRepository::new(db.connection())
+            .insert(NewTask {
+                id: "list",
+                kind: "list",
+                output_path: None,
+                started_at: "2026-07-02T00:00:00Z",
+            })
+            .unwrap();
+        let repo = FileExtractionRepository::new(db.connection());
+        for (task, status) in [
+            ("list", "extracted"),
+            ("extract", "failed"),
+            ("extract", "skipped"),
+        ] {
+            repo.insert(NewFileExtraction {
+                sample_hash: Some("h"),
+                file_size: Some(42),
+                ..base(task, "/a.zip", status)
+            })
+            .unwrap();
+        }
+        assert!(!repo.was_extracted("h", 42).unwrap());
+        repo.insert(NewFileExtraction {
+            sample_hash: Some("h"),
+            file_size: Some(42),
+            output_path: Some("/missing/moved-output"),
+            ..base("extract", "/a.zip", "extracted")
+        })
+        .unwrap();
+        assert!(repo.was_extracted("h", 42).unwrap());
+        assert!(!repo.was_extracted("other", 42).unwrap());
+        assert!(!repo.was_extracted("h", 43).unwrap());
+        db.connection()
+            .execute("DELETE FROM tasks WHERE id = 'extract'", [])
+            .unwrap();
+        assert!(!repo.was_extracted("h", 42).unwrap());
     }
 
     #[test]
