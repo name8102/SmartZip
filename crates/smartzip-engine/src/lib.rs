@@ -376,6 +376,9 @@ impl SmartZipEngine {
         let task_budget =
             std::sync::Arc::new(crate::budget::TaskBudget::from_snapshot(identity.budget));
         let task_cancellation = TaskCancellation::new(self.cancellation.child_token());
+        let dedup = std::rc::Rc::new(std::cell::RefCell::new(
+            extract_workflow::TaskDedup::default(),
+        ));
         if let Some(execution) = observer.execution.filter(|_| request.inputs.len() > 1) {
             if identity.roots.len() != request.inputs.len() {
                 return Err(smartzip_core::SmartZipError::ResourceLimit {
@@ -392,6 +395,7 @@ impl SmartZipEngine {
                 .map(|(input, root)| {
                     let batch_passwords = batch_passwords.clone();
                     let task_budget = task_budget.clone();
+                    let dedup = dedup.clone();
                     let cancellation = task_cancellation.clone();
                     let task_id = task_id.clone();
                     let listener = observer.listener.clone();
@@ -422,6 +426,7 @@ impl SmartZipEngine {
                             },
                             batch_passwords,
                             task_budget,
+                            dedup,
                         )
                         .await
                     }
@@ -475,6 +480,7 @@ impl SmartZipEngine {
             identity,
             std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
             task_budget,
+            dedup,
         )
         .await
     }

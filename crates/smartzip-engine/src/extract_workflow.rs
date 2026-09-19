@@ -37,6 +37,14 @@ use crate::types::{
 };
 use crate::volumes::VolumeResolver;
 
+/// Shared by concurrent roots; claims never hold a borrow across an await.
+#[derive(Default)]
+pub(crate) struct TaskDedup {
+    seen: HashSet<String>,
+    volumes: HashSet<String>,
+    members: HashSet<std::path::PathBuf>,
+}
+
 struct ExecutionNode {
     id: NodeId,
     root_id: NodeId,
@@ -92,6 +100,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
     identity: crate::ExtractTaskIdentity,
     batch_passwords: std::rc::Rc<std::cell::RefCell<Vec<PasswordCandidate>>>,
     task_budget: std::sync::Arc<crate::budget::TaskBudget>,
+    dedup: std::rc::Rc<std::cell::RefCell<TaskDedup>>,
 ) -> smartzip_core::Result<ExtractWorkflowResult> {
     let config = run_policy.map(crate::CompiledRunPolicy::values);
     let may_prompt =
@@ -145,7 +154,6 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
         policy.emit_plan(&events, &task_id);
     }
     let mut queue = VecDeque::new();
-    let mut seen = HashSet::new();
     let mut processed = Vec::new();
     let mut skipped = Vec::new();
     let mut enqueued = Vec::new();
@@ -204,8 +212,6 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
     let mut failed_count = 0usize;
     let mut was_cancelled = false;
     let mut volume_resolver = VolumeResolver::new();
-    let mut processed_volume_keys = HashSet::new();
-    let mut consumed_volume_members = HashSet::new();
 
     'nodes: loop {
         if failed_count > 0
@@ -267,7 +273,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
         }
         let original_input_path = candidate.path.clone();
         let key = candidate_key(&candidate);
-        let is_new = seen.insert(key);
+        let is_new = dedup.borrow_mut().seen.insert(key);
         // Split the merged skip so each reason lands its own file_extractions
         // row (duplicate within this run / over recursion limit / a non-first
         // volume of a split set).
@@ -306,7 +312,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
         let absolute_input =
             std::path::absolute(&candidate.path).unwrap_or_else(|_| candidate.path.clone());
         if candidate.source != CandidateSource::EmbeddedFinding
-            && consumed_volume_members.contains(&absolute_input)
+            && dedup.borrow().members.contains(&absolute_input)
         {
             record_skip(legacy_history, &task_id, &candidate, "duplicate");
             finish_execution(
@@ -335,7 +341,8 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
             let resolution = volume_resolver.resolve(&candidate);
             if let Some(set) = resolution.resolved_set() {
                 let key = volume_set_key(set);
-                if processed_volume_keys.contains(&key) {
+                let new_volume = dedup.borrow_mut().volumes.insert(key);
+                if !new_volume {
                     record_skip(legacy_history, &task_id, &candidate, "duplicate");
                     finish_execution(
                         execution,
@@ -351,9 +358,8 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                     skipped.push(candidate);
                     continue;
                 }
-                processed_volume_keys.insert(key);
                 for member in &set.members {
-                    consumed_volume_members.insert(
+                    dedup.borrow_mut().members.insert(
                         std::path::absolute(&member.path).unwrap_or_else(|_| member.path.clone()),
                     );
                 }

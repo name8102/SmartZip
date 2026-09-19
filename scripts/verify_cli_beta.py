@@ -132,6 +132,10 @@ def main():
         checks.append("explicit business-container extension attempts extraction; nested small carriers retain efficiency gates")
         report = run(["extract", archive, archive, "--output", root / "duplicate", "--json"])
         assert report["status"] == "completed" and report["processed_count"] == 1 and report["skipped_count"] == 1
+        with sqlite3.connect(db) as conn:
+            rows = conn.execute("SELECT status, reason FROM file_extractions WHERE task_id=?", (report["task_id"],)).fetchall()
+        assert sorted(status for status, _ in rows) == ["extracted", "skipped"], rows
+        assert ("skipped", "duplicate") in rows, rows
         report = run(["extract", archive, "--output", root / "first", "--layout", "raw", "--json"])
         assert report["status"] == "completed" and report["skipped_count"] == 1
         checks.append("benign duplicate and collision skip remain successful")
