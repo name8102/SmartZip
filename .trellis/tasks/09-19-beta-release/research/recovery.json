@@ -1,0 +1,12 @@
+{
+  "passed": 6,
+  "checks": [
+    "v5 database upgrades through CLI twice: password, history and encoding hints preserved; old tasks not recovered",
+    "during held real extraction: listing remains usable; second execution owner is rejected",
+    "extract: SIGKILL, restart, exact output/history/budget, no staging or backup leak",
+    "after-backup: SIGKILL, restart, exact output/history/budget, no staging or backup leak",
+    "before-publish: SIGKILL, restart, exact output/history/budget, no staging or backup leak",
+    "after-publish: SIGKILL, restart, exact output/history/budget, no staging or backup leak"
+  ],
+  "commit_fault_platform": "Linux renameat2 interposition; other platforms require native commit acceptance"
+}

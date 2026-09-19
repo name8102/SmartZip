@@ -75,6 +75,7 @@ def build(profile):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--source", type=Path, help="Install an existing signed .app without building")
     parser.add_argument("--profile", choices=["debug", "release"], default="release")
     parser.add_argument("--destination", type=Path, default=Path.home() / "Applications/SmartZip.app")
     args = parser.parse_args()
@@ -82,6 +83,9 @@ def main():
         parser.error("此安装脚本仅适用于 macOS")
     destination = args.destination.expanduser().absolute()
     validate_destination(destination)
+    if args.source is not None:
+        print(install_bundle(args.source.expanduser().absolute(), destination))
+        return
     executable = build(args.profile)
     bundle = PACKAGER.package(executable, executable.parent / "bundle/SmartZip.app")
     install_bundle(bundle, destination)

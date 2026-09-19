@@ -23,7 +23,7 @@
 | **Root scan** | 用户直接输入的文件应尽可能解压。空搜索窗口后继续扫描直到文件末尾；命中归档头后完整解析其范围，再从归档末尾继续搜索。窗口不限制前缀、归档间隔或已命中归档的长度。过小载荷、业务容器和嵌套扫描大小等效率门槛仅用于嵌套发现。解压资源预算独立生效。 |
 | **Recursive extraction** | BFS 队列驱动的递归解压。队列中每个候选经过同一管线：格式检测 → 编码检测 → 有界密码候选直接解压到 `OutputMaterializer` → 输出扫描 → 嵌套候选入队。 |
 | **Collapse single output** | 解压产出唯一条目时的优化：将该条目提到父目录，去掉中间层空目录。现在由 `LayoutPlanKind` 的各种 `Commit*` 变体实现，包括内容上移（`CommitSingleDirContentsAsArchiveName`）和直接重命名（`CommitSingleDirAsInnerName`/`CommitSingleFileAsInnerName`）。 |
-| **ArchiveNode** | 下一阶段动态节点模型。记录父节点、来源、深度、状态、指纹和成功密码。节点在父归档解压后增量产生，不要求预先构造完整 DAG。 |
+| **ArchiveNode** | 动态节点语义由持久 NodeId/generation 和现有文件历史行实现，记录父子、阶段、输入身份与提交事实。节点在父归档解压后增量产生，不预先构造完整 DAG；秘密不进入持久执行快照。 |
 | **VolumeSet** | 分卷归档集合；入口、成员和诊断语义见下方完整性校验。 |
 | **ExtractionLimits** | 不可信归档的资源预算：递归深度、内层候选数、文件数、磁盘安全余量和内嵌 finding 数量。 |
 | **OutputMaterializer** | 事务式输出策略与 **extraction staging** 的唯一所有者：为 adapter 尝试提供隔离目录、在失败后验证清理、对成功树做布局规划与碰撞处理，再 `CommitCommand` 提交或回滚。失败时默认清理临时目录；开发模式可保留**已选中**成功树用于诊断（失败 adapter 树必须删除）。碰撞在布局规划之后，经 `CollisionResolver` 交互。 |
@@ -74,6 +74,7 @@
 - **Diagnostic pass**：engine 在失败主测试后发起的独立只读阶段，ArchiveExecutor 至多选择一个不同实现家族的后端；仍尊重强制 `--backend`，普通 corruption fallback 规则保持不变。本地格式校验不经过外部后端路由。
 - DB **v4** 给 file_extractions 增加 nullable test_report_json，旧数据保留；damaged_volumes_json 只投影 confirmed 路径。test 不更新 known_files / last_extract_at，也不用首片 hash 表示整组。
 - DB **v5** 仅重建密码排名索引，完整匹配含 COALESCE 的排序。导入和批量禁用使用单事务；导入保留重复行计数、pin 和重新启用规则，输入/SQL 错误回滚整批。
+- DB **v6/v7** 在现有 tasks/file_extractions/task_events 上扩展执行状态、节点身份、提交对账与累计资源预算；旧历史保留且不自动恢复。当前实现与边界见 `.trellis/tasks/09-19-task-system-implementation/implement.md`。
 - 解压预算的全树/磁盘检查在阻塞工作线程运行，每个 monitor 仅一个检查在途；取消或后端结束先等待检查与后端回收，成功后做全新终检并返回累计 Usage。轮询是检查点预算，不是逐字节硬配额。
 - 外部 test 非零退出可返回 `TestResult { ok: false, diagnostics }` 保留证据；调用者必须检查 ok。旧解压流程在既有 test-before-extract 分支把失败报告转换回错误状态，密码/损坏歧义不记密码失败统计。
 

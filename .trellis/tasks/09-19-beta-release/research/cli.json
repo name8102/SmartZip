@@ -1,0 +1,28 @@
+{
+  "passed": 23,
+  "checks": [
+    "doctor: real backend version and capabilities",
+    "real ZIP extraction and repeated input to a new destination",
+    "ZIP and TAR renamed to JPG; harmless TAR root directory accepted",
+    "small root payloads and concatenated archives at offset zero all extract automatically",
+    "archive parsing crosses 64 MiB and continues to the following payload",
+    "explicit business-container extension attempts extraction; nested small carriers retain efficiency gates",
+    "benign duplicate and collision skip remain successful",
+    "mixed batch, JSON, history and exit status agree",
+    "unreadable detect and all-failed encoding preview return failure",
+    "suspicious encoding skip continues the remaining batch",
+    "file/byte/free-space limits roll back staging and retain old output",
+    "dangerous paths and link traversal rejected before commit",
+    "real encrypted 7z: correct, wrong and unavailable passwords",
+    "encrypted JPG retries remaining passwords after ambiguous encrypted-data error",
+    "password attempts extract directly: two x calls, zero full-test calls, failed staging removed",
+    "exhausted ambiguous passwords retain the diagnostic and history reason without penalties",
+    "terminal password preserves whitespace, hides echo, cancels and restores terminal",
+    "real split 7z, missing volume and corrupted ZIP",
+    "nested RAR volume set extracts once without retrying consumed members",
+    "continuation JPG volume with embedded ZIP bytes keeps the resolved archive identity",
+    "password in archive or entry names cannot change CRC failure classification",
+    "growing external output: dynamic stop; Ctrl+C reaps child and cleans staging",
+    "Unicode password listing, private database mode and source preservation"
+  ]
+}

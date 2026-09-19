@@ -1,0 +1,10 @@
+{
+  "verified": [
+    "checksum",
+    "unpack",
+    "CLI version and doctor",
+    "isolated install and update",
+    "uninstall preserves state"
+  ],
+  "native_gui": "user acceptance required"
+}

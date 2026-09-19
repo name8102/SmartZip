@@ -9,12 +9,14 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import tomllib
 
 ROOT = Path(__file__).resolve().parents[1]
 BUNDLE_ID = "org.smartzip.SmartZip"
 
 
 def info_plist():
+    version = tomllib.loads((ROOT / "crates/smartzip-gui/Cargo.toml").read_text())["package"]["version"]
     formats = json.loads((ROOT / "resources/file-types.json").read_text())
     return {
         "CFBundleIdentifier": BUNDLE_ID,
@@ -22,9 +24,10 @@ def info_plist():
         "CFBundleName": "SmartZip",
         "CFBundleDisplayName": "SmartZip",
         "CFBundlePackageType": "APPL",
-        "CFBundleShortVersionString": "0.1.0",
+        "CFBundleShortVersionString": version.split("-", 1)[0],
+        "SmartZipVersion": version,
         "CFBundleVersion": "1",
-        "LSMinimumSystemVersion": "12.0",
+        "LSMinimumSystemVersion": "14.0",
         "NSHighResolutionCapable": True,
         "CFBundleURLTypes": [{"CFBundleURLName": BUNDLE_ID, "CFBundleURLSchemes": ["smartzip"], "CFBundleTypeRole": "Viewer"}],
         "CFBundleDocumentTypes": [{

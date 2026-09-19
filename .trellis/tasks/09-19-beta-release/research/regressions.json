@@ -1,0 +1,10 @@
+{
+  "passed": 5,
+  "checks": [
+    "one history: list is not completion; missing output, hints off, force, config off, history read-only and clear",
+    "history disabled: successful extraction creates no hidden dedup state",
+    "listing a visible encrypted ZIP does not bind a wrong library password",
+    "encoding candidates produce distinct decoded names; noninteractive picker fails explicitly",
+    "PTY list/extract/test wrong-then-correct retry, list Ctrl+C=130, progress stays off stdout"
+  ]
+}

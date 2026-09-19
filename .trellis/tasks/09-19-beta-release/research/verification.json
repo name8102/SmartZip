@@ -1,0 +1,27 @@
+{
+  "source_base": "b4e5513921f12254d8dfff1bbf0103794b85e1b4",
+  "worktree_changes": true,
+  "host": "CachyOS",
+  "rustc": "rustc 1.100.0-nightly (0ed41eb41 2026-09-04)",
+  "python": "3.14.7",
+  "workspace": {
+    "passed": 577,
+    "failed": 0,
+    "ignored": 6
+  },
+  "explicit_gui_backend_tests": 5,
+  "python_packaging_tests": 7,
+  "native_gui": "user acceptance pending",
+  "ubuntu_24_04": "CI pending; local rootless container unavailable",
+  "macos_arm64": "CI and native platform acceptance pending",
+  "ci_toolchain_local_check": {
+    "rust": "1.97.1",
+    "workspace_check": "passed",
+    "format": "passed",
+    "runtime_tests": "not rerun on this toolchain"
+  },
+  "artifacts": {
+    "smartzip-0.1.0-beta.1-x86_64-unknown-linux-gnu.tar.gz.sha256": "fde97702015fbedf9852f000a81df2532838720d4ede380e411ebfd488441093",
+    "smartzip-desktop-0.1.0-beta.1-x86_64-unknown-linux-gnu.tar.gz.sha256": "48801e54ea5ef432d666cea8542b08e0875d4390c03cd9950e1132c5cb9af7a1"
+  }
+}

@@ -17,10 +17,11 @@ SmartZip 是一个用 Rust 重写的跨平台压缩包辅助工具，目标是�
 ## 当前状态与下一步
 
 - 能力路由整合已落地：后端按能力、配置与归档要求选择，CLI 与 engine 使用统一执行入口；文件级历史与密码/编码记忆保留。
-- `test` 已接通后端、自动诊断、JSON 和历史报告；[分卷定位说明](.trellis/tasks/2026-07/07-03-test-command-backend-split/design.md) 记录证据规则与格式边界。压缩命令与 GUI 不在 CLI beta 范围。
+- `test` 已接通后端、自动诊断、JSON 和历史报告；[分卷定位说明](.trellis/tasks/2026-07/07-03-test-command-backend-split/design.md) 记录证据规则与格式边界。压缩创建不在当前产品范围；桌面 beta 同时提供 GUI 与 CLI。
 - CLI beta 已加入可恢复覆盖提交、扫描与产出预算、Ctrl+C、非交互策略和 `doctor`。安装、平台范围、退出码、JSON 与限制见 [CLI beta 指南](docs/cli-beta.md)。设计草案中超出本轮的交互能力仍待实现。
 - CLI 与 GUI 已接入[统一配置](docs/configuration.md)；GUI 提供全局与单任务快速配置，以及共享校验的分组设置表单。
 - GUI 已有共享单并发解压队列的快速/详细双窗口、拖放解压、进度与后端显示、检测/列出/校验，以及历史和密码管理入口；原生实施与完整能力验收仍在进行，见 [GUI 实施记录](.trellis/tasks/09-12-gui-design/implement.md)。
+- 安装、升级、恢复边界和发布验收见 [桌面 beta 指南](docs/desktop-beta.md)。
 - 当前核对结果与已知缺口见 [实现进度](docs/implementation-progress.md)。
 
 ## 快速开始

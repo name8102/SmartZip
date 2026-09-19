@@ -1,0 +1,26 @@
+{
+  "passed": 3,
+  "checks": [
+    "192 MiB empty prefix: finds trailing ZIP; Linux sampled CLI RSS below 128 MiB",
+    "4000 small files with 2000-entry cap: fails safely, preserves previous output, cleans staging",
+    "three roots share a 3 MiB task budget: only one 2 MiB output commits"
+  ],
+  "measurements": [
+    {
+      "operation": "detect",
+      "seconds": 0.325,
+      "sampled_cli_peak_rss_kib": 13700
+    },
+    {
+      "operation": "extract",
+      "seconds": 0.081,
+      "sampled_cli_peak_rss_kib": 16200
+    },
+    {
+      "operation": "extract",
+      "seconds": 0.041,
+      "sampled_cli_peak_rss_kib": 15148
+    }
+  ],
+  "scope": "bounded synthetic cases; RSS samples cover CLI only, not child backends; no throughput claim"
+}

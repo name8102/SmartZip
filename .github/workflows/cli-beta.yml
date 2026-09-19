@@ -1,4 +1,4 @@
-name: CLI beta
+name: Beta release
 on:
   push:
     branches: [main]
@@ -7,6 +7,9 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
+defaults:
+  run:
+    shell: bash
 jobs:
   verify:
     strategy:
@@ -22,7 +25,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Linux dependencies
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y 7zip zip ripgrep pkg-config liblzma-dev libbz2-dev libfontconfig1-dev libfreetype6-dev
+        run: sudo apt-get update && sudo apt-get install -y 7zip zip ripgrep pkg-config liblzma-dev libbz2-dev libfontconfig1-dev libfreetype6-dev libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libvulkan-dev clang
       - name: macOS dependencies
         if: runner.os == 'macOS'
         run: brew install sevenzip xz pkg-config ripgrep
@@ -36,21 +39,41 @@ jobs:
         run: |
           cargo fmt --all --check
           bash scripts/check_routing_guards.sh
-      - name: CLI and library tests (real backend required)
-        run: cargo test --workspace --exclude smartzip-gui --locked
-      - name: Build CLI
-        run: cargo build --release --locked -p smartzip-cli --target ${{ matrix.target }}
+      - name: Workspace and GUI worker tests (no native windows)
+        run: |
+          cargo test --workspace --locked
+          cargo test --locked -p smartzip-gui --test runtime_worker -- --ignored
+          python3 -m unittest discover -s scripts -p 'test_*.py'
+      - name: Build CLI and GUI
+        run: cargo build --release --locked -p smartzip-cli -p smartzip-gui --target ${{ matrix.target }}
       - name: Package and verify unpacked binary
         env:
           TARGET: ${{ matrix.target }}
         run: |
           python3 scripts/package_cli_beta.py "target/$TARGET/release/smartzip" "$TARGET" dist
+          python3 scripts/package_desktop_beta.py "target/$TARGET/release/smartzip" "target/$TARGET/release/smartzip-gui" "$TARGET" dist
           scratch=$(mktemp -d)
-          tar -xzf dist/*.tar.gz -C "$scratch"
-          python3 scripts/verify_cli_beta.py "$scratch"/*/smartzip
+          tar -xzf dist/smartzip-desktop-*.tar.gz -C "$scratch"
+          binary=$(find "$scratch" -path '*/bin/smartzip' -type f)
+          cli_archive=$(find dist -name 'smartzip-*.tar.gz' ! -name 'smartzip-desktop-*')
+          tar -xzf "$cli_archive" -C "$scratch"
+          cli_binary=$(find "$scratch" -mindepth 2 -maxdepth 2 -name smartzip -type f)
+          cmp "$binary" "$cli_binary"
+          mkdir -p reports
+          python3 scripts/verify_cli_beta.py "$binary" | tee reports/cli.json
+          python3 scripts/verify_review_fixes.py "$binary" | tee reports/regressions.json
+          python3 scripts/verify_recovery.py "$binary" | tee reports/recovery.json
+          python3 scripts/verify_resource_bounds.py "$binary" | tee reports/resources.json
+          python3 scripts/verify_desktop_package.py dist/smartzip-desktop-*.tar.gz
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: always()
+        with:
+          name: verification-${{ matrix.target }}
+          path: reports/*
+          if-no-files-found: ignore
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: cli-${{ matrix.target }}
+          name: beta-${{ matrix.target }}
           path: dist/*
           if-no-files-found: error
   prerelease:
@@ -63,7 +86,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          pattern: cli-*
+          pattern: beta-*
           merge-multiple: true
           path: dist
       - name: Verify version, checksums and publish beta
@@ -73,4 +96,4 @@ jobs:
         run: |
           python3 -c 'import os,tomllib; v=tomllib.load(open("crates/smartzip-cli/Cargo.toml","rb"))["package"]["version"]; assert os.environ["TAG"] == "v"+v and "-beta." in v'
           (cd dist && sha256sum -c *.sha256)
-          gh release create "$TAG" dist/* --verify-tag --prerelease --title "SmartZip $TAG CLI beta" --notes-file docs/cli-beta-release-notes.md
+          gh release create "$TAG" dist/* --verify-tag --prerelease --title "SmartZip $TAG beta" --notes-file docs/cli-beta-release-notes.md
