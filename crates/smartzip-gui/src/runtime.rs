@@ -24,6 +24,7 @@ pub enum TaskOperation {
 }
 #[derive(Clone, Default)]
 pub struct TaskSettings {
+    pub force: bool,
     pub output: Option<PathBuf>,
     pub recursive: Option<bool>,
     pub smart_layout: Option<bool>,
@@ -60,6 +61,17 @@ pub enum InteractionRequest {
         respond: oneshot::Sender<EncodingConfirmationChoice>,
     },
 }
+impl InteractionRequest {
+    pub fn is_closed(&self) -> bool {
+        match self {
+            Self::Password { respond, .. } => respond.is_closed(),
+            Self::Output { respond, .. } => respond.is_closed(),
+            Self::Embedded { respond, .. } => respond.is_closed(),
+            Self::Encoding { respond, .. } => respond.is_closed(),
+        }
+    }
+}
+
 pub struct JobOutcome {
     pub status: String,
     pub detail: serde_json::Value,
@@ -111,6 +123,7 @@ impl Mailbox {
     }
 }
 pub struct JobHandle {
+    pub roots: Arc<smartzip_engine::root_management::RootManagement>,
     mailbox: Mailbox,
     cancellation: CancellationToken,
 }
@@ -141,6 +154,8 @@ pub fn spawn_job_at(request: JobRequest, queue_position: i64) -> Result<JobHandl
     }
     let mailbox = Mailbox::default();
     let cancellation = CancellationToken::new();
+    let roots = Arc::new(smartzip_engine::root_management::RootManagement::default());
+    let worker_roots = roots.clone();
     let worker_mailbox = mailbox.clone();
     let worker_token = cancellation.clone();
     std::thread::Builder::new()
@@ -156,6 +171,7 @@ pub fn spawn_job_at(request: JobRequest, queue_position: i64) -> Result<JobHandl
                     queue_position,
                     worker_mailbox.clone(),
                     worker_token.clone(),
+                    worker_roots.clone(),
                 ))
             }));
             let message = match result {
@@ -172,6 +188,7 @@ pub fn spawn_job_at(request: JobRequest, queue_position: i64) -> Result<JobHandl
         })
         .map_err(|e| e.to_string())?;
     Ok(JobHandle {
+        roots,
         mailbox,
         cancellation,
     })
@@ -387,8 +404,9 @@ async fn run_job(
     queue_position: i64,
     mailbox: Mailbox,
     cancellation: CancellationToken,
+    roots: Arc<smartzip_engine::root_management::RootManagement>,
 ) -> Result<JobOutcome, String> {
-    run_job_inner(request, queue_position, mailbox, cancellation)
+    run_job_inner(request, queue_position, mailbox, cancellation, roots)
         .await
         .map_err(|e| e.to_string())
 }
@@ -397,6 +415,7 @@ async fn run_job_inner(
     queue_position: i64,
     mailbox: Mailbox,
     cancellation: CancellationToken,
+    roots: Arc<smartzip_engine::root_management::RootManagement>,
 ) -> Result<JobOutcome, Box<dyn std::error::Error>> {
     use smartzip_config::StateMode;
     use smartzip_engine::history::{
@@ -451,6 +470,8 @@ async fn run_job_inner(
     warnings.extend(backend.warnings().iter().cloned());
     let engine = SmartZipEngine::default()
         .with_cancellation_token(cancellation.clone())
+        .with_root_management(roots.clone())
+        .with_source_recycling(request.settings.delete_source)
         .with_run_policy(policy.clone());
     let prompts = Prompter {
         mailbox: mailbox.clone(),
@@ -484,15 +505,6 @@ async fn run_job_inner(
                 .iter()
                 .map(std::path::absolute)
                 .collect::<Result<Vec<_>, _>>()?;
-            // Capture only explicit roots, before any backend reads. Never infer roots from nested candidates.
-            let sources = if request.settings.delete_source {
-                inputs
-                    .iter()
-                    .map(|p| SourceSnapshot::capture(p))
-                    .collect::<Result<Vec<_>, _>>()?
-            } else {
-                vec![]
-            };
             let output_dir = request
                 .settings
                 .output
@@ -505,6 +517,14 @@ async fn run_job_inner(
                         .expect("absolute input path has a parent")
                         .to_path_buf()
                 });
+            let groups = smartzip_engine::root_inputs::group_root_inputs(
+                &inputs,
+                c.extraction.volumes.auto_discover,
+            );
+            let inputs: Vec<_> = groups
+                .iter()
+                .flat_map(|group| group.inputs.iter().cloned())
+                .collect();
             let workflow_request = smartzip_engine::ExtractWorkflowRequest {
                 inputs: inputs.clone(),
                 output_dir: output_dir.clone(),
@@ -517,12 +537,13 @@ async fn run_job_inner(
                 embedded_scan_mode: smartzip_core::EmbeddedScanMode::Auto,
                 dominant_min_ratio: c.extraction.embedded.dominant_min_ratio,
                 confirm_large_scan: false,
-                force: false,
+                force: request.settings.force,
                 limits: c.limits.clone(),
             };
             let workflow_request = policy.resolve_request(workflow_request)?;
             let output_dir = workflow_request.output_dir.clone();
-            let identity = smartzip_engine::ExtractTaskIdentity::new(&inputs);
+            let mut identity = smartzip_engine::ExtractTaskIdentity::new(&inputs);
+            roots.configure_groups(&mut identity, groups)?;
             let submission = execution_store
                 .as_ref()
                 .map(|_| {
@@ -720,9 +741,10 @@ async fn run_job_inner(
                     return Err(error.into());
                 }
             };
-            if request.settings.delete_source {
-                recycle_roots(&sources, &result, &cancellation, &mut warnings);
-            }
+            warnings.extend(result.events.iter().filter_map(|event| match &event.kind {
+                TaskEventKind::Warning { message } => Some(message.clone()),
+                _ => None,
+            }));
             (
                 serde_json::to_value(result.status)?
                     .as_str()
@@ -805,122 +827,6 @@ async fn run_job_inner(
         detail,
         warnings,
     })
-}
-
-/// A root must retain its identity, size and timestamps before it can be recycled.
-struct SourceSnapshot {
-    path: PathBuf,
-    metadata: std::fs::Metadata,
-}
-impl SourceSnapshot {
-    fn capture(path: &Path) -> std::io::Result<Self> {
-        let metadata = std::fs::symlink_metadata(path)?;
-        if !metadata.is_file() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "解压后删除仅支持普通文件，不能用于目录或符号链接",
-            ));
-        }
-        Ok(Self {
-            path: path.into(),
-            metadata,
-        })
-    }
-    fn unchanged(&self) -> bool {
-        std::fs::symlink_metadata(&self.path).is_ok_and(|now| {
-            let basic = now.is_file()
-                && now.len() == self.metadata.len()
-                && now.modified().ok() == self.metadata.modified().ok();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::MetadataExt;
-                basic
-                    && now.dev() == self.metadata.dev()
-                    && now.ino() == self.metadata.ino()
-                    && now.ctime() == self.metadata.ctime()
-                    && now.ctime_nsec() == self.metadata.ctime_nsec()
-            }
-            #[cfg(not(unix))]
-            {
-                basic && now.created().ok() == self.metadata.created().ok()
-            }
-        })
-    }
-}
-// Empty archives and vanished outputs cannot justify removing the last source copy.
-fn contains_output_file(path: &Path) -> bool {
-    let mut pending = vec![path.to_path_buf()];
-    let mut visited = 0;
-    while let Some(path) = pending.pop() {
-        visited += 1;
-        if visited > 100_000 {
-            return false;
-        }
-        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
-            return false;
-        };
-        if metadata.is_file() {
-            return true;
-        }
-        if metadata.is_dir() {
-            let Ok(entries) = std::fs::read_dir(path) else {
-                return false;
-            };
-            for entry in entries {
-                let Ok(entry) = entry else {
-                    return false;
-                };
-                pending.push(entry.path());
-            }
-        }
-    }
-    false
-}
-fn recycle_roots(
-    sources: &[SourceSnapshot],
-    result: &smartzip_engine::ExtractWorkflowResult,
-    cancellation: &CancellationToken,
-    warnings: &mut Vec<String>,
-) {
-    let safe = result.status == smartzip_engine::history::TaskCompletionStatus::Completed
-        && result.failed_count == 0
-        && result.skipped.is_empty()
-        && !result.processed.is_empty()
-        && !cancellation.is_cancelled()
-        && result
-            .events
-            .iter()
-            .any(|event| matches!(event.kind, TaskEventKind::OutputCreated { .. }))
-        && result
-            .events
-            .iter()
-            .filter_map(|event| match &event.kind {
-                TaskEventKind::OutputCreated { path } => Some(path),
-                _ => None,
-            })
-            .all(|path| contains_output_file(path))
-        && sources.iter().all(|source| {
-            source.unchanged()
-                && result.processed.iter().any(|candidate| {
-                    candidate.path == source.path
-                        && candidate.depth == 0
-                        && candidate.source == smartzip_engine::CandidateSource::RootInput
-                })
-        });
-    if !safe {
-        warnings
-            .push("原包已保留：任务未全部成功、源文件变化、输出为空或缺少根归档提交记录".into());
-        return;
-    }
-    for source in sources {
-        if cancellation.is_cancelled() || !source.unchanged() {
-            warnings.push(format!("原包已保留：{}", source.path.display()));
-            continue;
-        }
-        if let Err(error) = smartzip_platform::move_to_trash(&source.path) {
-            warnings.push(format!("原包回收失败 {}：{error}", source.path.display()));
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1105,54 +1011,5 @@ mod tests {
         disabled.resolved.as_mut().unwrap().values.passwords.mode =
             smartzip_config::PasswordMode::Off;
         assert!(load_policy(&disabled).is_err());
-    }
-    #[test]
-    fn empty_success_never_recycles_input() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("archive.zip");
-        std::fs::write(&path, b"data").unwrap();
-        let sources = vec![SourceSnapshot::capture(&path).unwrap()];
-        let mut result = smartzip_engine::ExtractWorkflowResult {
-            status: smartzip_engine::history::TaskCompletionStatus::Completed,
-            failed_count: 0,
-            task_id: smartzip_core::TaskId::new(),
-            processed: vec![],
-            skipped: vec![],
-            enqueued: vec![],
-            events: vec![],
-        };
-        let mut warnings = vec![];
-        recycle_roots(&sources, &result, &CancellationToken::new(), &mut warnings);
-        assert!(path.exists());
-        assert_eq!(warnings.len(), 1);
-        let empty_output = temp.path().join("empty");
-        std::fs::create_dir(&empty_output).unwrap();
-        result.processed.push(smartzip_engine::ExtractionCandidate {
-            path: path.clone(),
-            relative_path: "archive".into(),
-            depth: 0,
-            source: smartzip_engine::CandidateSource::RootInput,
-            detected_format: Some(smartzip_core::ArchiveFormat::Zip),
-            embedded_offset: None,
-            embedded_size: None,
-        });
-        result.events.push(TaskEvent {
-            task_id: result.task_id.clone(),
-            kind: TaskEventKind::OutputCreated { path: empty_output },
-        });
-        recycle_roots(&sources, &result, &CancellationToken::new(), &mut warnings);
-        assert!(path.exists());
-        assert_eq!(warnings.len(), 2);
-    }
-    #[test]
-    fn source_replacement_is_detected_even_with_same_size() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("archive.zip");
-        std::fs::write(&path, b"same").unwrap();
-        let source = SourceSnapshot::capture(&path).unwrap();
-        let replacement = temp.path().join("other.zip");
-        std::fs::write(&replacement, b"same").unwrap();
-        std::fs::rename(replacement, &path).unwrap();
-        assert!(!source.unchanged());
     }
 }

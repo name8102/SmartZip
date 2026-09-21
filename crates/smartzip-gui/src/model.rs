@@ -35,6 +35,7 @@ impl Phase {
     }
 }
 pub struct Job {
+    pub files: Vec<smartzip_engine::root_management::FileTaskSnapshot>,
     pub id: u64,
     pub request: JobRequest,
     pub phase: Phase,
@@ -46,6 +47,10 @@ pub struct Job {
     pub result: Option<serde_json::Value>,
     pub prompt: Option<InteractionRequest>,
     pub task_id: Option<String>,
+    /// A configured draft stays queued until the user explicitly starts it.
+    held: bool,
+    /// Explicit start bypasses the global automatic-start pause for this job.
+    start_requested: bool,
     failure_summary: Option<String>,
     current_route_failure: Option<String>,
     quick_overrides: QuickOverrides,
@@ -160,6 +165,9 @@ impl Job {
         }
     }
     fn finish(&mut self, outcome: JobOutcome) {
+        if let Some(handle) = &self.handle {
+            self.files = handle.roots.snapshot();
+        }
         self.phase = match outcome.status.as_str() {
             "completed" => Phase::Completed,
             "partial" => Phase::Partial,
@@ -192,9 +200,18 @@ pub struct Queue {
 }
 impl Queue {
     pub fn enqueue(&mut self, request: JobRequest) -> u64 {
+        self.enqueue_with_hold(request, false)
+    }
+
+    pub fn enqueue_held(&mut self, request: JobRequest) -> u64 {
+        self.enqueue_with_hold(request, true)
+    }
+
+    fn enqueue_with_hold(&mut self, request: JobRequest, held: bool) -> u64 {
         self.next_id += 1;
         let id = self.next_id;
         self.jobs.push(Job {
+            files: vec![],
             id,
             request,
             phase: Phase::Queued,
@@ -206,6 +223,8 @@ impl Queue {
             result: None,
             prompt: None,
             task_id: None,
+            held,
+            start_requested: false,
             failure_summary: None,
             current_route_failure: None,
             quick_overrides: QuickOverrides::default(),
@@ -213,6 +232,37 @@ impl Queue {
         });
         self.selected = Some(id);
         id
+    }
+
+    pub fn is_held(&self, id: u64) -> bool {
+        self.jobs
+            .iter()
+            .find(|job| job.id == id)
+            .is_some_and(|job| job.held)
+    }
+
+    /// Start exactly one queued job, even while automatic queue starts are paused.
+    pub fn start(&mut self, id: u64) -> bool {
+        let Some(job) = self
+            .jobs
+            .iter_mut()
+            .find(|job| job.id == id && job.phase == Phase::Queued)
+        else {
+            return false;
+        };
+        job.held = false;
+        job.start_requested = true;
+        job.stage = "等待调度".into();
+        true
+    }
+
+    pub fn start_all(&mut self) {
+        self.paused = false;
+        for job in &mut self.jobs {
+            if job.phase == Phase::Queued {
+                job.held = false;
+            }
+        }
     }
     pub fn selected(&self) -> Option<&Job> {
         self.jobs.iter().find(|j| Some(j.id) == self.selected)
@@ -343,6 +393,59 @@ impl Queue {
             }
         }
     }
+    pub fn pause_root(&mut self, id: u64, root: &smartzip_core::NodeId, paused: bool) {
+        if let Some(handle) = self
+            .jobs
+            .iter()
+            .find(|j| j.id == id)
+            .and_then(|j| j.handle.as_ref())
+        {
+            handle.roots.set_paused(root, paused);
+        }
+    }
+    pub fn cancel_root(&mut self, id: u64, root: &smartzip_core::NodeId) {
+        if let Some(handle) = self
+            .jobs
+            .iter()
+            .find(|j| j.id == id)
+            .and_then(|j| j.handle.as_ref())
+        {
+            handle.roots.cancel(root);
+        }
+    }
+    pub fn retry_root(&mut self, id: u64, root: &smartzip_core::NodeId) -> Option<u64> {
+        let job = self.jobs.iter().find(|j| j.id == id)?;
+        // A new attempt starts after the batch has released its inputs/cleanup.
+        if job.phase.active() || job.phase == Phase::Queued {
+            return None;
+        }
+        let file = job.files.iter().find(|f| {
+            f.node_id == *root
+                && f.parent_id.is_none()
+                && matches!(
+                    f.root_outcome.as_deref(),
+                    Some("failed" | "partial" | "cancelled")
+                )
+        })?;
+        let mut request = job.request.clone();
+        request.paths = file
+            .volumes
+            .as_ref()
+            .map(|v| v.inputs.clone())
+            .unwrap_or_else(|| vec![file.path.clone()]);
+        if request.settings.output.is_none() {
+            request.settings.output = job
+                .request
+                .paths
+                .first()
+                .and_then(|p| std::path::absolute(p).ok())
+                .and_then(|p| p.parent().map(std::path::Path::to_path_buf));
+        }
+        request.settings.force = true;
+        request.settings.passwords.clear();
+        Some(self.enqueue(request))
+    }
+
     pub fn cancel_all(&mut self) {
         self.paused = true;
         let ids: Vec<_> = self.jobs.iter().map(|j| j.id).collect();
@@ -367,6 +470,24 @@ impl Queue {
     pub fn tick(&mut self) -> bool {
         let mut changed = false;
         for job in &mut self.jobs {
+            if let Some(handle) = &job.handle {
+                let files = handle.roots.snapshot();
+                if job.files != files {
+                    job.files = files;
+                    changed = true;
+                }
+            }
+            if job
+                .prompt
+                .as_ref()
+                .is_some_and(InteractionRequest::is_closed)
+            {
+                job.prompt = None;
+                if job.phase == Phase::Waiting {
+                    job.phase = Phase::Running;
+                }
+                changed = true;
+            }
             let messages = job.handle.as_ref().map(|h| h.drain()).unwrap_or_default();
             for message in messages {
                 changed = true;
@@ -398,27 +519,23 @@ impl Queue {
                 }
             }
         }
-        if !self.paused {
-            for (position, job) in self
-                .jobs
-                .iter_mut()
-                .enumerate()
-                .filter(|(_, job)| job.phase == Phase::Queued)
-            {
-                changed = true;
-                match spawn_job_at(job.request.clone(), position as i64) {
-                    Ok(handle) => {
-                        job.handle = Some(handle);
-                        job.phase = Phase::Running;
-                        job.stage = "正在准备".into();
-                        job.request.settings.passwords.clear();
-                    }
-                    Err(error) => {
-                        job.phase = Phase::Failed;
-                        job.request.settings.passwords.clear();
-                        job.failure_summary = Some(error.clone());
-                        job.stage = error;
-                    }
+        for (position, job) in self.jobs.iter_mut().enumerate().filter(|(_, job)| {
+            job.phase == Phase::Queued && (job.start_requested || (!self.paused && !job.held))
+        }) {
+            changed = true;
+            job.start_requested = false;
+            match spawn_job_at(job.request.clone(), position as i64) {
+                Ok(handle) => {
+                    job.handle = Some(handle);
+                    job.phase = Phase::Running;
+                    job.stage = "正在准备".into();
+                    job.request.settings.passwords.clear();
+                }
+                Err(error) => {
+                    job.phase = Phase::Failed;
+                    job.request.settings.passwords.clear();
+                    job.failure_summary = Some(error.clone());
+                    job.stage = error;
                 }
             }
         }
@@ -437,6 +554,87 @@ mod tests {
             resolved: None,
         }
     }
+    #[test]
+    fn root_retry_preserves_ambiguous_inputs_and_waits_for_batch_cleanup() {
+        use smartzip_engine::{root_inputs::VolumeGroupDetails, root_management::FileTaskSnapshot};
+        let mut queue = Queue::default();
+        let id = queue.enqueue(request("first.zip"));
+        let root = smartzip_core::NodeId::new();
+        let paths = vec![PathBuf::from("volume.001"), PathBuf::from("volume.002")];
+        queue.jobs[0].files.push(FileTaskSnapshot {
+            volumes: Some(VolumeGroupDetails {
+                inputs: paths.clone(),
+                members: paths.clone(),
+                candidates: vec![paths.clone()],
+                selected: vec![],
+                diagnostic: String::new(),
+            }),
+            events: vec![],
+            node_id: root.clone(),
+            root_id: root.clone(),
+            parent_id: None,
+            path: paths[0].clone(),
+            depth: 0,
+            state: "failed".into(),
+            stage: "grouping_ambiguous".into(),
+            progress: None,
+            backend: String::new(),
+            output: None,
+            committed: false,
+            root_outcome: Some("failed".into()),
+            root_activity: None,
+            pause_requested: false,
+            cancel_requested: false,
+        });
+        queue.jobs[0].phase = Phase::Running;
+        assert!(queue.retry_root(id, &root).is_none());
+        queue.jobs[0].phase = Phase::Partial;
+        queue.jobs[0].request.settings.passwords = vec!["temporary".into()];
+        let retry = queue.retry_root(id, &root).unwrap();
+        let retried = queue.jobs.iter().find(|j| j.id == retry).unwrap();
+        assert_eq!(retried.request.paths, paths);
+        assert!(retried.request.settings.force);
+        assert!(retried.request.settings.passwords.is_empty());
+        assert!(retried.request.settings.output.is_some());
+        assert_eq!(
+            queue.jobs[0].files[0].root_outcome.as_deref(),
+            Some("failed")
+        );
+    }
+
+    #[test]
+    fn configured_draft_waits_until_explicit_start() {
+        let mut queue = Queue::default();
+        let id = queue.enqueue_held(request("configured.zip"));
+
+        assert!(queue.is_held(id));
+        assert!(!queue.tick());
+        assert_eq!(queue.jobs[0].phase, Phase::Queued);
+        assert_eq!(queue.jobs[0].stage, "等待启动");
+
+        assert!(queue.start(id));
+        assert!(queue.tick());
+        assert_eq!(queue.jobs[0].phase, Phase::Running);
+        assert_eq!(queue.jobs[0].stage, "正在准备");
+    }
+
+    #[test]
+    fn explicit_start_launches_only_selected_job_while_auto_start_is_paused() {
+        let mut queue = Queue {
+            paused: true,
+            ..Default::default()
+        };
+        let first = queue.enqueue(request("first.zip"));
+        queue.enqueue(request("second.zip"));
+
+        assert!(!queue.tick());
+        assert!(queue.start(first));
+        assert!(queue.tick());
+        assert_eq!(queue.jobs[0].phase, Phase::Running);
+        assert_eq!(queue.jobs[1].phase, Phase::Queued);
+        assert!(queue.paused);
+    }
+
     #[test]
     fn pending_cancellation_never_starts_worker() {
         let mut q = Queue::default();

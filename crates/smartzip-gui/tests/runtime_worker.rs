@@ -285,3 +285,152 @@ fn real_backend_temporary_password_is_not_persisted() {
             .is_empty()
     );
 }
+
+#[test]
+#[ignore = "requires installed 7z; run with --include-ignored for backend acceptance"]
+fn real_backend_source_recycling_removes_the_successful_volume_set() {
+    for all in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let payload: Vec<u8> = (0..40_000u32)
+            .flat_map(|n| n.wrapping_mul(2654435761).to_le_bytes())
+            .collect();
+        std::fs::write(temp.path().join("payload.bin"), &payload).unwrap();
+        let created = std::process::Command::new("7z")
+            .current_dir(temp.path())
+            .args(["a", "-t7z", "-mx=0", "-v64k", "bundle.7z", "payload.bin"])
+            .output()
+            .unwrap();
+        assert!(created.status.success());
+        let mut volumes: Vec<_> = std::fs::read_dir(temp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|p| {
+                p.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("bundle.7z.")
+            })
+            .collect();
+        volumes.sort();
+        let handle = spawn_job(JobRequest {
+            operation: TaskOperation::Extract,
+            paths: if all {
+                volumes.clone()
+            } else {
+                vec![volumes[0].clone()]
+            },
+            settings: TaskSettings {
+                output: Some(temp.path().join("output")),
+                recursive: Some(false),
+                delete_source: true,
+                ..Default::default()
+            },
+            resolved: Some(if all {
+                config_with_database(&temp.path().join("execution.db"))
+            } else {
+                config()
+            }),
+        })
+        .unwrap();
+        let (outcome, events) = finish(&handle);
+        let snapshots = handle.roots.snapshot();
+        let roots: Vec<_> = snapshots.iter().filter(|n| n.parent_id.is_none()).collect();
+        assert_eq!(
+            roots.len(),
+            1,
+            "all physical volumes must share one control row"
+        );
+        let group = roots[0].volumes.as_ref().unwrap();
+        assert_eq!(group.members.len(), volumes.len());
+        assert_eq!(group.selected.len(), 1);
+        assert!(group.selected[0].iter().all(|path| volumes.contains(path)));
+        assert_eq!(outcome.status, "completed", "{:?}", outcome.detail);
+        assert!(
+            volumes.iter().all(|p| !p.exists()),
+            "{:?}",
+            outcome.warnings
+        );
+        let output = events
+            .iter()
+            .find_map(|event| match &event.kind {
+                smartzip_core::TaskEventKind::OutputCreated { path } => {
+                    Some(path.join("payload.bin"))
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(std::fs::read(output).unwrap(), payload);
+    }
+}
+
+#[test]
+#[ignore = "requires installed 7z; run with --include-ignored for backend acceptance"]
+fn root_controls_keep_siblings_running_while_password_prompt_is_parked() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut inputs = vec![];
+    for (index, name) in ["locked", "second", "third"].iter().enumerate() {
+        let dir = temp.path().join(name);
+        std::fs::create_dir(&dir).unwrap();
+        let archive = fixture(&dir, index == 0);
+        let renamed = dir.join(format!("{name}.zip"));
+        std::fs::rename(archive, &renamed).unwrap();
+        inputs.push(renamed);
+    }
+    let handle = spawn_job(JobRequest {
+        operation: TaskOperation::Extract,
+        paths: inputs.clone(),
+        settings: TaskSettings {
+            output: Some(temp.path().join("output")),
+            ..Default::default()
+        },
+        resolved: Some(config_with_database(&temp.path().join("state.db"))),
+    })
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut pending = None;
+    let mut cancelled = false;
+    loop {
+        for message in handle.drain() {
+            match message {
+                JobMessage::Prompt(InteractionRequest::Password { respond, .. }) => {
+                    pending = Some(respond)
+                }
+                JobMessage::Prompt(_) => panic!("unexpected prompt"),
+                JobMessage::Failed(error) => panic!("{error}"),
+                JobMessage::Finished(outcome) => {
+                    assert!(cancelled);
+                    assert_eq!(outcome.status, "cancelled");
+                    assert!(pending.as_ref().unwrap().is_closed());
+                    for input in &inputs {
+                        assert!(input.exists());
+                    }
+                    let files = handle.roots.snapshot();
+                    assert_eq!(files.iter().filter(|f| f.parent_id.is_none()).count(), 3);
+                    assert_eq!(files[0].root_outcome.as_deref(), Some("cancelled"));
+                    assert_eq!(files[1].root_outcome.as_deref(), Some("completed"));
+                    assert_eq!(files[2].root_outcome.as_deref(), Some("completed"));
+                    return;
+                }
+                _ => {}
+            }
+        }
+        // Both siblings must finish before cancelling the unanswered first root.
+        // This catches preparation slots being held indefinitely by parked roots.
+        let files = handle.roots.snapshot();
+        if !cancelled
+            && pending.is_some()
+            && files
+                .iter()
+                .filter(|f| f.root_outcome.as_deref() == Some("completed"))
+                .count()
+                == 2
+        {
+            let root = files.iter().find(|f| f.path == inputs[0]).unwrap();
+            assert!(handle.roots.set_paused(&root.root_id, true));
+            assert!(handle.roots.cancel(&root.root_id));
+            cancelled = true;
+        }
+        assert!(Instant::now() < deadline, "root control timeout: {files:?}");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}

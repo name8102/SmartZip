@@ -167,6 +167,10 @@ impl Workspace {
         }
     }
     fn enqueue(&mut self, paths: Vec<PathBuf>, operation: TaskOperation) {
+        self.enqueue_with_hold(paths, operation, false);
+    }
+
+    fn enqueue_with_hold(&mut self, paths: Vec<PathBuf>, operation: TaskOperation, hold: bool) {
         if paths.is_empty() {
             return;
         }
@@ -196,12 +200,17 @@ impl Workspace {
                 });
             }
         } else {
-            self.queue.enqueue(JobRequest {
+            let request = JobRequest {
                 operation,
                 paths,
                 settings,
                 resolved,
-            });
+            };
+            if hold {
+                self.queue.enqueue_held(request);
+            } else {
+                self.queue.enqueue(request);
+            }
         }
         self.message.clear();
     }
@@ -243,6 +252,10 @@ pub struct View {
     sidebar_collapsed: bool,
     diagnostics_open: bool,
     task_config_open: bool,
+    task_filter: usize,
+    selected_file: Option<(u64, smartzip_core::NodeId)>,
+    expanded_roots: std::collections::HashSet<smartzip_core::NodeId>,
+    queue_settings_open: bool,
     detail_state: Option<(u64, Phase)>,
     prompt_job: Option<(bool, u64)>,
     preview_revision: u64,
@@ -263,6 +276,112 @@ pub struct View {
 }
 fn control(id: impl Into<gpui::ElementId>) -> Button {
     Button::new(id).small().ghost()
+}
+
+fn state_label(state: &str) -> &str {
+    match state {
+        "queued" | "ready" => "排队中",
+        "running" => "处理中",
+        "paused" => "已暂停",
+        "waiting_resources" => "等待资源",
+        "waiting_user" => "需要处理",
+        "completed" | "extracted" => "已完成",
+        "partial" => "部分完成",
+        "failed" => "失败",
+        "cancelled" => "已取消",
+        "skipped" => "已跳过",
+        other => other,
+    }
+}
+fn stage_label(stage: &str) -> String {
+    if let Some((name, operation)) = stage.rsplit_once(" · ") {
+        return format!("{name} · {}", stage_label(operation));
+    }
+    match stage {
+        "resolve_inputs" => "识别输入",
+        "fingerprint" => "检查历史记录",
+        "scan_embedded" => "扫描内嵌归档",
+        "read_metadata" => "读取归档目录",
+        "analyze_encoding" => "分析文件名编码",
+        "prepare_access" => "准备归档",
+        "extract_attempt" => "解压中",
+        "inspect_and_plan" => "检查输出与布局",
+        "commit" => "提交输出",
+        "discover_children" => "查找嵌套归档",
+        "read_member" => "读取成员",
+        "decode_preview" => "生成预览",
+        "cleanup" => "清理中",
+        "password" => "等待密码",
+        "encoding" => "等待编码选择",
+        "output_collision" => "等待输出冲突处理",
+        "incomplete_volume" => "分卷不完整",
+        "grouping_ambiguous" => "无法确定分卷组",
+        "already_extracted" => "已解压，跳过重复处理",
+        "wrong_password" => "密码不正确",
+        "task_stopped" => "任务已停止",
+        other => state_label(other),
+    }
+    .into()
+}
+fn file_backend_label(backend: &str) -> &str {
+    if backend.starts_with("sevenzip:") {
+        "7-Zip"
+    } else if backend.starts_with("unrar") {
+        "UnRAR"
+    } else {
+        backend
+    }
+}
+
+fn job_category(phase: Phase) -> usize {
+    match phase {
+        Phase::Completed => 3,
+        Phase::Partial | Phase::Failed | Phase::Cancelled => 4,
+        Phase::Waiting => 2,
+        _ => 1,
+    }
+}
+fn file_category(file: &smartzip_engine::root_management::FileTaskSnapshot) -> usize {
+    match file.root_outcome.as_deref() {
+        Some("completed") => 3,
+        Some(_) => 4,
+        None if file.pause_requested
+            || file.state == "waiting_user"
+            || file
+                .root_activity
+                .as_ref()
+                .is_some_and(|(state, _)| state == "waiting_user") =>
+        {
+            2
+        }
+        None => 1,
+    }
+}
+fn file_status(file: &smartzip_engine::root_management::FileTaskSnapshot) -> String {
+    if let Some(outcome) = &file.root_outcome {
+        return state_label(outcome).into();
+    }
+    if file.cancel_requested {
+        return "停止并清理中".into();
+    }
+    if file.pause_requested
+        && file.state != "paused"
+        && !file
+            .root_activity
+            .as_ref()
+            .is_some_and(|(state, _)| state == "paused")
+    {
+        return "暂停中 · 等待阶段结束".into();
+    }
+    if let Some((state, _)) = &file.root_activity {
+        return state_label(state).into();
+    }
+    if file.parent_id.is_none()
+        && matches!(file.state.as_str(), "completed" | "extracted" | "skipped")
+    {
+        return "正在处理子项".into();
+    }
+    state_label(&file.state).into()
 }
 
 fn phase_color(phase: Phase, cx: &App) -> gpui::Hsla {
@@ -399,6 +518,10 @@ impl View {
             sidebar_collapsed: false,
             diagnostics_open: false,
             task_config_open: false,
+            task_filter: 0,
+            selected_file: None,
+            expanded_roots: std::collections::HashSet::new(),
+            queue_settings_open: true,
             detail_state: None,
             prompt_job: None,
             preview_revision: 0,
@@ -431,6 +554,10 @@ impl View {
         }
     }
     fn pick(&mut self, operation: TaskOperation, cx: &mut Context<Self>) {
+        self.pick_with_hold(operation, false, cx);
+    }
+
+    fn pick_with_hold(&mut self, operation: TaskOperation, hold: bool, cx: &mut Context<Self>) {
         let receiver = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
@@ -441,7 +568,7 @@ impl View {
         cx.spawn(async move |_, cx| {
             if let Ok(Ok(Some(paths))) = receiver.await {
                 shared.update(cx, |state, cx| {
-                    state.enqueue(paths, operation);
+                    state.enqueue_with_hold(paths, operation, hold);
                     cx.notify();
                 });
             }
@@ -634,7 +761,7 @@ impl View {
                     div()
                         .text_xs()
                         .text_color(cx.theme().muted_foreground)
-                        .child("全部成功后原包移入回收站"),
+                        .child("全部成功后原包及成功使用的分卷移入回收站"),
                 )
             })
             .child(div().text_xs().child(format!(
@@ -738,11 +865,7 @@ impl View {
                     .icon(IconName::SlidersHorizontal)
                     .label("添加并配置…")
                     .on_click(cx.listener(|this, _, _, cx| {
-                        this.shared.update(cx, |state, cx| {
-                            state.queue.paused = true;
-                            cx.notify();
-                        });
-                        this.pick(TaskOperation::Extract, cx);
+                        this.pick_with_hold(TaskOperation::Extract, true, cx);
                     })),
             )
             .child(
@@ -769,104 +892,434 @@ impl View {
             .child(
                 control("pause")
                     .label(if paused {
-                        "继续队列"
+                        "开始全部等待任务"
                     } else {
-                        "暂停队列"
+                        "暂停自动启动"
                     })
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.shared.update(cx, |state, cx| {
-                            state.queue.paused = !state.queue.paused;
+                            if state.queue.paused {
+                                state.queue.start_all();
+                            } else {
+                                state.queue.paused = true;
+                            }
                             cx.notify();
                         })
                     })),
             )
     }
-    fn tasks(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let state = self.shared.read(cx);
-        let rows: Vec<_> = state
-            .queue
-            .jobs
-            .iter()
-            .map(|job| {
-                (
-                    job.id,
-                    job.name(),
-                    job.phase,
-                    job.backend_label(),
-                    if job.phase == Phase::Running {
-                        job.progress
-                            .map(|p| format!("{p:.0}%"))
-                            .unwrap_or_else(|| job.stage.clone())
-                    } else {
-                        job.stage.clone()
-                    },
-                    Some(job.id) == state.queue.selected,
-                )
-            })
-            .collect();
-        let color = cx.theme().muted_foreground;
-        let selected_bg = cx.theme().sidebar_accent;
+    fn task_overview(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let queue = &self.shared.read(cx).queue;
+        let mut counts = [0usize; 5];
+        for job in &queue.jobs {
+            if job.files.is_empty() {
+                counts[0] += job.request.paths.len();
+                counts[job_category(job.phase)] += job.request.paths.len();
+                continue;
+            }
+            for file in job.files.iter().filter(|f| f.parent_id.is_none()) {
+                counts[0] += 1;
+                counts[file_category(file)] += 1;
+            }
+        }
         div()
             .flex()
             .flex_col()
-            .gap_2()
+            .gap_4()
             .child(
                 div()
                     .flex()
-                    .gap_2()
-                    .text_xs()
-                    .text_color(color)
-                    .py_1()
-                    .child(div().flex_1().child("任务 / 输入"))
-                    .child(div().w(px(85.)).child("状态"))
-                    .child(div().w(px(130.)).child("当前后端"))
-                    .child(div().w(px(130.)).child("当前操作")),
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_size(px(24.))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .child("任务中心"),
+                            )
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child("按归档管理进度，展开查看嵌套文件"),
+                            ),
+                    )
+                    .child(
+                        control("queue-options")
+                            .icon(if self.queue_settings_open {
+                                IconName::ChevronDown
+                            } else {
+                                IconName::SlidersHorizontal
+                            })
+                            .label(if self.queue_settings_open {
+                                "收起默认配置"
+                            } else {
+                                "展开默认配置"
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.queue_settings_open = !this.queue_settings_open;
+                                cx.notify();
+                            })),
+                    ),
             )
             .child(
-                div()
-                    .id("task-rows")
-                    .max_h(px(900.))
-                    .overflow_y_scroll()
-                    .children(rows.into_iter().map(
-                        move |(id, name, phase, backend, progress, selected)| {
-                            div()
-                                .id(("job", id))
-                                .flex()
-                                .gap_2()
-                                .items_center()
-                                .min_h(px(36.))
-                                .py_1()
-                                .px_2()
-                                .border_b_1()
-                                .border_color(cx.theme().border)
-                                .hover(|el| el.bg(cx.theme().sidebar))
-                                .when(selected, |el| el.bg(selected_bg))
+                div().flex().gap_2().flex_wrap().children(
+                    ["全部", "进行中", "待处理", "已完成", "失败 / 取消"]
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, label)| {
+                            control(("task-filter", index))
+                                .label(format!("{label}  {}", counts[index]))
+                                .when(self.task_filter == index, |button| button.primary())
                                 .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.task_filter = index;
+                                    cx.notify();
+                                }))
+                        }),
+                ),
+            )
+    }
+
+    fn tasks(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let state = self.shared.read(cx);
+        let jobs: Vec<_> = state
+            .queue
+            .jobs
+            .iter()
+            .map(|j| {
+                (
+                    j.id,
+                    j.name(),
+                    j.phase,
+                    j.request.paths.len(),
+                    j.files.clone(),
+                    state.queue.is_held(j.id),
+                )
+            })
+            .collect();
+        let mut groups = Vec::new();
+        for (id, name, phase, inputs, files, held) in jobs {
+            let roots: Vec<_> = files
+                .iter()
+                .filter(|f| {
+                    f.parent_id.is_none()
+                        && (self.task_filter == 0 || file_category(f) == self.task_filter)
+                })
+                .cloned()
+                .collect();
+            if !files.is_empty() && roots.is_empty() {
+                continue;
+            }
+            if files.is_empty() && self.task_filter != 0 && self.task_filter != job_category(phase)
+            {
+                continue;
+            }
+            let mut group = div()
+                .flex()
+                .flex_col()
+                .border_1()
+                .border_color(cx.theme().border)
+                .rounded_lg()
+                .overflow_hidden()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .px_3()
+                        .py_2()
+                        .bg(cx.theme().sidebar)
+                        .child(
+                            control(("batch", id))
+                                .label(format!("批次 {id} · {name}"))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.selected_file = None;
                                     this.shared.update(cx, |state, cx| {
                                         state.queue.selected = Some(id);
                                         cx.notify();
-                                    })
-                                }))
-                                .child(
-                                    Icon::new(IconName::FileArchive)
-                                        .size(px(17.))
-                                        .text_color(cx.theme().muted_foreground),
-                                )
-                                .child(div().flex_1().min_w_0().text_ellipsis().child(name))
+                                    });
+                                })),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
                                 .child(
                                     div()
-                                        .w(px(85.))
                                         .text_xs()
-                                        .text_color(phase_color(phase, cx))
-                                        .child(phase.label()),
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(format!(
+                                            "{} 个归档 · {}",
+                                            files.iter().filter(|f| f.parent_id.is_none()).count(),
+                                            if held { "等待配置" } else { phase.label() }
+                                        )),
                                 )
-                                .child(div().w(px(130.)).text_xs().text_ellipsis().child(backend))
-                                .child(div().w(px(130.)).text_xs().text_ellipsis().child(progress))
-                        },
-                    )),
-            )
+                                .when(phase == Phase::Queued, |actions| {
+                                    actions.child(
+                                        control(("start-batch", id))
+                                            .primary()
+                                            .label("开始任务")
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.shared.update(cx, |state, cx| {
+                                                    state.queue.start(id);
+                                                    cx.notify();
+                                                });
+                                            })),
+                                    )
+                                }),
+                        ),
+                );
+            if files.is_empty() {
+                group = group.child(
+                    div()
+                        .px_4()
+                        .py_4()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(format!(
+                            "{} · {inputs} 个输入，启动后识别归档与分卷组",
+                            if held { "等待配置" } else { phase.label() }
+                        )),
+                );
+            }
+            for root in roots {
+                let root_id = root.node_id.clone();
+                let descendants: Vec<_> = files
+                    .iter()
+                    .filter(|f| f.root_id == root_id && f.node_id != root_id)
+                    .cloned()
+                    .collect();
+                let expanded = self.expanded_roots.contains(&root_id);
+                group =
+                    group.child(self.file_task_row(id, root, descendants.len(), phase, false, cx));
+                if expanded {
+                    for child in descendants {
+                        group = group.child(self.file_task_row(id, child, 0, phase, true, cx));
+                    }
+                }
+            }
+            groups.push(group);
+        }
+        div().flex().flex_col().gap_3().children(groups)
     }
+
+    fn file_task_row(
+        &mut self,
+        id: u64,
+        file: smartzip_engine::root_management::FileTaskSnapshot,
+        children: usize,
+        batch_phase: Phase,
+        nested: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let node = file.node_id.clone();
+        let selected = self
+            .selected_file
+            .as_ref()
+            .is_some_and(|(job, n)| *job == id && *n == node);
+        let done = file.root_outcome.is_some() || !batch_phase.active();
+        let cancelled = file.cancel_requested;
+        let paused = file.pause_requested;
+        let status = file_status(&file);
+        let name = file
+            .path
+            .file_name()
+            .unwrap_or(file.path.as_os_str())
+            .to_string_lossy()
+            .into_owned();
+        let name = match &file.volumes {
+            Some(v) if v.candidates.len() > 1 => {
+                format!("{name} · {} 个候选分卷组", v.candidates.len())
+            }
+            Some(v) if v.members.len() > 1 => format!("{name} · {} 卷", v.members.len()),
+            _ if nested && file.depth == 0 => format!("候选入口 · {name}"),
+            _ => name,
+        };
+        let selected_node = node.clone();
+        let toggle_node = node.clone();
+        let pause_node = node.clone();
+        let cancel_node = node.clone();
+        let retry_node = node.clone();
+        let retry = matches!(
+            file.root_outcome.as_deref(),
+            Some("failed" | "partial" | "cancelled")
+        );
+        let expanded = self.expanded_roots.contains(&node);
+        div()
+            .id(SharedString::from(format!("file-{}", node)))
+            .flex()
+            .items_center()
+            .gap_3()
+            .px_3()
+            .py_3()
+            .border_t_1()
+            .border_color(cx.theme().border)
+            .when(nested, |row| {
+                row.pl(px(40. + 12. * f32::from(file.depth.min(4))))
+            })
+            .when(selected, |row| row.bg(cx.theme().sidebar_accent))
+            .hover(|row| row.bg(cx.theme().sidebar))
+            .child(
+                control(SharedString::from(format!("expand-{node}")))
+                    .label(if children == 0 {
+                        "·".into()
+                    } else if expanded {
+                        format!("▾ {children}")
+                    } else {
+                        format!("▸ {children}")
+                    })
+                    .disabled(children == 0)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if !this.expanded_roots.remove(&toggle_node) {
+                            this.expanded_roots.insert(toggle_node.clone());
+                        }
+                        cx.notify();
+                    })),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        control(SharedString::from(format!("select-{node}")))
+                            .justify_start()
+                            .label(name)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.selected_file = Some((id, selected_node.clone()));
+                                this.shared.update(cx, |state, cx| {
+                                    state.queue.selected = Some(id);
+                                    cx.notify();
+                                });
+                            })),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_ellipsis()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(stage_label(
+                                &file
+                                    .root_activity
+                                    .as_ref()
+                                    .map(|(_, stage)| stage.clone())
+                                    .unwrap_or_else(|| file.stage.clone()),
+                            )),
+                    ),
+            )
+            .child(div().w(px(125.)).text_xs().child(status))
+            .when(file.state == "running" && file.progress.is_some(), |row| {
+                row.child(
+                    div()
+                        .w(px(45.))
+                        .text_xs()
+                        .child(format!("{:.0}%", file.progress.unwrap_or_default())),
+                )
+            })
+            .when(!nested, |row| {
+                row.child(
+                    div()
+                        .flex()
+                        .gap_1()
+                        .when(!done, |actions| {
+                            actions
+                                .child(
+                                    control(SharedString::from(format!("pause-{node}")))
+                                        .label(if paused { "继续" } else { "暂停" })
+                                        .disabled(cancelled)
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.shared.update(cx, |state, cx| {
+                                                state.queue.pause_root(id, &pause_node, !paused);
+                                                cx.notify();
+                                            });
+                                        })),
+                                )
+                                .child(
+                                    control(SharedString::from(format!("cancel-{node}")))
+                                        .label("取消")
+                                        .disabled(cancelled)
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.shared.update(cx, |state, cx| {
+                                                state.queue.cancel_root(id, &cancel_node);
+                                                cx.notify();
+                                            });
+                                        })),
+                                )
+                        })
+                        .when(retry, |actions| {
+                            actions.child(
+                                control(SharedString::from(format!("retry-{node}")))
+                                    .label(if batch_phase.active() {
+                                        "批次结束后重试"
+                                    } else {
+                                        "重试"
+                                    })
+                                    .disabled(batch_phase.active())
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.shared.update(cx, |state, cx| {
+                                            state.queue.retry_root(id, &retry_node);
+                                            cx.notify();
+                                        });
+                                    })),
+                            )
+                        }),
+                )
+            })
+    }
+
+    fn file_detail(&mut self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let (job_id, node) = self.selected_file.as_ref()?;
+        let job = self
+            .shared
+            .read(cx)
+            .queue
+            .jobs
+            .iter()
+            .find(|j| j.id == *job_id)?;
+        let file = job.files.iter().find(|f| f.node_id == *node)?.clone();
+        let output = file.output.clone();
+        Some(div().flex().flex_col().gap_4()
+            .child(div().text_xs().text_color(cx.theme().muted_foreground).child(if file.parent_id.is_none() { "根归档详情" } else if file.depth == 0 { "候选入口详情" } else { "嵌套归档详情" }))
+            .child(div().text_size(px(18.)).font_weight(gpui::FontWeight::SEMIBOLD).child(file.path.file_name().unwrap_or(file.path.as_os_str()).to_string_lossy().into_owned()))
+            .child(div().text_sm().child(file_status(&file)))
+            .child(div().text_xs().child(file.path.display().to_string()))
+            .child(div().text_sm().child(format!("当前阶段：{}", stage_label(&file.stage))))
+            .when(!file.backend.is_empty(), |el| el.child(div().text_sm().child(format!("后端：{}", file_backend_label(&file.backend)))))
+            .when(file.committed, |el| el.child(div().text_sm().child("本文件输出已成功提交")))
+            .when_some(file.root_outcome.clone(), |el, outcome| el.child(div().text_sm().child(format!("包含嵌套归档的结果：{}", state_label(&outcome)))))
+            .when_some(file.volumes.clone(), |el, volumes| {
+                el.child(div().flex().flex_col().gap_2().border_t_1().border_color(cx.theme().border).pt_3()
+                    .child(div().text_sm().child(if volumes.candidates.len() > 1 { "分卷候选" } else { "输入成员" }))
+                    .when(!volumes.diagnostic.is_empty(), |el| el.child(div().text_xs().text_color(cx.theme().muted_foreground).child(volumes.diagnostic.clone())))
+                    .children(volumes.candidates.iter().enumerate().map(|(index, candidate)| {
+                        let adopted = volumes.selected.iter().any(|selected| selected.len() == candidate.len() && selected.iter().all(|path| candidate.contains(path)));
+                        div().flex().flex_col().gap_1().py_2()
+                            .child(div().text_xs().child(format!("候选 {} · {} 卷{}", index + 1, candidate.len(), if adopted { " · 已采用" } else { "" })))
+                            .children(candidate.iter().map(|path| div().text_xs().text_color(cx.theme().muted_foreground).child(path.display().to_string())))
+                    }))
+                    .when(volumes.candidates.is_empty(), |el| el.children(volumes.members.iter().map(|path| div().text_xs().child(path.display().to_string())))))
+            })
+            .child(control("file-output").icon(IconName::FolderOpen).label("打开输出目录").disabled(output.is_none()).on_click(move |_, _, cx| { if let Some(path) = &output { cx.reveal_path(path); } }))
+            .child(div().border_t_1().border_color(cx.theme().border).pt_4().text_xs().text_color(cx.theme().muted_foreground).child("暂停在当前阶段安全结束后生效。取消会停止该根归档及其嵌套文件，并等待清理。"))
+            .child(div().flex().flex_col().gap_2().child(div().text_sm().child("文件记录"))
+                .children(file.events.iter().rev().take(30).map(|event| div().text_xs().text_color(cx.theme().muted_foreground).child(event.clone()))))
+            .into_any_element())
+    }
+
     fn detail(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        if !self.quick {
+            if let Some(detail) = self.file_detail(cx) {
+                return detail;
+            }
+        }
         let queue = &self.shared.read(cx).queue;
         let selected = if self.quick {
             queue
@@ -1068,6 +1521,16 @@ impl View {
                     .flex()
                     .gap_2()
                     .flex_wrap()
+                    .when(phase == Phase::Queued, |el| {
+                        el.child(control("start").primary().label("开始任务").on_click(
+                            cx.listener(move |this, _, _, cx| {
+                                this.shared.update(cx, |state, cx| {
+                                    state.queue.start(id);
+                                    cx.notify();
+                                })
+                            }),
+                        ))
+                    })
                     .when(phase.active() || phase == Phase::Queued, |el| {
                         el.child(
                             control("cancel")
@@ -1657,7 +2120,10 @@ impl View {
                 config: resolved.values.backends.clone(),
                 allow_password: resolved.values.passwords.mode
                     != smartzip_config::PasswordMode::Off,
-                max_bytes: resolved.values.limits.max_output_bytes.min(8 * 1024 * 1024) as usize,
+                max_bytes: match resolved.values.limits.max_output_bytes {
+                    0 => 8 * 1024 * 1024,
+                    limit => limit.min(8 * 1024 * 1024) as usize,
+                },
                 encoding: result
                     .get("encoding")
                     .and_then(|v| v.as_str())
@@ -2175,22 +2641,19 @@ impl Render for View {
                                     cx.notify();
                                 })
                             }))
+                            .child(self.task_overview(cx))
                             .child(self.prompt(cx))
                             .child(self.actions(cx))
-                            .child(
-                                div()
-                                    .p_4()
-                                    .border_1()
-                                    .border_color(cx.theme().border)
-                                    .rounded_lg()
-                                    .child(self.quick_controls(None, cx)),
-                            )
-                            .child(
-                                div()
-                                    .mt_2()
-                                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                                    .child("解压队列"),
-                            )
+                            .when(self.queue_settings_open, |el| {
+                                el.child(
+                                    div()
+                                        .p_4()
+                                        .border_1()
+                                        .border_color(cx.theme().border)
+                                        .rounded_lg()
+                                        .child(self.quick_controls(None, cx)),
+                                )
+                            })
                             .child(self.tasks(cx))
                             .when(count == 0, |el| {
                                 el.child(div().py_8().child(self.drop_area(cx)))
@@ -2199,7 +2662,7 @@ impl Render for View {
                     .child(
                         div()
                             .id("detail-scroll")
-                            .w(px(300.))
+                            .w(px(320.))
                             .flex_shrink_0()
                             .border_l_1()
                             .border_color(cx.theme().border)

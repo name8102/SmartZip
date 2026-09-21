@@ -275,19 +275,19 @@ pub const SECTIONS: &[Section] = &[
             field!(
                 "limits.max_files",
                 "最大输出文件数",
-                "限制解压过程中允许产生的文件数量。",
+                "累计输出条目上限，0 表示不限。",
                 Kind::Number
             ),
             field!(
                 "limits.max_output_bytes",
                 "最大输出字节数",
-                "以字节为单位限制解压输出大小。",
+                "累计输出字节上限，0 表示不限。",
                 Kind::Number
             ),
             field!(
                 "limits.min_free_bytes",
                 "最小剩余空间",
-                "以字节为单位设置可用磁盘空间下限。",
+                "可用磁盘字节数下限，0 表示关闭容量检查。",
                 Kind::Number
             ),
             field!(
