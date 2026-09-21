@@ -88,12 +88,38 @@ impl ArtifactIdentity {
         })
     }
 
+    #[cfg(unix)]
+    fn matches_identity(&self, actual: &Self, path: &Path) -> std::io::Result<bool> {
+        if self.device != actual.device || self.file_type != actual.file_type {
+            return Ok(false);
+        }
+        if self.inode == actual.inode {
+            return Ok(true);
+        }
+        // Some NFS servers derive file IDs from paths, so rename changes inode.
+        // Only inspect the filesystem after an inode mismatch; ordinary local
+        // identity checks retain their existing cost and semantics.
+        #[cfg(target_os = "linux")]
+        if self.len == actual.len && self.modified_ns == actual.modified_ns {
+            use std::os::unix::ffi::OsStrExt;
+            let path = std::ffi::CString::new(path.as_os_str().as_bytes())?;
+            let mut filesystem = std::mem::MaybeUninit::<libc::statfs>::uninit();
+            // SAFETY: path is a live C string and statfs writes the supplied
+            // structure. It is read only after the syscall succeeds.
+            if unsafe { libc::statfs(path.as_ptr(), filesystem.as_mut_ptr()) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let filesystem = unsafe { filesystem.assume_init() };
+            return Ok(filesystem.f_type == libc::NFS_SUPER_MAGIC);
+        }
+        let _ = path;
+        Ok(false)
+    }
+
     pub fn matches_object(&self, path: &Path) -> std::io::Result<bool> {
         let actual = Self::capture(path)?;
         #[cfg(unix)]
-        return Ok(self.device == actual.device
-            && self.inode == actual.inode
-            && self.file_type == actual.file_type);
+        return self.matches_identity(&actual, path);
         #[cfg(not(unix))]
         {
             let _ = actual;
@@ -104,11 +130,9 @@ impl ArtifactIdentity {
     pub fn matches_version(&self, path: &Path) -> std::io::Result<bool> {
         let actual = Self::capture(path)?;
         #[cfg(unix)]
-        return Ok(self.device == actual.device
-            && self.inode == actual.inode
-            && self.file_type == actual.file_type
-            && self.len == actual.len
-            && self.modified_ns == actual.modified_ns);
+        return Ok(self.len == actual.len
+            && self.modified_ns == actual.modified_ns
+            && self.matches_identity(&actual, path)?);
         #[cfg(not(unix))]
         {
             let _ = actual;
@@ -204,6 +228,13 @@ impl NodeOutcome {
 
 #[async_trait(?Send)]
 pub trait ExecutionStateRecorder {
+    fn volume_selected(&self, _node_id: &NodeId, _members: Vec<PathBuf>) {}
+
+    /// Whether this recorder owns durable history, rather than only live UI state.
+    fn durable(&self) -> bool {
+        true
+    }
+
     async fn enqueue_child(
         &self,
         task_id: &TaskId,
@@ -285,4 +316,36 @@ pub trait ExecutionStateRecorder {
         generation: u64,
         outcome: NodeOutcome,
     ) -> smartzip_core::Result<bool>;
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod nfs_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires SMARTZIP_TEST_NFS_DIR pointing to a writable NFS mount"]
+    fn identity_survives_nfs_rename() {
+        let parent = std::env::var_os("SMARTZIP_TEST_NFS_DIR").unwrap();
+        let root = tempfile::tempdir_in(parent).unwrap();
+        for directory in [false, true] {
+            let source = root.path().join(if directory { "dir" } else { "file" });
+            let target = root
+                .path()
+                .join(if directory { "moved-dir" } else { "moved-file" });
+            if directory {
+                std::fs::create_dir(&source).unwrap();
+                std::fs::write(source.join("data"), b"payload").unwrap();
+            } else {
+                std::fs::write(&source, b"payload").unwrap();
+            }
+            let identity = ArtifactIdentity::capture(&source).unwrap();
+            crate::materialize::rename_no_replace(&source, &target).unwrap();
+            assert!(identity.matches_object(&target).unwrap());
+            assert!(identity.matches_version(&target).unwrap());
+            if !directory {
+                std::fs::write(&target, b"changed payload").unwrap();
+                assert!(!identity.matches_version(&target).unwrap());
+            }
+        }
+    }
 }

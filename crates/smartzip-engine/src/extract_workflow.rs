@@ -23,8 +23,8 @@ use crate::materialize::{
 };
 use crate::nested::{
     archive_stem, candidate_key, candidate_output_relative_path, discover_nested_candidates,
-    output_dir_for_candidate, output_relative_path_for, record_skip,
-    recyclable_nested_archive_path, recycle_archive, root_embedded_candidates,
+    discover_nested_candidates_from_inventory, output_dir_for_candidate, output_relative_path_for,
+    record_skip, recyclable_nested_archive_path, recycle_archive, root_embedded_candidates,
 };
 use crate::password_order::password_source_label;
 use crate::policy::{
@@ -103,6 +103,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
     batch_passwords: std::rc::Rc<std::cell::RefCell<Vec<PasswordCandidate>>>,
     task_budget: std::sync::Arc<crate::budget::TaskBudget>,
     dedup: std::rc::Rc<std::cell::RefCell<TaskDedup>>,
+    source_cleanup: crate::source_cleanup::SharedCleanup,
 ) -> smartzip_core::Result<ExtractWorkflowResult> {
     let config = run_policy.map(crate::CompiledRunPolicy::values);
     let may_prompt =
@@ -134,7 +135,11 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
         archive_recycler
     };
     let task_id = identity.task_id;
-    let legacy_history = if execution.is_none() { history } else { None };
+    let legacy_history = if execution.is_none_or(|e| !e.durable()) {
+        history
+    } else {
+        None
+    };
     let events = EventSink::new(listener);
     let task_context = backend.begin_task_with_cancellation(
         task_id.clone(),
@@ -632,6 +637,25 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                 }
             }
 
+            let source_paths = if source_cleanup.is_some()
+                && original_candidate.source == CandidateSource::RootInput
+            {
+                volume_set_for_candidate
+                    .as_ref()
+                    .map(|set| {
+                        set.members
+                            .iter()
+                            .map(|member| member.path.clone())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_else(|| vec![original_input_path.clone()])
+            } else {
+                Vec::new()
+            };
+            if let Some(cleanup) = &source_cleanup {
+                cleanup.borrow_mut().capture(&source_paths);
+            }
+
             // Header-based detection first, then scanner confirmation
             if let Some(policy) = run_policy {
                 embedded_policy.mode = policy.embedded_mode(candidate.depth == 0);
@@ -885,6 +909,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                 Vec::new()
             };
             if !root_findings.is_empty() {
+                let mut ready_archives = Vec::new();
                 for embedded_candidate in root_findings {
                     if !task_budget.reserve_nested(request.limits.max_nested_candidates) {
                         record_failure(&mut failed_count, config, &cancellation);
@@ -939,7 +964,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                     };
                     if inserted {
                         enqueued.push(embedded_candidate.clone());
-                        queue.push_back(ExecutionNode {
+                        ready_archives.push(ExecutionNode {
                             id: child_id,
                             root_id: node.root_id.clone(),
                             generation: 0,
@@ -948,6 +973,11 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                     } else {
                         task_budget.release_nested();
                     }
+                }
+                // These are ready archives from the current input, not nested
+                // discovery work. Extract them before scanning later inputs.
+                for archive in ready_archives.into_iter().rev() {
+                    queue.push_front(archive);
                 }
                 finish_execution_outcome(
                     execution,
@@ -1235,6 +1265,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
             let prepared = match prepare_resolved_archive(
                 &candidate,
                 volume_archive_path.zip(volume_materialized),
+                Some(&request.output_dir),
                 request.encoding_mode.clone(),
                 history,
                 run_policy,
@@ -1467,6 +1498,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
             let mut attempts: VecDeque<_> = candidate_passwords.into_iter().collect();
             let mut saw_password_required = false;
             let committed_output_usage = std::cell::Cell::new(crate::budget::Usage::default());
+            let committed_output_files = std::cell::RefCell::new(None);
             while !terminal_skip && !cancellation.is_cancelled() {
                 let extraction_attempt_id = AttemptId::new();
                 if !enter_stage(
@@ -1598,6 +1630,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                 candidate_encoding_used = Some(encoding_mode_label(&encoding));
                 let mut budget_reservation = task_budget.reserve_attempt();
                 let attempt_output_usage = std::cell::Cell::new(crate::budget::Usage::default());
+                let attempt_output_inventory = std::cell::RefCell::new(None);
                 let extracted_encrypted = std::cell::Cell::new(None);
                 let committed_has_password = std::cell::Cell::new(false);
                 let committed_password_id = std::cell::Cell::new(None);
@@ -1634,6 +1667,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                             let budget_reservation = &budget_reservation;
                             let extracted_encrypted = &extracted_encrypted;
                             let attempt_output_usage = &attempt_output_usage;
+                            let attempt_output_inventory = &attempt_output_inventory;
                             let task_id = task_id.clone();
                             let node_id = node.id.clone();
                             let generation = node.generation;
@@ -1657,7 +1691,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                                         });
                                     }
                                 }
-                                let (extracted, usage) = crate::budget::monitor_task(
+                                let (extracted, inventory) = crate::budget::monitor_task(
                                     &temp_output_dir,
                                     limits,
                                     budget_reservation,
@@ -1680,7 +1714,8 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                                     ),
                                 )
                                 .await?;
-                                attempt_output_usage.set(usage);
+                                attempt_output_usage.set(inventory.usage);
+                                *attempt_output_inventory.borrow_mut() = Some(inventory);
                                 extracted_encrypted.set(extracted.encrypted);
                                 Ok(())
                             }
@@ -1846,7 +1881,9 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                                                 );
                                             }
                                         }
-                                        match prepared.commit() {
+                                        match prepared.commit_with_recovery(
+                                            execution.is_some_and(|e| e.durable()),
+                                        ) {
                                             Ok(published) => {
                                                 committed_output_usage
                                                     .set(budget_reservation.commit());
@@ -1908,6 +1945,10 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                 };
                 match result {
                     Ok(result) => {
+                        *committed_output_files.borrow_mut() = attempt_output_inventory
+                            .borrow()
+                            .as_ref()
+                            .and_then(|inventory| inventory.published_files(&result.layout_plan));
                         for message in &result.layout_plan.warnings {
                             events.push(TaskEvent {
                                 task_id: task_id.clone(),
@@ -2036,6 +2077,14 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                     candidate = original_candidate.clone();
                     group_attempt += 1;
                     continue 'groupings;
+                }
+            }
+            if extracted {
+                if let (Some(execution), Some(set)) = (execution, &volume_set_for_candidate) {
+                    execution.volume_selected(
+                        &node.id,
+                        set.members.iter().map(|m| m.path.clone()).collect(),
+                    );
                 }
             }
             if extracted && group_trials {
@@ -2353,6 +2402,13 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                 output_bytes: committed_output_usage.get().bytes,
                 ..crate::NodeOutcome::terminal("extracted", None, Some(&actual_output_dir), true)
             };
+            if let Some(cleanup) = &source_cleanup {
+                cleanup.borrow_mut().committed(
+                    &source_paths,
+                    &actual_output_dir,
+                    committed_output_usage.get().files,
+                );
+            }
             processed.push(candidate.clone());
             if !enter_stage(
                 execution,
@@ -2385,22 +2441,36 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
             let nested_candidates = if !was_cancelled
                 && (config.is_none() || candidate.depth < request.recursion_limit)
             {
-                discover_nested_candidates(
-                    nested_scanner,
-                    &actual_output_dir,
-                    candidate.depth + 1,
-                    &output_relative_path,
-                    &discovery_policy,
-                    nested_embedded_enabled,
-                    config.is_none_or(|c| {
-                        matches!(
-                            c.extraction.embedded.nested,
-                            smartzip_config::NestedScan::Aggressive
-                                | smartzip_config::NestedScan::All
-                        )
-                    }),
-                    cancellation.token(),
-                )
+                let scan_unrecognized = config.is_none_or(|c| {
+                    matches!(
+                        c.extraction.embedded.nested,
+                        smartzip_config::NestedScan::Aggressive | smartzip_config::NestedScan::All
+                    )
+                });
+                if let Some(files) = committed_output_files.borrow().as_deref() {
+                    discover_nested_candidates_from_inventory(
+                        nested_scanner,
+                        &actual_output_dir,
+                        files,
+                        candidate.depth + 1,
+                        &output_relative_path,
+                        &discovery_policy,
+                        nested_embedded_enabled,
+                        scan_unrecognized,
+                        cancellation.token(),
+                    )
+                } else {
+                    discover_nested_candidates(
+                        nested_scanner,
+                        &actual_output_dir,
+                        candidate.depth + 1,
+                        &output_relative_path,
+                        &discovery_policy,
+                        nested_embedded_enabled,
+                        scan_unrecognized,
+                        cancellation.token(),
+                    )
+                }
             } else {
                 Vec::new()
             };

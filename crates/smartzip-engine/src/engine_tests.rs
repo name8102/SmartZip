@@ -908,6 +908,7 @@ struct StageWaitRecorder {
     block_at_stage: bool,
     stage_entered: Arc<tokio::sync::Notify>,
     outcomes: Mutex<Vec<(NodeId, crate::NodeOutcome)>>,
+    transitions: Arc<Mutex<Vec<(NodeId, crate::coordinator::Stage)>>>,
 }
 
 #[async_trait(?Send)]
@@ -939,6 +940,10 @@ impl crate::ExecutionStateRecorder for StageWaitRecorder {
         _attempt_id: Option<&AttemptId>,
         cancellation: &tokio_util::sync::CancellationToken,
     ) -> smartzip_core::Result<bool> {
+        self.transitions
+            .lock()
+            .unwrap()
+            .push((node_id.clone(), stage));
         let is_wait_node = self.wait_node.lock().unwrap().as_ref() == Some(node_id);
         if is_wait_node && stage == self.wait_stage {
             self.stage_entered.notify_one();
@@ -1035,6 +1040,8 @@ async fn stop_on_error_cancels_other_roots_waiting_for_backend_capacity() {
     let inputs = vec![
         root.path().join("first.zip"),
         root.path().join("second.zip"),
+        root.path().join("third.zip"),
+        root.path().join("fourth.zip"),
     ];
     for input in &inputs {
         std::fs::write(input, b"archive").unwrap();
@@ -1171,7 +1178,7 @@ async fn stop_on_error_cancels_other_roots_waiting_for_backend_capacity() {
         )
         .unwrap();
     assert_eq!(task_status, "failed");
-    assert_eq!((failed, skipped), (1, 1));
+    assert_eq!((failed, skipped), (1, 3));
     execution.release_task(&identity.task_id);
 }
 
@@ -1228,6 +1235,7 @@ async fn stop_on_error_finishes_waiting_nested_node_without_rewriting_its_root()
         block_at_stage: true,
         stage_entered: stage_entered.clone(),
         outcomes: Mutex::new(Vec::new()),
+        transitions: Default::default(),
     };
     let backend = NestedThenFailBackend {
         calls: Mutex::new(Vec::new()),
@@ -1334,6 +1342,7 @@ async fn stop_on_error_finishes_a_root_whose_scan_is_running() {
         block_at_stage: false,
         stage_entered: stage_entered.clone(),
         outcomes: Mutex::new(Vec::new()),
+        transitions: Default::default(),
     };
     let backend = ScanThenFailBackend {
         stage_entered,
@@ -2428,4 +2437,243 @@ fn nested_classification_keeps_header_precedence_and_single_output_scan_boundary
         )
         .is_empty());
     }
+}
+
+#[test]
+fn nested_discovery_uses_the_retained_output_inventory() {
+    let root = tempfile::tempdir().unwrap();
+    let included = root.path().join("included.zip");
+    let excluded = root.path().join("excluded.zip");
+    let zip = std::fs::read(fixture_path("enc_utf8.zip")).unwrap();
+    std::fs::write(&included, &zip).unwrap();
+    std::fs::write(&excluded, &zip).unwrap();
+    let files = vec![crate::budget::InventoryFile {
+        relative_path: PathBuf::from("included.zip"),
+        size: zip.len() as u64,
+    }];
+
+    let candidates = discover_nested_candidates_from_inventory(
+        &EmbeddedScanner::new(ScannerConfig::default()),
+        root.path(),
+        &files,
+        1,
+        Path::new("parent"),
+        &EmbeddedScanPolicy::default(),
+        true,
+        false,
+        &tokio_util::sync::CancellationToken::new(),
+    );
+
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].path, included);
+}
+
+#[test]
+fn small_unrecognized_files_skip_header_probe_but_archive_suffixes_do_not() {
+    let root = tempfile::tempdir().unwrap();
+    let unrecognized = root.path().join("payload.bin");
+    let archive_named = root.path().join("payload.zip");
+    let zip = std::fs::read(fixture_path("enc_utf8.zip")).unwrap();
+    std::fs::write(&unrecognized, &zip).unwrap();
+    std::fs::write(&archive_named, &zip).unwrap();
+    let files = vec![
+        crate::budget::InventoryFile {
+            relative_path: PathBuf::from("payload.bin"),
+            size: zip.len() as u64,
+        },
+        crate::budget::InventoryFile {
+            relative_path: PathBuf::from("payload.zip"),
+            size: zip.len() as u64,
+        },
+    ];
+    let policy = EmbeddedScanPolicy {
+        min_finding_size_bytes: zip.len() as u64 + 1,
+        mode: EmbeddedScanMode::All,
+        ..Default::default()
+    };
+
+    let candidates = discover_nested_candidates_from_inventory(
+        &EmbeddedScanner::new(ScannerConfig::default()),
+        root.path(),
+        &files,
+        1,
+        Path::new("parent"),
+        &policy,
+        true,
+        true,
+        &tokio_util::sync::CancellationToken::new(),
+    );
+
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].path, archive_named);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn multi_input_starts_extracting_before_scanning_the_entire_batch() {
+    let root = tempfile::tempdir().unwrap();
+    let inputs: Vec<_> = (0..8)
+        .map(|i| root.path().join(format!("input-{i}.zip")))
+        .collect();
+    for input in &inputs {
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(input).unwrap());
+        writer
+            .start_file("data.txt", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        std::io::Write::write_all(&mut writer, b"payload").unwrap();
+        writer.finish().unwrap();
+    }
+    let transitions = Arc::new(Mutex::new(Vec::new()));
+    let execution = StageWaitRecorder {
+        wait_node: Mutex::new(None),
+        wait_stage: crate::coordinator::Stage::ScanEmbedded,
+        block_at_stage: false,
+        stage_entered: Default::default(),
+        outcomes: Default::default(),
+        transitions: transitions.clone(),
+    };
+    let observed = Arc::new(Mutex::new(None));
+    let first_extract = observed.clone();
+    let listener: crate::events::TaskEventListener = Arc::new(move |event| {
+        if matches!(event.kind, TaskEventKind::PasswordTried { .. }) {
+            let mut first = first_extract.lock().unwrap();
+            if first.is_none() {
+                *first = Some(
+                    transitions
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|(_, stage)| *stage == crate::coordinator::Stage::ScanEmbedded)
+                        .count(),
+                );
+            }
+        }
+    });
+    let backend = FailFirstExtractBackend {
+        calls: AtomicUsize::new(1),
+    };
+    let db = SmartZipDb::in_memory().unwrap();
+    let passwords = PasswordService::new(PasswordRepository::new(db.connection()));
+    let expected_inputs = inputs.clone();
+    let result = SmartZipEngine::default()
+        .extract(
+            &backend,
+            &passwords,
+            ExtractWorkflowRequest {
+                inputs,
+                output_dir: root.path().join("out"),
+                recursion_limit: 0,
+                encoding_mode: EncodingMode::Override("UTF-8".into()),
+                scanner: ScannerConfig::default(),
+                password_candidates: PasswordCandidateRequest {
+                    include_empty: true,
+                    limit: 0,
+                    ..Default::default()
+                },
+                layout_policy: Default::default(),
+                single_root_name_policy: Default::default(),
+                embedded_scan_mode: Default::default(),
+                dominant_min_ratio: 0.7,
+                confirm_large_scan: false,
+                force: false,
+                limits: Default::default(),
+            },
+            crate::ExtractInteraction::default(),
+            crate::ExtractObserver {
+                listener: Some(listener),
+                history: None,
+                execution: Some(&execution),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        result
+            .processed
+            .iter()
+            .map(|candidate| candidate.path.clone())
+            .collect::<Vec<_>>(),
+        expected_inputs
+    );
+    assert!(
+        observed.lock().unwrap().is_some_and(|scanned| scanned <= 2),
+        "all roots were pre-scanned before extraction: {:?}",
+        observed.lock().unwrap()
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn stateless_embedded_inputs_extract_before_scanning_later_carriers() {
+    let root = tempfile::tempdir().unwrap();
+    let inputs: Vec<_> = (0..8)
+        .map(|i| root.path().join(format!("carrier-{i}.bin")))
+        .collect();
+    for input in &inputs {
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(input).unwrap());
+        writer
+            .start_file("data.txt", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        std::io::Write::write_all(&mut writer, b"payload").unwrap();
+        writer.finish().unwrap();
+        let zip = std::fs::read(input).unwrap();
+        let mut carrier = b"carrier prefix".to_vec();
+        carrier.extend(zip);
+        std::fs::write(input, carrier).unwrap();
+    }
+    let findings = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::new(Mutex::new(None));
+    let first_extract = observed.clone();
+    let listener: crate::events::TaskEventListener = Arc::new(move |event| {
+        if matches!(event.kind, TaskEventKind::EmbeddedArchiveFound { .. }) {
+            findings.fetch_add(1, Ordering::SeqCst);
+        }
+        if matches!(event.kind, TaskEventKind::PasswordTried { .. }) {
+            first_extract
+                .lock()
+                .unwrap()
+                .get_or_insert(findings.load(Ordering::SeqCst));
+        }
+    });
+    let backend = FailFirstExtractBackend {
+        calls: AtomicUsize::new(1),
+    };
+    let db = SmartZipDb::in_memory().unwrap();
+    let passwords = PasswordService::new(PasswordRepository::new(db.connection()));
+    let result = SmartZipEngine::default()
+        .extract(
+            &backend,
+            &passwords,
+            ExtractWorkflowRequest {
+                inputs,
+                output_dir: root.path().join("out"),
+                recursion_limit: 0,
+                encoding_mode: EncodingMode::Override("UTF-8".into()),
+                scanner: ScannerConfig::default(),
+                password_candidates: PasswordCandidateRequest {
+                    include_empty: true,
+                    limit: 0,
+                    ..Default::default()
+                },
+                layout_policy: Default::default(),
+                single_root_name_policy: Default::default(),
+                embedded_scan_mode: Default::default(),
+                dominant_min_ratio: 0.7,
+                confirm_large_scan: false,
+                force: false,
+                limits: Default::default(),
+            },
+            crate::ExtractInteraction::default(),
+            crate::ExtractObserver {
+                listener: Some(listener),
+                history: None,
+                execution: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.processed.len(), 8);
+    assert!(
+        observed.lock().unwrap().is_some_and(|scanned| scanned == 1),
+        "all roots were pre-scanned before extraction: {:?}",
+        observed.lock().unwrap()
+    );
 }

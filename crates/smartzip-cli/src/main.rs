@@ -74,11 +74,13 @@ struct SafetyOptions {
     #[arg(skip)]
     policy: Option<Arc<smartzip_engine::CompiledRunPolicy>>,
 
-    /// Maximum total output entries, including directories and nested outputs.
+    /// Maximum total output entries, including directories and nested outputs (0 = unlimited).
     #[arg(long, global = true)]
     max_files: Option<u64>,
+    /// Maximum cumulative output bytes (0 = unlimited).
     #[arg(long, global = true)]
     max_output_bytes: Option<u64>,
+    /// Minimum free disk space (0 disables capacity queries).
     #[arg(long, global = true)]
     min_free_bytes: Option<u64>,
     #[arg(long, global = true)]

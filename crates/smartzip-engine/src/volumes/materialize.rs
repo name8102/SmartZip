@@ -4,7 +4,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 /// RAII staging object for resolved volume sets.
-/// Creates canonical filenames, prefers CoW/reflink, fallback copy, never renames originals.
+/// Creates canonical symbolic links without copying or renaming source volumes.
 pub struct MaterializedVolumeSet {
     pub staging_dir: PathBuf,
     pub canonical_entrypoint: PathBuf,
@@ -39,9 +39,26 @@ pub fn materialize_volume_set(set: &super::VolumeSet) -> io::Result<Materialized
         .path
         .parent()
         .unwrap_or_else(|| Path::new("."));
-    // Try to stage on same filesystem as source when practical to preserve CoW.
-    let staging = create_staging_dir(source_dir)?;
+    // Keep relative links next to the originals when the source allows it.
+    // A local link directory handles read-only shares or unsupported links.
+    if let Ok(staging) = tempfile::Builder::new()
+        .prefix(".smartzip-volume-")
+        .tempdir_in(source_dir)
+    {
+        if let Ok(materialized) = materialize_with_staging(set, staging) {
+            return Ok(materialized);
+        }
+    }
+    let staging = tempfile::Builder::new()
+        .prefix(".smartzip-volume-")
+        .tempdir()?;
+    materialize_with_staging(set, staging)
+}
 
+fn materialize_with_staging(
+    set: &super::VolumeSet,
+    staging: tempfile::TempDir,
+) -> io::Result<MaterializedVolumeSet> {
     let staging_path = staging.path().to_path_buf();
     let mut canonical_members = Vec::new();
     // Use a stable stem for canonical naming: derive from first member's stem without ordinal?
@@ -66,7 +83,7 @@ pub fn materialize_volume_set(set: &super::VolumeSet) -> io::Result<Materialized
             canonical_name_for(&set.format, canonical_stem, seq, member.logical_index)
         };
         let dest = staging_path.join(&canonical_name);
-        cow_copy(&member.path, &dest)?;
+        link_input(&member.path, &dest)?;
         canonical_members.push(dest);
     }
 
@@ -93,18 +110,41 @@ pub fn materialize_volume_set(set: &super::VolumeSet) -> io::Result<Materialized
     Ok(materialized)
 }
 
-fn create_staging_dir(source_dir: &Path) -> io::Result<tempfile::TempDir> {
-    // Try to create temp dir inside source_dir's filesystem for CoW.
-    // If source_dir is not writable or similar, fallback to temp_dir.
-    match tempfile::Builder::new()
-        .prefix("smartzip-volume-")
-        .tempdir_in(source_dir)
-    {
-        Ok(dir) => Ok(dir),
-        Err(_) => tempfile::Builder::new()
-            .prefix("smartzip-volume-")
-            .tempdir(),
+fn link_input(source: &Path, destination: &Path) -> io::Result<()> {
+    let source = fs::canonicalize(source)?;
+    let staging_parent = destination
+        .parent()
+        .and_then(Path::parent)
+        .map(fs::canonicalize)
+        .transpose()?;
+    let link_target = if source.parent() == staging_parent.as_deref() {
+        // Relative paths also work when the remote server resolves the link;
+        // it need not know the client's mount point.
+        Path::new("..").join(
+            source
+                .file_name()
+                .ok_or_else(|| io::Error::other("volume has no filename"))?,
+        )
+    } else {
+        source.clone()
+    };
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&link_target, destination)?;
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_file(&link_target, destination)?;
+    #[cfg(not(any(unix, windows)))]
+    return Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "volume aliases require symbolic link support; data copying is disabled",
+    ));
+
+    // Some remote filesystems accept link creation but cannot follow it.
+    // Check access before handing the canonical name to the backend.
+    let metadata = fs::metadata(destination)?;
+    if !metadata.is_file() {
+        return Err(io::Error::other("volume alias does not resolve to a file"));
     }
+    Ok(())
 }
 
 fn canonical_name_for(
@@ -136,57 +176,61 @@ fn canonical_name_for(
     }
 }
 
-// Wrapper that tries CoW reflink before falling back to copy.
-fn cow_copy(src: &Path, dst: &Path) -> io::Result<()> {
-    // Try reflink via `reflink` crate semantics? We don't have that crate, so try manual ioctl on Linux/macOS.
-    #[cfg(target_os = "linux")]
-    {
-        if try_reflink_linux(src, dst).is_ok() {
-            return Ok(());
-        }
-    }
-    #[cfg(target_os = "macos")]
-    {
-        if try_clonefile_macos(src, dst).is_ok() {
-            return Ok(());
-        }
-    }
-    // Fallback regular copy
-    fs::copy(src, dst).map(|_| ())
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-#[cfg(target_os = "linux")]
-fn try_reflink_linux(src: &Path, dst: &Path) -> io::Result<()> {
-    use std::os::unix::io::AsRawFd;
-    let src_file = fs::File::open(src)?;
-    let dst_file = fs::File::create(dst)?;
-    let src_fd = src_file.as_raw_fd();
-    let dst_fd = dst_file.as_raw_fd();
-    // FICLONE = _IOW(0x94, 9, int) = 0x40049409
-    const FICLONE: libc::c_ulong = 0x40049409;
-    let ret = unsafe { libc::ioctl(dst_fd, FICLONE as _, src_fd) };
-    if ret == 0 {
-        Ok(())
-    } else {
-        let err = io::Error::last_os_error();
-        // Clean up failed dst
-        let _ = fs::remove_file(dst);
-        Err(err)
-    }
-}
+    #[test]
+    fn volume_aliases_are_relative_links_without_copying_sources() {
+        let source = tempfile::tempdir().unwrap();
+        let paths: Vec<_> = (1..=2)
+            .map(|n| source.path().join(format!("archive.7z.{n:03}")))
+            .collect();
+        for path in &paths {
+            fs::write(path, b"original volume").unwrap();
+        }
+        let set = crate::volumes::VolumeSet {
+            format: ArchiveFormat::SevenZip,
+            entrypoint: paths[0].clone(),
+            members: paths
+                .iter()
+                .enumerate()
+                .map(|(n, path)| crate::volumes::VolumeMember {
+                    path: path.clone(),
+                    filename_ordinal: Some(n as u64 + 1),
+                    logical_index: None,
+                })
+                .collect(),
+            expected_volume_count: None,
+            expected_logical_size: None,
+            zip_kind: None,
+        };
+        let materialized = materialize_volume_set(&set).unwrap();
+        assert_eq!(materialized.staging_dir.parent(), Some(source.path()));
+        assert_eq!(fs::read_dir(source.path()).unwrap().count(), 3);
+        for path in &materialized.canonical_members {
+            assert_eq!(fs::read(path).unwrap(), b"original volume");
+            assert!(fs::symlink_metadata(path).unwrap().file_type().is_symlink());
+            assert!(fs::read_link(path).unwrap().starts_with(".."));
+        }
+        let staging = materialized.staging_dir.clone();
+        drop(materialized);
+        assert!(!staging.exists());
+        for path in &paths {
+            assert_eq!(fs::read(path).unwrap(), b"original volume");
+        }
 
-#[cfg(target_os = "macos")]
-fn try_clonefile_macos(src: &Path, dst: &Path) -> io::Result<()> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-    let src_c = CString::new(src.as_os_str().as_bytes())
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    let dst_c = CString::new(dst.as_os_str().as_bytes())
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    let ret = unsafe { libc::clonefile(src_c.as_ptr(), dst_c.as_ptr(), 0) };
-    if ret == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
+        assert_eq!(fs::read_dir(source.path()).unwrap().count(), 2);
+        // A local alias fallback uses the absolute source path, with no copies.
+        let local = tempfile::tempdir().unwrap();
+        let fallback = materialize_with_staging(&set, local).unwrap();
+        for path in &fallback.canonical_members {
+            assert!(fs::symlink_metadata(path).unwrap().file_type().is_symlink());
+            assert!(fs::read_link(path).unwrap().is_absolute());
+            assert_eq!(fs::read(path).unwrap(), b"original volume");
+        }
+        let fallback_dir = fallback.staging_dir.clone();
+        drop(fallback);
+        assert!(!fallback_dir.exists());
     }
 }

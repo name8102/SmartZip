@@ -387,7 +387,15 @@ impl PreparedCommit {
         self.intent.as_ref()
     }
 
+    #[cfg(test)]
     pub(crate) fn commit(self) -> std::result::Result<PublishedOutput, MaterializeFailure> {
+        self.commit_with_recovery(true)
+    }
+
+    pub(crate) fn commit_with_recovery(
+        self,
+        persistent: bool,
+    ) -> std::result::Result<PublishedOutput, MaterializeFailure> {
         let Self {
             request,
             temp,
@@ -408,6 +416,9 @@ impl PreparedCommit {
         };
 
         let marker_result = (|| -> std::io::Result<()> {
+            if !persistent {
+                return Ok(());
+            }
             use std::io::Write;
             let mut marker = std::fs::OpenOptions::new()
                 .write(true)
@@ -701,32 +712,40 @@ fn commit_output_recoverable(
     Ok(backup)
 }
 
-/// Atomically refuse an occupied destination, including a dangling symlink.
+/// Refuse an occupied destination, including a dangling symlink.
+/// Linux filesystems without atomic no-replace support use a checked rename;
+/// another writer can occupy the destination between the check and rename.
 pub(crate) fn rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         use std::os::unix::ffi::OsStrExt;
-        let from = std::ffi::CString::new(from.as_os_str().as_bytes())?;
-        let to = std::ffi::CString::new(to.as_os_str().as_bytes())?;
+        let from_c = std::ffi::CString::new(from.as_os_str().as_bytes())?;
+        let to_c = std::ffi::CString::new(to.as_os_str().as_bytes())?;
         // SAFETY: both C strings remain alive for the syscall; no borrowed
-        // descriptor is closed. Unsupported filesystems fail without clobbering.
+        // descriptor is closed.
         #[cfg(target_os = "linux")]
         let result = unsafe {
             libc::renameat2(
                 libc::AT_FDCWD,
-                from.as_ptr(),
+                from_c.as_ptr(),
                 libc::AT_FDCWD,
-                to.as_ptr(),
+                to_c.as_ptr(),
                 libc::RENAME_NOREPLACE,
             )
         };
         #[cfg(target_os = "macos")]
-        let result = unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL) };
-        if result == 0 {
+        let result = unsafe { libc::renamex_np(from_c.as_ptr(), to_c.as_ptr(), libc::RENAME_EXCL) };
+        let result = if result == 0 {
             Ok(())
         } else {
             Err(std::io::Error::last_os_error())
+        };
+        #[cfg(target_os = "linux")]
+        {
+            finish_no_replace_rename(from, to, result)
         }
+        #[cfg(target_os = "macos")]
+        result
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
@@ -735,6 +754,34 @@ pub(crate) fn rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
             ErrorKind::Unsupported,
             "atomic no-replace commit requires Linux or macOS",
         ))
+    }
+}
+
+// Keep this fallback shared by publication, rollback, and crash recovery.
+#[cfg(target_os = "linux")]
+fn finish_no_replace_rename(
+    from: &Path,
+    to: &Path,
+    result: std::io::Result<()>,
+) -> std::io::Result<()> {
+    match result {
+        Err(error)
+            if matches!(
+                error.raw_os_error(),
+                Some(libc::EINVAL | libc::EOPNOTSUPP | libc::ENOSYS)
+            ) => {}
+        other => return other,
+    }
+    // Do not use exists(): it follows symlinks and hides inspection errors.
+    // NFS lacks atomic no-replace rename, so this compatibility path has a
+    // check/rename race. Callers must avoid concurrent output modifications.
+    match std::fs::symlink_metadata(to) {
+        Ok(_) => Err(std::io::Error::new(
+            ErrorKind::AlreadyExists,
+            "rename destination already exists",
+        )),
+        Err(error) if error.kind() == ErrorKind::NotFound => std::fs::rename(from, to),
+        Err(error) => Err(error),
     }
 }
 
@@ -756,6 +803,116 @@ fn find_non_colliding_name(parent: &Path, name: &std::ffi::OsStr) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unsupported_atomic_rename_falls_back_for_files_and_trees() {
+        for errno in [libc::EINVAL, libc::EOPNOTSUPP, libc::ENOSYS] {
+            for directory in [false, true] {
+                let root = tempfile::tempdir().unwrap();
+                let source = root.path().join("source");
+                let target = root.path().join("target");
+                if directory {
+                    std::fs::create_dir(&source).unwrap();
+                    std::fs::write(source.join("data"), b"payload").unwrap();
+                } else {
+                    std::fs::write(&source, b"payload").unwrap();
+                }
+                finish_no_replace_rename(
+                    &source,
+                    &target,
+                    Err(std::io::Error::from_raw_os_error(errno)),
+                )
+                .unwrap();
+                assert!(!source.exists());
+                let data = if directory {
+                    target.join("data")
+                } else {
+                    target
+                };
+                assert_eq!(std::fs::read(data).unwrap(), b"payload");
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fallback_refuses_files_directories_and_dangling_links() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        std::fs::write(&source, b"new").unwrap();
+        let file = root.path().join("file");
+        let directory = root.path().join("directory");
+        let link = root.path().join("link");
+        std::fs::write(&file, b"old").unwrap();
+        std::fs::create_dir(&directory).unwrap();
+        std::os::unix::fs::symlink("missing", &link).unwrap();
+        for target in [&file, &directory, &link] {
+            let error = finish_no_replace_rename(
+                &source,
+                target,
+                Err(std::io::Error::from_raw_os_error(libc::EINVAL)),
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::AlreadyExists);
+            assert_eq!(std::fs::read(&source).unwrap(), b"new");
+        }
+        assert_eq!(std::fs::read(file).unwrap(), b"old");
+        assert!(directory.is_dir());
+        assert_eq!(std::fs::read_link(link).unwrap(), PathBuf::from("missing"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rename_fallback_preserves_other_errors() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let target = root.path().join("target");
+        std::fs::write(&source, b"payload").unwrap();
+        for errno in [libc::EACCES, libc::EXDEV, libc::EIO, libc::EEXIST] {
+            let error = finish_no_replace_rename(
+                &source,
+                &target,
+                Err(std::io::Error::from_raw_os_error(errno)),
+            )
+            .unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(errno));
+            assert!(source.exists());
+            assert!(!target.exists());
+        }
+        // An inspection failure must not be treated as an absent destination.
+        let loop_path = root.path().join("loop");
+        std::os::unix::fs::symlink("loop", &loop_path).unwrap();
+        let error = finish_no_replace_rename(
+            &source,
+            &loop_path.join("target"),
+            Err(std::io::Error::from_raw_os_error(libc::EINVAL)),
+        )
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ELOOP));
+        assert!(source.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fallback_commit_failure_restores_old_tree() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("missing-source");
+        let target = root.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("old"), b"old").unwrap();
+        let failure = commit_output(&source, &target, CommitPolicy::Overwrite, |from, to| {
+            finish_no_replace_rename(
+                from,
+                to,
+                Err(std::io::Error::from_raw_os_error(libc::EINVAL)),
+            )
+        })
+        .unwrap_err();
+        assert!(failure.preserved_temp_dir.is_none());
+        assert_eq!(std::fs::read(target.join("old")).unwrap(), b"old");
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+    }
 
     #[test]
     fn commit_failure_restores_old_tree() {
@@ -967,6 +1124,37 @@ mod tests {
             std::fs::read(output.join("concurrent")).unwrap(),
             b"concurrent"
         );
+    }
+
+    #[tokio::test]
+    async fn stateless_commit_does_not_create_recovery_marker() {
+        let root = tempfile::tempdir().unwrap();
+        let output = root.path().join("output");
+        let staged = OutputMaterializer::default()
+            .prepare(
+                MaterializeRequest {
+                    output_dir: output.clone(),
+                    archive_path: output.clone(),
+                    commit_policy: CommitPolicy::FailIfExists,
+                    archive_stem: None,
+                    layout_policy: OutputLayoutPolicy::Raw,
+                    single_root_name_policy: SingleRootNamePolicy::default(),
+                },
+                |temp| async move {
+                    std::fs::write(temp.join("data"), b"payload")
+                        .map_err(|e| SmartZipError::io(Some(temp), e))
+                },
+            )
+            .await
+            .unwrap();
+        let prepared = staged
+            .prepare_commit(None, crate::CommitSuccessFacts::default())
+            .unwrap();
+        let marker = prepared.intent().unwrap().marker_path.clone();
+        let published = prepared.commit_with_recovery(false).unwrap();
+        assert!(!marker.exists());
+        assert_eq!(std::fs::read(output.join("data")).unwrap(), b"payload");
+        published.finalize();
     }
 
     #[tokio::test]

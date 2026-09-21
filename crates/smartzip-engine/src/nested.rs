@@ -137,6 +137,7 @@ pub(crate) struct ArchiveInput {
 
 pub(crate) fn materialize_archive_input(
     candidate: &ExtractionCandidate,
+    staging_root: Option<&Path>,
 ) -> smartzip_core::Result<ArchiveInput> {
     if let Some(offset) = candidate
         .embedded_offset
@@ -147,6 +148,7 @@ pub(crate) fn materialize_archive_input(
             offset,
             candidate.embedded_size,
             candidate.detected_format.as_ref(),
+            staging_root,
         )
         .map_err(
             |source| smartzip_core::SmartZipError::EmbeddedArchiveCarveFailed {
@@ -185,6 +187,7 @@ pub(crate) fn carve_embedded_archive(
     offset: u64,
     size: Option<u64>,
     format: Option<&ArchiveFormat>,
+    staging_root: Option<&Path>,
 ) -> std::io::Result<tempfile::NamedTempFile> {
     let file_len = std::fs::metadata(source)?.len();
 
@@ -228,7 +231,15 @@ pub(crate) fn carve_embedded_archive(
     let mut input = File::open(source)?;
     input.seek(SeekFrom::Start(offset))?;
 
-    let mut output = tempfile::NamedTempFile::new()?;
+    let mut output = match staging_root {
+        Some(root) => {
+            std::fs::create_dir_all(root)?;
+            tempfile::Builder::new()
+                .prefix(".smartzip-carve-")
+                .tempfile_in(root)?
+        }
+        None => tempfile::NamedTempFile::new()?,
+    };
     let bytes_to_copy = effective_end - offset;
     std::io::copy(&mut input.take(bytes_to_copy), &mut output)?;
     output.flush()?;
@@ -260,9 +271,20 @@ pub(crate) fn discover_nested_candidates(
         nested_embedded_enabled,
         scan_unrecognized,
     };
+    // Links are archive contents, not additional archives to follow outside output.
+    if root.is_symlink() {
+        return Vec::new();
+    }
     // Preserve the collapsed single-output contract: header/extension only.
     if root.is_file() {
-        return classify_nested_file(None, root, prefix.join(archive_stem(root)), depth, &policy);
+        return classify_nested_file(
+            None,
+            root,
+            prefix.join(archive_stem(root)),
+            depth,
+            None,
+            &policy,
+        );
     }
     let mut candidates = Vec::new();
     for entry in walkdir::WalkDir::new(root)
@@ -285,6 +307,52 @@ pub(crate) fn discover_nested_candidates(
             path,
             relative_path,
             depth,
+            None,
+            &policy,
+        ));
+    }
+    candidates
+}
+
+pub(crate) fn discover_nested_candidates_from_inventory(
+    scanner: &EmbeddedScanner,
+    root: &Path,
+    files: &[crate::budget::InventoryFile],
+    depth: u8,
+    prefix: &Path,
+    policy: &smartzip_core::EmbeddedScanPolicy,
+    nested_embedded_enabled: bool,
+    scan_unrecognized: bool,
+    cancellation: &tokio_util::sync::CancellationToken,
+) -> Vec<ExtractionCandidate> {
+    let policy = NestedDiscoveryPolicy {
+        cancellation,
+        embedded: policy,
+        nested_embedded_enabled,
+        scan_unrecognized,
+    };
+    let mut candidates = Vec::new();
+    for file in files {
+        if cancellation.is_cancelled() {
+            break;
+        }
+        let path = if file.relative_path.as_os_str().is_empty() {
+            root.to_path_buf()
+        } else {
+            root.join(&file.relative_path)
+        };
+        let mut relative_path = if file.relative_path.as_os_str().is_empty() {
+            prefix.join(archive_stem(&path))
+        } else {
+            prefix.join(&file.relative_path)
+        };
+        relative_path.set_file_name(archive_stem(&path));
+        candidates.extend(classify_nested_file(
+            (!file.relative_path.as_os_str().is_empty()).then_some(scanner),
+            &path,
+            relative_path,
+            depth,
+            Some(file.size),
             &policy,
         ));
     }
@@ -296,6 +364,7 @@ fn classify_nested_file(
     path: &Path,
     relative_path: PathBuf,
     depth: u8,
+    known_size: Option<u64>,
     discovery: &NestedDiscoveryPolicy<'_>,
 ) -> Vec<ExtractionCandidate> {
     let NestedDiscoveryPolicy {
@@ -307,12 +376,19 @@ fn classify_nested_file(
     let path = path.to_path_buf();
     let detected_format = format_from_extension(&path);
     let mut candidates = Vec::new();
+    let unrecognized_size = (scan_unrecognized && detected_format.is_none())
+        .then(|| {
+            known_size.or_else(|| std::fs::metadata(&path).ok().map(|metadata| metadata.len()))
+        })
+        .flatten();
+    let scan_unrecognized_header = scan_unrecognized
+        && unrecognized_size.is_some_and(|size| size >= policy.min_finding_size_bytes);
     let header_result = (nested_embedded_enabled
-        && (scan_unrecognized || detected_format.is_some()))
-    .then(|| crate::detect::probe_file_header(&path))
-    .flatten();
+        && (detected_format.is_some() || scan_unrecognized_header))
+        .then(|| crate::detect::probe_file_header(&path))
+        .flatten();
     if let Some((fmt, offset)) = header_result {
-        if is_business_container(&path) || crate::container::classify_zip_path(&path).is_some() {
+        if is_business_container(&path) {
             return candidates;
         }
         candidates.push(ExtractionCandidate {
@@ -328,7 +404,7 @@ fn classify_nested_file(
     }
 
     if detected_format.is_some() {
-        if is_business_container(&path) || crate::container::classify_zip_path(&path).is_some() {
+        if is_business_container(&path) {
             return candidates;
         }
         candidates.push(ExtractionCandidate {
@@ -349,9 +425,10 @@ fn classify_nested_file(
     if !nested_embedded_enabled || !scan_unrecognized {
         return candidates;
     }
-    let file_size = std::fs::metadata(&path)
-        .map(|metadata| metadata.len())
-        .unwrap_or(0);
+    let file_size = unrecognized_size.unwrap_or(0);
+    if file_size < policy.min_finding_size_bytes {
+        return candidates;
+    }
     if policy
         .inner_scan_max_bytes
         .is_some_and(|max_bytes| file_size > max_bytes)
@@ -432,5 +509,29 @@ pub fn format_from_extension(path: impl AsRef<std::path::Path>) -> Option<Archiv
         "lz4" => Some(ArchiveFormat::Lz4),
         "lzma" => Some(ArchiveFormat::Lzma),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod target_staging_tests {
+    use super::*;
+
+    #[test]
+    fn embedded_input_is_carved_on_target_and_removed_after_use() {
+        let source = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let path = source.path().join("carrier.bin");
+        std::fs::write(&path, b"prefixPAYLOADsuffix").unwrap();
+        let mut candidate = ExtractionCandidate::root(path.clone());
+        candidate.embedded_offset = Some(6);
+        candidate.embedded_size = Some(7);
+        let input = materialize_archive_input(&candidate, Some(target.path())).unwrap();
+        assert_eq!(input.path.parent(), Some(target.path()));
+        assert_eq!(std::fs::read(&input.path).unwrap(), b"PAYLOAD");
+        assert_eq!(std::fs::read_dir(source.path()).unwrap().count(), 1);
+        let staging = input.path.clone();
+        drop(input);
+        assert!(!staging.exists());
+        assert_eq!(std::fs::read(path).unwrap(), b"prefixPAYLOADsuffix");
     }
 }

@@ -13,6 +13,9 @@ pub mod history;
 pub mod layout;
 mod materialize;
 pub mod name_score;
+pub mod root_inputs;
+pub mod root_management;
+mod source_cleanup;
 
 mod access;
 mod backend_util;
@@ -47,15 +50,27 @@ use std::sync::Arc;
 pub(crate) struct TaskCancellation {
     token: tokio_util::sync::CancellationToken,
     user: tokio_util::sync::CancellationToken,
+    failure: tokio_util::sync::CancellationToken,
     stopped_on_error: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl TaskCancellation {
     fn new(user: tokio_util::sync::CancellationToken) -> Self {
+        let token = user.child_token();
         Self {
-            token: user.child_token(),
+            failure: token.clone(),
+            token,
             user,
             stopped_on_error: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    fn fork(&self) -> Self {
+        Self {
+            token: self.token.child_token(),
+            user: self.user.child_token(),
+            failure: self.failure.clone(),
+            stopped_on_error: self.stopped_on_error.clone(),
         }
     }
 
@@ -83,7 +98,7 @@ impl TaskCancellation {
     pub(crate) fn stop_on_error(&self) {
         self.stopped_on_error
             .store(true, std::sync::atomic::Ordering::Release);
-        self.token.cancel();
+        self.failure.cancel();
     }
 
     pub(crate) async fn cancelled(&self) {
@@ -157,6 +172,8 @@ impl SmartZipEngine {
             run_policy: None,
             cancellation: tokio_util::sync::CancellationToken::new(),
             archive_recycler: Arc::new(smartzip_platform::move_to_trash),
+            recycle_sources: false,
+            root_management: None,
             min_embedded_size_bytes: smartzip_core::DEFAULT_MIN_EMBEDDED_FINDING_SIZE,
         }
     }
@@ -166,7 +183,23 @@ impl SmartZipEngine {
         self
     }
 
-    /// Override how successfully processed nested archives are recycled.
+    /// Recycle explicit input archives and all successfully used volumes after
+    /// the entire task succeeds. Disabled by default; failures retain sources.
+    /// Attach live per-root controls and node snapshots for this extraction.
+    pub fn with_root_management(
+        mut self,
+        management: Arc<root_management::RootManagement>,
+    ) -> Self {
+        self.root_management = Some(management);
+        self
+    }
+
+    pub fn with_source_recycling(mut self, enabled: bool) -> Self {
+        self.recycle_sources = enabled;
+        self
+    }
+
+    /// Override recycling for sources and successfully processed nested archives.
     pub fn with_archive_recycler(mut self, archive_recycler: ArchiveRecycleHandler) -> Self {
         self.archive_recycler = archive_recycler;
         self
@@ -364,9 +397,47 @@ impl SmartZipEngine {
         identity: ExtractTaskIdentity,
         backend: &B,
         passwords: &PasswordService<'_>,
+        request: ExtractWorkflowRequest,
+        interaction: ExtractInteraction<'_>,
+        observer: ExtractObserver<'_>,
+    ) -> smartzip_core::Result<ExtractWorkflowResult> {
+        let cleanup = self.recycle_sources.then(|| {
+            std::rc::Rc::new(std::cell::RefCell::new(source_cleanup::SourceCleanup::new(
+                &request.inputs,
+            )))
+        });
+        let listener = observer.listener.clone();
+        let mut result = self
+            .extract_task_inner(
+                identity,
+                backend,
+                passwords,
+                request,
+                interaction,
+                observer,
+                cleanup.clone(),
+            )
+            .await?;
+        source_cleanup::SourceCleanup::finish(
+            cleanup,
+            &mut result,
+            &self.cancellation,
+            &self.archive_recycler,
+            listener.as_ref(),
+        )
+        .await;
+        Ok(result)
+    }
+
+    async fn extract_task_inner<B: ArchiveExecutor>(
+        &self,
+        identity: ExtractTaskIdentity,
+        backend: &B,
+        passwords: &PasswordService<'_>,
         mut request: ExtractWorkflowRequest,
         interaction: ExtractInteraction<'_>,
         observer: ExtractObserver<'_>,
+        source_cleanup: source_cleanup::SharedCleanup,
     ) -> smartzip_core::Result<ExtractWorkflowResult> {
         if let Some(policy) = self.run_policy.as_deref() {
             request = policy
@@ -379,7 +450,13 @@ impl SmartZipEngine {
         let dedup = std::rc::Rc::new(std::cell::RefCell::new(
             extract_workflow::TaskDedup::default(),
         ));
-        if let Some(execution) = observer.execution.filter(|_| request.inputs.len() > 1) {
+        if self.root_management.is_some()
+            || (observer.execution.is_some() && request.inputs.len() > 1)
+        {
+            let execution = observer.execution;
+            if let Some(management) = &self.root_management {
+                management.register(&identity, &task_cancellation);
+            }
             if identity.roots.len() != request.inputs.len() {
                 return Err(smartzip_core::SmartZipError::ResourceLimit {
                     detail: "task root identity count does not match input count".into(),
@@ -392,18 +469,46 @@ impl SmartZipEngine {
                 .iter()
                 .cloned()
                 .zip(identity.roots.iter().cloned())
-                .map(|(input, root)| {
+                .enumerate()
+                .map(|(index, (input, root))| {
                     let batch_passwords = batch_passwords.clone();
                     let task_budget = task_budget.clone();
                     let dedup = dedup.clone();
-                    let cancellation = task_cancellation.clone();
+                    let source_cleanup = source_cleanup.clone();
+                    let management = self.root_management.clone();
+                    let cancellation = management
+                        .as_ref()
+                        .map(|m| m.cancellation(&root.root_id))
+                        .unwrap_or_else(|| task_cancellation.clone());
                     let task_id = task_id.clone();
                     let listener = observer.listener.clone();
                     let history = observer.history;
                     let mut root_request = request.clone();
                     root_request.inputs = vec![input];
                     async move {
-                        workflow::extract_recursive_with_listener_interactive(
+                        let root_id = root.root_id.clone();
+                        let managed =
+                            management
+                                .as_ref()
+                                .map(|m| root_management::ManagedRecorder {
+                                    inner: execution,
+                                    management: m.clone(),
+                                    root: root_id.clone(),
+                                    lane: root.node_id.clone(),
+                                });
+                        let listener = if let Some(m) = &management {
+                            let m = m.clone();
+                            let root_id = root.node_id.clone();
+                            Some(Arc::new(move |event: &smartzip_core::TaskEvent| {
+                                m.event(&root_id, event);
+                                if let Some(listener) = &listener {
+                                    listener(event);
+                                }
+                            }) as TaskEventListener)
+                        } else {
+                            listener
+                        };
+                        let result = workflow::extract_recursive_with_listener_interactive(
                             &self.scanner,
                             self.run_policy.as_deref(),
                             self.min_embedded_size_bytes,
@@ -418,7 +523,10 @@ impl SmartZipEngine {
                             interaction.encoding,
                             listener,
                             history,
-                            Some(execution),
+                            managed
+                                .as_ref()
+                                .map(|m| m as &dyn ExecutionStateRecorder)
+                                .or(execution),
                             ExtractTaskIdentity {
                                 task_id: task_id.clone(),
                                 roots: vec![root],
@@ -427,18 +535,72 @@ impl SmartZipEngine {
                             batch_passwords,
                             task_budget,
                             dedup,
+                            source_cleanup,
                         )
-                        .await
+                        .await;
+                        if let Some(m) = &management {
+                            m.finish(&root_id, &result);
+                        }
+                        (index, result)
                     }
                 });
-            let results = futures_util::future::join_all(futures).await;
+            // Keep one additional root in flight for preparation/interaction.
+            // Polling the entire batch lets full scans queue ahead of extraction
+            // on the same disk, delaying all output until every input is read.
+            use futures_util::StreamExt;
+            let mut results: Vec<_> = if let Some(management) = &self.root_management {
+                // Parked roots release the preparation slot; unrelated roots keep
+                // progressing without creating a future for every queued input.
+                let mut revision = management.subscribe();
+                let mut pending: std::collections::VecDeque<_> = futures.enumerate().collect();
+                let mut active = futures_util::stream::FuturesUnordered::new();
+                let mut active_indices = std::collections::HashSet::new();
+                let mut results = Vec::new();
+                while !pending.is_empty() || !active.is_empty() {
+                    let occupied = active_indices
+                        .iter()
+                        .filter(|&&i: &&usize| management.occupies_slot(&identity.roots[i].node_id))
+                        .count();
+                    for _ in occupied..2 {
+                        let Some(position) = pending.iter().position(|(i, _)| {
+                            (task_cancellation.is_cancelled()
+                                || !management.paused(&identity.roots[*i].root_id))
+                                && !active_indices.iter().any(|&active| {
+                                    identity.roots[active].root_id == identity.roots[*i].root_id
+                                })
+                        }) else {
+                            break;
+                        };
+                        let (i, future) = pending.remove(position).unwrap();
+                        active_indices.insert(i);
+                        active.push(future);
+                    }
+                    tokio::select! {
+                        Some((index, result)) = active.next(), if !active.is_empty() => { active_indices.remove(&index); results.push((index, result)); }
+                        _ = revision.changed() => {}
+                        _ = task_cancellation.cancelled(), if !pending.is_empty() && active.is_empty() => {
+                            // Re-enter bounded admission, including paused queued roots.
+                            // Their cancellation is persisted by the ordinary workflow.
+                        }
+                    }
+                }
+                results
+            } else {
+                futures_util::stream::iter(futures)
+                    .buffer_unordered(2)
+                    .collect()
+                    .await
+            };
+            // Completion is unordered so a waiting root cannot block admission,
+            // but the public result keeps the original input ordering.
+            results.sort_by_key(|(index, _)| *index);
             let mut processed = Vec::new();
             let mut skipped = Vec::new();
             let mut enqueued = Vec::new();
             let mut events = Vec::new();
             let mut failed_count = 0;
             let mut cancelled = false;
-            for result in results {
+            for (_, result) in results {
                 let result = result?;
                 failed_count += result.failed_count;
                 cancelled |= result.status == history::TaskCompletionStatus::Cancelled;
@@ -481,6 +643,7 @@ impl SmartZipEngine {
             std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
             task_budget,
             dedup,
+            source_cleanup,
         )
         .await
     }

@@ -80,9 +80,9 @@ pub struct ExtractionLimits {
 impl Default for ExtractionLimits {
     fn default() -> Self {
         Self {
-            max_files: 100_000,
-            max_output_bytes: 20 * 1024 * 1024 * 1024,
-            min_free_bytes: 512 * 1024 * 1024,
+            max_files: 0,
+            max_output_bytes: 0,
+            min_free_bytes: 0,
             max_nested_candidates: 10_000,
         }
     }

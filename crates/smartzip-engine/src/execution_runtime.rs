@@ -13,6 +13,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::Notify;
 
+const IO_DOMAIN_CAPACITY: u32 = 2;
+
 #[derive(Debug, Clone)]
 struct NodeResources {
     root_id: NodeId,
@@ -66,7 +68,9 @@ impl ExecutionCoordinator {
             store,
             ResourceCapacity {
                 cpu_units: units,
-                backend_processes: 1,
+                // Device admission still serializes work sharing a disk. A
+                // global single backend would also serialize independent disks.
+                backend_processes: units,
                 ..ResourceCapacity::default()
             },
         )
@@ -201,10 +205,10 @@ impl ExecutionCoordinator {
                 let target_io_domain = io_domain(&output_root);
                 state
                     .coordinator
-                    .set_io_domain_capacity(source_io_domain.clone(), 1);
+                    .set_io_domain_capacity(source_io_domain.clone(), IO_DOMAIN_CAPACITY);
                 state
                     .coordinator
-                    .set_io_domain_capacity(target_io_domain.clone(), 1);
+                    .set_io_domain_capacity(target_io_domain.clone(), IO_DOMAIN_CAPACITY);
                 state.nodes.insert(
                     (task_id.clone(), NodeId::from_stored(node.node_id.clone())),
                     NodeResources {
@@ -245,10 +249,10 @@ impl ExecutionCoordinator {
             let target_io_domain = io_domain(&output_root);
             state
                 .coordinator
-                .set_io_domain_capacity(source_io_domain.clone(), 1);
+                .set_io_domain_capacity(source_io_domain.clone(), IO_DOMAIN_CAPACITY);
             state
                 .coordinator
-                .set_io_domain_capacity(target_io_domain.clone(), 1);
+                .set_io_domain_capacity(target_io_domain.clone(), IO_DOMAIN_CAPACITY);
             state.nodes.insert(
                 (submission.task_id.clone(), root.node_id.clone()),
                 NodeResources {
@@ -381,10 +385,13 @@ impl ExecutionCoordinator {
                 if !state.nodes.contains_key(&key) {
                     return Err(smartzip_core::SmartZipError::Cancelled);
                 }
-                if state.active.contains_key(&key) {
+                if enqueued && state.active.contains_key(&key) {
                     (true, false)
                 } else {
                     if !enqueued {
+                        // Replace the previous lease and enqueue its continuation
+                        // under one lock, before dispatching competing work.
+                        release_active(&mut state, &key);
                         let node = state.nodes.get(&key).cloned().ok_or_else(|| {
                             smartzip_core::SmartZipError::BackendFailed {
                                 backend: "task-coordinator".into(),
@@ -492,19 +499,29 @@ fn resources_for(stage: Stage, node: &NodeResources) -> ResourceRequest {
                 request.io_domains.insert(node.target_io_domain.clone(), 1);
             }
         }
-        Stage::ScanEmbedded | Stage::Fingerprint | Stage::PrepareAccess => {
+        Stage::ScanEmbedded
+        | Stage::Fingerprint
+        | Stage::PrepareAccess
+        | Stage::AnalyzeEncoding => {
             request.artifact_reads.push(node.input.clone());
             request.io_domains.insert(node.source_io_domain.clone(), 1);
         }
         Stage::Commit => {
             request.target_paths.push(node.output_root.clone());
+            // The output path lease serializes conflicting publications; one
+            // device permit still lets an unrelated extraction make progress.
             request.io_domains.insert(node.target_io_domain.clone(), 1);
         }
         Stage::DiscoverChildren | Stage::DecodePreview => {
             request.artifact_reads.push(node.output_root.clone());
             request.io_domains.insert(node.target_io_domain.clone(), 1);
         }
-        Stage::ResolveInputs | Stage::AnalyzeEncoding | Stage::InspectAndPlan | Stage::Cleanup => {}
+        Stage::InspectAndPlan | Stage::Cleanup => {
+            // Keep the output disk through the short finalization chain, rather
+            // than starting another full extraction between inspection and commit.
+            request.io_domains.insert(node.target_io_domain.clone(), 1);
+        }
+        Stage::ResolveInputs => {}
     }
     request
 }
@@ -602,10 +619,10 @@ impl ExecutionStateRecorder for ExecutionCoordinator {
         let mut state = self.state.lock().unwrap();
         state
             .coordinator
-            .set_io_domain_capacity(source_io_domain.clone(), 1);
+            .set_io_domain_capacity(source_io_domain.clone(), IO_DOMAIN_CAPACITY);
         state
             .coordinator
-            .set_io_domain_capacity(target_io_domain.clone(), 1);
+            .set_io_domain_capacity(target_io_domain.clone(), IO_DOMAIN_CAPACITY);
         state.nodes.insert(
             (task_id.clone(), node_id.clone()),
             NodeResources {
@@ -630,7 +647,8 @@ impl ExecutionStateRecorder for ExecutionCoordinator {
         attempt_id: Option<&AttemptId>,
         cancellation: &tokio_util::sync::CancellationToken,
     ) -> smartzip_core::Result<bool> {
-        self.release_node(task_id, node_id);
+        // Keep the current lease until the continuation can be queued. Releasing
+        // here lets another long scan/extraction occupy the disk during the DB write.
         let waiting = self
             .store
             .transition(
@@ -642,10 +660,17 @@ impl ExecutionStateRecorder for ExecutionCoordinator {
                 stage.as_str(),
                 attempt_id.map(ToString::to_string),
             )
-            .await
-            .map_err(state_error)?;
-        if !waiting {
-            return Ok(false);
+            .await;
+        match waiting {
+            Ok(true) => {}
+            Ok(false) => {
+                self.release_node(task_id, node_id);
+                return Ok(false);
+            }
+            Err(error) => {
+                self.release_node(task_id, node_id);
+                return Err(state_error(error));
+            }
         }
         self.admit(
             task_id,
@@ -828,7 +853,8 @@ mod tests {
     use std::time::Duration;
 
     fn submission(task_id: &TaskId, node_id: &NodeId, path: &Path) -> TaskSubmission {
-        let candidate = crate::ExtractionCandidate::root(path.to_path_buf());
+        let input = path.join("input.zip");
+        let candidate = crate::ExtractionCandidate::root(input.clone());
         TaskSubmission {
             task_id: task_id.clone(),
             kind: "extract".into(),
@@ -843,12 +869,324 @@ mod tests {
                 node_id: node_id.clone(),
                 parent_id: None,
                 root_id: node_id.clone(),
-                input_path: path.to_path_buf(),
+                input_path: input,
                 input_ref_json: serde_json::to_string(&candidate).unwrap(),
                 config_revision: 0,
                 generation: 0,
             }],
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn finalization_overlaps_queued_extraction_when_capacity_allows() {
+        for (cpu_units, same_task) in [(1, false), (2, false), (2, true)] {
+            let root = tempfile::tempdir().unwrap();
+            let store = Arc::new(StateStore::start(root.path().join("state.db")).unwrap());
+            let runtime = ExecutionCoordinator::new(
+                store,
+                ResourceCapacity {
+                    cpu_units,
+                    backend_processes: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let first = (TaskId::new(), NodeId::new());
+            let second = (
+                if same_task {
+                    first.0.clone()
+                } else {
+                    TaskId::new()
+                },
+                NodeId::new(),
+            );
+            let mut first_submission = submission(&first.0, &first.1, root.path());
+            let second_submission = submission(&second.0, &second.1, root.path());
+            if same_task {
+                first_submission.roots.extend(second_submission.roots);
+            } else {
+                runtime.submit(second_submission).await.unwrap();
+            }
+            runtime.submit(first_submission).await.unwrap();
+            let cancellation = tokio_util::sync::CancellationToken::new();
+            runtime
+                .transition(
+                    &first.0,
+                    &first.1,
+                    0,
+                    "ready",
+                    "running",
+                    Stage::ExtractAttempt,
+                    None,
+                    &cancellation,
+                )
+                .await
+                .unwrap();
+            let mut waiting = Box::pin(runtime.transition(
+                &second.0,
+                &second.1,
+                0,
+                "ready",
+                "running",
+                Stage::ExtractAttempt,
+                None,
+                &cancellation,
+            ));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), &mut waiting)
+                    .await
+                    .is_err()
+            );
+            let finalization = [
+                Stage::InspectAndPlan,
+                Stage::Commit,
+                Stage::DiscoverChildren,
+                Stage::Cleanup,
+            ];
+            for (index, stage) in finalization.into_iter().enumerate() {
+                assert!(tokio::time::timeout(
+                    Duration::from_secs(1),
+                    runtime.transition(
+                        &first.0,
+                        &first.1,
+                        0,
+                        "running",
+                        "running",
+                        stage,
+                        None,
+                        &cancellation
+                    )
+                )
+                .await
+                .expect("completed extraction must not wait for another extraction")
+                .unwrap());
+                if index == 0 && cpu_units > 1 {
+                    assert!(tokio::time::timeout(Duration::from_secs(1), &mut waiting)
+                        .await
+                        .unwrap()
+                        .unwrap());
+                }
+                assert_eq!(
+                    runtime.state.lock().unwrap().active.contains_key(&second),
+                    cpu_units > 1
+                );
+            }
+            runtime
+                .finish_node(
+                    &first.0,
+                    &first.1,
+                    0,
+                    NodeOutcome::terminal("extracted", None, None, true),
+                )
+                .await
+                .unwrap();
+            if cpu_units == 1 {
+                assert!(tokio::time::timeout(Duration::from_secs(1), &mut waiting)
+                    .await
+                    .unwrap()
+                    .unwrap());
+            }
+            runtime.release_task(&first.0);
+            runtime.release_task(&second.0);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn prepared_input_continues_to_extraction_before_another_scan() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Arc::new(StateStore::start(root.path().join("state.db")).unwrap());
+        let runtime = ExecutionCoordinator::new(
+            store,
+            ResourceCapacity {
+                cpu_units: 2,
+                backend_processes: 2,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let first = (TaskId::new(), NodeId::new());
+        let second = (TaskId::new(), NodeId::new());
+        for (task, node) in [&first, &second] {
+            runtime
+                .submit(submission(task, node, root.path()))
+                .await
+                .unwrap();
+        }
+        {
+            // This test covers continuity and rank when a device is explicitly
+            // constrained to one operation; the host default is more permissive.
+            let mut state = runtime.state.lock().unwrap();
+            let domains: Vec<_> = state
+                .nodes
+                .values()
+                .flat_map(|node| [node.source_io_domain.clone(), node.target_io_domain.clone()])
+                .collect();
+            for domain in domains {
+                state.coordinator.set_io_domain_capacity(domain, 1);
+            }
+        }
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        runtime
+            .transition(
+                &first.0,
+                &first.1,
+                0,
+                "ready",
+                "running",
+                Stage::ScanEmbedded,
+                None,
+                &cancellation,
+            )
+            .await
+            .unwrap();
+        let mut waiting = Box::pin(runtime.transition(
+            &second.0,
+            &second.1,
+            0,
+            "ready",
+            "running",
+            Stage::ScanEmbedded,
+            None,
+            &cancellation,
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut waiting)
+                .await
+                .is_err()
+        );
+        for stage in [
+            Stage::PrepareAccess,
+            Stage::AnalyzeEncoding,
+            Stage::ExtractAttempt,
+        ] {
+            assert!(tokio::time::timeout(
+                Duration::from_secs(1),
+                runtime.transition(
+                    &first.0,
+                    &first.1,
+                    0,
+                    "running",
+                    "running",
+                    stage,
+                    None,
+                    &cancellation
+                )
+            )
+            .await
+            .expect("prepared input should reach extraction before another scan")
+            .unwrap());
+            assert!(!runtime.state.lock().unwrap().active.contains_key(&second));
+        }
+        runtime.release_task(&first.0);
+        assert!(tokio::time::timeout(Duration::from_secs(1), &mut waiting)
+            .await
+            .unwrap()
+            .unwrap());
+        runtime.release_task(&second.0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn host_can_extract_on_independent_devices_concurrently() {
+        if std::thread::available_parallelism().unwrap().get() < 2 {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let store = Arc::new(StateStore::start(root.path().join("state.db")).unwrap());
+        let runtime = ExecutionCoordinator::for_host(store).unwrap();
+        let first = (TaskId::new(), NodeId::new());
+        let second = (TaskId::new(), NodeId::new());
+        for (i, (task, node)) in [&first, &second].into_iter().enumerate() {
+            runtime
+                .submit(submission(task, node, root.path()))
+                .await
+                .unwrap();
+            // Model separate devices without requiring extra mounted disks in CI.
+            let mut state = runtime.state.lock().unwrap();
+            let domain = format!("test-device-{i}");
+            state.coordinator.set_io_domain_capacity(domain.clone(), 1);
+            let resources = state.nodes.get_mut(&(task.clone(), node.clone())).unwrap();
+            resources.source_io_domain = domain.clone();
+            resources.target_io_domain = domain;
+        }
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        for (task, node) in [&first, &second] {
+            assert!(tokio::time::timeout(
+                Duration::from_secs(1),
+                runtime.transition(
+                    task,
+                    node,
+                    0,
+                    "ready",
+                    "running",
+                    Stage::ExtractAttempt,
+                    None,
+                    &cancellation
+                )
+            )
+            .await
+            .expect("independent disks should not share a single backend slot")
+            .unwrap());
+        }
+        assert_eq!(
+            runtime
+                .state
+                .lock()
+                .unwrap()
+                .coordinator
+                .resources()
+                .used()
+                .backend_processes,
+            2
+        );
+        runtime.release_task(&first.0);
+        runtime.release_task(&second.0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn same_device_admits_two_extractions() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Arc::new(StateStore::start(root.path().join("state.db")).unwrap());
+        let runtime = ExecutionCoordinator::new(
+            store,
+            ResourceCapacity {
+                cpu_units: 2,
+                backend_processes: 2,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let first = (TaskId::new(), NodeId::new());
+        let second = (TaskId::new(), NodeId::new());
+        for (task, node) in [&first, &second] {
+            runtime
+                .submit(submission(task, node, root.path()))
+                .await
+                .unwrap();
+        }
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        for (task, node) in [&first, &second] {
+            assert!(runtime
+                .transition(
+                    task,
+                    node,
+                    0,
+                    "ready",
+                    "running",
+                    Stage::ExtractAttempt,
+                    None,
+                    &cancellation,
+                )
+                .await
+                .unwrap());
+        }
+        {
+            let state = runtime.state.lock().unwrap();
+            let used = state.coordinator.resources().used();
+            assert_eq!(used.backend_processes, 2);
+            assert!(used.io_domains.values().all(|units| *units == 2));
+        }
+        runtime.release_task(&first.0);
+        runtime.release_task(&second.0);
     }
 
     #[tokio::test(flavor = "current_thread")]

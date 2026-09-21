@@ -212,8 +212,18 @@ impl VolumeResolver {
         };
 
         // If probe was Standalone we already returned. For NotApplicable without sequence evidence, return Single.
-        // Generate primary single-token hypotheses.
-        let mut hypotheses = generate_single_token_hypotheses(path, index);
+        // Native ZIP disk names change extension (.z01 ... .zip), not a token
+        // in the basename. Prefer that family before interpreting basename
+        // digits (or the digits in .z01) as an unrelated sequence. Structural
+        // validation below still checks completeness and archive format.
+        let zip_hypothesis = index.find_file(path).and_then(|file| {
+            let (base, ext) = split_base_ext(&file.normalized_name)?;
+            is_zip_volume_extension(ext).then(|| zip_fallback_hypothesis(base, index))?
+        });
+        let mut hypotheses = match zip_hypothesis {
+            Some(hypothesis) => vec![hypothesis],
+            None => generate_single_token_hypotheses(path, index),
+        };
         if hypotheses.is_empty() {
             // Try format-specific fallback for ZIP/RAR split where extensions differ, but still validate via same structural path.
             if let Some(fallback_hyp) = try_fallback_hypothesis(path, index, &probe) {
@@ -1315,8 +1325,7 @@ fn try_fallback_hypothesis<'a>(
     let seed_file = index.find_file(seed_path)?;
     let seed_norm = &seed_file.normalized_name;
     let (seed_base, seed_ext) = split_base_ext(seed_norm)?;
-    let is_zip_seed = seed_ext == "zip"
-        || (seed_ext.starts_with('z') && seed_ext[1..].chars().all(|c| c.is_ascii_digit()));
+    let is_zip_seed = is_zip_volume_extension(seed_ext);
     let is_rar_old_seed = seed_ext == "rar"
         || (seed_ext.starts_with('r')
             && seed_ext[1..].chars().all(|c| c.is_ascii_digit())
@@ -1334,6 +1343,18 @@ fn try_fallback_hypothesis<'a>(
     None
 }
 
+fn is_zip_volume_extension(ext: &str) -> bool {
+    ext.eq_ignore_ascii_case("zip") || zip_disk_number(ext).is_some()
+}
+
+fn zip_disk_number(ext: &str) -> Option<u64> {
+    let digits = ext.strip_prefix('z').or_else(|| ext.strip_prefix('Z'))?;
+    if digits.is_empty() || !digits.bytes().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse::<u64>().ok().filter(|&number| number > 0)
+}
+
 fn zip_fallback_hypothesis<'a>(
     seed_base: &str,
     index: &'a DirectoryVolumeIndex,
@@ -1347,19 +1368,17 @@ fn zip_fallback_hypothesis<'a>(
         if base != seed_base {
             continue;
         }
-        if ext.starts_with('z') && ext.len() > 1 && ext[1..].chars().all(|c| c.is_ascii_digit()) {
-            if let Ok(v) = ext[1..].parse::<u64>() {
-                groups.entry(v).or_default().push(file);
-                max_z = Some(max_z.map_or(v, |m| m.max(v)));
-            }
+        if let Some(v) = zip_disk_number(ext) {
+            groups.entry(v).or_default().push(file);
+            max_z = Some(max_z.map_or(v, |m| m.max(v)));
         }
     }
     for file in &index.files {
         let Some((base, ext)) = split_base_ext(&file.normalized_name) else {
             continue;
         };
-        if base == seed_base && ext == "zip" {
-            let zip_ord = max_z.map_or(1, |m| m + 1);
+        if base == seed_base && ext.eq_ignore_ascii_case("zip") {
+            let zip_ord = max_z.unwrap_or(0).checked_add(1)?;
             groups.entry(zip_ord).or_default().push(file);
             break;
         }
@@ -1642,6 +1661,46 @@ mod tests {
             embedded_size: None,
         }
     }
+    #[test]
+    fn native_zip_family_resolves_all_entries_and_rejects_missing_disks() {
+        let dir = TempDir::new().unwrap();
+        let paths: Vec<_> = ["backup2026.Z01", "backup2026.z02", "backup2026.zip"]
+            .iter()
+            .map(|name| dir.path().join(name))
+            .collect();
+        create_raw_file(&paths[0], b"PK\x07\x08split payload one");
+        create_raw_file(&paths[1], b"split payload two");
+        let mut eocd = vec![0u8; 22];
+        eocd[..4].copy_from_slice(b"PK\x05\x06");
+        eocd[4..6].copy_from_slice(&2u16.to_le_bytes());
+        eocd[6..8].copy_from_slice(&2u16.to_le_bytes());
+        fs::write(&paths[2], &eocd).unwrap();
+        for path in &paths {
+            match VolumeResolver::new().resolve(&make_candidate(path.clone())) {
+                VolumeResolution::Resolved(set)
+                | VolumeResolution::ResolvedWithWarnings { set, .. } => {
+                    assert_eq!(set.members.len(), 3);
+                    assert_eq!(set.entrypoint, paths[2]);
+                    assert_eq!(set.zip_kind, Some(ZipSplitKind::Spanned));
+                }
+                other => panic!("native ZIP family should resolve from {path:?}: {other:?}"),
+            }
+        }
+        fs::remove_file(&paths[1]).unwrap();
+        assert!(matches!(
+            VolumeResolver::new().resolve(&make_candidate(paths[2].clone())),
+            VolumeResolution::Incomplete(_)
+        ));
+
+        // A complete standalone ZIP must not absorb a similarly named .z01.
+        eocd[4..8].fill(0);
+        fs::write(&paths[2], eocd).unwrap();
+        assert!(matches!(
+            VolumeResolver::new().resolve(&make_candidate(paths[2].clone())),
+            VolumeResolution::Single
+        ));
+    }
+
     #[test]
     fn prepared_volume_keeps_candidate_identity() {
         let dir = TempDir::new().unwrap();

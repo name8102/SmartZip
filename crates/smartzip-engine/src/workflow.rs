@@ -146,9 +146,15 @@ pub(crate) async fn inspect_file_with_listener<B: ArchiveExecutor>(
         reason = Some("business_container".to_string());
         detected_format = Some(ArchiveFormat::Zip);
     } else if let Some(candidate) = candidate {
-        let resolved =
-            prepare_resolved_archive(&candidate, None, EncodingMode::Auto, history, run_policy)
-                .await?;
+        let resolved = prepare_resolved_archive(
+            &candidate,
+            None,
+            None,
+            EncodingMode::Auto,
+            history,
+            run_policy,
+        )
+        .await?;
         if let Some(assessment) = &resolved.zip_encoding_assessment {
             events.push(TaskEvent {
                 task_id: task_id.clone(),
@@ -371,6 +377,7 @@ pub(crate) async fn list_archive_with_listener_interactive<B: ArchiveExecutor>(
     let resolved = prepare_resolved_archive(
         &candidate,
         volume_input,
+        None,
         request.encoding_mode.clone(),
         history,
         run_policy,

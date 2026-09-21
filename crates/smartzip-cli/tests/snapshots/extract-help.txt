@@ -43,15 +43,15 @@ Options:
       --dry-run
           Show planned output without extracting
       --max-files <MAX_FILES>
-          Maximum total output entries, including directories and nested outputs
+          Maximum total output entries, including directories and nested outputs (0 = unlimited)
       --embedded <EMBEDDED>
           Embedded scan mode: "auto", "ask", "largest", "aggressive", "all", "ignore" [default: auto] [possible values: auto, ask, largest, aggressive, all, ignore]
       --max-output-bytes <MAX_OUTPUT_BYTES>
-          
+          Maximum cumulative output bytes (0 = unlimited)
       --dominant-min-ratio <DOMINANT_MIN_RATIO>
           Minimum ratio for a finding to be considered dominant (0.0-1.0) [default: 0.7]
       --min-free-bytes <MIN_FREE_BYTES>
-          
+          Minimum free disk space (0 disables capacity queries)
       --confirm-large-scan
           Auto-confirm large file scans (>10GB)
       --max-nested-candidates <MAX_NESTED_CANDIDATES>

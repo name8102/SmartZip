@@ -94,10 +94,12 @@ pub(crate) struct ArchiveAccessOutcome {
 }
 
 pub struct SmartZipEngine {
+    pub(crate) root_management: Option<Arc<crate::root_management::RootManagement>>,
     pub(crate) run_policy: Option<Arc<crate::CompiledRunPolicy>>,
     pub(crate) cancellation: tokio_util::sync::CancellationToken,
     pub(crate) scanner: smartzip_scanner::EmbeddedScanner,
     pub(crate) archive_recycler: ArchiveRecycleHandler,
+    pub(crate) recycle_sources: bool,
     pub(crate) min_embedded_size_bytes: u64,
 }
 

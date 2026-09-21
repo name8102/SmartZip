@@ -1020,55 +1020,78 @@ async fn test_engine_interactive_password_reuses_carved_embedded_archive_path() 
 
 #[tokio::test]
 async fn test_router_extracts_split_encrypted_zip_with_manual_password() {
-    let root = TempDir::new().unwrap();
-    let archive = create_split_encrypted_zip(root.path(), "secret");
+    for (stem, uppercase, entry_ext) in [
+        ("split", false, "zip"),
+        ("backup2026", false, "zip"),
+        ("backup2026", false, "z01"),
+        ("backup2026", true, "ZIP"),
+        ("backup2026", true, "Z02"),
+    ] {
+        let root = TempDir::new().unwrap();
+        create_split_encrypted_zip(root.path(), "secret");
+        for entry in std::fs::read_dir(root.path()).unwrap() {
+            let path = entry.unwrap().path();
+            if path.file_stem().and_then(|s| s.to_str()) == Some("split") {
+                let ext = path.extension().unwrap().to_str().unwrap();
+                let ext = if uppercase {
+                    ext.to_uppercase()
+                } else {
+                    ext.to_string()
+                };
+                std::fs::rename(&path, root.path().join(format!("{stem}.{ext}"))).unwrap();
+            }
+        }
+        let archive = root.path().join(format!("{stem}.{entry_ext}"));
 
-    let backend = router();
-    let db = SmartZipDb::in_memory().unwrap();
-    let service = PasswordService::new(PasswordRepository::new(db.connection()));
-    let engine = SmartZipEngine::default();
-    let output = TempDir::new().unwrap();
+        let backend = router();
+        let db = SmartZipDb::in_memory().unwrap();
+        let service = PasswordService::new(PasswordRepository::new(db.connection()));
+        let engine = SmartZipEngine::default();
+        let output = TempDir::new().unwrap();
 
-    let result = engine
-        .extract_recursive(
-            &backend,
-            &service,
-            ExtractWorkflowRequest {
-                inputs: vec![archive],
-                output_dir: output.path().to_path_buf(),
-                recursion_limit: 0,
-                encoding_mode: EncodingMode::Auto,
-                scanner: ScannerConfig::default(),
-                password_candidates: PasswordCandidateRequest {
-                    manual: vec!["secret".into()],
-                    clipboard: None,
-                    include_empty: false,
-                    limit: 8,
+        let result = engine
+            .extract_recursive(
+                &backend,
+                &service,
+                ExtractWorkflowRequest {
+                    inputs: vec![archive],
+                    output_dir: output.path().to_path_buf(),
+                    recursion_limit: 0,
+                    encoding_mode: EncodingMode::Auto,
+                    scanner: ScannerConfig::default(),
+                    password_candidates: PasswordCandidateRequest {
+                        manual: vec!["secret".into()],
+                        clipboard: None,
+                        include_empty: false,
+                        limit: 8,
+                    },
+                    layout_policy: smartzip_engine::layout::OutputLayoutPolicy::default(),
+                    single_root_name_policy: smartzip_engine::layout::SingleRootNamePolicy::default(
+                    ),
+                    embedded_scan_mode: smartzip_core::EmbeddedScanMode::default(),
+                    dominant_min_ratio: 0.70,
+                    confirm_large_scan: false,
+                    force: false,
+                    limits: Default::default(),
                 },
-                layout_policy: smartzip_engine::layout::OutputLayoutPolicy::default(),
-                single_root_name_policy: smartzip_engine::layout::SingleRootNamePolicy::default(),
-                embedded_scan_mode: smartzip_core::EmbeddedScanMode::default(),
-                dominant_min_ratio: 0.70,
-                confirm_large_scan: false,
-                force: false,
-                limits: Default::default(),
-            },
-            None,
-            None,
-        )
-        .await
-        .unwrap();
+                None,
+                None,
+            )
+            .await
+            .unwrap();
 
-    assert_eq!(
-        result.processed.len(),
-        1,
-        "split zip should extract successfully"
-    );
-    assert!(result.skipped.is_empty(), "split zip should not be skipped");
-    assert!(
-        find_file(output.path(), "big.bin").is_some(),
-        "split zip payload should be extracted"
-    );
+        assert_eq!(
+            result.processed.len(),
+            1,
+            "split zip should extract successfully: {stem}.{entry_ext}, {result:?}"
+        );
+        assert!(result.skipped.is_empty(), "split zip should not be skipped");
+        let extracted = find_file(output.path(), "big.bin").expect("split ZIP payload");
+        assert_eq!(
+            std::fs::read(extracted).unwrap(),
+            std::fs::read(root.path().join("big.bin")).unwrap()
+        );
+    }
 }
 
 #[tokio::test]

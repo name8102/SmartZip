@@ -1,8 +1,8 @@
-//! Dynamic limits for the managed extraction tree. Polling bounds resource use
+//! Optional limits for the managed extraction tree. Polling bounds resource use
 //! at checkpoints, not to the last byte a subprocess can write between checks.
 use smartzip_core::{Result, SmartZipError, TaskExecutionContext};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 pub use smartzip_config::ExtractionLimits;
@@ -10,6 +10,56 @@ pub use smartzip_config::ExtractionLimits;
 pub(crate) struct Usage {
     pub files: u64,
     pub bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InventoryFile {
+    pub relative_path: PathBuf,
+    pub size: u64,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct OutputInventory {
+    pub root: PathBuf,
+    pub usage: Usage,
+    pub files: Vec<InventoryFile>,
+}
+
+impl OutputInventory {
+    pub(crate) fn published_files(
+        &self,
+        plan: &crate::layout::LayoutPlan,
+    ) -> Option<Vec<InventoryFile>> {
+        use crate::layout::{LayoutPlanKind, PlanSource};
+
+        let source = match (&plan.kind, &plan.source) {
+            (LayoutPlanKind::PreserveBothSingleDir | LayoutPlanKind::PreserveBothSingleFile, _)
+            | (_, PlanSource::WholeTempDir) => return Some(self.files.clone()),
+            (
+                _,
+                PlanSource::SingleDir(path)
+                | PlanSource::SingleDirContents(path)
+                | PlanSource::SingleFile(path),
+            ) => path.strip_prefix(&self.root).ok()?,
+        };
+
+        Some(
+            self.files
+                .iter()
+                .filter_map(|file| {
+                    let relative_path = if file.relative_path == source {
+                        PathBuf::new()
+                    } else {
+                        file.relative_path.strip_prefix(source).ok()?.to_path_buf()
+                    };
+                    Some(InventoryFile {
+                        relative_path,
+                        size: file.size,
+                    })
+                })
+                .collect(),
+        )
+    }
 }
 
 #[derive(Debug, Default)]
@@ -87,13 +137,13 @@ impl TaskBudgetReservation {
             files: other.files.saturating_add(usage.files),
             bytes: other.bytes.saturating_add(usage.bytes),
         };
-        if total.files > limits.max_files {
+        if limits.max_files != 0 && total.files > limits.max_files {
             return Err(exceeded(format!(
                 "output entry limit {} exceeded",
                 limits.max_files
             )));
         }
-        if total.bytes > limits.max_output_bytes {
+        if limits.max_output_bytes != 0 && total.bytes > limits.max_output_bytes {
             return Err(exceeded(format!(
                 "output byte limit {} exceeded",
                 limits.max_output_bytes
@@ -130,9 +180,16 @@ pub(crate) fn exceeded(detail: impl Into<String>) -> SmartZipError {
     }
 }
 
-pub(crate) fn inspect(path: &Path, limits: &ExtractionLimits, previous: Usage) -> Result<Usage> {
+fn inspect_inventory(
+    path: &Path,
+    limits: &ExtractionLimits,
+    previous: Usage,
+    collect_files: bool,
+) -> Result<OutputInventory> {
     let mut usage = previous;
-    // Streaming traversal; no vector of all files and no following symlinks.
+    let mut files = Vec::new();
+    // Streaming traversal with no following symlinks. The final pass retains
+    // regular-file paths so nested discovery does not need to walk the tree again.
     for entry in walkdir::WalkDir::new(path).follow_links(false) {
         let entry = match entry {
             Ok(entry) => entry,
@@ -158,31 +215,27 @@ pub(crate) fn inspect(path: &Path, limits: &ExtractionLimits, previous: Usage) -
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => return Err(SmartZipError::io(Some(entry.path().into()), error)),
         };
-        if !metadata.is_file() && !metadata.is_dir() {
-            return Err(SmartZipError::UnsafeArchivePath {
-                entry: entry.path().display().to_string(),
-            });
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            if metadata.is_file() && metadata.nlink() > 1 {
-                return Err(SmartZipError::UnsafeArchivePath {
-                    entry: entry.path().display().to_string(),
-                });
-            }
-        }
         usage.files = usage.files.saturating_add(1);
         if metadata.is_file() {
             usage.bytes = usage.bytes.saturating_add(metadata.len());
+            if collect_files {
+                files.push(InventoryFile {
+                    relative_path: entry
+                        .path()
+                        .strip_prefix(path)
+                        .unwrap_or(entry.path())
+                        .to_path_buf(),
+                    size: metadata.len(),
+                });
+            }
         }
-        if usage.files > limits.max_files {
+        if limits.max_files != 0 && usage.files > limits.max_files {
             return Err(exceeded(format!(
                 "output entry limit {} exceeded",
                 limits.max_files
             )));
         }
-        if usage.bytes > limits.max_output_bytes {
+        if limits.max_output_bytes != 0 && usage.bytes > limits.max_output_bytes {
             return Err(exceeded(format!(
                 "output byte limit {} exceeded",
                 limits.max_output_bytes
@@ -190,10 +243,22 @@ pub(crate) fn inspect(path: &Path, limits: &ExtractionLimits, previous: Usage) -
         }
     }
     check_free_space(path, limits)?;
-    Ok(usage)
+    Ok(OutputInventory {
+        root: path.to_path_buf(),
+        usage,
+        files,
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn inspect(path: &Path, limits: &ExtractionLimits, previous: Usage) -> Result<Usage> {
+    inspect_inventory(path, limits, previous, false).map(|inventory| inventory.usage)
 }
 
 fn check_free_space(path: &Path, limits: &ExtractionLimits) -> Result<()> {
+    if limits.min_free_bytes == 0 {
+        return Ok(());
+    }
     if free_bytes(path)? < limits.min_free_bytes {
         return Err(exceeded(format!(
             "free disk space fell below {} bytes",
@@ -234,21 +299,26 @@ fn scan(
     limits: &ExtractionLimits,
     previous: Usage,
     full: bool,
-) -> tokio::task::JoinHandle<Result<Usage>> {
+    collect_files: bool,
+) -> tokio::task::JoinHandle<Result<OutputInventory>> {
     let path = path.to_owned();
     let limits = limits.clone();
     tokio::task::spawn_blocking(move || {
         if full {
-            inspect(&path, &limits, previous)
+            inspect_inventory(&path, &limits, previous, collect_files)
         } else {
-            check_free_space(&path, &limits).map(|()| previous)
+            check_free_space(&path, &limits).map(|()| OutputInventory {
+                root: path,
+                usage: previous,
+                files: Vec::new(),
+            })
         }
     })
 }
 
 fn scan_result(
-    result: std::result::Result<Result<Usage>, tokio::task::JoinError>,
-) -> Result<Usage> {
+    result: std::result::Result<Result<OutputInventory>, tokio::task::JoinError>,
+) -> Result<OutputInventory> {
     result.map_err(|error| SmartZipError::io(None, std::io::Error::other(error)))?
 }
 
@@ -260,54 +330,21 @@ pub(crate) async fn monitor<T>(
     context: Arc<TaskExecutionContext>,
     operation: impl std::future::Future<Output = Result<T>>,
 ) -> Result<(T, Usage)> {
-    use std::time::Duration;
-    use tokio::time::{Instant, MissedTickBehavior};
-    scan_result(scan(path, limits, previous, true).await)?;
-    let mut operation = std::pin::pin!(operation);
-    let period = Duration::from_millis(50);
-    let mut interval = tokio::time::interval_at(Instant::now() + period, period);
-    interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    let mut next_tree = Instant::now() + period;
-    let value = loop {
-        tokio::select! {
-            result = &mut operation => break result?,
-            _ = interval.tick() => {
-                let started = Instant::now();
-                let full = started >= next_tree;
-                let mut pending = scan(path, limits, previous, full);
-                let result = tokio::select! {
-                    result = &mut operation => {
-                        // Drain the scanner before the caller can remove staging.
-                        let checked = scan_result(pending.await);
-                        let value = result?;
-                        checked?;
-                        break value;
-                    }
-                    result = &mut pending => scan_result(result),
-                };
-                if let Err(error) = result {
-                    context.cancel();
-                    // Adapters must terminate and reap processes before cleanup.
-                    let _ = operation.await;
-                    return Err(error);
-                }
-                if full {
-                    // Keep traversal duty cycle bounded on large output trees.
-                    let delay = (started.elapsed() * 4).clamp(period, Duration::from_secs(1));
-                    next_tree = Instant::now() + delay;
-                }
-            }
-        }
-    };
-    if context.is_cancelled() {
-        return Err(SmartZipError::Cancelled);
-    }
-    // A scan started while extraction was active cannot certify its final tree.
-    let usage = scan_result(scan(path, limits, previous, true).await)?;
-    if context.is_cancelled() {
-        return Err(SmartZipError::Cancelled);
-    }
-    Ok((value, usage))
+    let budget = Arc::new(TaskBudget::from_snapshot(crate::TaskBudgetSnapshot {
+        output_files: previous.files,
+        output_bytes: previous.bytes,
+        ..Default::default()
+    }));
+    let reservation = budget.reserve_attempt();
+    let (value, inventory) = monitor_task(path, limits, &reservation, context, operation).await?;
+    let usage = inventory.usage;
+    Ok((
+        value,
+        Usage {
+            files: previous.files.saturating_add(usage.files),
+            bytes: previous.bytes.saturating_add(usage.bytes),
+        },
+    ))
 }
 
 pub(crate) async fn monitor_task<T>(
@@ -316,14 +353,28 @@ pub(crate) async fn monitor_task<T>(
     reservation: &TaskBudgetReservation,
     context: Arc<TaskExecutionContext>,
     operation: impl std::future::Future<Output = Result<T>>,
-) -> Result<(T, Usage)> {
+) -> Result<(T, OutputInventory)> {
     use std::time::Duration;
     use tokio::time::{Instant, MissedTickBehavior};
 
-    let initial = scan_result(scan(path, limits, Usage::default(), true).await)?;
-    reservation.update(initial, limits)?;
+    let tree_limits = limits.max_files != 0 || limits.max_output_bytes != 0;
+    if !tree_limits && limits.min_free_bytes == 0 {
+        let value = operation.await?;
+        if context.is_cancelled() {
+            return Err(SmartZipError::Cancelled);
+        }
+        // One final inventory for history/recovery; no polling of the live tree.
+        let inventory = scan_result(scan(path, limits, Usage::default(), true, true).await)?;
+        reservation.update(inventory.usage, limits)?;
+        if context.is_cancelled() {
+            return Err(SmartZipError::Cancelled);
+        }
+        return Ok((value, inventory));
+    }
+    let initial = scan_result(scan(path, limits, Usage::default(), tree_limits, false).await)?;
+    reservation.update(initial.usage, limits)?;
     let mut operation = std::pin::pin!(operation);
-    let period = Duration::from_millis(50);
+    let period = Duration::from_secs(1);
     let mut interval = tokio::time::interval_at(Instant::now() + period, period);
     interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut next_tree = Instant::now() + period;
@@ -332,23 +383,23 @@ pub(crate) async fn monitor_task<T>(
             result = &mut operation => break result?,
             _ = interval.tick() => {
                 let started = Instant::now();
-                let full = started >= next_tree;
-                let mut pending = scan(path, limits, Usage::default(), full);
+                let full = tree_limits && started >= next_tree;
+                let mut pending = scan(path, limits, Usage::default(), full, false);
                 let result = tokio::select! {
                     result = &mut operation => {
                         let checked = scan_result(pending.await);
                         let value = result?;
-                        let usage = checked?;
+                        let inventory = checked?;
                         if full {
-                            reservation.update(usage, limits)?;
+                            reservation.update(inventory.usage, limits)?;
                         }
                         break value;
                     }
                     result = &mut pending => scan_result(result),
                 };
-                let checked = result.and_then(|usage| {
+                let checked = result.and_then(|inventory| {
                     if full {
-                        reservation.update(usage, limits)
+                        reservation.update(inventory.usage, limits)
                     } else {
                         Ok(())
                     }
@@ -359,7 +410,7 @@ pub(crate) async fn monitor_task<T>(
                         return Err(error);
                 }
                 if full {
-                    let delay = (started.elapsed() * 4).clamp(period, Duration::from_secs(1));
+                    let delay = (started.elapsed() * 4).max(period);
                     next_tree = Instant::now() + delay;
                 }
             }
@@ -368,17 +419,91 @@ pub(crate) async fn monitor_task<T>(
     if context.is_cancelled() {
         return Err(SmartZipError::Cancelled);
     }
-    let usage = scan_result(scan(path, limits, Usage::default(), true).await)?;
-    reservation.update(usage, limits)?;
+    let inventory = scan_result(scan(path, limits, Usage::default(), true, true).await)?;
+    reservation.update(inventory.usage, limits)?;
     if context.is_cancelled() {
         return Err(SmartZipError::Cancelled);
     }
-    Ok((value, usage))
+    Ok((value, inventory))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disabled_disk_limit_does_not_inspect_the_filesystem() {
+        let root = tempfile::tempdir().unwrap();
+        check_free_space(&root.path().join("missing"), &ExtractionLimits::default()).unwrap();
+    }
+
+    #[test]
+    fn default_limits_accept_large_outputs() {
+        let budget = Arc::new(TaskBudget::default());
+        budget
+            .reserve_attempt()
+            .update(
+                Usage {
+                    files: 200_000,
+                    bytes: 100 * 1024 * 1024 * 1024,
+                },
+                &ExtractionLimits::default(),
+            )
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_inventory_accepts_links_without_following_them() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("file"), b"hello").unwrap();
+        std::fs::hard_link(root.path().join("file"), root.path().join("hard")).unwrap();
+        std::os::unix::fs::symlink("file", root.path().join("link")).unwrap();
+        std::os::unix::fs::symlink("missing", root.path().join("dangling")).unwrap();
+        std::os::unix::fs::symlink(".", root.path().join("loop")).unwrap();
+        let usage = inspect(root.path(), &ExtractionLimits::default(), Usage::default()).unwrap();
+        assert_eq!(
+            usage,
+            Usage {
+                files: 5,
+                bytes: 10
+            }
+        );
+    }
+
+    #[test]
+    fn published_inventory_follows_the_selected_layout_source() {
+        let staging = PathBuf::from("/tmp/smartzip-staging");
+        let inventory = OutputInventory {
+            root: staging.clone(),
+            usage: Usage::default(),
+            files: vec![
+                InventoryFile {
+                    relative_path: PathBuf::from("wrapper/nested.zip"),
+                    size: 123,
+                },
+                InventoryFile {
+                    relative_path: PathBuf::from("ignored.txt"),
+                    size: 7,
+                },
+            ],
+        };
+        let plan = crate::layout::LayoutPlan {
+            source: crate::layout::PlanSource::SingleDir(staging.join("wrapper")),
+            kind: crate::layout::LayoutPlanKind::CommitSingleDirAsInnerName,
+            target: PathBuf::from("/published/wrapper"),
+            reason: crate::layout::LayoutDecisionReason::SingleDirGoodName,
+            warnings: Vec::new(),
+        };
+
+        assert_eq!(
+            inventory.published_files(&plan).unwrap(),
+            vec![InventoryFile {
+                relative_path: PathBuf::from("nested.zip"),
+                size: 123,
+            }]
+        );
+    }
 
     #[test]
     fn task_budget_counts_concurrent_roots_and_nested_candidates_once() {
@@ -464,13 +589,11 @@ mod tests {
                 &limits,
                 Usage::default(),
                 Arc::new(TaskExecutionContext::detached()),
-                async {
-                    assert!(ticked.load(std::sync::atomic::Ordering::SeqCst));
-                    Ok(())
-                },
+                async { Ok(()) },
             )
             .await
             .unwrap();
+            assert!(ticked.load(std::sync::atomic::Ordering::SeqCst));
             heartbeat.await.unwrap();
             occupied.await.unwrap();
         });

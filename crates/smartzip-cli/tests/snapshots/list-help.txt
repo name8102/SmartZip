@@ -37,11 +37,11 @@ Options:
       --password-limit <PASSWORD_LIMIT>
           Maximum stored password candidates (manual passwords are tried first) [default: 128]
       --max-files <MAX_FILES>
-          Maximum total output entries, including directories and nested outputs
+          Maximum total output entries, including directories and nested outputs (0 = unlimited)
       --max-output-bytes <MAX_OUTPUT_BYTES>
-          
+          Maximum cumulative output bytes (0 = unlimited)
       --min-free-bytes <MIN_FREE_BYTES>
-          
+          Minimum free disk space (0 disables capacity queries)
       --max-nested-candidates <MAX_NESTED_CANDIDATES>
           
       --non-interactive

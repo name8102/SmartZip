@@ -114,6 +114,7 @@ pub(crate) fn resolve_root_candidate(
 pub(crate) async fn prepare_resolved_archive(
     candidate: &ExtractionCandidate,
     volume_input: Option<(PathBuf, crate::volumes::materialize::MaterializedVolumeSet)>,
+    staging_root: Option<&Path>,
     requested_encoding: EncodingMode,
     history: Option<&dyn crate::history::TaskHistoryRecorder>,
     run_policy: Option<&crate::CompiledRunPolicy>,
@@ -121,7 +122,7 @@ pub(crate) async fn prepare_resolved_archive(
     let (archive_path, archive_temp, volume_keep) = if let Some((path, guard)) = volume_input {
         (path, None, Some(guard))
     } else {
-        let archive_input = materialize_archive_input(candidate)?;
+        let archive_input = materialize_archive_input(candidate, staging_root)?;
         (archive_input.path, archive_input._temp, None)
     };
     let (sample_hash, sample_size) = if history.is_none() {

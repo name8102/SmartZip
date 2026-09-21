@@ -39,6 +39,19 @@ pub enum Stage {
 }
 
 impl Stage {
+    fn dispatch_rank(self) -> u8 {
+        match self {
+            Self::InspectAndPlan
+            | Self::Commit
+            | Self::DiscoverChildren
+            | Self::Cleanup
+            | Self::DecodePreview => 0,
+            Self::ExtractAttempt | Self::ReadMember => 1,
+            Self::PrepareAccess | Self::AnalyzeEncoding | Self::ReadMetadata => 2,
+            Self::ResolveInputs | Self::Fingerprint | Self::ScanEmbedded => 3,
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::ResolveInputs => "resolve_inputs",
@@ -302,7 +315,11 @@ impl TaskCoordinator {
                 })
             })
             .collect();
-        candidates.sort_by_key(|(_, _, service, position, _)| (*service, *position));
+        // Finish already extracted output before admitting another expensive
+        // scan or extraction, then preserve weighted fairness within each class.
+        candidates.sort_by_key(|(_, _, service, position, stage)| {
+            (stage.stage.dispatch_rank(), *service, *position)
+        });
 
         for (task_id, root_id, _, _, stage) in candidates {
             let Ok(lease) = self.broker.try_acquire(&stage.resources) else {
@@ -511,6 +528,46 @@ mod tests {
             coordinator.complete(dispatch, 1);
         }
         assert!(order.contains(&background));
+    }
+
+    #[test]
+    fn ready_extraction_precedes_new_scans_without_blocking_other_disks() {
+        let mut coordinator = coordinator();
+        let fresh = TaskId::new();
+        let ready = TaskId::new();
+        let root = NodeId::new();
+        coordinator.submit(fresh.clone(), TaskPriority::Normal);
+        coordinator.submit(ready.clone(), TaskPriority::Normal);
+        // Charge the progressed task for its previous work.
+        coordinator.enqueue(stage(&ready, &root, 100, 1, "a"));
+        let previous = coordinator.dispatch_next().unwrap();
+        coordinator.complete(previous, 100);
+        let mut scan = stage(&fresh, &NodeId::new(), 40, 1, "a");
+        scan.stage = Stage::ScanEmbedded;
+        coordinator.enqueue(scan);
+        coordinator.enqueue(stage(&ready, &root, 100, 1, "a"));
+        let extract = coordinator.dispatch_next().unwrap();
+        assert_eq!(extract.stage.task_id, ready);
+        let mut finish = stage(&ready, &NodeId::new(), 5, 1, "a");
+        finish.stage = Stage::Commit;
+        coordinator.enqueue(finish);
+        let mut other_disk = stage(&fresh, &NodeId::new(), 40, 1, "b");
+        other_disk.stage = Stage::ScanEmbedded;
+        coordinator.enqueue(other_disk);
+        let parallel = coordinator.dispatch_next().unwrap();
+        assert_eq!(
+            parallel.stage.resources.io_domains,
+            BTreeMap::from([("b".into(), 1)])
+        );
+        coordinator.complete(parallel, 40);
+        coordinator.complete(extract, 100);
+        let finish = coordinator.dispatch_next().unwrap();
+        assert_eq!(finish.stage.stage, Stage::Commit);
+        coordinator.complete(finish, 5);
+        assert_eq!(
+            coordinator.dispatch_next().unwrap().stage.stage,
+            Stage::ScanEmbedded
+        );
     }
 
     #[test]
