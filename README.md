@@ -26,13 +26,16 @@ SmartZip 是一个用 Rust 重写的跨平台压缩包辅助工具，目标是�
 
 ## 快速开始
 
-全局安装 CLI（安装到 Cargo 的用户级 bin 目录）：
+构建、打包并安装当前平台的 CLI 和 GUI（默认 release，需要 Python 3.11+）：
 
 ```bash
 just install
+# 可选：just install debug
 smartzip --help
 smartzip doctor
 ```
+
+CLI 安装到 Cargo 的用户级 bin 目录。Linux GUI 安装到 `~/.local/opt/SmartZip` 并加入应用菜单；macOS GUI 安装到 `~/Applications/SmartZip.app`。`just install release /自定义/GUI路径` 可指定 GUI 位置。构建使用当前平台工具链，打包产物位于 Cargo 实际输出目录下的 `bundle/`，兼容自定义 `CARGO_TARGET_DIR`。
 
 查看帮助：
 
@@ -94,19 +97,19 @@ cargo run -p smartzip-gui
 cargo run -p smartzip-gui -- /path/to/archive.zip
 ```
 
-macOS 一键构建、打包并安装（macOS 12+）：
+仅构建、打包并安装 GUI（Linux/macOS；macOS 14+）：
 
 ```bash
-just install-gui                      # release，安装到 ~/Applications/SmartZip.app
+just install-gui                      # release，使用当前平台默认安装位置
 just install-gui debug                # 安装 debug 版
 just install-gui release /Applications/SmartZip.app  # 自定义安装位置，需有写入权限
 # 不使用 just：
-python3 scripts/install-macos.py
+python3 scripts/install_desktop.py --gui-only
 ```
 
-脚本校验签名后替换同标识的旧应用，替换失败会恢复旧版；不会覆盖其他应用，也不会自动更改默认程序或右键菜单。已有 `just install` 仍用于安装 CLI。
+macOS 会校验签名并替换同标识的旧应用，Linux 会更新已管理的安装目录；替换失败会恢复旧版，不会自动更改默认程序或右键菜单。`just install` 会同时安装 CLI 和 GUI。
 
-仅打包、不安装：
+macOS 仅打包、不安装：
 
 ```bash
 cargo build -p smartzip-gui --release

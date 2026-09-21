@@ -1,0 +1,152 @@
+{
+  "timings": [
+    {
+      "storage": "local",
+      "variant": "before",
+      "seconds": 0.07611992199963424
+    },
+    {
+      "storage": "local",
+      "variant": "after",
+      "seconds": 0.05772576599883905
+    },
+    {
+      "storage": "local",
+      "variant": "after",
+      "seconds": 0.05978595699889411
+    },
+    {
+      "storage": "local",
+      "variant": "before",
+      "seconds": 0.0569890110000415
+    },
+    {
+      "storage": "local",
+      "variant": "before",
+      "seconds": 0.056205285000032745
+    },
+    {
+      "storage": "local",
+      "variant": "after",
+      "seconds": 0.05505139799970493
+    },
+    {
+      "storage": "nfs",
+      "variant": "before",
+      "seconds": 1.700914338000075
+    },
+    {
+      "storage": "nfs",
+      "variant": "after",
+      "seconds": 1.611625854000522
+    },
+    {
+      "storage": "nfs",
+      "variant": "after",
+      "seconds": 2.168532549001611
+    },
+    {
+      "storage": "nfs",
+      "variant": "before",
+      "seconds": 1.6399347730002773
+    }
+  ],
+  "syscalls": {
+    "before": {
+      "newfstatat": 10577,
+      "statx": 2930,
+      "statfs": 8,
+      "fsync": 1
+    },
+    "after": {
+      "newfstatat": 10577,
+      "statx": 1580
+    }
+  },
+  "checks": [
+    "links /tmp",
+    "links /mnt/storage/Downloads",
+    "disabled capacity survives injected statfs error",
+    "stateful original ZIP NFS fresh+overwrite CRC32"
+  ],
+  "test_results": [
+    [
+      "78",
+      "1"
+    ],
+    [
+      "3",
+      "0"
+    ],
+    [
+      "2",
+      "0"
+    ],
+    [
+      "5",
+      "0"
+    ],
+    [
+      "10",
+      "0"
+    ],
+    [
+      "3",
+      "0"
+    ],
+    [
+      "3",
+      "0"
+    ],
+    [
+      "2",
+      "0"
+    ],
+    [
+      "5",
+      "0"
+    ],
+    [
+      "0",
+      "0"
+    ],
+    [
+      "7",
+      "0"
+    ],
+    [
+      "232",
+      "1"
+    ],
+    [
+      "9",
+      "0"
+    ],
+    [
+      "5",
+      "0"
+    ],
+    [
+      "69",
+      "0"
+    ],
+    [
+      "8",
+      "0"
+    ],
+    [
+      "0",
+      "0"
+    ],
+    [
+      "0",
+      "0"
+    ],
+    [
+      "0",
+      "0"
+    ]
+  ],
+  "test_passed_total": 441,
+  "test_ignored_total": 2
+}

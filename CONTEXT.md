@@ -21,7 +21,7 @@
 | **CandidateAttempt** | 对单个 `ExtractionCandidate` 的核心处理尝试。负责检测决策、内嵌归档材质化、编码检测、密码尝试、后端解压、输出材质化和结果事件；BFS 队列仍由 `SmartZipEngine` 管理。 |
 | **CandidateSource** | 候选来源枚举：`RootInput`（用户直接输入）、`ExtractedFile`（解压产物中找到的）、`EmbeddedFinding`（扫描器在二进制偏移处发现的）。 |
 | **Root scan** | 用户直接输入的文件应尽可能解压。空搜索窗口后继续扫描直到文件末尾；命中归档头后完整解析其范围，再从归档末尾继续搜索。窗口不限制前缀、归档间隔或已命中归档的长度。过小载荷、业务容器和嵌套扫描大小等效率门槛仅用于嵌套发现。解压资源预算独立生效。 |
-| **Recursive extraction** | BFS 队列驱动的递归解压。队列中每个候选经过同一管线：格式检测 → 编码检测 → 有界密码候选直接解压到 `OutputMaterializer` → 输出扫描 → 嵌套候选入队。 |
+| **Recursive extraction** | BFS 队列驱动的递归解压。有状态批次最多同时推进两个根输入；当前根扫描发现的归档优先于后续根输入，普通嵌套发现仍按 BFS。队列中每个候选经过同一管线：格式检测 → 编码检测 → 有界密码候选直接解压到 `OutputMaterializer` → 输出扫描 → 嵌套候选入队。 |
 | **Collapse single output** | 解压产出唯一条目时的优化：将该条目提到父目录，去掉中间层空目录。现在由 `LayoutPlanKind` 的各种 `Commit*` 变体实现，包括内容上移（`CommitSingleDirContentsAsArchiveName`）和直接重命名（`CommitSingleDirAsInnerName`/`CommitSingleFileAsInnerName`）。 |
 | **ArchiveNode** | 动态节点语义由持久 NodeId/generation 和现有文件历史行实现，记录父子、阶段、输入身份与提交事实。节点在父归档解压后增量产生，不预先构造完整 DAG；秘密不进入持久执行快照。 |
 | **VolumeSet** | 分卷归档集合；入口、成员和诊断语义见下方完整性校验。 |
@@ -75,7 +75,7 @@
 - DB **v4** 给 file_extractions 增加 nullable test_report_json，旧数据保留；damaged_volumes_json 只投影 confirmed 路径。test 不更新 known_files / last_extract_at，也不用首片 hash 表示整组。
 - DB **v5** 仅重建密码排名索引，完整匹配含 COALESCE 的排序。导入和批量禁用使用单事务；导入保留重复行计数、pin 和重新启用规则，输入/SQL 错误回滚整批。
 - DB **v6/v7** 在现有 tasks/file_extractions/task_events 上扩展执行状态、节点身份、提交对账与累计资源预算；旧历史保留且不自动恢复。当前实现与边界见 `.trellis/tasks/09-19-task-system-implementation/implement.md`。
-- 解压预算的全树/磁盘检查在阻塞工作线程运行，每个 monitor 仅一个检查在途；取消或后端结束先等待检查与后端回收，成功后做全新终检并返回累计 Usage。轮询是检查点预算，不是逐字节硬配额。
+- 解压预算默认不启用运行中检查，只在结束时做一次产出统计。显式限额才启动全树/磁盘检查，在阻塞工作线程运行且每个 monitor 仅一个检查在途；取消或后端结束先等待检查与后端回收，成功后做全新终检并返回累计 Usage。轮询是检查点预算，不是逐字节硬配额。
 - 外部 test 非零退出可返回 `TestResult { ok: false, diagnostics }` 保留证据；调用者必须检查 ok。旧解压流程在既有 test-before-extract 分支把失败报告转换回错误状态，密码/损坏歧义不记密码失败统计。
 
 
@@ -116,6 +116,10 @@ executor 隔离 engine 与 adapter 细节；router 按 operation、容器、密�
 ### ADR-008: Single TaskEvent timeline (route events included)
 
 路由观测作为 `TaskEventKind::Route` 纳入统一任务时间线，供结果、CLI/GUI 与测试使用，避免依赖 router 旁路收集器。任务级缓存与事件共享任务作用域。
+
+### 源归档回收
+
+`SmartZipEngine::with_source_recycling(true)` 启用任务级成功后回收，默认关闭。共享引擎记录实际成功卷组并在整批结束后清理，GUI 只传递选项；不重新按文件名猜测卷组。具体行为见 [桌面指南](docs/desktop-beta.md#解压后回收源文件)。
 
 ### ADR-009: Single extraction staging owner
 

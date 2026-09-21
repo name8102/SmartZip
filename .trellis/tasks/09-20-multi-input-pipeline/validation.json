@@ -1,0 +1,19 @@
+[
+  {
+    "mode": "stateful",
+    "source_bytes_before_first_output_write": {
+      "garden.bin": 8496054,
+      "ocean.bin": 8430454
+    },
+    "substantially_read_inputs_before_first_write": 2,
+    "outputs_verified": 8
+  },
+  {
+    "mode": "stateless",
+    "source_bytes_before_first_output_write": {
+      "garden.bin": 8495927
+    },
+    "substantially_read_inputs_before_first_write": 1,
+    "outputs_verified": 8
+  }
+]
