@@ -184,6 +184,25 @@ pub(crate) async fn read_member(
     };
     let listing = listing.as_ref();
     validate_extraction_listing(listing)?;
+    // Preview returns one regular member's bytes; extracting links is a separate operation.
+    if listing.lines().any(|line| {
+        line.strip_prefix("Symbolic Link = ")
+            .is_some_and(|value| !value.is_empty())
+            || line
+                .strip_prefix("Hard Link = ")
+                .is_some_and(|value| !value.is_empty())
+            || line
+                .strip_prefix("Attributes = ")
+                .is_some_and(|attributes| {
+                    attributes
+                        .split_whitespace()
+                        .any(|a| a.starts_with('l') && a.len() == 10)
+                })
+    }) {
+        return Err(SmartZipError::UnsafeArchivePath {
+            entry: "member preview contains a link".into(),
+        });
+    }
     let entries = parse_entries(listing);
     if let Some(bytes) =
         crate::decoded_zip::read_member_if_needed(&request, entries.len(), &token, deadline).await?

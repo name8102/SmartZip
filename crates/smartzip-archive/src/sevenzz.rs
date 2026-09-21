@@ -770,26 +770,6 @@ pub(crate) fn validate_extraction_listing(stdout: &str) -> Result<()> {
             });
         }
     }
-    for line in stdout.lines() {
-        if line
-            .strip_prefix("Symbolic Link = ")
-            .is_some_and(|target| !target.is_empty())
-            || line
-                .strip_prefix("Hard Link = ")
-                .is_some_and(|target| !target.is_empty())
-            || line
-                .strip_prefix("Attributes = ")
-                .is_some_and(|attributes| {
-                    attributes
-                        .split_whitespace()
-                        .any(|a| a.starts_with('l') && a.len() == 10)
-                })
-        {
-            return Err(SmartZipError::UnsafeArchivePath {
-                entry: "archive contains a link".into(),
-            });
-        }
-    }
     Ok(())
 }
 
@@ -800,6 +780,7 @@ pub(crate) fn parse_entries(stdout: &str) -> Vec<ArchiveEntry> {
     let mut current_packed_size: Option<u64> = None;
     let mut current_is_dir = false;
     let mut current_is_archive = false;
+    let mut current_is_link = false;
 
     for line in stdout.split_terminator('\n') {
         let line = line.strip_suffix('\r').unwrap_or(line);
@@ -811,7 +792,7 @@ pub(crate) fn parse_entries(stdout: &str) -> Vec<ArchiveEntry> {
                         raw_name: Vec::new(),
                         compressed_size: current_packed_size,
                         uncompressed_size: current_size,
-                        is_dir: current_is_dir,
+                        is_dir: current_is_dir && !current_is_link,
                     });
                 }
             }
@@ -820,6 +801,15 @@ pub(crate) fn parse_entries(stdout: &str) -> Vec<ArchiveEntry> {
             current_packed_size = None;
             current_is_dir = false;
             current_is_archive = false;
+            current_is_link = false;
+        } else if line
+            .strip_prefix("Symbolic Link = ")
+            .is_some_and(|v| !v.is_empty())
+            || line
+                .strip_prefix("Hard Link = ")
+                .is_some_and(|v| !v.is_empty())
+        {
+            current_is_link = true;
         } else if let Some(_type) = line.strip_prefix("Type = ") {
             current_is_archive = true;
         } else if let Some(size) = line.strip_prefix("Size = ") {
@@ -840,7 +830,7 @@ pub(crate) fn parse_entries(stdout: &str) -> Vec<ArchiveEntry> {
                 raw_name: Vec::new(),
                 compressed_size: current_packed_size,
                 uncompressed_size: current_size,
-                is_dir: current_is_dir,
+                is_dir: current_is_dir && !current_is_link,
             });
         }
     }
@@ -1034,6 +1024,8 @@ mod tests {
         validate_extraction_listing("Path = .\nFolder = +\n\nPath = ./hello.txt\nFolder = -\n")
             .unwrap();
         validate_extraction_listing("Path = ./\nFolder = +\n").unwrap();
+        validate_extraction_listing("Path = shortcut\nSymbolic Link = data.txt\n").unwrap();
+        validate_extraction_listing("Path = copy\nHard Link = data.txt\n").unwrap();
         for listing in [
             "Path = .\nFolder = -\n",
             "Path = \nFolder = +\n",

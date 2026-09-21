@@ -431,13 +431,6 @@ fn validate_extraction_listing(stdout: &str) -> Result<()> {
                 return Err(SmartZipError::UnsafeArchivePath { entry: name.into() });
             }
         }
-        if let Some(kind) = line.strip_prefix("Type: ") {
-            if !matches!(kind.trim(), "File" | "Directory") {
-                return Err(SmartZipError::UnsafeArchivePath {
-                    entry: format!("unsupported RAR entry type: {kind}"),
-                });
-            }
-        }
     }
     Ok(())
 }

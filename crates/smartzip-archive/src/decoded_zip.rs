@@ -5,7 +5,7 @@ use smartzip_core::{EncodingMode, Result, SmartZipError};
 use std::{
     fs::File,
     io::{Read, Seek, SeekFrom, Write},
-    path::{Path, PathBuf},
+    path::Path,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -151,7 +151,7 @@ fn extract(
             .map_err(|e| zip_error(e, &request.archive))?;
         if raw
             .unix_mode()
-            .is_some_and(|mode| !matches!(mode & 0o170000, 0 | 0o040000 | 0o100000))
+            .is_some_and(|mode| !matches!(mode & 0o170000, 0 | 0o040000 | 0o100000 | 0o120000))
         {
             return Err(SmartZipError::UnsafeArchivePath {
                 entry: name.to_string(),
@@ -164,6 +164,8 @@ fn extract(
         }
         safe.push(path);
     }
+    let mut directories = std::collections::HashSet::new();
+    let mut links = Vec::new();
     for (index, relative) in safe.iter().enumerate() {
         if token.is_cancelled() {
             return Err(SmartZipError::Cancelled);
@@ -174,11 +176,31 @@ fn extract(
         }
         .map_err(|e| zip_error(e, &request.archive))?;
         let target = request.output_dir.join(relative);
-        ensure_directories(&request.output_dir, relative, entry.is_dir())?;
+        let parent = if entry.is_dir() {
+            target.as_path()
+        } else {
+            target.parent().unwrap_or(&request.output_dir)
+        };
+        if directories.insert(parent.to_path_buf()) {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| SmartZipError::io(Some(parent.into()), e))?;
+        }
         if entry.is_dir() {
             continue;
         }
-        // create_new also refuses pre-existing symlinks and decoded collisions.
+        if entry
+            .unix_mode()
+            .is_some_and(|mode| mode & 0o170000 == 0o120000)
+        {
+            let mut destination = Vec::new();
+            entry
+                .read_to_end(&mut destination)
+                .map_err(|e| SmartZipError::io(Some(target.clone()), e))?;
+            links.push((target, destination));
+            continue;
+        }
+        // Links are created after regular files, so output writes cannot follow them.
+        // create_new also refuses decoded name collisions.
         let mut output = File::options()
             .write(true)
             .create_new(true)
@@ -210,33 +232,40 @@ fn extract(
                 .map_err(|e| SmartZipError::io(Some(target.clone()), e))?;
         }
     }
+    for (target, destination) in links {
+        if token.is_cancelled() {
+            return Err(SmartZipError::Cancelled);
+        }
+        create_symlink(&destination, &target).map_err(|e| SmartZipError::io(Some(target), e))?;
+    }
     Ok(())
 }
 
-fn ensure_directories(root: &Path, relative: &Path, is_dir: bool) -> Result<()> {
-    let directories = if is_dir {
-        relative
-    } else {
-        relative.parent().unwrap_or(Path::new(""))
-    };
-    let mut current = PathBuf::from(root);
-    for part in std::iter::once(None).chain(directories.components().map(Some)) {
-        if let Some(part) = part {
-            current.push(part.as_os_str());
-        }
-        match std::fs::symlink_metadata(&current) {
-            Ok(metadata) if metadata.is_dir() && !metadata.is_symlink() => {}
-            Ok(_) => {
-                return Err(SmartZipError::UnsafeArchivePath {
-                    entry: current.display().to_string(),
-                })
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::fs::create_dir(&current)
-                .map_err(|e| SmartZipError::io(Some(current.clone()), e))?,
-            Err(e) => return Err(SmartZipError::io(Some(current.clone()), e)),
+fn create_symlink(destination: &[u8], target: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        std::os::unix::fs::symlink(std::ffi::OsStr::from_bytes(destination), target)
+    }
+    #[cfg(windows)]
+    {
+        let destination = std::str::from_utf8(destination)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let resolved = target.parent().unwrap_or(Path::new(".")).join(destination);
+        if resolved.is_dir() {
+            std::os::windows::fs::symlink_dir(destination, target)
+        } else {
+            std::os::windows::fs::symlink_file(destination, target)
         }
     }
-    Ok(())
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (destination, target);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "symlinks are unsupported",
+        ))
+    }
 }
 
 /// Read a decoded legacy ZIP member, with the same bounds as external previews.
@@ -333,4 +362,51 @@ pub(crate) async fn read_member_if_needed(
         backend: "zip-name-decoder".into(),
         detail: e.to_string(),
     })?
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decoded_zip_preserves_links_even_when_the_target_comes_later() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = root.path().join("links.zip");
+        let mut writer = zip::ZipWriter::new(File::create(&archive).unwrap());
+        let options = zip::write::SimpleFileOptions::default();
+        writer
+            .add_symlink("folder/shortcut", "data.txt", options)
+            .unwrap();
+        writer.add_symlink("dangling", "missing", options).unwrap();
+        writer.start_file("folder/data.txt", options).unwrap();
+        writer.write_all(b"payload").unwrap();
+        writer.finish().unwrap();
+        let output_dir = root.path().join("output");
+        std::fs::create_dir(&output_dir).unwrap();
+        let (listed, _) = entries(&archive, "UTF-8").unwrap();
+        extract(
+            ExtractArchiveRequest {
+                archive,
+                format: Some(smartzip_core::ArchiveFormat::Zip),
+                output_dir: output_dir.clone(),
+                password: None,
+                encoding: EncodingMode::Override("UTF-8".into()),
+            },
+            listed,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_link(output_dir.join("folder/shortcut")).unwrap(),
+            Path::new("data.txt")
+        );
+        assert_eq!(
+            std::fs::read(output_dir.join("folder/shortcut")).unwrap(),
+            b"payload"
+        );
+        assert_eq!(
+            std::fs::read_link(output_dir.join("dangling")).unwrap(),
+            Path::new("missing")
+        );
+    }
 }
