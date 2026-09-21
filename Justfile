@@ -1,8 +1,9 @@
-# Install the SmartZip CLI into Cargo's user-wide bin directory.
-install:
-    cargo install --path crates/smartzip-cli --bin smartzip --locked --force
-
-# Build, package and install the macOS GUI (release by default).
+# Build, package and install the native CLI and GUI (Linux/macOS).
 [positional-arguments]
-install-gui profile="release" destination="~/Applications/SmartZip.app":
-    python3 scripts/install-macos.py --profile "$1" --destination "$2"
+install profile="release" destination="":
+    python3 scripts/install_desktop.py --profile "$1" --destination "$2"
+
+# Install only the native GUI, using the platform's default application directory.
+[positional-arguments]
+install-gui profile="release" destination="":
+    python3 scripts/install_desktop.py --gui-only --profile "$1" --destination "$2"
