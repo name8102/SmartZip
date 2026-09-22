@@ -471,7 +471,7 @@ async fn run(mut cli: Cli, matches: &clap::ArgMatches) -> Result<(), Box<dyn std
         println!(
             "{}",
             serde_json::to_string_pretty(
-                &serde_json::json!({"schema_version": 1, "configuration": policy.resolved, "inactive": policy.resolved.explanation(), "stages": policy.stage_plan(), "dynamic_content": "unknown_until_run", "root_archives": "keep", "transaction": "staged"})
+                &serde_json::json!({"schema_version": 1, "configuration": policy.resolved(), "inactive": policy.resolved().explanation(), "stages": policy.stage_plan(), "dynamic_content": "unknown_until_run", "root_archives": "keep", "transaction": "staged"})
             )?
         );
         return Ok(());
@@ -489,7 +489,7 @@ async fn run(mut cli: Cli, matches: &clap::ArgMatches) -> Result<(), Box<dyn std
         policy.values().logging.level,
         smartzip_config::LogLevel::Off | smartzip_config::LogLevel::Error
     ) {
-        for diagnostic in &policy.resolved.diagnostics {
+        for diagnostic in &policy.resolved().diagnostics {
             eprintln!("configuration: {diagnostic}");
         }
     }
@@ -1121,6 +1121,29 @@ impl StdinLock {
             encoding: safety.suspicious_encoding,
         }
     }
+
+    fn for_policy(&self, policy: &smartzip_engine::CompiledRunPolicy, json: bool) -> Self {
+        use std::io::IsTerminal;
+        let c = policy.values();
+        Self {
+            gate: self.gate.clone(),
+            cancellation: self.cancellation.clone(),
+            interactive: !json
+                && c.interaction.mode != smartzip_config::InteractionMode::Never
+                && std::io::stdin().is_terminal(),
+            conflict: match c.extraction.output.on_conflict {
+                smartzip_config::Conflict::Ask => ConflictArg::Ask,
+                smartzip_config::Conflict::Skip => ConflictArg::Skip,
+                smartzip_config::Conflict::Rename => ConflictArg::Rename,
+                smartzip_config::Conflict::Overwrite => ConflictArg::Overwrite,
+            },
+            encoding: match c.extraction.encoding.on_suspicious {
+                smartzip_config::SuspiciousEncoding::Ask => SuspiciousEncodingArg::Ask,
+                smartzip_config::SuspiciousEncoding::Skip => SuspiciousEncodingArg::Skip,
+                smartzip_config::SuspiciousEncoding::Accept => SuspiciousEncodingArg::Accept,
+            },
+        }
+    }
 }
 
 /// A blocking prompt with bounded waits. Ctrl+C wakes the token; no stdin
@@ -1454,11 +1477,38 @@ fn prompt_encoding_stdin(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_extract_json_output, Cli, Command};
+    use super::{
+        build_extract_json_output, Arc, Cli, Command, ConflictArg, StdinLock, SuspiciousEncodingArg,
+    };
     use clap::Parser;
     use serde_json::json;
     use smartzip_core::TaskId;
     use smartzip_engine::ExtractWorkflowResult;
+
+    #[test]
+    fn recovered_prompt_policy_keeps_host_gate_and_uses_its_own_decisions() {
+        let safety =
+            Cli::try_parse_from(["smartzip", "--non-interactive", "extract", "archive.zip"])
+                .unwrap()
+                .safety;
+        let lock =
+            StdinLock::configured(tokio_util::sync::CancellationToken::new(), &safety, false);
+        let mut resolved = smartzip_config::ResolvedConfig::load(None).unwrap();
+        resolved.values.extraction.output.on_conflict = smartzip_config::Conflict::Overwrite;
+        resolved.values.extraction.encoding.on_suspicious =
+            smartzip_config::SuspiciousEncoding::Accept;
+        let policy = smartzip_engine::CompiledRunPolicy::compile(resolved).unwrap();
+        let recovered = lock.for_policy(&policy, true);
+        assert!(Arc::ptr_eq(&recovered.gate, &lock.gate));
+        assert!(
+            !recovered.interactive,
+            "JSON mode must not ask for terminal input"
+        );
+        assert!(matches!(recovered.conflict, ConflictArg::Overwrite));
+        assert!(matches!(recovered.encoding, SuspiciousEncodingArg::Accept));
+        lock.cancellation.cancel();
+        assert!(recovered.cancellation.is_cancelled());
+    }
 
     #[test]
     fn test_alias_accepts_groups_and_validates_the_diagnostic_budget() {

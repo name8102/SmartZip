@@ -418,9 +418,7 @@ async fn run_job_inner(
     roots: Arc<smartzip_engine::root_management::RootManagement>,
 ) -> Result<JobOutcome, Box<dyn std::error::Error>> {
     use smartzip_config::StateMode;
-    use smartzip_engine::history::{
-        DbKnownFileStore, DbTaskHistoryRecorder, KnownFileStore, RunStores, TaskHistoryRecorder,
-    };
+    use smartzip_engine::history::TaskHistoryRecorder;
     let policy = load_policy(&request)?;
     let c = policy.values();
     let db = open_database(&policy)?;
@@ -432,41 +430,14 @@ async fn run_job_inner(
     } else {
         None
     };
-    let passwords = smartzip_passwords::PasswordService::configured(
-        db.as_ref()
-            .map(|db| smartzip_db::password::PasswordRepository::new(db.connection())),
-        c.passwords.clone(),
-        c.state.mode,
-    );
-    let history = db
-        .as_ref()
-        .filter(|_| c.state.mode != StateMode::Off)
-        .map(|db| {
-            DbTaskHistoryRecorder::new(db.connection())
-                .with_writes(c.state.mode == StateMode::ReadWrite && c.state.history)
-        });
-    let known = db
-        .as_ref()
-        .filter(|_| c.state.mode != StateMode::Off && c.state.known_files != StateMode::Off)
-        .map(|db| DbKnownFileStore {
-            connection: db.connection(),
-            writable: c.state.mode == StateMode::ReadWrite
-                && c.state.known_files == StateMode::ReadWrite,
-            password_hint: c.extraction.reuse.password_hint
-                && c.passwords.mode == smartzip_config::PasswordMode::Auto
-                && c.passwords
-                    .sources
-                    .contains(&smartzip_config::PasswordSource::Known),
-            encoding_hint: c.extraction.reuse.encoding_hint && c.extraction.encoding.mode == "auto",
-        });
-    let stores = RunStores {
-        history: history.as_ref().map(|s| s as &dyn TaskHistoryRecorder),
-        known_files: known.as_ref().map(|s| s as &dyn KnownFileStore),
-    };
-    let recorder =
-        (history.is_some() || known.is_some()).then_some(&stores as &dyn TaskHistoryRecorder);
+    let services = policy.services(db.as_ref().map(smartzip_db::SmartZipDb::connection));
+    let passwords = &services.passwords;
+    let stores = services.stores();
+    let recorder = services
+        .has_stores()
+        .then_some(&stores as &dyn TaskHistoryRecorder);
     let backend = smartzip_archive::BackendRouter::from_config(&c.backends)?;
-    let mut warnings = policy.resolved.diagnostics.clone();
+    let mut warnings = policy.resolved().diagnostics.clone();
     warnings.extend(backend.warnings().iter().cloned());
     let engine = SmartZipEngine::default()
         .with_cancellation_token(cancellation.clone())
@@ -540,56 +511,14 @@ async fn run_job_inner(
                 force: request.settings.force,
                 limits: c.limits.clone(),
             };
-            let workflow_request = policy.resolve_request(workflow_request)?;
-            let output_dir = workflow_request.output_dir.clone();
-            let mut identity = smartzip_engine::ExtractTaskIdentity::new(&inputs);
-            roots.configure_groups(&mut identity, groups)?;
-            let submission = execution_store
-                .as_ref()
-                .map(|_| {
-                    let roots = identity
-                        .roots
-                        .iter()
-                        .zip(&inputs)
-                        .map(|(root, input)| {
-                            Ok::<_, serde_json::Error>(
-                                smartzip_engine::state_store::NodeSubmission {
-                                    node_id: root.node_id.clone(),
-                                    parent_id: None,
-                                    root_id: root.root_id.clone(),
-                                    input_path: input.clone(),
-                                    input_ref_json: serde_json::to_string(&root.candidate)?,
-                                    config_revision: 0,
-                                    generation: root.generation as i64,
-                                },
-                            )
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
-                    Ok::<_, Box<dyn std::error::Error>>(
-                        smartzip_engine::state_store::TaskSubmission {
-                            task_id: identity.task_id.clone(),
-                            kind: "extract".into(),
-                            output_path: Some(output_dir.clone()),
-                            started_at: smartzip_db::timestamp::now_utc_iso8601(),
-                            inputs_json: serde_json::to_string(&inputs)?,
-                            config_snapshot_json: serde_json::to_string(
-                                &smartzip_engine::state_store::PersistedExtractPlan::new(
-                                    policy.resolved.values.clone(),
-                                    workflow_request.clone(),
-                                ),
-                            )?,
-                            priority: smartzip_db::task_execution::Priority::Normal,
-                            queue_position,
-                            recoverable: true,
-                            roots,
-                        },
-                    )
-                })
-                .transpose()?;
+            let mut prepared =
+                smartzip_engine::PreparedExtractTask::new(policy.clone(), workflow_request)?;
+            prepared.configure_groups(&roots, groups)?;
+            let task_id = prepared.identity().task_id.clone();
             if let Some(execution) = &execution_store {
-                if let Some(submission) = submission {
-                    execution.submit(submission).await?;
-                }
+                execution
+                    .submit(prepared.submission(queue_position)?)
+                    .await?;
             }
             let recovery_db = db.as_ref();
             let recovery_work = async {
@@ -607,46 +536,21 @@ async fn run_job_inner(
                             let recovered_task_id =
                                 smartzip_core::TaskId::from_stored(recovered.task_id.clone());
                             let recovered_result: Result<(), Box<dyn std::error::Error>> = async {
-                                let (plan, recovered_identity) = smartzip_engine::execution_runtime::ExecutionCoordinator::decode_recovery(&recovered)?;
-                                let recovered_policy = smartzip_engine::CompiledRunPolicy::compile(
-                                    smartzip_config::ResolvedConfig {
-                                        values: plan.policy.clone(),
-                                        origins: std::collections::BTreeMap::new(),
-                                        path: None,
-                                        diagnostics: vec![
-                                            "resumed from persisted task snapshot".into(),
-                                        ],
-                                    },
-                                )?;
+                                let prepared =
+                                    smartzip_engine::PreparedExtractTask::recover(&recovered)?;
                                 let recovered_backend =
                                     smartzip_archive::BackendRouter::from_config(
-                                        &recovered_policy.values().backends,
+                                        &prepared.policy().values().backends,
                                     )?;
-                                let recovered_passwords =
-                                    smartzip_passwords::PasswordService::configured(
-                                        recovery_db.map(|db| {
-                                            smartzip_db::password::PasswordRepository::new(
-                                                db.connection(),
-                                            )
-                                        }),
-                                        recovered_policy.values().passwords.clone(),
-                                        recovered_policy.values().state.mode,
-                                    );
-                                SmartZipEngine::default()
-                                    .with_cancellation_token(
-                                        recovery_prompts.cancellation.clone(),
-                                    )
-                                    .with_run_policy(recovered_policy)
-                                    .extract_task(
-                                        recovered_identity,
+                                prepared
+                                    .run(
+                                        SmartZipEngine::default().with_cancellation_token(
+                                            recovery_prompts.cancellation.clone(),
+                                        ),
                                         &recovered_backend,
-                                        &recovered_passwords,
-                                        plan.request,
+                                        recovery_db.map(smartzip_db::SmartZipDb::connection),
                                         smartzip_engine::ExtractInteraction {
-                                            password: interactive.then_some(
-                                                &recovery_prompts
-                                                    as &dyn InteractivePasswordPrompter,
-                                            ),
+                                            password: Some(&recovery_prompts),
                                             output: Some(&recovery_prompts),
                                             embedded: Some(&recovery_prompts),
                                             encoding: Some(&recovery_prompts),
@@ -684,9 +588,7 @@ async fn run_job_inner(
                                         listener(&TaskEvent {
                                             task_id: recovered_task_id,
                                             kind: TaskEventKind::Warning {
-                                                message: format!(
-                                                    "task recovery failed: {detail}"
-                                                ),
+                                                message: format!("task recovery failed: {detail}"),
                                             },
                                         });
                                     }
@@ -696,20 +598,19 @@ async fn run_job_inner(
                     });
                 futures_util::future::join_all(futures).await;
             };
-            let current_work = engine.extract_task(
-                identity.clone(),
+            let current_work = prepared.run(
+                engine,
                 &backend,
-                &passwords,
-                workflow_request,
+                db.as_ref().map(smartzip_db::SmartZipDb::connection),
                 smartzip_engine::ExtractInteraction {
-                    password: password_prompt,
+                    password: Some(&prompts),
                     output: Some(&prompts),
                     embedded: Some(&prompts),
                     encoding: Some(&prompts),
                 },
                 smartzip_engine::ExtractObserver {
                     listener: listener.clone(),
-                    history: recorder,
+                    history: None,
                     execution: execution_store
                         .as_deref()
                         .map(|execution| execution as &dyn smartzip_engine::ExecutionStateRecorder),
@@ -719,7 +620,7 @@ async fn run_job_inner(
             let result = match result {
                 Ok(result) => {
                     if let Some(execution) = &execution_store {
-                        execution.release_task(&identity.task_id);
+                        execution.release_task(&task_id);
                     }
                     result
                 }
@@ -728,7 +629,7 @@ async fn run_job_inner(
                         let cancelled = matches!(error, smartzip_core::SmartZipError::Cancelled);
                         execution
                             .stop_task(
-                                &identity.task_id,
+                                &task_id,
                                 if cancelled { "cancelled" } else { "failed" },
                                 if cancelled {
                                     "cancelled"
@@ -757,7 +658,7 @@ async fn run_job_inner(
             let result = engine
                 .inspect_file_with_listener(
                     &backend,
-                    &passwords,
+                    passwords,
                     smartzip_engine::InspectRequest { path, scanner },
                     listener,
                     recorder,
@@ -774,7 +675,7 @@ async fn run_job_inner(
             let result = engine
                 .list_archive_with_listener_interactive(
                     &backend,
-                    &passwords,
+                    passwords,
                     smartzip_engine::ListArchiveRequest {
                         path,
                         scanner,
@@ -793,7 +694,7 @@ async fn run_job_inner(
             let result = engine
                 .test_archives(
                     &backend,
-                    &passwords,
+                    passwords,
                     smartzip_engine::TestWorkflowRequest {
                         paths: request.paths,
                         encoding,
@@ -995,11 +896,11 @@ mod tests {
         assert!(!policy.values().passwords.save_success);
         assert!(!policy.values().passwords.record_statistics);
         assert_eq!(
-            policy.resolved.origins["passwords.save_success"],
+            policy.resolved().origins["passwords.save_success"],
             "task:temporary-password"
         );
         assert_eq!(
-            policy.resolved.origins["passwords.record_statistics"],
+            policy.resolved().origins["passwords.record_statistics"],
             "task:temporary-password"
         );
         assert_eq!(
@@ -1011,5 +912,115 @@ mod tests {
         disabled.resolved.as_mut().unwrap().values.passwords.mode =
             smartzip_config::PasswordMode::Off;
         assert!(load_policy(&disabled).is_err());
+    }
+    #[tokio::test]
+    async fn recovery_prompts_from_saved_policy_when_new_task_disables_interaction() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures");
+        let encrypted = temp.path().join("recover.zip");
+        let current = temp.path().join("current.zip");
+        std::fs::copy(fixtures.join("pass_cn.zip"), &encrypted).unwrap();
+        std::fs::copy(fixtures.join("enc_utf8.zip"), &current).unwrap();
+        let db_path = temp.path().join("state.db");
+        let mut resolved = smartzip_config::ResolvedConfig::load(None).unwrap();
+        resolved.values.state.database = Some(db_path.clone());
+        resolved.values.extraction.recursion.enabled = false;
+        resolved.values.extraction.embedded.root = smartzip_config::RootScan::Off;
+        resolved.values.extraction.embedded.nested = smartzip_config::NestedScan::Off;
+        resolved.values.passwords.sources = vec![
+            smartzip_config::PasswordSource::Manual,
+            smartzip_config::PasswordSource::Empty,
+        ];
+        resolved.values.passwords.save_success = false;
+        resolved.values.passwords.record_statistics = false;
+        let prepared = smartzip_engine::PreparedExtractTask::new(
+            CompiledRunPolicy::compile(resolved.clone()).unwrap(),
+            smartzip_engine::ExtractWorkflowRequest {
+                inputs: vec![encrypted.clone()],
+                output_dir: temp.path().join("recovered-output"),
+                recursion_limit: 0,
+                encoding_mode: smartzip_core::EncodingMode::Auto,
+                scanner: Default::default(),
+                password_candidates: Default::default(),
+                layout_policy: Default::default(),
+                single_root_name_policy: Default::default(),
+                embedded_scan_mode: smartzip_core::EmbeddedScanMode::Ignore,
+                dominant_min_ratio: 0.7,
+                confirm_large_scan: false,
+                force: false,
+                limits: Default::default(),
+            },
+        )
+        .unwrap();
+        let recovered_id = prepared.identity().task_id.to_string();
+        {
+            let store = smartzip_engine::state_store::StateStore::start(&db_path).unwrap();
+            store.submit(prepared.submission(0).unwrap()).await.unwrap();
+        }
+        resolved.values.interaction.mode = smartzip_config::InteractionMode::Never;
+        let mailbox = Mailbox::default();
+        let worker = run_job_inner(
+            JobRequest {
+                operation: TaskOperation::Extract,
+                paths: vec![current],
+                resolved: Some(resolved),
+                settings: TaskSettings {
+                    output: Some(temp.path().join("current-output")),
+                    ..Default::default()
+                },
+            },
+            1,
+            mailbox.clone(),
+            CancellationToken::new(),
+            Default::default(),
+        );
+        tokio::pin!(worker);
+        let mut password_prompts = 0;
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                tokio::select! {
+                    result = &mut worker => { result.unwrap(); break; }
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {
+                        for message in mailbox.drain() {
+                            if let JobMessage::Prompt(prompt) = message {
+                                match prompt {
+                                    InteractionRequest::Password { path, respond } => {
+                                        assert_eq!(path, encrypted);
+                                        password_prompts += 1;
+                                        respond.send(Some("中文密码123".into())).unwrap();
+                                    }
+                                    _ => panic!("unexpected non-password interaction"),
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(password_prompts, 1);
+        let db = smartzip_db::SmartZipDb::open(&db_path).unwrap();
+        let status: String = db
+            .connection()
+            .query_row(
+                "SELECT status FROM tasks WHERE id=?1",
+                [&recovered_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "completed");
+        assert!(temp
+            .path()
+            .join("recovered-output/recover/文档.txt")
+            .exists());
+        let mut statement = db.connection().prepare("SELECT status FROM tasks").unwrap();
+        let statuses = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(statuses.len(), 2);
+        assert!(statuses.iter().all(|status| status == "completed"));
     }
 }

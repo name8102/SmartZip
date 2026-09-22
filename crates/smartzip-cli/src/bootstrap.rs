@@ -230,12 +230,12 @@ pub(super) fn task_passwords<'a>(
     db: Option<&'a SmartZipDb>,
     safety: &SafetyOptions,
 ) -> PasswordService<'a> {
-    let c = safety.policy.as_ref().unwrap().values();
-    PasswordService::configured(
-        db.map(|db| PasswordRepository::new(db.connection())),
-        c.passwords.clone(),
-        c.state.mode,
-    )
+    safety
+        .policy
+        .as_ref()
+        .unwrap()
+        .services(db.map(SmartZipDb::connection))
+        .passwords
 }
 
 pub(super) fn task_stores<'a>(
@@ -245,26 +245,12 @@ pub(super) fn task_stores<'a>(
     Option<smartzip_engine::history::DbTaskHistoryRecorder<'a>>,
     Option<smartzip_engine::history::DbKnownFileStore<'a>>,
 ) {
-    use smartzip_config::StateMode;
-    let c = safety.policy.as_ref().unwrap().values();
-    let history = db.filter(|_| c.state.mode != StateMode::Off).map(|db| {
-        smartzip_engine::history::DbTaskHistoryRecorder::new(db.connection())
-            .with_writes(c.state.mode == StateMode::ReadWrite && c.state.history)
-    });
-    let known = db
-        .filter(|_| c.state.mode != StateMode::Off && c.state.known_files != StateMode::Off)
-        .map(|db| smartzip_engine::history::DbKnownFileStore {
-            connection: db.connection(),
-            writable: c.state.mode == StateMode::ReadWrite
-                && c.state.known_files == StateMode::ReadWrite,
-            password_hint: c.extraction.reuse.password_hint
-                && c.passwords.mode == smartzip_config::PasswordMode::Auto
-                && c.passwords
-                    .sources
-                    .contains(&smartzip_config::PasswordSource::Known),
-            encoding_hint: c.extraction.reuse.encoding_hint && c.extraction.encoding.mode == "auto",
-        });
-    (history, known)
+    let services = safety
+        .policy
+        .as_ref()
+        .unwrap()
+        .services(db.map(SmartZipDb::connection));
+    (services.history, services.known)
 }
 
 pub(super) fn run_stores<'a>(

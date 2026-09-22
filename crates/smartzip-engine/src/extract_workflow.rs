@@ -13,7 +13,7 @@ use std::io::Read;
 use crate::access::prepare_resolved_archive;
 use crate::backend_util::{backend_call, confidence_score};
 use crate::encoding_flow::{encoding_mode_label, resolve_encoding_mode};
-use crate::events::{EventSink, TaskEventListener};
+use crate::events::EventSink;
 use crate::interactive::{
     EmbeddedSelectionChoice, InteractiveEmbeddedPrompter, InteractiveEncodingPrompter,
     InteractiveOutputPrompter, InteractivePasswordPrompter,
@@ -45,6 +45,16 @@ pub(crate) struct TaskDedup {
     members: HashSet<std::path::PathBuf>,
     // Claim overlapping candidate sets before trial, but consume only winners.
     volume_locks: HashMap<std::path::PathBuf, std::sync::Arc<tokio::sync::Mutex<()>>>,
+}
+
+/// Mutable task state shared across roots; each workflow keeps its own node queue.
+#[derive(Clone)]
+pub(crate) struct ExtractTaskState {
+    pub batch_passwords: std::rc::Rc<std::cell::RefCell<Vec<PasswordCandidate>>>,
+    pub budget: std::sync::Arc<crate::budget::TaskBudget>,
+    pub dedup: std::rc::Rc<std::cell::RefCell<TaskDedup>>,
+    pub source_cleanup: crate::source_cleanup::SharedCleanup,
+    pub backend_context: std::sync::Arc<smartzip_core::TaskExecutionContext>,
 }
 
 struct ExecutionNode {
@@ -79,10 +89,6 @@ fn record_failure(
     }
 }
 
-/// Override how successfully processed nested archives are recycled.
-///
-/// This is primarily useful for deterministic tests and platform hosts
-/// that provide their own recycle-bin integration.
 pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecutor>(
     engine_scanner: &EmbeddedScanner,
     run_policy: Option<&crate::CompiledRunPolicy>,
@@ -96,15 +102,19 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
     output_prompter: Option<&dyn InteractiveOutputPrompter>,
     embedded_prompter: Option<&dyn InteractiveEmbeddedPrompter>,
     encoding_prompter: Option<&dyn InteractiveEncodingPrompter>,
-    listener: Option<TaskEventListener>,
+    events: EventSink,
     history: Option<&dyn crate::history::TaskHistoryRecorder>,
     execution: Option<&dyn crate::ExecutionStateRecorder>,
     identity: crate::ExtractTaskIdentity,
-    batch_passwords: std::rc::Rc<std::cell::RefCell<Vec<PasswordCandidate>>>,
-    task_budget: std::sync::Arc<crate::budget::TaskBudget>,
-    dedup: std::rc::Rc<std::cell::RefCell<TaskDedup>>,
-    source_cleanup: crate::source_cleanup::SharedCleanup,
+    state: ExtractTaskState,
 ) -> smartzip_core::Result<ExtractWorkflowResult> {
+    let ExtractTaskState {
+        batch_passwords,
+        budget: task_budget,
+        dedup,
+        source_cleanup,
+        backend_context,
+    } = state;
     let config = run_policy.map(crate::CompiledRunPolicy::values);
     let may_prompt =
         config.is_none_or(|c| c.interaction.mode != smartzip_config::InteractionMode::Never);
@@ -140,12 +150,10 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
     } else {
         None
     };
-    let events = EventSink::new(listener);
-    let task_context = backend.begin_task_with_cancellation(
-        task_id.clone(),
+    let task_context = std::sync::Arc::new(backend_context.scoped(
         std::sync::Arc::new(events.clone()),
         cancellation.token().child_token(),
-    );
+    ));
     let nested_scanner = if request.scanner == *engine_scanner.config() {
         None
     } else {
@@ -156,10 +164,6 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
         .is_none_or(|c| c.extraction.embedded.root != smartzip_config::RootScan::Off)
         .then(|| EmbeddedScanner::new(full_root_scanner_config(&request.scanner)));
 
-    events.push(TaskEvent::started(task_id.clone()));
-    if let Some(policy) = run_policy {
-        policy.emit_plan(&events, &task_id);
-    }
     let mut queue = VecDeque::new();
     let mut processed = Vec::new();
     let mut skipped = Vec::new();
@@ -204,18 +208,6 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
             exit_code: None,
             stderr: error.to_string(),
         })?;
-    // History: register the task up-front and accumulate metrics as the
-    // loop runs. All history writes are best-effort — a repo error becomes
-    // a Warning event through the recorder and never aborts extraction.
-    if let Some(recorder) = legacy_history {
-        recorder.start_extract(&task_id, Some(&request.output_dir));
-    }
-    let mut completion = crate::history::CompletionGuard::new(
-        legacy_history,
-        task_id.clone(),
-        events.clone(),
-        cancellation.user_token(),
-    );
     let mut failed_count = 0usize;
     let mut was_cancelled = false;
     let mut volume_resolver = VolumeResolver::new();
@@ -253,6 +245,16 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
             node_id: node.id.clone(),
         };
         let mut candidate = node.candidate;
+        let completion = NodeCompletion {
+            execution,
+            history: legacy_history,
+            task_id: &task_id,
+            node_id: &node.id,
+            generation: node.generation,
+            events: &events,
+            config,
+            cancellation: &cancellation,
+        };
         let attempt_id = AttemptId::new();
         if !enter_stage(
             execution,
@@ -285,35 +287,15 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
         // row (duplicate within this run / over recursion limit / a non-first
         // volume of a split set).
         if !is_new {
-            record_skip(legacy_history, &task_id, &candidate, "duplicate");
-            finish_execution(
-                execution,
-                &task_id,
-                &node.id,
-                node.generation,
-                "skipped",
-                Some("duplicate"),
-                None,
-                false,
-            )
-            .await?;
-            skipped.push(candidate);
+            completion
+                .skip(candidate, "duplicate", &mut skipped)
+                .await?;
             continue;
         }
         if candidate.depth > request.recursion_limit {
-            record_skip(legacy_history, &task_id, &candidate, "recursion_limit");
-            finish_execution(
-                execution,
-                &task_id,
-                &node.id,
-                node.generation,
-                "skipped",
-                Some("recursion_limit"),
-                None,
-                false,
-            )
-            .await?;
-            skipped.push(candidate);
+            completion
+                .skip(candidate, "recursion_limit", &mut skipped)
+                .await?;
             continue;
         }
         let absolute_input =
@@ -321,19 +303,9 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
         if candidate.source != CandidateSource::EmbeddedFinding
             && dedup.borrow().members.contains(&absolute_input)
         {
-            record_skip(legacy_history, &task_id, &candidate, "duplicate");
-            finish_execution(
-                execution,
-                &task_id,
-                &node.id,
-                node.generation,
-                "skipped",
-                Some("duplicate"),
-                None,
-                false,
-            )
-            .await?;
-            skipped.push(candidate);
+            completion
+                .skip(candidate, "duplicate", &mut skipped)
+                .await?;
             continue;
         }
         let original_candidate = candidate.clone();
@@ -390,19 +362,9 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
         if candidate.source != CandidateSource::EmbeddedFinding
             && dedup.borrow().members.contains(&absolute_input)
         {
-            record_skip(legacy_history, &task_id, &candidate, "duplicate");
-            finish_execution(
-                execution,
-                &task_id,
-                &node.id,
-                node.generation,
-                "skipped",
-                Some("duplicate"),
-                None,
-                false,
-            )
-            .await?;
-            skipped.push(candidate);
+            completion
+                .skip(candidate, "duplicate", &mut skipped)
+                .await?;
             continue;
         }
         if needs_volume_lease
@@ -468,19 +430,9 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                     let key = volume_set_key(set);
                     let new_volume = dedup.borrow_mut().volumes.insert(key);
                     if !new_volume {
-                        record_skip(legacy_history, &task_id, &candidate, "duplicate");
-                        finish_execution(
-                            execution,
-                            &task_id,
-                            &node.id,
-                            node.generation,
-                            "skipped",
-                            Some("duplicate"),
-                            None,
-                            false,
-                        )
-                        .await?;
-                        skipped.push(candidate);
+                        completion
+                            .skip(candidate, "duplicate", &mut skipped)
+                            .await?;
                         continue 'nodes;
                     }
                     for member in &set.members {
@@ -523,116 +475,62 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                     candidate: failed,
                     problem,
                 } => {
-                    record_failure(&mut failed_count, config, &cancellation);
-                    events.push(TaskEvent {
-                        task_id: task_id.clone(),
-                        kind: TaskEventKind::Failed {
-                            error: format!(
-                                "incomplete volume set for {}: {}",
-                                failed.path.display(),
-                                problem.reason
-                            ),
-                        },
-                    });
-                    if let Some(recorder) = legacy_history {
-                        recorder.record_file_extraction(
-                            &task_id,
-                            crate::history::FileExtractionRow::failed(
-                                &original_input_path,
-                                failed.embedded_offset,
-                                "incomplete_volume",
-                            ),
-                        );
-                    }
-                    finish_execution(
-                        execution,
-                        &task_id,
-                        &node.id,
-                        node.generation,
-                        "failed",
-                        Some("incomplete_volume"),
-                        None,
-                        false,
-                    )
-                    .await?;
-                    skipped.push(failed);
+                    let error = format!(
+                        "incomplete volume set for {}: {}",
+                        failed.path.display(),
+                        problem.reason
+                    );
+                    completion
+                        .fail(
+                            failed,
+                            &original_input_path,
+                            "incomplete_volume",
+                            error,
+                            &mut failed_count,
+                            &mut skipped,
+                        )
+                        .await?;
                     continue 'nodes;
                 }
                 crate::volumes::VolumePreparation::GroupingAmbiguous {
                     candidate: failed,
                     hypotheses,
                 } => {
-                    record_failure(&mut failed_count, config, &cancellation);
-                    events.push(TaskEvent {
-                        task_id: task_id.clone(),
-                        kind: TaskEventKind::Failed {
-                            error: format!(
-                                "grouping ambiguous for {}: {} hypotheses",
-                                failed.path.display(),
-                                hypotheses.len()
-                            ),
-                        },
-                    });
-                    if let Some(recorder) = legacy_history {
-                        recorder.record_file_extraction(
-                            &task_id,
-                            crate::history::FileExtractionRow::failed(
-                                &original_input_path,
-                                failed.embedded_offset,
-                                "grouping_ambiguous",
-                            ),
-                        );
-                    }
-                    finish_execution(
-                        execution,
-                        &task_id,
-                        &node.id,
-                        node.generation,
-                        "failed",
-                        Some("grouping_ambiguous"),
-                        None,
-                        false,
-                    )
-                    .await?;
-                    skipped.push(failed);
+                    let error = format!(
+                        "grouping ambiguous for {}: {} hypotheses",
+                        failed.path.display(),
+                        hypotheses.len()
+                    );
+                    completion
+                        .fail(
+                            failed,
+                            &original_input_path,
+                            "grouping_ambiguous",
+                            error,
+                            &mut failed_count,
+                            &mut skipped,
+                        )
+                        .await?;
                     continue 'nodes;
                 }
                 crate::volumes::VolumePreparation::MaterializationFailed {
                     candidate: failed,
                     error,
                 } => {
-                    record_failure(&mut failed_count, config, &cancellation);
-                    events.push(TaskEvent {
-                        task_id: task_id.clone(),
-                        kind: TaskEventKind::Failed {
-                            error: format!(
-                                "volume materialization failed for {}: {error}",
-                                failed.path.display()
-                            ),
-                        },
-                    });
-                    if let Some(recorder) = legacy_history {
-                        recorder.record_file_extraction(
-                            &task_id,
-                            crate::history::FileExtractionRow::failed(
-                                &original_input_path,
-                                failed.embedded_offset,
-                                "materialize_failed",
-                            ),
-                        );
-                    }
-                    finish_execution(
-                        execution,
-                        &task_id,
-                        &node.id,
-                        node.generation,
-                        "failed",
-                        Some("materialize_failed"),
-                        None,
-                        false,
-                    )
-                    .await?;
-                    skipped.push(failed);
+                    let error = format!(
+                        "volume materialization failed for {}: {error}",
+                        failed.path.display()
+                    );
+                    completion
+                        .fail(
+                            failed,
+                            &original_input_path,
+                            "materialize_failed",
+                            error,
+                            &mut failed_count,
+                            &mut skipped,
+                        )
+                        .await?;
                     continue 'nodes;
                 }
             }
@@ -775,19 +673,9 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                     Some(EmbeddedSelectionChoice::Extract) => {}
                     Some(EmbeddedSelectionChoice::ExtractAll) => embedded_extract_all = true,
                     Some(EmbeddedSelectionChoice::Skip) | None => {
-                        record_skip(legacy_history, &task_id, &candidate, "not_found");
-                        finish_execution(
-                            execution,
-                            &task_id,
-                            &node.id,
-                            node.generation,
-                            "skipped",
-                            Some("not_found"),
-                            None,
-                            false,
-                        )
-                        .await?;
-                        skipped.push(candidate);
+                        completion
+                            .skip(candidate, "not_found", &mut skipped)
+                            .await?;
                         continue 'nodes;
                     }
                 }
@@ -1126,54 +1014,24 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                                     }
                                 }
                                 EmbeddedSelectionChoice::Skip => {
-                                    record_skip(legacy_history, &task_id, &candidate, "not_found");
-                                    finish_execution(
-                                        execution,
-                                        &task_id,
-                                        &node.id,
-                                        node.generation,
-                                        "skipped",
-                                        Some("not_found"),
-                                        None,
-                                        false,
-                                    )
-                                    .await?;
-                                    skipped.push(candidate);
+                                    completion
+                                        .skip(candidate, "not_found", &mut skipped)
+                                        .await?;
                                     continue 'nodes;
                                 }
                             },
                             None => {
-                                record_skip(legacy_history, &task_id, &candidate, "not_found");
-                                finish_execution(
-                                    execution,
-                                    &task_id,
-                                    &node.id,
-                                    node.generation,
-                                    "skipped",
-                                    Some("not_found"),
-                                    None,
-                                    false,
-                                )
-                                .await?;
-                                skipped.push(candidate);
+                                completion
+                                    .skip(candidate, "not_found", &mut skipped)
+                                    .await?;
                                 continue 'nodes;
                             }
                         }
                     }
                     _ => {
-                        record_skip(legacy_history, &task_id, &candidate, "not_found");
-                        finish_execution(
-                            execution,
-                            &task_id,
-                            &node.id,
-                            node.generation,
-                            "skipped",
-                            Some("not_found"),
-                            None,
-                            false,
-                        )
-                        .await?;
-                        skipped.push(candidate);
+                        completion
+                            .skip(candidate, "not_found", &mut skipped)
+                            .await?;
                         continue 'nodes;
                     }
                 }
@@ -2605,33 +2463,6 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
         failed_count,
         was_cancelled,
     );
-    events.push(TaskEvent {
-        task_id: task_id.clone(),
-        kind: TaskEventKind::Finished {
-            status: format!("{status:?}").to_ascii_lowercase(),
-        },
-    });
-
-    let snapshot = events.snapshot();
-
-    // History: replay the full event timeline into task_events, then close
-    // out the task row. Per-file detail (encoding, password, embedded
-    // findings) now lives in file_extractions rows written inline above;
-    // this final pass only handles task_events + the slim task finish.
-    if let Some(recorder) = legacy_history {
-        for event in &snapshot {
-            recorder.record_event(&task_id, event);
-        }
-        recorder.finish(
-            &task_id,
-            crate::history::TaskOutcome {
-                status,
-                output_path: Some(&request.output_dir),
-            },
-        );
-    }
-
-    completion.complete();
     Ok(ExtractWorkflowResult {
         status,
         failed_count,
@@ -2639,7 +2470,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
         processed,
         skipped,
         enqueued,
-        events: snapshot,
+        events: Vec::new(),
     })
 }
 
@@ -2692,6 +2523,78 @@ async fn enter_stage(
             stderr: format!("stale stage result for node {node_id} generation {generation}"),
         }),
         Err(error) => Err(error),
+    }
+}
+
+/// Complete pre-extraction skips/failures consistently. Commit-aware outcomes
+/// below stay explicit because they carry publication and recovery facts.
+struct NodeCompletion<'a> {
+    execution: Option<&'a dyn crate::ExecutionControl>,
+    history: Option<&'a dyn crate::history::TaskHistoryRecorder>,
+    task_id: &'a TaskId,
+    node_id: &'a NodeId,
+    generation: u64,
+    events: &'a EventSink,
+    config: Option<&'a smartzip_config::SmartZipConfig>,
+    cancellation: &'a crate::TaskCancellation,
+}
+
+impl NodeCompletion<'_> {
+    async fn skip(
+        &self,
+        candidate: ExtractionCandidate,
+        reason: &str,
+        skipped: &mut Vec<ExtractionCandidate>,
+    ) -> smartzip_core::Result<()> {
+        record_skip(self.history, self.task_id, &candidate, reason);
+        finish_execution(
+            self.execution,
+            self.task_id,
+            self.node_id,
+            self.generation,
+            "skipped",
+            Some(reason),
+            None,
+            false,
+        )
+        .await?;
+        skipped.push(candidate);
+        Ok(())
+    }
+
+    async fn fail(
+        &self,
+        candidate: ExtractionCandidate,
+        input: &std::path::Path,
+        reason: &str,
+        error: String,
+        failed_count: &mut usize,
+        skipped: &mut Vec<ExtractionCandidate>,
+    ) -> smartzip_core::Result<()> {
+        record_failure(failed_count, self.config, self.cancellation);
+        self.events.push(TaskEvent {
+            task_id: self.task_id.clone(),
+            kind: TaskEventKind::Failed { error },
+        });
+        if let Some(history) = self.history {
+            history.record_file_extraction(
+                self.task_id,
+                crate::history::FileExtractionRow::failed(input, candidate.embedded_offset, reason),
+            );
+        }
+        finish_execution(
+            self.execution,
+            self.task_id,
+            self.node_id,
+            self.generation,
+            "failed",
+            Some(reason),
+            None,
+            false,
+        )
+        .await?;
+        skipped.push(candidate);
+        Ok(())
     }
 }
 

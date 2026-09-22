@@ -109,7 +109,7 @@ impl SourceCleanup {
         result: &mut ExtractWorkflowResult,
         cancellation: &tokio_util::sync::CancellationToken,
         recycler: &ArchiveRecycleHandler,
-        listener: Option<&crate::TaskEventListener>,
+        events: &crate::events::EventSink,
     ) {
         let Some(cleanup) = cleanup else {
             return;
@@ -145,10 +145,7 @@ impl SourceCleanup {
                 task_id: result.task_id.clone(),
                 kind: smartzip_core::TaskEventKind::Warning { message },
             };
-            if let Some(listener) = listener {
-                listener(&event);
-            }
-            result.events.push(event);
+            events.push(event);
         }
     }
 }

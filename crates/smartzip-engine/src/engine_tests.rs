@@ -2299,19 +2299,9 @@ async fn configured_cleanup_keep_never_calls_recycler_and_policy_is_a_snapshot()
             calls.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }));
-    let mut next_task_policy = policy;
-    next_task_policy
-        .resolved
-        .values
-        .extraction
-        .cleanup
-        .nested_archives = smartzip_config::Cleanup::Delete;
-    next_task_policy
-        .resolved
-        .values
-        .extraction
-        .recursion
-        .enabled = false;
+    let mut next_task_policy = policy.resolved().clone();
+    next_task_policy.values.extraction.cleanup.nested_archives = smartzip_config::Cleanup::Delete;
+    next_task_policy.values.extraction.recursion.enabled = false;
     let backend = FakeBackend::default();
     let result = engine
         .extract_recursive(
@@ -2677,3 +2667,5 @@ async fn stateless_embedded_inputs_extract_before_scanning_later_carriers() {
         observed.lock().unwrap()
     );
 }
+
+mod execution_cleanup;

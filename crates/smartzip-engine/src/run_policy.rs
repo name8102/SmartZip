@@ -7,12 +7,15 @@ use smartzip_config as config;
 
 #[derive(Debug, Clone)]
 pub struct CompiledRunPolicy {
-    pub resolved: config::ResolvedConfig,
+    resolved: config::ResolvedConfig,
 }
 impl CompiledRunPolicy {
     pub fn compile(resolved: config::ResolvedConfig) -> std::io::Result<Self> {
         resolved.values.validate()?;
         Ok(Self { resolved })
+    }
+    pub fn resolved(&self) -> &config::ResolvedConfig {
+        &self.resolved
     }
     pub fn values(&self) -> &config::SmartZipConfig {
         &self.resolved.values
@@ -112,32 +115,9 @@ impl CompiledRunPolicy {
         }
     }
     pub fn stage_plan(&self) -> Vec<smartzip_core::TaskEventKind> {
-        let events = crate::events::EventSink::new(None);
-        self.emit_plan(&events, &smartzip_core::TaskId::new());
-        events.snapshot().into_iter().map(|event| event.kind).filter(|kind| !matches!(kind, smartzip_core::TaskEventKind::Decision { stage, .. } if stage == "task_policy")).collect()
-    }
-
-    pub(crate) fn emit_plan(
-        &self,
-        events: &crate::events::EventSink,
-        task_id: &smartzip_core::TaskId,
-    ) {
-        use smartzip_core::{TaskEvent, TaskEventKind};
-        events.push(TaskEvent {
-            task_id: task_id.clone(),
-            kind: TaskEventKind::Decision {
-                stage: "task_policy".into(),
-                action: "snapshot".into(),
-                reason: "resolved_configuration".into(),
-                policy_key: "defaults_version".into(),
-                source: "resolved".into(),
-                detail: Some(
-                    serde_json::to_string(&self.resolved).expect("configuration is serializable"),
-                ),
-            },
-        });
+        let mut plan = Vec::new();
         for (key, reason) in self.resolved.explanation() {
-            self.decision(events, task_id, "policy", "skip", &reason, &key);
+            plan.push(self.decision_kind("policy", "skip", &reason, &key));
         }
         let c = self.values();
         for (stage, key, enabled) in [
@@ -174,9 +154,7 @@ impl CompiledRunPolicy {
                 c.extraction.cleanup.nested_archives != config::Cleanup::Keep,
             ),
         ] {
-            self.decision(
-                events,
-                task_id,
+            plan.push(self.decision_kind(
                 stage,
                 if enabled { "allow" } else { "skip" },
                 if enabled {
@@ -185,7 +163,35 @@ impl CompiledRunPolicy {
                     "disabled_by_config"
                 },
                 key,
-            );
+            ));
+        }
+        plan
+    }
+
+    pub(crate) fn emit_plan(
+        &self,
+        events: &crate::events::EventSink,
+        task_id: &smartzip_core::TaskId,
+    ) {
+        use smartzip_core::{TaskEvent, TaskEventKind};
+        events.push(TaskEvent {
+            task_id: task_id.clone(),
+            kind: TaskEventKind::Decision {
+                stage: "task_policy".into(),
+                action: "snapshot".into(),
+                reason: "resolved_configuration".into(),
+                policy_key: "defaults_version".into(),
+                source: "resolved".into(),
+                detail: Some(
+                    serde_json::to_string(&self.resolved).expect("configuration is serializable"),
+                ),
+            },
+        });
+        for kind in self.stage_plan() {
+            events.push(TaskEvent {
+                task_id: task_id.clone(),
+                kind,
+            });
         }
     }
     pub(crate) fn decision(
@@ -199,20 +205,29 @@ impl CompiledRunPolicy {
     ) {
         events.push(smartzip_core::TaskEvent {
             task_id: task_id.clone(),
-            kind: smartzip_core::TaskEventKind::Decision {
-                stage: stage.into(),
-                action: action.into(),
-                reason: reason.into(),
-                policy_key: key.into(),
-                source: self
-                    .resolved
-                    .origins
-                    .get(key)
-                    .cloned()
-                    .unwrap_or_else(|| "defaults-v1".into()),
-                detail: None,
-            },
+            kind: self.decision_kind(stage, action, reason, key),
         });
+    }
+    fn decision_kind(
+        &self,
+        stage: &str,
+        action: &str,
+        reason: &str,
+        key: &str,
+    ) -> smartzip_core::TaskEventKind {
+        smartzip_core::TaskEventKind::Decision {
+            stage: stage.into(),
+            action: action.into(),
+            reason: reason.into(),
+            policy_key: key.into(),
+            source: self
+                .resolved
+                .origins
+                .get(key)
+                .cloned()
+                .unwrap_or_else(|| "defaults-v1".into()),
+            detail: None,
+        }
     }
 }
 

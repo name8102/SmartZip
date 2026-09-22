@@ -121,20 +121,6 @@ impl ExecutionCoordinator {
                     task.task_id
                 ))
             })?;
-        plan.request.inputs = task
-            .nodes
-            .iter()
-            .map(|node| {
-                serde_json::from_str::<crate::ExtractionCandidate>(&node.input_ref_json)
-                    .map(|candidate| candidate.path)
-                    .map_err(|error| {
-                        StateStoreError::InvalidSubmission(format!(
-                            "recoverable node {} has an invalid input reference: {error}",
-                            node.node_id
-                        ))
-                    })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
         let roots = task
             .nodes
             .iter()
@@ -158,6 +144,10 @@ impl ExecutionCoordinator {
                 })
             })
             .collect::<Result<Vec<_>, StateStoreError>>()?;
+        plan.request.inputs = roots
+            .iter()
+            .map(|root| root.candidate.path.clone())
+            .collect();
         Ok((
             plan,
             ExtractTaskIdentity {

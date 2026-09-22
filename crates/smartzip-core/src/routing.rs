@@ -118,7 +118,7 @@ impl TaskRouteContext {
 pub struct TaskExecutionContext {
     task_id: TaskId,
     sink: Arc<dyn TaskEventSink>,
-    route: Mutex<TaskRouteContext>,
+    route: Arc<Mutex<TaskRouteContext>>,
     cancellation: tokio_util::sync::CancellationToken,
 }
 
@@ -137,7 +137,7 @@ impl TaskExecutionContext {
         Self {
             task_id,
             sink,
-            route: Mutex::new(TaskRouteContext::default()),
+            route: Arc::new(Mutex::new(TaskRouteContext::default())),
             cancellation: tokio_util::sync::CancellationToken::new(),
         }
     }
@@ -145,6 +145,21 @@ impl TaskExecutionContext {
     pub fn with_cancellation(mut self, cancellation: tokio_util::sync::CancellationToken) -> Self {
         self.cancellation = cancellation;
         self
+    }
+
+    /// Share this task's negative capability cache while routing a root's events
+    /// and cancellation independently. Separate tasks still have separate caches.
+    pub fn scoped(
+        &self,
+        sink: Arc<dyn TaskEventSink>,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) -> Self {
+        Self {
+            task_id: self.task_id.clone(),
+            route: self.route.clone(),
+            sink,
+            cancellation,
+        }
     }
 
     pub fn emit_progress(&self, progress: crate::TaskProgress) {
@@ -198,4 +213,36 @@ pub enum RouteEvent {
     BackendAttemptCleaned { adapter_id: String },
     BackendSelected { adapter_id: String },
     RouteExhausted { attempted: Vec<String> },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scoped_context_shares_cache_but_keeps_root_cancellation_independent() {
+        let task = TaskExecutionContext::detached();
+        let first = task.scoped(
+            Arc::new(DiscardingTaskEventSink),
+            task.cancellation_token().child_token(),
+        );
+        let second = task.scoped(
+            Arc::new(DiscardingTaskEventSink),
+            task.cancellation_token().child_token(),
+        );
+        let key = NegativeCapabilityKey {
+            adapter_id: "backend".into(),
+            operation: ArchiveOperation::Extract,
+            container: None,
+            codec: None,
+        };
+        first.record_rejection(key.clone(), "unsupported codec");
+        assert_eq!(second.rejection(&key).as_deref(), Some("unsupported codec"));
+        assert!(TaskExecutionContext::detached().rejection(&key).is_none());
+        first.cancel();
+        assert!(!second.is_cancelled());
+        assert!(!task.is_cancelled());
+        task.cancel();
+        assert!(second.is_cancelled());
+    }
 }

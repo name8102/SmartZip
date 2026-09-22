@@ -19,6 +19,7 @@ struct RetainedEvents {
 pub(crate) struct EventSink {
     events: Arc<Mutex<RetainedEvents>>,
     listener: Option<TaskEventListener>,
+    delivery: Arc<Mutex<()>>,
 }
 
 impl TaskEventSink for EventSink {
@@ -32,14 +33,22 @@ impl EventSink {
         Self {
             events: Arc::new(Mutex::new(RetainedEvents::default())),
             listener,
+            delivery: Arc::new(Mutex::new(())),
+        }
+    }
+
+    /// Attach root-local live observation while sharing task retention/order.
+    pub(crate) fn with_listener(&self, listener: Option<TaskEventListener>) -> Self {
+        Self {
+            listener,
+            ..self.clone()
         }
     }
 
     pub(crate) fn push(&self, event: TaskEvent) {
-        // Live listeners receive every event; only retained diagnostics are bounded.
-        if let Some(listener) = &self.listener {
-            listener(&event);
-        }
+        // Backend callbacks can arrive on different threads. Serialize delivery
+        // with retention, without holding the retained buffer during callbacks.
+        let _delivery = self.delivery.lock().unwrap_or_else(|p| p.into_inner());
         let mut retained = self.events.lock().unwrap_or_else(|p| p.into_inner());
         if retained.events.len() == RETAINED_EVENTS - 1 {
             // Keep task start/policy context and the most recent diagnostics,
@@ -47,7 +56,11 @@ impl EventSink {
             retained.events.remove(2);
             retained.dropped += 1;
         }
-        retained.events.push_back(event);
+        retained.events.push_back(event.clone());
+        drop(retained);
+        if let Some(listener) = &self.listener {
+            listener(&event);
+        }
     }
 
     pub(crate) fn snapshot(&self) -> Vec<TaskEvent> {

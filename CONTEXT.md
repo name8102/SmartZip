@@ -44,9 +44,9 @@
 |------|------------|
 | **TaskEvent** | 工作流唯一任务可观测时间线：生命周期、进度、密码、编码、内嵌归档、输出，以及经 `TaskEventKind::Route` 承载的路由观测。默认输出摘要，verbose 展示排除原因与 fallback 链；密码及敏感参数不得进入事件。 |
 | **RouteEvent** | 路由域载荷（RoutePlanned / BackendAttempt* / BackendSelected / RouteExhausted 等），**不是**独立收集通道。只作为 `TaskEvent` 的一部分出现在任务时间线中。 |
-| **Task-scoped execution context** | 单次工作流任务内的可变作用域：持有有序 `TaskEvent` 列表、任务级负面能力缓存（原 `TaskRouteContext` 语义），并可被 engine 与 `ArchiveExecutor` 共享写入。实现类型名未冻结；最终形态可扩展 `ArchiveExecutor` 各 operation 的参数，或经 `begin_task` 绑定的 sink 分阶段落地。 |
+| **Task-scoped execution context** | 单次解压任务共享事件保留预算、负面能力缓存、资源预算、去重与批次密码；根输入仍独立接收事件与取消信号。生命周期与历史收尾在任务层执行一次。 |
 | **Event channel** | ADR-002：有界 `tokio::sync::mpsc` 在统一 `TaskEvent` 时间线**之后**接入；实时推送与最终 `ExtractWorkflowResult` 事件集合并存。背压策略不得拖慢解压。 |
-| **ExtractWorkflowResult** | `extract_recursive` 的返回值。包含 processed/skipped/enqueued 列表 + **完整**任务事件集合（含路由事件）。CLI/GUI 与测试以该集合为权威观测面，不从 `BackendRouter` 再取旁路事件。 |
+| **ExtractWorkflowResult** | 解压入口的返回值。包含按输入顺序聚合的 processed/skipped/enqueued 列表，以及按发生顺序保留的任务事件（含路由事件，最多 4096 条，超限有截断说明）。listener 接收实时事件；不从 `BackendRouter` 另取事件。 |
 
 ## Password Model
 
@@ -63,6 +63,8 @@
 |------|------------|
 | **TaskHistoryRecorder** | 调用方注入的历史记录接口，保存任务、事件和 per-file 解压动作，并更新 `known_files`。写库失败降级为 Warning，不中断解压。 |
 | **DbTaskHistoryRecorder** | `TaskHistoryRecorder` 的 SQLite 实现，借用 `&rusqlite::Connection`。`Connection` 是 `!Sync`，因此 trait 不加 `Send + Sync` 约束——与已有的 `&PasswordService` 一样，解压 future 本就是 non-Send，仅 `.await` 不 spawn。 |
+| **PreparedExtractTask** | CLI/GUI 新建与恢复解压共用的准备入口：持有只读 `CompiledRunPolicy`、规范化请求与任务身份，生成脱敏提交快照，并按该任务策略构造密码、历史与已知文件服务。恢复保留节点代次和累计预算。 |
+| **ExecutionControl** | 主动执行控制接口，负责阶段准入、用户决定与持久化提交；`ExecutionStateRecorder` 是兼容别名。与 best-effort 历史观察职责分开。 |
 | **TaskOutcome** | 任务结束时交给 `finish()` 的聚合值。v3 精简为终态（completed/partial/failed/cancelled）+ 输出根路径；`encoding_selected` / `embedded_found` 等明细下沉到 `file_extractions`，不再作为 task 级聚合累积。 |
 | **sample_hash** | 内容采样指纹：`BLAKE3(前 64KB ‖ 后 64KB)` 与 `file_size` 联合判等；文件小于 128KB 时全量哈希。内嵌归档按其范围采样，范围未知时不参与去重。 |
 | **known_files** | `UNIQUE(sample_hash, size)` 复用索引，保存精确密码记忆、人工确认编码、成功解压时间和 name/offset 配对。自动猜测不覆盖人工确认编码。 |

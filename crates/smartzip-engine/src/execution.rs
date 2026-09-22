@@ -226,8 +226,10 @@ impl NodeOutcome {
     }
 }
 
+/// Active execution authority: stage admission, decisions, and durable commits.
+/// History observation remains a separate best-effort interface.
 #[async_trait(?Send)]
-pub trait ExecutionStateRecorder {
+pub trait ExecutionControl {
     fn volume_selected(&self, _node_id: &NodeId, _members: Vec<PathBuf>) {}
 
     /// Whether this recorder owns durable history, rather than only live UI state.
