@@ -604,6 +604,11 @@ pub struct RunStores<'a> {
     pub history: Option<&'a dyn TaskHistoryRecorder>,
     pub known_files: Option<&'a dyn KnownFileStore>,
 }
+impl RunStores<'_> {
+    pub fn recorder(&self) -> Option<&dyn TaskHistoryRecorder> {
+        (self.history.is_some() || self.known_files.is_some()).then_some(self)
+    }
+}
 impl TaskHistoryRecorder for RunStores<'_> {
     fn start_task(&self, id: &TaskId, kind: &str, output: Option<&Path>) {
         if let Some(s) = self.history {

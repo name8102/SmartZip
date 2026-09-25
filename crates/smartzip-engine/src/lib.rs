@@ -53,7 +53,37 @@ pub use types::{
     ListArchiveRequest, ListArchiveResult, SmartZipEngine,
 };
 
+/// Interactive capabilities supplied by the host; task policy may disable them.
+#[derive(Default)]
+pub struct ExtractPrompts<'a> {
+    pub password: Option<&'a dyn InteractivePasswordPrompter>,
+    pub output: Option<&'a dyn InteractiveOutputPrompter>,
+    pub embedded: Option<&'a dyn InteractiveEmbeddedPrompter>,
+    pub encoding: Option<&'a dyn InteractiveEncodingPrompter>,
+}
+
+#[derive(Default)]
+pub struct ExtractObserver<'a> {
+    pub listener: Option<TaskEventListener>,
+    pub history: Option<&'a dyn history::TaskHistoryRecorder>,
+}
+
 impl SmartZipEngine {
+    /// Execute an effective request without applying configuration again.
+    /// Configured hosts build it with `CompiledRunPolicy::extract_request` from
+    /// the same snapshot passed to `with_run_policy`. Legacy recursive entry
+    /// points continue applying policy to their caller-supplied requests.
+    pub async fn extract<B: ArchiveExecutor>(
+        &self,
+        backend: &B,
+        passwords: &PasswordService<'_>,
+        request: ExtractWorkflowRequest,
+        prompts: ExtractPrompts<'_>,
+        observer: ExtractObserver<'_>,
+    ) -> smartzip_core::Result<ExtractWorkflowResult> {
+        extract_workflow::run(self, backend, passwords, request, prompts, observer).await
+    }
+
     pub async fn test_archives<B: ArchiveExecutor>(
         &self,
         backend: &B,
@@ -229,7 +259,7 @@ impl SmartZipEngine {
         &self,
         backend: &B,
         passwords: &PasswordService<'_>,
-        request: ExtractWorkflowRequest,
+        mut request: ExtractWorkflowRequest,
         password_prompter: Option<&dyn InteractivePasswordPrompter>,
         output_prompter: Option<&dyn InteractiveOutputPrompter>,
         embedded_prompter: Option<&dyn InteractiveEmbeddedPrompter>,
@@ -237,21 +267,20 @@ impl SmartZipEngine {
         listener: Option<TaskEventListener>,
         history: Option<&dyn history::TaskHistoryRecorder>,
     ) -> smartzip_core::Result<ExtractWorkflowResult> {
-        workflow::extract_recursive_with_listener_interactive(
-            &self.scanner,
-            self.run_policy.as_deref(),
-            self.min_embedded_size_bytes,
-            &self.archive_recycler,
-            self.cancellation.clone(),
+        if let Some(policy) = &self.run_policy {
+            policy.apply_request(&mut request);
+        }
+        self.extract(
             backend,
             passwords,
             request,
-            password_prompter,
-            output_prompter,
-            embedded_prompter,
-            encoding_prompter,
-            listener,
-            history,
+            ExtractPrompts {
+                password: password_prompter,
+                output: output_prompter,
+                embedded: embedded_prompter,
+                encoding: encoding_prompter,
+            },
+            ExtractObserver { listener, history },
         )
         .await
     }

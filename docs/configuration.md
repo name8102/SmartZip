@@ -126,7 +126,7 @@ smartzip --config old.toml config migrate --apply
 
 当前 `--explain` 和 `--dry-run` 都只生成配置阶段计划：不读归档、不探测后端、不访问数据库，也不准确预演嵌套成员与最终布局；这些动态内容标记为运行后才能确定。`--dry-run` 尚未增加列表预演。
 
-运行事件新增结构化 `Decision`，包含 `stage/action/reason/policy_key/source/detail`，用于策略跳过与需要确认的决定；已有路由、密码、编码、布局事件继续保留。任务记录保存一次配置快照，快照不含手动密码。完整事件可通过 JSON 或启用的任务历史查看。
+运行事件新增结构化 `Decision`，包含 `stage/action/reason/policy_key/source/detail`，用于策略跳过与需要确认的决定；已有路由、密码、编码、布局事件继续保留。任务记录保存一次配置快照，快照不含手动密码。保留的事件可通过 JSON 或启用的任务历史查看；进度保留规则见 [事件模型](../CONTEXT.md#event-model)。
 
 编辑使用 `toml_edit` 保留未改字段与注释，经校验后在同目录临时写入并原子替换；通过锁文件和原文复核拒绝并发冲突。符号链接和只读文件可读取但拒绝保存。旧无版本配置仅在内存中转换：原 `[extraction]` 资源限制迁至 `[limits]`。只有 `migrate --apply` 才改写，并先创建不覆盖的 `.toml.v0.bak` 备份。
 

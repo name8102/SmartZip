@@ -1434,19 +1434,9 @@ async fn configured_cleanup_keep_never_calls_recycler_and_policy_is_a_snapshot()
             calls.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }));
-    let mut next_task_policy = policy;
-    next_task_policy
-        .resolved
-        .values
-        .extraction
-        .cleanup
-        .nested_archives = smartzip_config::Cleanup::Delete;
-    next_task_policy
-        .resolved
-        .values
-        .extraction
-        .recursion
-        .enabled = false;
+    let mut next_task_config = policy.resolved().clone();
+    next_task_config.values.extraction.cleanup.nested_archives = smartzip_config::Cleanup::Delete;
+    next_task_config.values.extraction.recursion.enabled = false;
     let backend = FakeBackend::default();
     let result = engine
         .extract_recursive(
@@ -1477,4 +1467,342 @@ async fn configured_cleanup_keep_never_calls_recycler_and_policy_is_a_snapshot()
     assert_eq!(recycled.load(Ordering::SeqCst), 0);
     assert!(input.exists());
     assert!(root.path().join("out/root/nested.zip").exists());
+}
+
+fn extraction_policy() -> crate::CompiledRunPolicy {
+    let mut resolved = smartzip_config::ResolvedConfig::load(None).unwrap();
+    let c = &mut resolved.values;
+    c.extraction.recursion.enabled = false;
+    c.extraction.embedded.root = smartzip_config::RootScan::Off;
+    c.extraction.embedded.nested = smartzip_config::NestedScan::Off;
+    c.extraction.volumes.auto_discover = false;
+    c.extraction.encoding.mode = "backend".into();
+    c.extraction.output.layout = smartzip_config::Layout::Raw;
+    crate::CompiledRunPolicy::compile(resolved).unwrap()
+}
+
+#[tokio::test]
+async fn canonical_and_legacy_extract_preserve_mixed_outcomes_and_event_order() {
+    use crate::history::TaskCompletionStatus;
+    use smartzip_db::file_extractions::FileExtractionRepository;
+    let root = tempfile::tempdir().unwrap();
+    let input = root.path().join("good.zip");
+    let missing = root.path().join("missing.zip");
+    let output = root.path().join("out");
+    std::fs::write(&input, b"archive").unwrap();
+    let inputs = vec![input.clone(), input.clone(), missing];
+    let policy = extraction_policy();
+    let engine = SmartZipEngine::default().with_run_policy(policy.clone());
+    let mut timelines = Vec::new();
+    for canonical in [false, true] {
+        let db = SmartZipDb::in_memory().unwrap();
+        let services = policy.services(Some(db.connection()));
+        let stores = services.stores();
+        let mut request = policy.extract_request(inputs.clone(), output.clone());
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let captured = observed.clone();
+        let listener: crate::TaskEventListener = Arc::new(move |event| {
+            captured.lock().unwrap().push(event.clone());
+        });
+        let result = if canonical {
+            engine
+                .extract(
+                    &FakeBackend::default(),
+                    &services.passwords,
+                    request,
+                    crate::ExtractPrompts::default(),
+                    crate::ExtractObserver {
+                        listener: Some(listener),
+                        history: stores.recorder(),
+                    },
+                )
+                .await
+        } else {
+            // The compatibility API still resolves legacy overrides at its boundary.
+            request.recursion_limit = 9;
+            request.layout_policy = crate::layout::OutputLayoutPolicy::Conservative;
+            engine
+                .extract_recursive_with_listener_interactive(
+                    &FakeBackend::default(),
+                    &services.passwords,
+                    request,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(listener),
+                    stores.recorder(),
+                )
+                .await
+        }
+        .unwrap();
+        assert_eq!(result.status, TaskCompletionStatus::Partial);
+        assert_eq!(result.failed_count, 1);
+        assert_eq!(result.processed.len(), 1);
+        assert_eq!(result.skipped.len(), 2);
+        assert_eq!(*observed.lock().unwrap(), result.events);
+        assert_eq!(
+            result
+                .events
+                .iter()
+                .filter(|e| matches!(e.kind, TaskEventKind::Started))
+                .count(),
+            1
+        );
+        assert_eq!(
+            result
+                .events
+                .iter()
+                .filter(|e| matches!(e.kind, TaskEventKind::Finished { .. }))
+                .count(),
+            1
+        );
+        let rows = FileExtractionRepository::new(db.connection())
+            .list_by_task(result.task_id.as_str())
+            .unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|r| (r.status.as_str(), r.reason.as_deref()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("extracted", None),
+                ("skipped", Some("duplicate")),
+                ("skipped", Some("not_found"))
+            ]
+        );
+        assert_eq!(
+            std::fs::read(output.join("good/extracted.txt")).unwrap(),
+            b"content"
+        );
+        timelines.push(
+            result
+                .events
+                .into_iter()
+                .map(|e| e.kind)
+                .collect::<Vec<_>>(),
+        );
+        std::fs::remove_dir_all(&output).unwrap();
+    }
+    assert_eq!(timelines[0], timelines[1]);
+}
+
+#[rstest]
+#[case(
+    smartzip_config::StateMode::Off,
+    smartzip_config::StateMode::ReadWrite,
+    true,
+    false,
+    false
+)]
+#[case(
+    smartzip_config::StateMode::ReadOnly,
+    smartzip_config::StateMode::ReadWrite,
+    true,
+    false,
+    false
+)]
+#[case(
+    smartzip_config::StateMode::ReadWrite,
+    smartzip_config::StateMode::ReadWrite,
+    false,
+    false,
+    true
+)]
+#[case(
+    smartzip_config::StateMode::ReadWrite,
+    smartzip_config::StateMode::Off,
+    true,
+    true,
+    false
+)]
+#[case(
+    smartzip_config::StateMode::ReadWrite,
+    smartzip_config::StateMode::ReadOnly,
+    true,
+    true,
+    false
+)]
+#[case(
+    smartzip_config::StateMode::ReadWrite,
+    smartzip_config::StateMode::ReadWrite,
+    true,
+    true,
+    true
+)]
+#[tokio::test]
+async fn configured_services_preserve_independent_state_permissions(
+    #[case] state: smartzip_config::StateMode,
+    #[case] known: smartzip_config::StateMode,
+    #[case] history: bool,
+    #[case] writes_history: bool,
+    #[case] writes_known: bool,
+) {
+    let root = tempfile::tempdir().unwrap();
+    let input = root.path().join("good.zip");
+    std::fs::write(&input, b"archive").unwrap();
+    let mut resolved = extraction_policy().resolved().clone();
+    resolved.values.state.mode = state;
+    resolved.values.state.known_files = known;
+    resolved.values.state.history = history;
+    resolved.values.passwords.save_success = true;
+    resolved.values.passwords.record_statistics = true;
+    let policy = crate::CompiledRunPolicy::compile(resolved).unwrap();
+    let db = SmartZipDb::in_memory().unwrap();
+    let changes = db.connection().total_changes();
+    let services = policy.services(Some(db.connection()));
+    let stores = services.stores();
+    let mut request = policy.extract_request(vec![input], root.path().join("out"));
+    request
+        .password_candidates
+        .manual
+        .push("invocation-secret".into());
+    let result = SmartZipEngine::default()
+        .with_run_policy(policy)
+        .extract(
+            &FakeBackend::default(),
+            &services.passwords,
+            request,
+            crate::ExtractPrompts::default(),
+            crate::ExtractObserver {
+                listener: None,
+                history: stores.recorder(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        result.status,
+        crate::history::TaskCompletionStatus::Completed
+    );
+    let count = |table: &str| {
+        db.connection()
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap()
+    };
+    assert_eq!(count("tasks"), i64::from(writes_history));
+    assert_eq!(count("file_extractions"), i64::from(writes_history));
+    assert_eq!(count("known_files"), i64::from(writes_known));
+    assert_eq!(
+        count("passwords"),
+        i64::from(state == smartzip_config::StateMode::ReadWrite)
+    );
+    if state != smartzip_config::StateMode::ReadWrite {
+        assert_eq!(db.connection().total_changes(), changes);
+    }
+    assert!(!serde_json::to_string(&result.events)
+        .unwrap()
+        .contains("invocation-secret"));
+}
+
+#[rstest]
+#[case(
+    smartzip_config::InteractionMode::Never,
+    0,
+    crate::history::TaskCompletionStatus::Failed
+)]
+#[case(
+    smartzip_config::InteractionMode::Always,
+    1,
+    crate::history::TaskCompletionStatus::Completed
+)]
+#[tokio::test]
+async fn each_task_uses_its_own_interaction_policy(
+    #[case] interaction: smartzip_config::InteractionMode,
+    #[case] expected_prompts: usize,
+    #[case] expected_status: crate::history::TaskCompletionStatus,
+) {
+    let root = tempfile::tempdir().unwrap();
+    let input = root.path().join("secret.zip");
+    std::fs::write(&input, b"archive").unwrap();
+    let mut resolved = extraction_policy().resolved().clone();
+    resolved.values.interaction.mode = interaction;
+    resolved.values.state.mode = smartzip_config::StateMode::Off;
+    let policy = crate::CompiledRunPolicy::compile(resolved).unwrap();
+    let services = policy.services(None);
+    let request = policy.extract_request(vec![input], root.path().join("out"));
+    let prompter = CountingPasswordPrompter {
+        calls: AtomicUsize::new(0),
+    };
+    let result = SmartZipEngine::default()
+        .with_run_policy(policy)
+        .extract(
+            &BatchPasswordBackend::default(),
+            &services.passwords,
+            request,
+            crate::ExtractPrompts {
+                password: Some(&prompter),
+                ..Default::default()
+            },
+            crate::ExtractObserver::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.status, expected_status);
+    assert_eq!(prompter.calls.load(Ordering::SeqCst), expected_prompts);
+    assert!(!root.path().join("out/secret/wrong-partial.txt").exists());
+    assert!(!serde_json::to_string(&result.events)
+        .unwrap()
+        .contains("batch-secret"));
+}
+
+#[rstest]
+#[case(false, "failed", 1)]
+#[case(true, "skipped", 0)]
+#[tokio::test]
+async fn password_failure_or_declined_prompt_records_one_outcome_and_cleans_staging(
+    #[case] may_prompt: bool,
+    #[case] expected_row_status: &str,
+    #[case] expected_failures: usize,
+) {
+    let root = tempfile::tempdir().unwrap();
+    let input = root.path().join("secret.zip");
+    let output = root.path().join("out");
+    std::fs::write(&input, b"archive").unwrap();
+    let policy = extraction_policy();
+    let db = SmartZipDb::in_memory().unwrap();
+    let services = policy.services(Some(db.connection()));
+    let stores = services.stores();
+    let request = policy.extract_request(vec![input.clone()], output.clone());
+    let prompt = ListingPasswordPrompt(None);
+    let result = SmartZipEngine::default()
+        .with_run_policy(policy)
+        .extract(
+            &BatchPasswordBackend::default(),
+            &services.passwords,
+            request,
+            crate::ExtractPrompts {
+                password: may_prompt.then_some(&prompt as &dyn InteractivePasswordPrompter),
+                ..Default::default()
+            },
+            crate::ExtractObserver {
+                listener: None,
+                history: stores.recorder(),
+            },
+        )
+        .await
+        .unwrap();
+    let rows = smartzip_db::file_extractions::FileExtractionRepository::new(db.connection())
+        .list_by_task(result.task_id.as_str())
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status, expected_row_status);
+    assert_eq!(rows[0].reason.as_deref(), Some("password_indeterminate"));
+    assert_eq!(result.failed_count, expected_failures);
+    assert_eq!(result.skipped.len(), 1);
+    assert!(result.processed.is_empty());
+    assert_eq!(
+        result
+            .events
+            .iter()
+            .filter(|e| matches!(e.kind, TaskEventKind::Failed { .. }))
+            .count(),
+        expected_failures
+    );
+    assert!(!output.join("secret").exists());
+    if output.exists() {
+        assert_eq!(std::fs::read_dir(output).unwrap().count(), 0);
+    }
+    assert_eq!(std::fs::read(input).unwrap(), b"archive");
 }

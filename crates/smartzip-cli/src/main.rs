@@ -3,12 +3,10 @@ use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use smartzip_archive::{ArchiveExecutor, BackendRouter};
 use smartzip_core::{EncodingMode, TaskEvent, TaskEventSink, TaskId};
 use smartzip_db::{password::PasswordRepository, SmartZipDb};
-use smartzip_engine::name_score;
 use smartzip_engine::{
-    EmbeddedSelectionChoice, EncodingConfirmationChoice, ExtractWorkflowRequest,
-    FileAwareDetectResult, InspectRequest, InteractiveEmbeddedPrompter,
-    InteractiveEncodingPrompter, InteractiveOutputPrompter, InteractivePasswordPrompter,
-    ListArchiveRequest, OutputCollisionStrategy, SmartZipEngine,
+    EmbeddedSelectionChoice, EncodingConfirmationChoice, FileAwareDetectResult, InspectRequest,
+    InteractiveEmbeddedPrompter, InteractiveEncodingPrompter, InteractiveOutputPrompter,
+    InteractivePasswordPrompter, ListArchiveRequest, OutputCollisionStrategy, SmartZipEngine,
 };
 use smartzip_passwords::{PasswordCandidateRequest, PasswordService};
 use smartzip_platform::PlatformPaths;
@@ -614,7 +612,7 @@ async fn run(mut cli: Cli, matches: &clap::ArgMatches) -> Result<(), Box<dyn std
         println!(
             "{}",
             serde_json::to_string_pretty(
-                &serde_json::json!({"schema_version": 1, "configuration": policy.resolved, "inactive": policy.resolved.explanation(), "stages": policy.stage_plan(), "dynamic_content": "unknown_until_run", "root_archives": "keep", "transaction": "staged"})
+                &serde_json::json!({"schema_version": 1, "configuration": policy.resolved(), "inactive": policy.resolved().explanation(), "stages": policy.stage_plan(), "dynamic_content": "unknown_until_run", "root_archives": "keep", "transaction": "staged"})
             )?
         );
         return Ok(());
@@ -632,7 +630,7 @@ async fn run(mut cli: Cli, matches: &clap::ArgMatches) -> Result<(), Box<dyn std
         policy.values().logging.level,
         smartzip_config::LogLevel::Off | smartzip_config::LogLevel::Error
     ) {
-        for diagnostic in &policy.resolved.diagnostics {
+        for diagnostic in &policy.resolved().diagnostics {
             eprintln!("configuration: {diagnostic}");
         }
     }
@@ -834,21 +832,15 @@ async fn run(mut cli: Cli, matches: &clap::ArgMatches) -> Result<(), Box<dyn std
         Command::Extract {
             paths,
             output,
-            recursion_limit,
             password: manual_passwords,
             no_empty,
             deep,
             max_scan_bytes,
-            encoding,
             json,
-            layout,
-            single_root_name,
-            dry_run,
             embedded,
-            dominant_min_ratio,
             confirm_large_scan,
             force,
-            no_history: _,
+            ..
         } => {
             let db = if policy.needs_database() {
                 Some(open_state_db(cli.db, policy.values().state.mode)?)
@@ -860,18 +852,12 @@ async fn run(mut cli: Cli, matches: &clap::ArgMatches) -> Result<(), Box<dyn std
                 db.as_ref(),
                 paths,
                 output,
-                recursion_limit,
                 manual_passwords,
                 no_empty,
                 deep,
                 max_scan_bytes,
-                &encoding,
                 json,
-                layout.into(),
-                single_root_name.into(),
-                dry_run,
                 embedded,
-                dominant_min_ratio,
                 confirm_large_scan,
                 force,
                 verbose_routing,
@@ -1129,55 +1115,6 @@ fn apply_cli_overrides(
     Ok(())
 }
 
-fn task_passwords<'a>(db: Option<&'a SmartZipDb>, safety: &SafetyOptions) -> PasswordService<'a> {
-    let c = safety.policy.as_ref().unwrap().values();
-    PasswordService::configured(
-        db.map(|db| PasswordRepository::new(db.connection())),
-        c.passwords.clone(),
-        c.state.mode,
-    )
-}
-fn task_stores<'a>(
-    db: Option<&'a SmartZipDb>,
-    safety: &SafetyOptions,
-) -> (
-    Option<smartzip_engine::history::DbTaskHistoryRecorder<'a>>,
-    Option<smartzip_engine::history::DbKnownFileStore<'a>>,
-) {
-    use smartzip_config::StateMode;
-    let c = safety.policy.as_ref().unwrap().values();
-    let history = db
-        .filter(|_| c.state.mode == StateMode::ReadWrite && c.state.history)
-        .map(|db| smartzip_engine::history::DbTaskHistoryRecorder::new(db.connection()));
-    let known = db
-        .filter(|_| c.state.mode != StateMode::Off && c.state.known_files != StateMode::Off)
-        .map(|db| smartzip_engine::history::DbKnownFileStore {
-            connection: db.connection(),
-            writable: c.state.mode == StateMode::ReadWrite
-                && c.state.known_files == StateMode::ReadWrite,
-            password_hint: c.extraction.reuse.password_hint
-                && c.passwords.mode == smartzip_config::PasswordMode::Auto
-                && c.passwords
-                    .sources
-                    .contains(&smartzip_config::PasswordSource::Known),
-            encoding_hint: c.extraction.reuse.encoding_hint && c.extraction.encoding.mode == "auto",
-        });
-    (history, known)
-}
-fn run_stores<'a>(
-    history: &'a Option<smartzip_engine::history::DbTaskHistoryRecorder<'_>>,
-    known: &'a Option<smartzip_engine::history::DbKnownFileStore<'_>>,
-) -> smartzip_engine::history::RunStores<'a> {
-    smartzip_engine::history::RunStores {
-        history: history
-            .as_ref()
-            .map(|s| s as &dyn smartzip_engine::history::TaskHistoryRecorder),
-        known_files: known
-            .as_ref()
-            .map(|s| s as &dyn smartzip_engine::history::KnownFileStore),
-    }
-}
-
 fn build_backend(
     config: &smartzip_config::BackendConfig,
     forced_adapter: Option<&str>,
@@ -1252,23 +1189,26 @@ async fn detect(
         min_confidence: min_confidence.into(),
         ..scanner_config(deep, max_scan_bytes)
     };
-    let service = task_passwords(db, safety);
+    let services = safety
+        .policy
+        .as_ref()
+        .unwrap()
+        .services(db.map(SmartZipDb::connection));
+    let service = &services.passwords;
     let engine = SmartZipEngine::with_scanner_config(config.clone())
         .with_cancellation_token(cancellation.clone())
         .with_run_policy(safety.policy.as_ref().unwrap().as_ref().clone());
-    let (history_store, known_store) = task_stores(db, safety);
-    let recorder = run_stores(&history_store, &known_store);
+    let stores = services.stores();
     let result = engine
         .inspect_file_with_listener(
             backend,
-            &service,
+            service,
             InspectRequest {
                 path,
                 scanner: config,
             },
             task_listener(json, verbose_routing, safety),
-            (history_store.is_some() || known_store.is_some())
-                .then_some(&recorder as &dyn smartzip_engine::history::TaskHistoryRecorder),
+            stores.recorder(),
         )
         .await?;
 
@@ -1286,11 +1226,15 @@ async fn test_archives(
     safety: &SafetyOptions,
     cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let service = task_passwords(db, safety);
+    let services = safety
+        .policy
+        .as_ref()
+        .unwrap()
+        .services(db.map(SmartZipDb::connection));
+    let service = &services.passwords;
     let engine = SmartZipEngine::with_scanner_config(request.scanner.clone())
         .with_run_policy(safety.policy.as_ref().unwrap().as_ref().clone());
-    let (history_store, known_store) = task_stores(db, safety);
-    let recorder = run_stores(&history_store, &known_store);
+    let stores = services.stores();
     let prompter = StdinPrompter {
         lock: StdinLock::configured(cancellation.clone(), safety, json),
     };
@@ -1319,7 +1263,7 @@ async fn test_archives(
     let result = engine
         .test_archives(
             backend,
-            &service,
+            service,
             request,
             if prompter.lock.interactive {
                 Some(&prompter)
@@ -1327,7 +1271,7 @@ async fn test_archives(
                 None
             },
             listener,
-            if no_history { None } else { Some(&recorder) },
+            if no_history { None } else { stores.recorder() },
         )
         .await;
     let result = result?;
@@ -1465,12 +1409,16 @@ async fn list_archive(
         min_confidence: min_confidence.into(),
         ..scanner_config(deep, max_scan_bytes)
     };
-    let service = task_passwords(db, safety);
+    let services = safety
+        .policy
+        .as_ref()
+        .unwrap()
+        .services(db.map(SmartZipDb::connection));
+    let service = &services.passwords;
     let engine = SmartZipEngine::with_scanner_config(config.clone())
         .with_cancellation_token(cancellation.clone())
         .with_run_policy(safety.policy.as_ref().unwrap().as_ref().clone());
-    let (history_store, known_store) = task_stores(db, safety);
-    let recorder = run_stores(&history_store, &known_store);
+    let stores = services.stores();
     let stdin_lock = StdinLock::configured(cancellation.clone(), safety, json);
     let password_prompter = StdinPrompter {
         lock: stdin_lock.clone(),
@@ -1480,7 +1428,7 @@ async fn list_archive(
     let result = engine
         .list_archive_with_listener_interactive(
             backend,
-            &service,
+            service,
             ListArchiveRequest {
                 path,
                 scanner: config,
@@ -1499,8 +1447,7 @@ async fn list_archive(
             },
             Some(&StdinEncodingPrompter { lock: stdin_lock }),
             task_listener(json, verbose_routing, safety),
-            (history_store.is_some() || known_store.is_some())
-                .then_some(&recorder as &dyn smartzip_engine::history::TaskHistoryRecorder),
+            stores.recorder(),
         )
         .await?;
 
@@ -1645,18 +1592,12 @@ async fn extract(
     db: Option<&SmartZipDb>,
     paths: Vec<PathBuf>,
     output: Option<PathBuf>,
-    recursion_limit: u8,
     manual_passwords: Vec<String>,
     no_empty: bool,
     deep: bool,
     max_scan_bytes: Option<u64>,
-    encoding: &str,
     json: bool,
-    layout_policy: smartzip_engine::layout::OutputLayoutPolicy,
-    single_root_name_policy: smartzip_engine::layout::SingleRootNamePolicy,
-    dry_run: bool,
     embedded: EmbeddedModeArg,
-    dominant_min_ratio: f32,
     confirm_large_scan: bool,
     force: bool,
     verbose_routing: bool,
@@ -1667,30 +1608,14 @@ async fn extract(
         return Err("no paths provided".into());
     }
 
-    if dry_run {
-        let output_dir = output.unwrap_or_else(|| default_output_dir(paths.first().unwrap()));
-        let archive_stem = name_score::archive_display_stem(paths.first().unwrap());
-        println!("Archive: {}", paths.first().unwrap().display());
-        println!("Archive stem: {archive_stem}");
-        println!("Layout policy: {layout_policy:?}");
-        println!("Note: --dry-run shows initial candidate path. Final layout depends on extracted content.");
-        println!(
-            "Planned output: {}",
-            output_dir.join(&archive_stem).display()
-        );
-        return Ok(());
-    }
-
-    let encoding_mode =
-        if encoding.eq_ignore_ascii_case("auto") || encoding.eq_ignore_ascii_case("backend") {
-            EncodingMode::Auto
-        } else {
-            EncodingMode::Override(encoding.to_string())
-        };
-
     let output_dir = output.unwrap_or_else(|| default_output_dir(paths.first().unwrap()));
 
-    let service = task_passwords(db, safety);
+    let services = safety
+        .policy
+        .as_ref()
+        .unwrap()
+        .services(db.map(SmartZipDb::connection));
+    let service = &services.passwords;
 
     let stdin_lock = StdinLock::configured(cancellation.clone(), safety, json);
     let password_prompter = StdinPrompter {
@@ -1701,49 +1626,43 @@ async fn extract(
         .with_run_policy(safety.policy.as_ref().unwrap().as_ref().clone());
     let event_listener = task_listener(json, verbose_routing, safety);
 
-    let (history_store, known_store) = task_stores(db, safety);
-    let recorder = run_stores(&history_store, &known_store);
-    let recorder_ref = (history_store.is_some() || known_store.is_some())
-        .then_some(&recorder as &dyn smartzip_engine::history::TaskHistoryRecorder);
+    let stores = services.stores();
+    let recorder_ref = stores.recorder();
 
+    let mut request = safety
+        .policy
+        .as_ref()
+        .unwrap()
+        .extract_request(paths, output_dir);
+    request.scanner = scanner_config(deep, max_scan_bytes);
+    request.password_candidates.manual = manual_passwords;
+    request.password_candidates.include_empty = !no_empty;
+    request.embedded_scan_mode = embedded.into();
+    request.confirm_large_scan = confirm_large_scan;
+    request.force = force;
     let result = engine
-        .extract_recursive_with_listener_interactive(
+        .extract(
             backend,
-            &service,
-            ExtractWorkflowRequest {
-                inputs: paths,
-                output_dir,
-                recursion_limit,
-                scanner: scanner_config(deep, max_scan_bytes),
-                encoding_mode,
-                password_candidates: PasswordCandidateRequest {
-                    manual: manual_passwords,
-                    clipboard: None,
-                    include_empty: !no_empty,
-                    limit: safety.password_limit,
+            service,
+            request,
+            smartzip_engine::ExtractPrompts {
+                password: if stdin_lock.interactive {
+                    Some(&password_prompter)
+                } else {
+                    None
                 },
-                layout_policy,
-                single_root_name_policy,
-                embedded_scan_mode: embedded.into(),
-                dominant_min_ratio,
-                confirm_large_scan,
-                force,
-                limits: safety.limits(),
+                output: Some(&StdinOutputPrompter {
+                    lock: stdin_lock.clone(),
+                }),
+                embedded: Some(&StdinEmbeddedPrompter {
+                    lock: stdin_lock.clone(),
+                }),
+                encoding: Some(&StdinEncodingPrompter { lock: stdin_lock }),
             },
-            if stdin_lock.interactive {
-                Some(&password_prompter)
-            } else {
-                None
+            smartzip_engine::ExtractObserver {
+                listener: event_listener,
+                history: recorder_ref,
             },
-            Some(&StdinOutputPrompter {
-                lock: stdin_lock.clone(),
-            }),
-            Some(&StdinEmbeddedPrompter {
-                lock: stdin_lock.clone(),
-            }),
-            Some(&StdinEncodingPrompter { lock: stdin_lock }),
-            event_listener,
-            recorder_ref,
         )
         .await?;
 

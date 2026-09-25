@@ -44,7 +44,7 @@
 | **RouteEvent** | 路由域载荷（RoutePlanned / BackendAttempt* / BackendSelected / RouteExhausted 等），**不是**独立收集通道。只作为 `TaskEvent` 的一部分出现在任务时间线中。 |
 | **Task-scoped execution context** | 单次工作流任务内的可变作用域：持有有序 `TaskEvent` 列表、任务级负面能力缓存（原 `TaskRouteContext` 语义），并可被 engine 与 `ArchiveExecutor` 共享写入。实现类型名未冻结；最终形态可扩展 `ArchiveExecutor` 各 operation 的参数，或经 `begin_task` 绑定的 sink 分阶段落地。 |
 | **Event channel** | ADR-002：有界 `tokio::sync::mpsc` 在统一 `TaskEvent` 时间线**之后**接入；实时推送与最终 `ExtractWorkflowResult` 事件集合并存。背压策略不得拖慢解压。 |
-| **ExtractWorkflowResult** | `extract_recursive` 的返回值。包含 processed/skipped/enqueued 列表 + **完整**任务事件集合（含路由事件）。CLI/GUI 与测试以该集合为权威观测面，不从 `BackendRouter` 再取旁路事件。 |
+| **ExtractWorkflowResult** | `extract` 及兼容入口 `extract_recursive*` 的返回值。包含完整的 processed/skipped/enqueued 列表与保留的任务事件（含路由事件）。当前每个任务最多保留前 4096 条 Progress；其余事件不受此进度上限影响，listener 仍接收全部事件。CLI/GUI 与测试以该集合为权威观测面，不从 `BackendRouter` 再取旁路事件。 |
 
 ## Password Model
 
@@ -83,6 +83,8 @@
 ### ADR-001: Thin engine with caller injection
 
 engine 负责工作流编排，由 CLI/GUI 注入后端、密码、交互和历史依赖，便于替换策略和测试。
+
+`CompiledRunPolicy` 保持只读快照，集中生成有效解压请求并装配借用数据库的密码、历史和已知文件服务。CLI/GUI 仍负责打开数据库与选择后端、交互方式。正式入口 `extract` 执行已解析请求，不再次覆盖配置；`extract_recursive*` 保留原有策略覆盖语义，在适配边界解析后转入同一工作流。
 
 ### ADR-002: Real-time event streaming via mpsc
 

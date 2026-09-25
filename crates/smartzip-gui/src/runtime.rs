@@ -359,45 +359,15 @@ async fn run_job_inner(
     mailbox: Mailbox,
     cancellation: CancellationToken,
 ) -> Result<JobOutcome, Box<dyn std::error::Error>> {
-    use smartzip_config::StateMode;
-    use smartzip_engine::history::{
-        DbKnownFileStore, DbTaskHistoryRecorder, KnownFileStore, RunStores, TaskHistoryRecorder,
-    };
     let policy = load_policy(&request)?;
     let c = policy.values();
     let db = open_database(&policy)?;
-    let passwords = smartzip_passwords::PasswordService::configured(
-        db.as_ref()
-            .map(|db| smartzip_db::password::PasswordRepository::new(db.connection())),
-        c.passwords.clone(),
-        c.state.mode,
-    );
-    let history = db
-        .as_ref()
-        .filter(|_| c.state.mode == StateMode::ReadWrite && c.state.history)
-        .map(|db| DbTaskHistoryRecorder::new(db.connection()));
-    let known = db
-        .as_ref()
-        .filter(|_| c.state.mode != StateMode::Off && c.state.known_files != StateMode::Off)
-        .map(|db| DbKnownFileStore {
-            connection: db.connection(),
-            writable: c.state.mode == StateMode::ReadWrite
-                && c.state.known_files == StateMode::ReadWrite,
-            password_hint: c.extraction.reuse.password_hint
-                && c.passwords.mode == smartzip_config::PasswordMode::Auto
-                && c.passwords
-                    .sources
-                    .contains(&smartzip_config::PasswordSource::Known),
-            encoding_hint: c.extraction.reuse.encoding_hint && c.extraction.encoding.mode == "auto",
-        });
-    let stores = RunStores {
-        history: history.as_ref().map(|s| s as &dyn TaskHistoryRecorder),
-        known_files: known.as_ref().map(|s| s as &dyn KnownFileStore),
-    };
-    let recorder =
-        (history.is_some() || known.is_some()).then_some(&stores as &dyn TaskHistoryRecorder);
+    let services = policy.services(db.as_ref().map(|db| db.connection()));
+    let stores = services.stores();
+    let recorder = stores.recorder();
+    let passwords = &services.passwords;
     let backend = smartzip_archive::BackendRouter::from_config(&c.backends)?;
-    let mut warnings = policy.resolved.diagnostics.clone();
+    let mut warnings = policy.resolved().diagnostics.clone();
     warnings.extend(backend.warnings().iter().cloned());
     let engine = SmartZipEngine::default()
         .with_cancellation_token(cancellation.clone())
@@ -438,36 +408,31 @@ async fn run_job_inner(
             } else {
                 vec![]
             };
+            let mut extraction = policy.extract_request(
+                request.paths.clone(),
+                request
+                    .settings
+                    .output
+                    .clone()
+                    .unwrap_or_else(|| path.parent().unwrap_or(Path::new(".")).into()),
+            );
+            extraction.scanner = scanner;
+            extraction.password_candidates = candidates;
             let result = engine
-                .extract_recursive_with_listener_interactive(
+                .extract(
                     &backend,
-                    &passwords,
-                    smartzip_engine::ExtractWorkflowRequest {
-                        inputs: request.paths.clone(),
-                        output_dir: request
-                            .settings
-                            .output
-                            .clone()
-                            .unwrap_or_else(|| path.parent().unwrap_or(Path::new(".")).into()),
-                        recursion_limit: c.extraction.recursion.max_depth,
-                        encoding_mode: encoding,
-                        scanner,
-                        password_candidates: candidates,
-                        layout_policy: smartzip_engine::layout::OutputLayoutPolicy::Conservative,
-                        single_root_name_policy:
-                            smartzip_engine::layout::SingleRootNamePolicy::Auto,
-                        embedded_scan_mode: smartzip_core::EmbeddedScanMode::Auto,
-                        dominant_min_ratio: c.extraction.embedded.dominant_min_ratio,
-                        confirm_large_scan: false,
-                        force: false,
-                        limits: c.limits.clone(),
+                    passwords,
+                    extraction,
+                    smartzip_engine::ExtractPrompts {
+                        password: password_prompt,
+                        output: Some(&prompts),
+                        embedded: Some(&prompts),
+                        encoding: Some(&prompts),
                     },
-                    password_prompt,
-                    Some(&prompts),
-                    Some(&prompts),
-                    Some(&prompts),
-                    listener,
-                    recorder,
+                    smartzip_engine::ExtractObserver {
+                        listener,
+                        history: recorder,
+                    },
                 )
                 .await?;
             if request.settings.delete_source {
@@ -485,7 +450,7 @@ async fn run_job_inner(
             let result = engine
                 .inspect_file_with_listener(
                     &backend,
-                    &passwords,
+                    passwords,
                     smartzip_engine::InspectRequest { path, scanner },
                     listener,
                     recorder,
@@ -502,7 +467,7 @@ async fn run_job_inner(
             let result = engine
                 .list_archive_with_listener_interactive(
                     &backend,
-                    &passwords,
+                    passwords,
                     smartzip_engine::ListArchiveRequest {
                         path,
                         scanner,
@@ -521,7 +486,7 @@ async fn run_job_inner(
             let result = engine
                 .test_archives(
                     &backend,
-                    &passwords,
+                    passwords,
                     smartzip_engine::TestWorkflowRequest {
                         paths: request.paths,
                         encoding,
@@ -771,11 +736,11 @@ mod tests {
         assert!(!policy.values().passwords.save_success);
         assert!(!policy.values().passwords.record_statistics);
         assert_eq!(
-            policy.resolved.origins["passwords.save_success"],
+            policy.resolved().origins["passwords.save_success"],
             "task:temporary-password"
         );
         assert_eq!(
-            policy.resolved.origins["passwords.record_statistics"],
+            policy.resolved().origins["passwords.record_statistics"],
             "task:temporary-password"
         );
         assert_eq!(

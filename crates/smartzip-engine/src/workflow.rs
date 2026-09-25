@@ -20,11 +20,6 @@ use crate::types::{
     ListArchiveResult,
 };
 
-/// Override how successfully processed nested archives are recycled.
-///
-/// This is primarily useful for deterministic tests and platform hosts
-/// that provide their own recycle-bin integration.
-
 pub(crate) fn detect(
     engine_scanner: &EmbeddedScanner,
     request: DetectRequest,
@@ -491,5 +486,3 @@ pub(crate) async fn list_archive_with_listener_interactive<B: ArchiveExecutor>(
         events: snapshot,
     })
 }
-
-pub(crate) use crate::extract_workflow::extract_recursive_with_listener_interactive;

@@ -1,6 +1,6 @@
 //! Nested candidate discovery, carve, recycle, volume helpers.
 
-use smartzip_core::{ArchiveFormat, TaskId};
+use smartzip_core::ArchiveFormat;
 use smartzip_scanner::{EmbeddedArchiveFinding, EmbeddedScanner};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -11,34 +11,6 @@ use crate::materialize::{CollisionAction, CollisionResolver};
 use crate::name_score;
 use crate::policy::{finding_meets_min_size, is_business_container};
 use crate::types::{ArchiveRecycleHandler, CandidateSource, ExtractionCandidate};
-
-pub(crate) fn record_skip(
-    history: Option<&dyn crate::history::TaskHistoryRecorder>,
-    task_id: &TaskId,
-    candidate: &ExtractionCandidate,
-    reason: &str,
-) {
-    if let Some(recorder) = history {
-        recorder.record_file_extraction(
-            task_id,
-            crate::history::FileExtractionRow {
-                input_path: &candidate.path,
-                sample_hash: None,
-                file_size: None,
-                offset: candidate.embedded_offset.map(|o| o as i64),
-                output_path: None,
-                has_password: false,
-                password_id: None,
-                status: "skipped",
-                reason: Some(reason),
-                encoding: None,
-                encoding_corrected: false,
-                damaged_volumes_json: None,
-                test_report_json: None,
-            },
-        );
-    }
-}
 
 pub(crate) fn archive_output_name(path: &Path) -> PathBuf {
     PathBuf::from(archive_stem(path))
