@@ -88,11 +88,12 @@ async fn process_start_errors_preserve_backend_identity_and_io_path() {
     assert!(
         matches!(error, SmartZipError::BackendUnavailable { backend } if backend == "selected")
     );
+    let expected_path = root.path().canonicalize().unwrap();
     let error = SevenZipBackend::new(root.path().to_path_buf())
         .list(list())
         .await
         .unwrap_err();
-    assert!(matches!(error, SmartZipError::Io { path: Some(path), .. } if path == root.path()));
+    assert!(matches!(error, SmartZipError::Io { path: Some(path), .. } if path == expected_path));
 }
 
 #[tokio::test]
