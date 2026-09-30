@@ -199,7 +199,7 @@ pub const SECTIONS: &[Section] = &[
             field!(
                 "passwords.sources",
                 "候选来源顺序",
-                "TOML 字符串数组，按顺序使用 manual、known、batch、empty、database；不可重复。不是密码值列表。",
+                "按列表顺序尝试密码来源，可以添加、移除或上移。这里不保存密码明文。",
                 Kind::Toml
             ),
             field!(
@@ -310,7 +310,7 @@ pub const SECTIONS: &[Section] = &[
             field!(
                 "backends.installations",
                 "后端安装列表",
-                "TOML 内联表数组；每项包含 id、family（seven-zip-cli/unrar-cli）、executable，可选 declared_version、enabled、priority。",
+                "添加已安装的 7-Zip 或 UnRAR，填写唯一名称与可执行文件路径。优先级越高越先尝试；禁用后保留配置。",
                 Kind::Toml
             ),
             field!(

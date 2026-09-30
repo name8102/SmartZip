@@ -53,6 +53,12 @@ impl PreparedExtractTask {
         &self.identity
     }
 
+    /// Preserve the identity assigned to a persisted waiting draft before submission.
+    pub fn with_task_id(mut self, task_id: smartzip_core::TaskId) -> Self {
+        self.identity.task_id = task_id;
+        self
+    }
+
     /// Configure live root controls before the task is submitted.
     pub fn configure_groups(
         &mut self,

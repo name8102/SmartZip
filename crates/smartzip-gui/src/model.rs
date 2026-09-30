@@ -46,6 +46,9 @@ pub struct Job {
     pub outputs: Vec<PathBuf>,
     pub result: Option<serde_json::Value>,
     pub prompt: Option<InteractionRequest>,
+    pub prompt_revision: u64,
+    pub dismiss_requested: bool,
+    pub persistence_pending: bool,
     pub task_id: Option<String>,
     /// A configured draft stays queued until the user explicitly starts it.
     held: bool,
@@ -199,15 +202,51 @@ pub struct Queue {
     next_id: u64,
 }
 impl Queue {
+    pub fn close(&mut self, id: u64) {
+        self.cancel(id);
+        if let Some(job) = self.jobs.iter_mut().find(|j| j.id == id) {
+            job.dismiss_requested = true;
+        }
+        if self.selected == Some(id) {
+            self.selected = self
+                .jobs
+                .iter()
+                .rev()
+                .find(|j| !j.dismiss_requested)
+                .map(|j| j.id);
+        }
+    }
+    pub fn remove_finished(&mut self) {
+        self.jobs
+            .retain(|job| job.phase.active() || job.phase == Phase::Queued);
+        if !self.jobs.iter().any(|j| Some(j.id) == self.selected) {
+            self.selected = self.jobs.last().map(|j| j.id);
+        }
+    }
     pub fn enqueue(&mut self, request: JobRequest) -> u64 {
         self.enqueue_with_hold(request, false)
     }
 
+    pub fn restore(&mut self, request: JobRequest) -> u64 {
+        let id = self.enqueue_with_hold(request, true);
+        self.jobs.last_mut().unwrap().quick_overrides = QuickOverrides {
+            output: true,
+            recursive: true,
+            smart_layout: true,
+            delete_source: true,
+            auto_encoding: true,
+        };
+        id
+    }
     pub fn enqueue_held(&mut self, request: JobRequest) -> u64 {
         self.enqueue_with_hold(request, true)
     }
 
-    fn enqueue_with_hold(&mut self, request: JobRequest, held: bool) -> u64 {
+    fn enqueue_with_hold(&mut self, mut request: JobRequest, held: bool) -> u64 {
+        if request.operation == TaskOperation::Extract && request.settings.queued_task_id.is_none()
+        {
+            request.settings.queued_task_id = Some(smartzip_core::TaskId::new().to_string());
+        }
         self.next_id += 1;
         let id = self.next_id;
         self.jobs.push(Job {
@@ -222,6 +261,9 @@ impl Queue {
             outputs: vec![],
             result: None,
             prompt: None,
+            prompt_revision: 0,
+            dismiss_requested: false,
+            persistence_pending: false,
             task_id: None,
             held,
             start_requested: false,
@@ -441,11 +483,23 @@ impl Queue {
                 .and_then(|p| std::path::absolute(p).ok())
                 .and_then(|p| p.parent().map(std::path::Path::to_path_buf));
         }
+        request.operation = TaskOperation::Extract;
+        request.settings.recovery_task_id = None;
+        request.settings.queued_task_id = None;
         request.settings.force = true;
         request.settings.passwords.clear();
         Some(self.enqueue(request))
     }
 
+    pub fn hold_all(&mut self) {
+        self.paused = true;
+        for job in &mut self.jobs {
+            if job.phase == Phase::Queued {
+                job.held = true;
+                job.start_requested = false;
+            }
+        }
+    }
     pub fn cancel_all(&mut self) {
         self.paused = true;
         let ids: Vec<_> = self.jobs.iter().map(|j| j.id).collect();
@@ -495,6 +549,7 @@ impl Queue {
                     JobMessage::Event(event) => job.event(event),
                     JobMessage::Prompt(prompt) => {
                         if job.phase != Phase::Cancelling {
+                            job.prompt_revision += 1;
                             job.prompt = Some(prompt);
                             job.phase = Phase::Waiting;
                             job.stage = "等待用户决定".into();
@@ -519,8 +574,12 @@ impl Queue {
                 }
             }
         }
+        self.jobs
+            .retain(|job| !job.dismiss_requested || job.phase.active());
         for (position, job) in self.jobs.iter_mut().enumerate().filter(|(_, job)| {
-            job.phase == Phase::Queued && (job.start_requested || (!self.paused && !job.held))
+            job.phase == Phase::Queued
+                && !job.persistence_pending
+                && (job.start_requested || (!self.paused && !job.held))
         }) {
             changed = true;
             job.start_requested = false;
@@ -553,6 +612,25 @@ mod tests {
             settings: TaskSettings::default(),
             resolved: None,
         }
+    }
+    #[test]
+    fn pending_persistence_blocks_even_explicit_start_and_restored_settings_are_frozen() {
+        let mut queue = Queue::default();
+        let mut req = request("held.zip");
+        req.settings.recursive = Some(false);
+        let id = queue.restore(req);
+        queue.jobs[0].persistence_pending = true;
+        queue.start(id);
+        queue.tick();
+        assert_eq!(queue.jobs[0].phase, Phase::Queued);
+        queue.apply_global_settings(&TaskSettings {
+            recursive: Some(true),
+            ..Default::default()
+        });
+        assert_eq!(queue.jobs[0].request.settings.recursive, Some(false));
+        queue.hold_all();
+        assert!(queue.is_held(id));
+        assert!(!queue.jobs[0].start_requested);
     }
     #[test]
     fn root_retry_preserves_ambiguous_inputs_and_waits_for_batch_cleanup() {

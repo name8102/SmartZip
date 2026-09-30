@@ -1,4 +1,6 @@
 //! Archive workers own their runtime and database; only messages cross the UI boundary.
+#[path = "runtime/recovery.rs"]
+mod recovery;
 use async_trait::async_trait;
 use smartzip_core::{TaskEvent, TaskEventKind};
 use smartzip_engine::{
@@ -15,25 +17,30 @@ use std::{
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TaskOperation {
     Extract,
     Detect,
     List,
     Test,
+    Recover,
 }
-#[derive(Clone, Default)]
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct TaskSettings {
+    pub recovery_task_id: Option<String>,
+    pub queued_task_id: Option<String>,
     pub force: bool,
     pub output: Option<PathBuf>,
     pub recursive: Option<bool>,
     pub smart_layout: Option<bool>,
     pub auto_encoding: Option<bool>,
     pub delete_source: bool,
+    #[serde(skip)]
     pub passwords: Vec<String>,
     pub temporary_passwords: bool,
 }
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct JobRequest {
     pub operation: TaskOperation,
     pub paths: Vec<PathBuf>,
@@ -417,6 +424,9 @@ async fn run_job_inner(
     cancellation: CancellationToken,
     roots: Arc<smartzip_engine::root_management::RootManagement>,
 ) -> Result<JobOutcome, Box<dyn std::error::Error>> {
+    if request.operation == TaskOperation::Recover {
+        return recovery::run(request, mailbox, cancellation, roots).await;
+    }
     use smartzip_config::StateMode;
     use smartzip_engine::history::TaskHistoryRecorder;
     let policy = load_policy(&request)?;
@@ -513,6 +523,9 @@ async fn run_job_inner(
             };
             let mut prepared =
                 smartzip_engine::PreparedExtractTask::new(policy.clone(), workflow_request)?;
+            if let Some(id) = &request.settings.queued_task_id {
+                prepared = prepared.with_task_id(smartzip_core::TaskId::from_stored(id.clone()));
+            }
             prepared.configure_groups(&roots, groups)?;
             let task_id = prepared.identity().task_id.clone();
             if let Some(execution) = &execution_store {
@@ -520,84 +533,6 @@ async fn run_job_inner(
                     .submit(prepared.submission(queue_position)?)
                     .await?;
             }
-            let recovery_db = db.as_ref();
-            let recovery_work = async {
-                let Some(execution) = &execution_store else {
-                    return;
-                };
-                let futures = execution
-                    .take_runnable_recovery()
-                    .into_iter()
-                    .map(|recovered| {
-                        let execution = execution.as_ref();
-                        let listener = listener.clone();
-                        let recovery_prompts = prompts.clone();
-                        async move {
-                            let recovered_task_id =
-                                smartzip_core::TaskId::from_stored(recovered.task_id.clone());
-                            let recovered_result: Result<(), Box<dyn std::error::Error>> = async {
-                                let prepared =
-                                    smartzip_engine::PreparedExtractTask::recover(&recovered)?;
-                                let recovered_backend =
-                                    smartzip_archive::BackendRouter::from_config(
-                                        &prepared.policy().values().backends,
-                                    )?;
-                                prepared
-                                    .run(
-                                        SmartZipEngine::default().with_cancellation_token(
-                                            recovery_prompts.cancellation.clone(),
-                                        ),
-                                        &recovered_backend,
-                                        recovery_db.map(smartzip_db::SmartZipDb::connection),
-                                        smartzip_engine::ExtractInteraction {
-                                            password: Some(&recovery_prompts),
-                                            output: Some(&recovery_prompts),
-                                            embedded: Some(&recovery_prompts),
-                                            encoding: Some(&recovery_prompts),
-                                        },
-                                        smartzip_engine::ExtractObserver {
-                                            listener: listener.clone(),
-                                            history: None,
-                                            execution: Some(execution),
-                                        },
-                                    )
-                                    .await?;
-                                Ok(())
-                            }
-                            .await;
-                            match recovered_result {
-                                Ok(()) => execution.release_task(&recovered_task_id),
-                                Err(error) => {
-                                    let cancelled = recovery_prompts.cancellation.is_cancelled();
-                                    let stop_result = execution
-                                        .stop_task(
-                                            &recovered_task_id,
-                                            if cancelled { "cancelled" } else { "failed" },
-                                            if cancelled {
-                                                "cancelled"
-                                            } else {
-                                                "recovery_failed"
-                                            },
-                                        )
-                                        .await;
-                                    if let Some(listener) = &listener {
-                                        let detail = match stop_result {
-                                            Ok(()) => error.to_string(),
-                                            Err(stop_error) => format!("{error}; {stop_error}"),
-                                        };
-                                        listener(&TaskEvent {
-                                            task_id: recovered_task_id,
-                                            kind: TaskEventKind::Warning {
-                                                message: format!("task recovery failed: {detail}"),
-                                            },
-                                        });
-                                    }
-                                }
-                            }
-                        }
-                    });
-                futures_util::future::join_all(futures).await;
-            };
             let current_work = prepared.run(
                 engine,
                 &backend,
@@ -616,7 +551,7 @@ async fn run_job_inner(
                         .map(|execution| execution as &dyn smartzip_engine::ExecutionStateRecorder),
                 },
             );
-            let (_, result) = tokio::join!(recovery_work, current_work);
+            let result = current_work.await;
             let result = match result {
                 Ok(result) => {
                     if let Some(execution) = &execution_store {
@@ -722,6 +657,7 @@ async fn run_job_inner(
                 serde_json::to_value(result)?,
             )
         }
+        TaskOperation::Recover => unreachable!("recovery is dispatched before new work"),
     };
     Ok(JobOutcome {
         status,
@@ -958,14 +894,32 @@ mod tests {
             store.submit(prepared.submission(0).unwrap()).await.unwrap();
         }
         resolved.values.interaction.mode = smartzip_config::InteractionMode::Never;
-        let mailbox = Mailbox::default();
-        let worker = run_job_inner(
+        run_job_inner(
             JobRequest {
                 operation: TaskOperation::Extract,
                 paths: vec![current],
-                resolved: Some(resolved),
+                resolved: Some(resolved.clone()),
                 settings: TaskSettings {
                     output: Some(temp.path().join("current-output")),
+                    ..Default::default()
+                },
+            },
+            1,
+            Mailbox::default(),
+            CancellationToken::new(),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        assert!(!temp.path().join("recovered-output").exists());
+        let mailbox = Mailbox::default();
+        let worker = run_job_inner(
+            JobRequest {
+                operation: TaskOperation::Recover,
+                paths: vec![encrypted.clone()],
+                resolved: Some(resolved),
+                settings: TaskSettings {
+                    recovery_task_id: Some(recovered_id.clone()),
                     ..Default::default()
                 },
             },

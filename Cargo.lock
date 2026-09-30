@@ -7049,6 +7049,8 @@ dependencies = [
  "futures-util",
  "gpui-kit",
  "image 0.25.10",
+ "libc",
+ "serde",
  "serde_json",
  "smartzip-archive",
  "smartzip-config",

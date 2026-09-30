@@ -3,6 +3,7 @@ use crate::{
     library::ConfigSnapshot,
     settings_fields::{Field, Kind, SECTIONS},
 };
+use gpui::base::Disableable;
 use gpui::component::{
     button::{Button, ButtonVariants},
     input::{Input, InputState},
@@ -10,6 +11,7 @@ use gpui::component::{
     switch::Switch,
     ActiveTheme, IndexPath, Sizable,
 };
+use gpui::Focusable;
 use gpui::{
     div, prelude::*, App, AppContext, Context, Entity, IntoElement, Render, SharedString, Window,
 };
@@ -27,7 +29,12 @@ struct Draft {
 
 pub struct ConfigForm {
     fields: Vec<Draft>,
+    _subscriptions: Vec<gpui::Subscription>,
     section: usize,
+    pub saving: bool,
+    search: Entity<InputState>,
+    backend_list: Entity<crate::config_lists::ConfigLists>,
+    source_list: Entity<crate::config_lists::ConfigLists>,
 }
 
 impl ConfigForm {
@@ -35,7 +42,7 @@ impl ConfigForm {
         let values = toml::Value::try_from(&snapshot.resolved.values)
             .expect("validated configuration is TOML serializable");
         let explanations = snapshot.resolved.explanation();
-        let fields = SECTIONS
+        let fields: Vec<Draft> = SECTIONS
             .iter()
             .flat_map(|section| section.fields)
             .map(|field| {
@@ -77,10 +84,44 @@ impl ConfigForm {
                 }
             })
             .collect();
-        Self { fields, section: 0 }
+        let search =
+            cx.new(|cx| InputState::new(window, cx).placeholder("搜索设置名称、说明或配置键…"));
+        let backend_list = cx.new(|cx| {
+            let mut list =
+                crate::config_lists::ConfigLists::new(&snapshot.resolved.values, window, cx);
+            list.show_backends = true;
+            list
+        });
+        let source_list = cx
+            .new(|cx| crate::config_lists::ConfigLists::new(&snapshot.resolved.values, window, cx));
+        let mut subscriptions = vec![
+            cx.observe(&search, |_, _, cx| cx.notify()),
+            cx.observe(&backend_list, |_, _, cx| cx.notify()),
+            cx.observe(&source_list, |_, _, cx| cx.notify()),
+        ];
+        for field in &fields {
+            if let Some(input) = &field.input {
+                subscriptions.push(cx.observe(input, |_, _, cx| cx.notify()));
+            }
+            if let Some(select) = &field.select {
+                subscriptions.push(cx.observe(select, |_, _, cx| cx.notify()));
+            }
+        }
+        Self {
+            fields,
+            section: 0,
+            saving: false,
+            backend_list,
+            source_list,
+            search,
+            _subscriptions: subscriptions,
+        }
     }
 
     /// TOML text is validated by the shared persistence layer, including invalid numeric input.
+    pub fn focus_search(&self, window: &mut Window, cx: &mut App) {
+        self.search.read(cx).focus_handle(cx).focus(window, cx);
+    }
     pub fn patches(&self, cx: &App) -> Vec<(String, Option<String>)> {
         self.fields
             .iter()
@@ -91,7 +132,19 @@ impl ConfigForm {
                 if draft.reset {
                     return Some((draft.field.key.into(), None));
                 }
-                let value = if let (Kind::Choice(options), Some(select)) =
+                let value = if matches!(
+                    draft.field.key,
+                    "backends.installations" | "passwords.sources"
+                ) {
+                    let backends = draft.field.key == "backends.installations";
+                    (if backends {
+                        &self.backend_list
+                    } else {
+                        &self.source_list
+                    })
+                    .read(cx)
+                    .value(backends, cx)
+                } else if let (Kind::Choice(options), Some(select)) =
                     (draft.field.kind, &draft.select)
                 {
                     select
@@ -125,10 +178,19 @@ impl ConfigForm {
                 .text_color(cx.theme().muted_foreground)
                 .child("保存后恢复继承值")
                 .into_any_element()
+        } else if matches!(field.key, "backends.installations" | "passwords.sources") {
+            let list = if field.key == "backends.installations" {
+                &self.backend_list
+            } else {
+                &self.source_list
+            };
+            list.update(cx, |list, _| list.saving = self.saving);
+            list.clone().into_any_element()
         } else {
             match field.kind {
                 Kind::Bool => Switch::new(("setting-switch", index))
                     .small()
+                    .disabled(self.saving)
                     .checked(draft.value == "true")
                     .on_change(cx.listener(move |this, checked: &bool, _, cx| {
                         this.fields[index].value = checked.to_string();
@@ -142,6 +204,7 @@ impl ConfigForm {
                         .expect("choice field has select state"),
                 )
                 .small()
+                .disabled(self.saving)
                 .into_any_element(),
                 Kind::Text | Kind::Number | Kind::Toml => Input::new(
                     draft
@@ -150,6 +213,7 @@ impl ConfigForm {
                         .expect("editable text field has an input"),
                 )
                 .small()
+                .disabled(self.saving)
                 .into_any_element(),
                 Kind::ReadOnly => div()
                     .text_sm()
@@ -182,6 +246,7 @@ impl ConfigForm {
                             Button::new(("setting-reset", index))
                                 .ghost()
                                 .xsmall()
+                                .disabled(self.saving)
                                 .label(if draft.reset {
                                     "撤销恢复"
                                 } else {
@@ -220,6 +285,8 @@ impl ConfigForm {
 
 impl Render for ConfigForm {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let query = self.search.read(cx).value().to_lowercase();
+        let dirty = self.patches(cx).len();
         let section = self.section;
         let offset: usize = SECTIONS[..section]
             .iter()
@@ -230,6 +297,16 @@ impl Render for ConfigForm {
             .flex_col()
             .gap_2()
             .w_full()
+            .child(Input::new(&self.search).cleanable(true))
+            .when(dirty > 0, |el| {
+                el.child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().primary)
+                        .child(format!("{dirty} 项未保存修改 · 切换页面会保留草稿")),
+                )
+            })
+            .when(self.saving, |el| el.child("正在保存，表单暂时锁定…"))
             .child(
                 div()
                     .flex()
@@ -247,7 +324,19 @@ impl Render for ConfigForm {
                     })),
             )
             .children(
-                (offset..offset + SECTIONS[section].fields.len()).map(|index| self.row(index, cx)),
+                (0..self.fields.len())
+                    .filter(|&index| {
+                        if query.is_empty() {
+                            (offset..offset + SECTIONS[section].fields.len()).contains(&index)
+                        } else {
+                            let f = self.fields[index].field;
+                            format!("{} {} {}", f.label, f.key, f.help)
+                                .to_lowercase()
+                                .contains(&query)
+                        }
+                    })
+                    .map(|index| self.row(index, cx))
+                    .collect::<Vec<_>>(),
             )
     }
 }

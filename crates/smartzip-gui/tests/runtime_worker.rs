@@ -434,3 +434,160 @@ fn root_controls_keep_siblings_running_while_password_prompt_is_parked() {
         std::thread::sleep(Duration::from_millis(5));
     }
 }
+
+#[test]
+#[ignore = "requires installed 7z; run with --include-ignored for backend acceptance"]
+fn explicit_recovery_keeps_identity_and_does_not_run_other_pending_tasks() {
+    use smartzip_engine::state_store::{
+        NodeSubmission, PersistedExtractPlan, StateStore, TaskSubmission,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let archive = fixture(dir.path(), false);
+    let database = dir.path().join("state.db");
+    let cfg = config_with_database(&database);
+    let first = smartzip_core::TaskId::new();
+    let second = smartzip_core::TaskId::new();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let store = StateStore::start(&database).unwrap();
+        for (id, name) in [(&first, "recovered"), (&second, "untouched")] {
+            let node = smartzip_core::NodeId::new();
+            let output = dir.path().join(name);
+            let request = smartzip_engine::ExtractWorkflowRequest {
+                inputs: vec![archive.clone()],
+                output_dir: output.clone(),
+                recursion_limit: 0,
+                encoding_mode: Default::default(),
+                scanner: Default::default(),
+                password_candidates: Default::default(),
+                layout_policy: smartzip_engine::layout::OutputLayoutPolicy::Conservative,
+                single_root_name_policy: smartzip_engine::layout::SingleRootNamePolicy::Auto,
+                embedded_scan_mode: smartzip_core::EmbeddedScanMode::Auto,
+                dominant_min_ratio: 0.7,
+                confirm_large_scan: false,
+                force: true,
+                limits: cfg.values.limits.clone(),
+            };
+            let plan = PersistedExtractPlan::new(cfg.values.clone(), request);
+            store
+                .submit(TaskSubmission {
+                    task_id: id.clone(),
+                    kind: "extract".into(),
+                    output_path: Some(output),
+                    started_at: smartzip_db::timestamp::now_utc_iso8601(),
+                    inputs_json: serde_json::to_string(&[&archive]).unwrap(),
+                    config_snapshot_json: serde_json::to_string(&plan).unwrap(),
+                    priority: smartzip_db::task_execution::Priority::Normal,
+                    queue_position: 0,
+                    recoverable: true,
+                    roots: vec![NodeSubmission {
+                        node_id: node.clone(),
+                        parent_id: None,
+                        root_id: node,
+                        input_path: archive.clone(),
+                        input_ref_json: serde_json::to_string(
+                            &smartzip_engine::ExtractionCandidate::root(archive.clone()),
+                        )
+                        .unwrap(),
+                        config_revision: 0,
+                        generation: 0,
+                    }],
+                })
+                .await
+                .unwrap();
+        }
+    });
+    let new_job = spawn_job(JobRequest {
+        operation: TaskOperation::Extract,
+        paths: vec![archive.clone()],
+        settings: TaskSettings {
+            output: Some(dir.path().join("new")),
+            recursive: Some(false),
+            ..Default::default()
+        },
+        resolved: Some(cfg.clone()),
+    })
+    .unwrap();
+    assert_eq!(finish(&new_job).0.status, "completed");
+    drop(new_job);
+    assert!(!dir.path().join("recovered").exists());
+    assert!(!dir.path().join("untouched").exists());
+    let recovered = spawn_job(JobRequest {
+        operation: TaskOperation::Recover,
+        paths: vec![archive.clone()],
+        settings: TaskSettings {
+            recovery_task_id: Some(first.to_string()),
+            ..Default::default()
+        },
+        resolved: Some(cfg),
+    })
+    .unwrap();
+    let (result, events) = finish(&recovered);
+    assert_eq!(result.status, "completed");
+    assert!(events.iter().all(|e| e.task_id == first));
+    assert_eq!(
+        std::fs::read(dir.path().join("recovered/fixture/hello.txt")).unwrap(),
+        b"GUI runtime acceptance\n"
+    );
+    assert!(!dir.path().join("untouched").exists());
+    assert!(archive.exists());
+}
+
+#[test]
+#[ignore = "requires installed 7z; run with --include-ignored for backend acceptance"]
+fn persisted_gui_draft_is_adopted_with_its_original_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let archive = fixture(dir.path(), false);
+    let database = dir.path().join("state.db");
+    let id = smartzip_core::TaskId::new();
+    {
+        let db = smartzip_db::SmartZipDb::open(&database).unwrap();
+        db.connection()
+            .execute(
+                "INSERT INTO tasks(id,kind,status,started_at,recoverable,paused) \
+                 VALUES (?1,'extract','queued_gui','draft',0,1)",
+                [id.as_str()],
+            )
+            .unwrap();
+    }
+    let handle = spawn_job(JobRequest {
+        operation: TaskOperation::Extract,
+        paths: vec![archive.clone()],
+        settings: TaskSettings {
+            queued_task_id: Some(id.to_string()),
+            output: Some(dir.path().join("output")),
+            recursive: Some(false),
+            ..Default::default()
+        },
+        resolved: Some(config_with_database(&database)),
+    })
+    .unwrap();
+    let (result, events) = finish(&handle);
+    assert_eq!(result.status, "completed");
+    assert!(!events.is_empty());
+    assert!(events.iter().all(|event| event.task_id == id));
+    let db = smartzip_db::SmartZipDb::open(&database).unwrap();
+    let (status, paused): (String, bool) = db
+        .connection()
+        .query_row(
+            "SELECT status,paused FROM tasks WHERE id=?1",
+            [id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(status, "completed");
+    assert!(!paused);
+    let count: i64 = db
+        .connection()
+        .query_row("SELECT count(*) FROM tasks", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 1);
+    assert_eq!(
+        std::fs::read(dir.path().join("output/fixture/hello.txt")).unwrap(),
+        b"GUI runtime acceptance\n"
+    );
+    assert!(archive.exists());
+}

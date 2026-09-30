@@ -15,7 +15,7 @@ pub(crate) struct ArchiveChild {
 }
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ArchiveBrowser {
-    entries: Vec<ArchiveEntry>,
+    directories: BTreeMap<Vec<String>, Vec<ArchiveChild>>,
 }
 
 impl ArchiveBrowser {
@@ -26,42 +26,49 @@ impl ArchiveBrowser {
             }
             validate_member_path(&entry.path)?;
         }
-        Ok(Self { entries })
-    }
-    pub(crate) fn children(&self, directory: &[String]) -> Vec<ArchiveChild> {
-        let mut grouped: BTreeMap<String, Vec<ArchiveChild>> = BTreeMap::new();
-        for entry in &self.entries {
+        type Siblings = BTreeMap<(String, bool), Vec<ArchiveChild>>;
+        let mut directories: BTreeMap<Vec<String>, Siblings> = BTreeMap::new();
+        for entry in entries {
             let Some(parts) = member_parts(&entry.path) else {
                 continue;
             };
-            if parts.len() <= directory.len() || parts[..directory.len()] != directory[..] {
-                continue;
-            }
-            let name = parts[directory.len()].to_owned();
-            let child_path = parts[..directory.len() + 1].join("/");
-            let is_dir = parts.len() > directory.len() + 1 || entry.is_dir;
-            let child = ArchiveChild {
-                path: if is_dir {
-                    child_path.clone()
+            for depth in 0..parts.len() {
+                let directory = parts[..depth].iter().map(|s| s.to_string()).collect();
+                let name = parts[depth].to_owned();
+                let is_dir = depth + 1 < parts.len() || entry.is_dir;
+                let path = if is_dir {
+                    parts[..=depth].join("/")
                 } else {
                     entry.path.clone()
-                },
-                name,
-                is_dir,
-                size: (!is_dir).then_some(entry.size).flatten(),
-            };
-            let same = grouped.entry(child_path).or_default();
-            if child.is_dir {
-                if !same.iter().any(|existing| existing.is_dir) {
-                    same.push(child);
+                };
+                let siblings = directories
+                    .entry(directory)
+                    .or_default()
+                    .entry((name.clone(), is_dir))
+                    .or_default();
+                if !is_dir || siblings.is_empty() {
+                    siblings.push(ArchiveChild {
+                        path,
+                        name,
+                        is_dir,
+                        size: if is_dir { None } else { entry.size },
+                    });
                 }
-            } else {
-                same.push(child);
             }
         }
-        let mut children: Vec<_> = grouped.into_values().flatten().collect();
-        children.sort_by_key(|child| (!child.is_dir, child.name.to_ascii_lowercase()));
-        children
+        Ok(Self {
+            directories: directories
+                .into_iter()
+                .map(|(path, grouped)| {
+                    let mut children: Vec<_> = grouped.into_values().flatten().collect();
+                    children.sort_by_key(|child| (!child.is_dir, child.name.to_lowercase()));
+                    (path, children)
+                })
+                .collect(),
+        })
+    }
+    pub(crate) fn children(&self, directory: &[String]) -> Vec<ArchiveChild> {
+        self.directories.get(directory).cloned().unwrap_or_default()
     }
     pub(crate) fn path_parts(path: &str) -> Option<Vec<String>> {
         member_parts(path).map(|parts| parts.into_iter().map(str::to_owned).collect())

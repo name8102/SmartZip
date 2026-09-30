@@ -97,11 +97,11 @@ impl Render for SystemIntegration {
             .unwrap_or_default();
         div().flex().flex_col().gap_4()
             .child(div().text_base().child("系统集成"))
-            .child(div().text_sm().child("普通打开压缩包进入预览；右键快速解压进入快速窗口。"))
-            .child(div().text_xs().text_color(cx.theme().muted_foreground).child(bundle.as_ref().map(|path|path.display().to_string()).unwrap_or_else(||"请从固定位置的 SmartZip.app 启动后配置。开发用裸可执行文件不能注册为默认程序。".into())))
+            .child(div().text_sm().child("普通打开压缩包进入预览；右键快速解压进入快速模式。"))
+            .child(div().text_xs().text_color(cx.theme().muted_foreground).child(bundle.as_ref().map(|path|path.display().to_string()).unwrap_or_else(||if cfg!(target_os="macos") {"请从固定位置的 SmartZip.app 启动后配置。".into()} else {format!("尚未注册用户级桌面启动器。注册将使用当前程序路径：{}，移动程序后需重新注册。",std::env::current_exe().map(|p|p.display().to_string()).unwrap_or_default())})))
             .child(div().flex().gap_2()
                 .child(Button::new("integration-refresh").small().ghost().label("刷新状态").disabled(self.busy).on_click(cx.listener(|this,_,_,cx|this.refresh(cx))))
-                .child(Button::new("integration-register").small().label("注册打开方式").disabled(self.busy||bundle.is_none()).on_click(cx.listener(|this,_,_,cx|this.operation(||system_integration::register_application().map(|_|"已注册为可选打开方式".into()).map_err(|e|e.to_string()),cx))))
+                .child(Button::new("integration-register").small().label("注册打开方式").disabled(self.busy || (cfg!(target_os="macos") && bundle.is_none())).on_click(cx.listener(|this,_,_,cx|this.operation(||system_integration::register_application().map(|_|"已注册为可选打开方式".into()).map_err(|e|e.to_string()),cx))))
                 .when_some(bundle.clone(),|el,path|el.child(Button::new("integration-reveal").small().ghost().label("显示应用位置").on_click(move|_,_,cx|cx.reveal_path(&path)))))
             .child(div().text_sm().child("默认打开方式"))
             .children(formats.into_iter().map(|association| {
@@ -118,11 +118,12 @@ impl Render for SystemIntegration {
                             cx.notify();
                         })))
             }))
-            .child(div().text_sm().child("Finder 右键快速解压"))
+.when(cfg!(target_os="macos"),|el| el            .child(div().text_sm().child("Finder 右键快速解压"))
             .child(div().text_xs().text_color(cx.theme().muted_foreground).child(if installed {"已安装。在 Finder 选择文件，右键 → 快速操作 → SmartZip 快速解压。"} else {"安装后，在 Finder 的右键“快速操作”中选择 SmartZip 快速解压，支持多选文件。"}))
             .child(div().flex().gap_2()
                 .child(Button::new("finder-install").small().label("安装右键菜单").disabled(self.busy||bundle.is_none()||installed).on_click(cx.listener(|this,_,_,cx|this.operation(||system_integration::install_finder_service().map(|_|"右键快速解压已安装；若菜单未出现，请在系统设置的扩展中启用该快速操作".into()).map_err(|e|e.to_string()),cx))))
-                .child(Button::new("finder-remove").small().ghost().label("移除右键菜单").disabled(self.busy||!installed).on_click(cx.listener(|this,_,_,cx|this.operation(||system_integration::remove_finder_service().map(|_|"已移除 SmartZip 右键菜单".into()).map_err(|e|e.to_string()),cx)))))
+                .child(Button::new("finder-remove").small().ghost().label("移除右键菜单").disabled(self.busy||!installed).on_click(cx.listener(|this,_,_,cx|this.operation(||system_integration::remove_finder_service().map(|_|"已移除 SmartZip 右键菜单".into()).map_err(|e|e.to_string()),cx))))))
+            .when(cfg!(target_os="linux"),|el|el.child(div().text_sm().child("Linux 桌面启动器支持多选文件与“快速解压”动作；文件管理器是否展示该动作取决于桌面环境。默认打开进入归档预览。")))
             .when(!self.message.is_empty(),|el|el.child(div().text_sm().child(self.message.clone())))
     }
 }

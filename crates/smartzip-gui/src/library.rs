@@ -1,5 +1,9 @@
 //! Blocking persistence operations. Call from a worker, never the GPUI render thread.
 //! Password values deliberately never appear in list models or errors.
+#[path = "library/browsing.rs"]
+mod browsing;
+pub use browsing::*;
+
 use smartzip_config::{ResolvedConfig, StateMode};
 use smartzip_db::{
     file_extractions::{FileExtractionRecord, FileExtractionRepository},
@@ -32,6 +36,7 @@ pub struct ConfigSnapshot {
 
 #[derive(Clone, Debug)]
 pub struct TaskDetail {
+    pub inputs: Vec<PathBuf>,
     pub task: TaskRecord,
     pub files: Vec<FileExtractionRecord>,
     pub events: Vec<TaskEventRecord>,
@@ -44,6 +49,7 @@ pub struct PasswordSummary {
     pub masked: &'static str,
     pub source: String,
     pub pinned: bool,
+    pub disabled: bool,
     pub success_count: i64,
     pub failure_count: i64,
     pub last_success_at: Option<String>,
@@ -118,6 +124,7 @@ fn database(options: &LibraryOptions, write: bool) -> Result<SmartZipDb> {
     }
 }
 
+#[cfg(test)]
 pub fn load_history(options: &LibraryOptions, limit: usize) -> Result<Vec<TaskRecord>> {
     let db = database(options, false)?;
     TaskRepository::new(db.connection())
@@ -131,7 +138,18 @@ pub fn load_task_detail(options: &LibraryOptions, id: &str) -> Result<TaskDetail
         .find_by_id(id)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "未找到该历史任务".to_string())?;
+    let inputs_json: Option<String> = db
+        .connection()
+        .query_row("SELECT inputs_json FROM tasks WHERE id=?1", [id], |r| {
+            r.get(0)
+        })
+        .map_err(|e| e.to_string())?;
+    let inputs = inputs_json
+        .as_deref()
+        .and_then(|text| serde_json::from_str(text).ok())
+        .unwrap_or_default();
     Ok(TaskDetail {
+        inputs,
         task,
         files: FileExtractionRepository::new(db.connection())
             .list_by_task(id)
@@ -142,6 +160,7 @@ pub fn load_task_detail(options: &LibraryOptions, id: &str) -> Result<TaskDetail
     })
 }
 
+#[cfg(test)]
 pub fn load_file_history(
     options: &LibraryOptions,
     status: Option<&str>,
@@ -160,6 +179,7 @@ pub fn load_file_history(
     .map_err(|e| e.to_string())
 }
 
+#[cfg(test)]
 pub fn list_passwords(options: &LibraryOptions, limit: usize) -> Result<Vec<PasswordSummary>> {
     let db = database(options, false)?;
     PasswordRepository::new(db.connection())
@@ -171,6 +191,7 @@ pub fn list_passwords(options: &LibraryOptions, limit: usize) -> Result<Vec<Pass
                     masked: "••••••••",
                     source: p.source,
                     pinned: p.pinned,
+                    disabled: p.disabled,
                     success_count: p.success_count,
                     failure_count: p.failure_count,
                     last_success_at: p.last_success_at,
@@ -209,6 +230,7 @@ pub fn add_password(
         .map_err(|_| "无法保存密码".into())
 }
 
+#[cfg(test)]
 pub fn remove_password(options: &LibraryOptions, id: i64) -> Result<()> {
     let db = database(options, true)?;
     PasswordRepository::new(db.connection())
@@ -338,7 +360,7 @@ pub fn migrate_config(options: &LibraryOptions, apply: bool) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn options(root: &Path, mode: &str) -> LibraryOptions {
+    pub(super) fn options(root: &Path, mode: &str) -> LibraryOptions {
         let config = root.join("config.toml");
         std::fs::write(
             &config,

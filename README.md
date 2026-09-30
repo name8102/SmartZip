@@ -20,7 +20,7 @@ SmartZip 是一个用 Rust 重写的跨平台压缩包辅助工具，目标是�
 - `test` 已接通后端、自动诊断、JSON 和历史报告；[分卷定位说明](.trellis/tasks/2026-07/07-03-test-command-backend-split/design.md) 记录证据规则与格式边界。压缩创建不在当前产品范围；桌面 beta 同时提供 GUI 与 CLI。
 - CLI beta 已加入可恢复覆盖提交、扫描与产出预算、Ctrl+C、非交互策略和 `doctor`。安装、平台范围、退出码、JSON 与限制见 [CLI beta 指南](docs/cli-beta.md)。设计草案中超出本轮的交互能力仍待实现。
 - CLI 与 GUI 已接入[统一配置](docs/configuration.md)；GUI 提供全局与单任务快速配置，以及共享校验的分组设置表单。
-- GUI 已有共享单并发解压队列的快速/详细双窗口、拖放解压、进度与后端显示、检测/列出/校验，以及历史和密码管理入口；原生实施与完整能力验收仍在进行，见 [GUI 实施记录](.trellis/tasks/09-12-gui-design/implement.md)。
+- GUI 在同一窗口内切换快速/完整模式，提供深浅主题、任务队列、归档浏览、历史与密码管理。校验和内嵌检测位于当前归档的操作菜单；队列持久化、显式恢复及平台验收范围见 [桌面体验实施记录](.trellis/tasks/09-26-gui-experience/implement.md)。
 - 安装、升级、恢复边界和发布验收见 [桌面 beta 指南](docs/desktop-beta.md)。
 - 当前核对结果与已知缺口见 [实现进度](docs/implementation-progress.md)。
 
@@ -120,7 +120,9 @@ python3 scripts/package-macos.py --profile release
 
 - “注册打开方式”将 SmartZip 加入系统候选程序；按格式点击“设为默认”可配置 ZIP、7z、RAR、TAR、GZ、BZ2、XZ、ZST。
 - “安装右键菜单”添加 Finder → 快速操作 → SmartZip 快速解压，支持多选；同页可移除。若系统未显示该项，可在系统设置的扩展/快速操作中启用。
-- 普通启动进入任务中心；系统打开归档进入预览；右键快速解压进入快速窗口，沿用当前队列暂停状态和快速配置。
+- 普通启动进入任务中心；系统打开归档进入预览；右键快速解压将当前窗口切换为快速模式，沿用队列与快速配置。右上角可切回完整模式，保留原页面、归档标签与设置草稿。
+- 外观页支持跟随系统、浅色、深色、列表密度和字号；桌面偏好独立保存，不改变解压策略。完整性校验和内嵌检测先打开归档，再从「归档操作」菜单执行。
+- 等待解压队列在启用可写历史时自动保存，重启后等待手动开始；临时密码不会保存。任务恢复页面只检查历史，点击「恢复此任务」后才继续执行。
 - 归档预览按内部目录浏览，支持面包屑和返回上级；点击文件可预览受支持的文本或图片。密码管理用于持久密码库，临时密码在排队任务详情中设置。
 
 打包与启动不会自动更改默认程序。右键菜单绑定应用当前位置，移动应用后需重新安装该菜单。当前系统集成实现针对 macOS；Windows/Linux 尚未接入。
@@ -173,7 +175,7 @@ scripts/crap-scan.sh
 - `docs/implementation-plan.md`
 - `docs/implementation-progress.md`
 - [CLI 交互设计草案](.trellis/tasks/09-05-cli-interaction-design/design.md)
-- [GUI 双窗口设计与组件调查](.trellis/tasks/09-12-gui-design/prd.md)（设计已完成，原生实施进行中）
+- [GUI 桌面体验计划与实施](.trellis/tasks/09-26-gui-experience/prd.md)（单窗口显示模式、UI、主题与主流程）
 - `docs/agents/`
 - `docs/compose/plans/`
 - `docs/research/`
