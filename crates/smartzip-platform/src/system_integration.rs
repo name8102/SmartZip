@@ -5,6 +5,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[cfg(target_os = "linux")]
+mod linux;
 pub const BUNDLE_ID: &str = "org.smartzip.SmartZip";
 #[derive(Clone, Debug, Deserialize)]
 pub struct ArchiveType {
@@ -174,7 +176,7 @@ mod mac {
         Ok(())
     }
 }
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn unsupported() -> io::Error {
     io::Error::new(
         io::ErrorKind::Unsupported,
@@ -186,7 +188,11 @@ pub fn status() -> io::Result<IntegrationStatus> {
     {
         mac::status()
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        linux::status()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         Err(unsupported())
     }
@@ -198,7 +204,11 @@ pub fn register_application() -> io::Result<PathBuf> {
         mac::register(&bundle)?;
         Ok(bundle)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        linux::register()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         Err(unsupported())
     }
@@ -211,7 +221,11 @@ pub fn set_default(
     {
         mac::set_default(extension, done)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        linux::set_default(extension, done)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = (extension, done);
         Err(unsupported())
