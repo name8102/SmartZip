@@ -1,0 +1,74 @@
+{
+  "select_one": {
+    "exit": 0,
+    "stdout": null,
+    "stderr": "",
+    "files": [
+      "dir/a.txt"
+    ]
+  },
+  "exclude_one": {
+    "exit": 0,
+    "stdout": null,
+    "stderr": "",
+    "files": [
+      "dir/a.txt"
+    ]
+  },
+  "exclude_long_components": {
+    "exit": 0,
+    "stdout": null,
+    "stderr": "",
+    "files": [
+      "README.txt",
+      "Readme.txt",
+      "dir/a.txt",
+      "dir/b.txt",
+      "normal.txt",
+      "star*.txt",
+      "starX.txt"
+    ]
+  },
+  "long_name_stream": {
+    "exit": 0,
+    "stdout": "long-name",
+    "stderr": ""
+  },
+  "long_directory_stream": {
+    "exit": 0,
+    "stdout": "long-dir",
+    "stderr": ""
+  },
+  "literal_wildcard_stream": {
+    "exit": 0,
+    "stdout": "literal",
+    "stderr": ""
+  },
+  "case_exact_stream": {
+    "exit": 0,
+    "stdout": "upper",
+    "stderr": ""
+  },
+  "multiple_stream": {
+    "exit": 0,
+    "stdout": "AB",
+    "stderr": ""
+  },
+  "duplicate_name_stream": {
+    "exit": 0,
+    "stdout": "firstsecond",
+    "stderr": ""
+  },
+  "environment": {
+    "7z": "7-Zip 26.03 (x64) : Copyright (c) 1999-2026 Igor Pavlov : 2026-09-03",
+    "filesystem": "tmpfs",
+    "platform": "Linux",
+    "archive_format": "ZIP",
+    "note": "Small synthetic fixtures; not performance or cross-platform evidence."
+  },
+  "validation": {
+    "checked_cases": 9,
+    "passed": 9,
+    "note": "Expected output/file sets checked; last two cases establish concatenation rather than safe unique-member extraction."
+  }
+}
