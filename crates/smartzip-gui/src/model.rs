@@ -49,6 +49,8 @@ pub struct Job {
     pub prompt_revision: u64,
     pub dismiss_requested: bool,
     pub persistence_pending: bool,
+    /// Advances only when the persisted request is edited, not on UI ticks.
+    pub(crate) draft_revision: u64,
     pub task_id: Option<String>,
     /// A configured draft stays queued until the user explicitly starts it.
     held: bool,
@@ -58,6 +60,7 @@ pub struct Job {
     current_route_failure: Option<String>,
     quick_overrides: QuickOverrides,
     handle: Option<JobHandle>,
+    files_revision: Option<u64>,
 }
 
 #[derive(Default)]
@@ -264,6 +267,7 @@ impl Queue {
             prompt_revision: 0,
             dismiss_requested: false,
             persistence_pending: false,
+            draft_revision: 1,
             task_id: None,
             held,
             start_requested: false,
@@ -271,6 +275,7 @@ impl Queue {
             current_route_failure: None,
             quick_overrides: QuickOverrides::default(),
             handle: None,
+            files_revision: None,
         });
         self.selected = Some(id);
         id
@@ -333,6 +338,7 @@ impl Queue {
             job.request.settings.auto_encoding,
         );
         update(&mut job.request.settings);
+        job.draft_revision = job.draft_revision.wrapping_add(1);
         job.quick_overrides.output |= job.request.settings.output != before.0;
         job.quick_overrides.recursive |= job.request.settings.recursive != before.1;
         job.quick_overrides.smart_layout |= job.request.settings.smart_layout != before.2;
@@ -363,6 +369,7 @@ impl Queue {
                 job.request.settings.temporary_passwords = false;
             }
         }
+        job.draft_revision = job.draft_revision.wrapping_add(1);
         Ok(())
     }
     pub fn apply_global_settings(&mut self, settings: &TaskSettings) {
@@ -370,6 +377,13 @@ impl Queue {
             if job.phase != Phase::Queued || job.request.operation != TaskOperation::Extract {
                 continue;
             }
+            let before = (
+                job.request.settings.output.clone(),
+                job.request.settings.recursive,
+                job.request.settings.smart_layout,
+                job.request.settings.delete_source,
+                job.request.settings.auto_encoding,
+            );
             if !job.quick_overrides.output {
                 job.request.settings.output = settings.output.clone();
             }
@@ -384,6 +398,17 @@ impl Queue {
             }
             if !job.quick_overrides.auto_encoding {
                 job.request.settings.auto_encoding = settings.auto_encoding;
+            }
+            if before
+                != (
+                    job.request.settings.output.clone(),
+                    job.request.settings.recursive,
+                    job.request.settings.smart_layout,
+                    job.request.settings.delete_source,
+                    job.request.settings.auto_encoding,
+                )
+            {
+                job.draft_revision = job.draft_revision.wrapping_add(1);
             }
         }
     }
@@ -405,6 +430,7 @@ impl Queue {
         job.request.settings.delete_source = settings.delete_source;
         job.request.settings.auto_encoding = settings.auto_encoding;
         job.quick_overrides = QuickOverrides::default();
+        job.draft_revision = job.draft_revision.wrapping_add(1);
         Ok(())
     }
     pub fn has_active(&self) -> bool {
@@ -525,8 +551,10 @@ impl Queue {
         let mut changed = false;
         for job in &mut self.jobs {
             if let Some(handle) = &job.handle {
-                let files = handle.roots.snapshot();
-                if job.files != files {
+                if let Some((revision, files)) =
+                    handle.roots.snapshot_if_changed(job.files_revision)
+                {
+                    job.files_revision = Some(revision);
                     job.files = files;
                     changed = true;
                 }

@@ -20,7 +20,7 @@ type Capture = (Vec<u8>, bool);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Mode {
-    /// Wait for process, then collect pipes; reject truncated output.
+    /// Wait for process, then collect pipes within cancellation; reject truncation.
     Ordinary,
     /// Same lifecycle, but the backend continues interpreting bounded progress records.
     Streaming,
@@ -177,13 +177,15 @@ async fn cancel_child(
     mode: Mode,
     initial_pid: Option<u32>,
 ) -> Failure {
-    let kill_error = if mode == Mode::Diagnostic {
-        #[cfg(unix)]
-        if let Some(pid) = initial_pid {
-            unsafe {
-                libc::kill(-(pid as i32), libc::SIGKILL);
-            }
+    #[cfg(unix)]
+    if let Some(pid) = initial_pid {
+        // wait may already have reaped the leader; its descendants can still
+        // own stdout/stderr. Keep killing the original group in every mode.
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGKILL);
         }
+    }
+    let kill_error = if mode == Mode::Diagnostic {
         Box::into_pin(child.kill()).await.err()
     } else {
         child.start_kill().err()
@@ -213,9 +215,18 @@ async fn run_child(
                 stdout.collect(None),
                 stderr.collect(None)
             )?;
-            Ok::<_, Failure>((status, Some((out, err))))
+            Ok::<_, Failure>((status, (out, err)))
         } else {
-            Ok((child.wait().await.map_err(Failure::Wait)?, None))
+            let status = child.wait().await.map_err(Failure::Wait)?;
+            let out = stdout.collect(status.code()).await?;
+            if mode == Mode::Ordinary && out.1 {
+                return Err(Failure::OutputLimit);
+            }
+            let err = stderr.collect(status.code()).await?;
+            if mode == Mode::Ordinary && err.1 {
+                return Err(Failure::OutputLimit);
+            }
+            Ok((status, (out, err)))
         }
     };
     let (status, captures): (ExitStatus, _) = tokio::select! {
@@ -227,19 +238,7 @@ async fn run_child(
             return Err(error);
         }
     };
-    let ((stdout, cut_out), (stderr, cut_err)) = if let Some(captures) = captures {
-        captures
-    } else {
-        let out = stdout.collect(status.code()).await?;
-        if mode == Mode::Ordinary && out.1 {
-            return Err(Failure::OutputLimit);
-        }
-        let err = stderr.collect(status.code()).await?;
-        if mode == Mode::Ordinary && err.1 {
-            return Err(Failure::OutputLimit);
-        }
-        (out, err)
-    };
+    let ((stdout, cut_out), (stderr, cut_err)) = captures;
     Ok((
         BackendCommandOutput {
             status: status.code(),
@@ -467,6 +466,82 @@ mod tests {
                     assert!(matches!(error, SmartZipError::Cancelled));
                 }
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_parent_wait_also_stops_pipe_holding_descendants() {
+        for mode in [Mode::Ordinary, Mode::Streaming, Mode::Diagnostic] {
+            let root = tempfile::tempdir().unwrap();
+            let marker = root.path().join("descendant-output");
+            let child = spawn(
+                Path::new("/bin/sh"),
+                &[
+                    "-c".into(),
+                    format!(
+                        "(while :; do printf x >> '{}'; sleep 0.01; done) & exit 0",
+                        marker.display()
+                    ),
+                ],
+                mode,
+            )
+            .unwrap();
+            let group = child.id().unwrap() as i32;
+            struct Cleanup(i32);
+            impl Drop for Cleanup {
+                fn drop(&mut self) {
+                    unsafe {
+                        libc::kill(-self.0, libc::SIGKILL);
+                    }
+                }
+            }
+            let _cleanup = Cleanup(group);
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let mut child = Box::new(FaultChild {
+                inner: child,
+                fail_kill: false,
+                fail_wait: false,
+                calls: calls.clone(),
+            });
+            let out = child.stdout().take().unwrap();
+            let err = child.stderr().take().unwrap();
+            let token = CancellationToken::new();
+            let cancelled = token.clone();
+            let pending = tokio::spawn(async move {
+                run_child(
+                    child,
+                    Reader::spawn(bounded_read(out)),
+                    Reader::spawn(bounded_read(err)),
+                    &cancelled,
+                    mode,
+                )
+                .await
+            });
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while !calls.lock().unwrap().contains(&"wait") || !marker.exists() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("parent did not exit while the descendant retained its pipes");
+            assert!(!pending.is_finished());
+            token.cancel();
+            let error = tokio::time::timeout(Duration::from_secs(3), pending)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap_err();
+            assert!(matches!(
+                error.into_error(Path::new("/bin/sh"), "fault-test", mode),
+                SmartZipError::Cancelled
+            ));
+            let size = std::fs::metadata(&marker).unwrap().len();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(
+                std::fs::metadata(&marker).unwrap().len(),
+                size,
+                "descendant still writes after cancellation"
+            );
         }
     }
 

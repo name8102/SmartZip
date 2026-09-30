@@ -3,6 +3,9 @@
 use serde::{Deserialize, Serialize};
 use smartzip_db::password::{NewPassword, PasswordRecord, PasswordRepository};
 
+mod export;
+pub use export::export_passwords;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PasswordSource {
     Empty,

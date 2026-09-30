@@ -68,7 +68,9 @@ fn probe_rar5(header: &[u8], _path: &Path, _file: &mut File) -> VolumeProbeResul
 fn parse_rar5_main_flags(data: &[u8]) -> Option<(bool, Option<u32>)> {
     let mut pos = 0usize;
     let _crc = read_bytes(data, &mut pos, 4)?;
-    let _header_size = read_vint(data, &mut pos)?;
+    let header_size = usize::try_from(read_vint(data, &mut pos)?).ok()?;
+    let header_end = pos.checked_add(header_size)?;
+    let data = data.get(..header_end)?;
     let header_type = read_vint(data, &mut pos)?;
     if header_type != 1 {
         return None;
@@ -76,36 +78,35 @@ fn parse_rar5_main_flags(data: &[u8]) -> Option<(bool, Option<u32>)> {
     let hdr_flags = read_vint(data, &mut pos)?;
     let has_extra = (hdr_flags & 0x01) != 0;
     let extra_size = if has_extra {
-        read_vint(data, &mut pos)?
+        usize::try_from(read_vint(data, &mut pos)?).ok()?
     } else {
         0
     };
-    if data.len() < pos + 1 {
-        return None;
+    if hdr_flags & 0x02 != 0 {
+        let _data_size = read_vint(data, &mut pos)?;
     }
+    // Optional extra records follow the main-header body. Never read flags
+    // or the volume number from that area, or beyond the declared header.
+    let body_end = header_end.checked_sub(extra_size)?;
+    let data = data.get(..body_end)?;
     let arc_flags = read_vint(data, &mut pos)?;
     let is_volume = (arc_flags & 0x01) != 0;
     let has_vol_number = (arc_flags & 0x02) != 0;
     let vol_number = if has_vol_number {
-        Some(read_vint(data, &mut pos)? as u32)
+        Some(u32::try_from(read_vint(data, &mut pos)?).ok()?)
     } else if is_volume {
         // First volume has no explicit number field; it is logical 0
         Some(0)
     } else {
         None
     };
-    if has_extra && data.len() < pos + extra_size as usize {
-        return None;
-    }
     Some((is_volume, vol_number))
 }
 
 fn read_bytes<'a>(data: &'a [u8], pos: &mut usize, n: usize) -> Option<&'a [u8]> {
-    if *pos + n > data.len() {
-        return None;
-    }
-    let v = &data[*pos..*pos + n];
-    *pos += n;
+    let end = pos.checked_add(n)?;
+    let v = data.get(*pos..end)?;
+    *pos = end;
     Some(v)
 }
 
@@ -118,6 +119,9 @@ fn read_vint(data: &[u8], pos: &mut usize) -> Option<u64> {
         }
         let b = data[*pos];
         *pos += 1;
+        if shift == 63 && b > 1 {
+            return None;
+        }
         result |= ((b & 0x7F) as u64) << shift;
         if (b & 0x80) == 0 {
             break;
@@ -166,5 +170,88 @@ fn probe_rar4(header: &[u8], _path: &Path, file: &mut File) -> VolumeProbeResult
         // We could also verify by seeking to see if file ends with end header.
         let _ = file.seek(SeekFrom::End(-10)).is_ok();
         VolumeProbeResult::Standalone(ArchiveFormat::Rar)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn vint(mut number: u64) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        loop {
+            let byte = (number & 0x7f) as u8;
+            number >>= 7;
+            bytes.push(byte | if number != 0 { 0x80 } else { 0 });
+            if number == 0 {
+                return bytes;
+            }
+        }
+    }
+    fn header(body: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![0; 4];
+        bytes.extend(vint(body.len() as u64));
+        bytes.extend(body);
+        bytes
+    }
+
+    #[test]
+    fn rar5_bounds_header_extra_vint_and_volume_number() {
+        assert_eq!(
+            parse_rar5_main_flags(&header(&[1, 0, 0])),
+            Some((false, None))
+        );
+        assert_eq!(
+            parse_rar5_main_flags(&header(&[1, 0, 1])),
+            Some((true, Some(0)))
+        );
+        assert_eq!(
+            parse_rar5_main_flags(&header(&[1, 1, 2, 3, 7, 0, 0])),
+            Some((true, Some(7)))
+        );
+        assert_eq!(
+            parse_rar5_main_flags(&header(&[1, 2, 9, 3, 7])),
+            Some((true, Some(7)))
+        );
+        let mut body = vec![1, 0, 3];
+        body.extend(vint(u32::MAX as u64));
+        assert_eq!(
+            parse_rar5_main_flags(&header(&body)),
+            Some((true, Some(u32::MAX)))
+        );
+        let mut malformed = Vec::new();
+        let mut extra = vec![1, 1];
+        extra.extend(vint(u64::MAX));
+        extra.push(1);
+        malformed.push(header(&extra));
+        let mut volume = vec![1, 0, 3];
+        volume.extend(vint(u32::MAX as u64 + 1));
+        malformed.push(header(&volume));
+        let mut oversized = vec![0; 4];
+        oversized.extend(vint(u64::MAX));
+        oversized.extend([1, 0, 1]);
+        malformed.push(oversized);
+        let mut invalid_vint = vec![0; 4];
+        invalid_vint.extend([0xff; 9]);
+        invalid_vint.push(2);
+        invalid_vint.extend([1, 0, 1]);
+        malformed.push(invalid_vint);
+        malformed.push(header(&[1, 1, 2, 1]));
+        malformed.push(vec![0, 0, 0, 0, 2, 1, 0, 1]); // Flags beyond the declared header.
+        for data in malformed {
+            assert_eq!(parse_rar5_main_flags(&data), None, "{data:?}");
+            let mut file = tempfile::NamedTempFile::new().unwrap();
+            file.write_all(RAR5_MAGIC).unwrap();
+            file.write_all(&data).unwrap();
+            assert!(matches!(
+                probe_rar(file.path()),
+                Some(VolumeProbeResult::PossiblyMultiVolume(_))
+            ));
+        }
+        let valid = header(&[1, 0, 3, 7]);
+        for end in 0..valid.len() {
+            assert_eq!(parse_rar5_main_flags(&valid[..end]), None);
+        }
     }
 }

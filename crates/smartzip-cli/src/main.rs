@@ -295,7 +295,7 @@ enum PasswordCmd {
         source: String,
     },
 
-    /// Export passwords to a text file.
+    /// Export passwords to a new private text file; preserve existing files and links.
     Export {
         #[arg(long)]
         path: Option<PathBuf>,
@@ -430,7 +430,7 @@ async fn main() -> std::process::ExitCode {
                 serde_json::json!({"schema_version": 1, "status": if cancelled { "cancelled" } else { "failed" }, "exit_code": code, "error": error.to_string()})
             );
         } else {
-            eprintln!("error: {error}");
+            eprintln!("error: {}", safe_text(&error.to_string()));
         }
         return std::process::ExitCode::from(code as u8);
     }
@@ -490,7 +490,7 @@ async fn run(mut cli: Cli, matches: &clap::ArgMatches) -> Result<(), Box<dyn std
         smartzip_config::LogLevel::Off | smartzip_config::LogLevel::Error
     ) {
         for diagnostic in &policy.resolved().diagnostics {
-            eprintln!("configuration: {diagnostic}");
+            eprintln!("configuration: {}", safe_text(diagnostic));
         }
     }
     // Management commands don't require discovering or starting archive backends.
@@ -562,7 +562,7 @@ async fn run(mut cli: Cli, matches: &clap::ArgMatches) -> Result<(), Box<dyn std
                 println!(
                     "SmartZip {}\nDatabase: {}",
                     env!("CARGO_PKG_VERSION"),
-                    db_path.display()
+                    safe_text(&db_path.to_string_lossy())
                 );
                 for adapter in &adapters {
                     println!(
@@ -822,20 +822,20 @@ async fn preview_encodings(
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
         for preview in previews {
-            println!("[{}]", preview.encoding);
+            println!("[{}]", safe_text(&preview.encoding));
             if preview.ok {
                 if preview.names.is_empty() {
                     println!("  (no entries)");
                 } else {
                     for name in preview.names.iter().take(20) {
-                        println!("  {name}");
+                        println!("  {}", safe_text(name));
                     }
                     if preview.names.len() > 20 {
                         println!("  ... {} more", preview.names.len() - 20);
                     }
                 }
             } else if let Some(error) = preview.error {
-                println!("  ERROR: {error}");
+                println!("  ERROR: {}", safe_text(&error));
             }
         }
     }
@@ -885,9 +885,9 @@ fn password(db: &SmartZipDb, cmd: PasswordCmd) -> Result<(), Box<dyn std::error:
                         if p.pinned { "*" } else { "" },
                         p.success_count,
                         p.failure_count,
-                        p.last_success_at.as_deref().unwrap_or("-"),
-                        p.last_failure_at.as_deref().unwrap_or("-"),
-                        value
+                        safe_text(p.last_success_at.as_deref().unwrap_or("-")),
+                        safe_text(p.last_failure_at.as_deref().unwrap_or("-")),
+                        safe_text(&value)
                     );
                 }
             }
@@ -908,11 +908,13 @@ fn password(db: &SmartZipDb, cmd: PasswordCmd) -> Result<(), Box<dyn std::error:
         PasswordCmd::Import { path, source } => {
             let reader = std::io::BufReader::new(std::fs::File::open(&path)?);
             let count = PasswordRepository::new(db.connection()).import_lines(reader, &source)?;
-            println!("imported {count} password(s) from {}", path.display());
+            println!(
+                "imported {count} password(s) from {}",
+                safe_text(&path.to_string_lossy())
+            );
         }
         PasswordCmd::Export { path } => {
             let repo = PasswordRepository::new(db.connection());
-            let passwords = repo.ranked_candidates(usize::MAX)?;
             let out_path = if let Some(path) = path {
                 path
             } else {
@@ -920,12 +922,11 @@ fn password(db: &SmartZipDb, cmd: PasswordCmd) -> Result<(), Box<dyn std::error:
                 std::fs::create_dir_all(&paths.data_dir)?;
                 paths.password_export_path()
             };
-            let lines: Vec<String> = passwords.iter().map(|p| p.value.clone()).collect();
-            std::fs::write(&out_path, lines.join("\n") + "\n")?;
+            let count = smartzip_passwords::export_passwords(&repo, &out_path)?;
             println!(
                 "exported {} password(s) to {}",
-                lines.len(),
-                out_path.display()
+                count,
+                safe_text(&out_path.to_string_lossy())
             );
         }
         PasswordCmd::Cleanup {
@@ -993,11 +994,11 @@ fn history(db: &SmartZipDb, cmd: HistoryCmd) -> Result<(), Box<dyn std::error::E
                 for t in &tasks {
                     println!(
                         "{}  {:<8} {:<9} {}  {}",
-                        t.id,
-                        t.kind,
-                        t.status,
-                        t.started_at,
-                        t.output_path.as_deref().unwrap_or("-"),
+                        safe_text(&t.id),
+                        safe_text(&t.kind),
+                        safe_text(&t.status),
+                        safe_text(&t.started_at),
+                        safe_text(t.output_path.as_deref().unwrap_or("-")),
                     );
                 }
             }
@@ -1028,12 +1029,12 @@ fn history(db: &SmartZipDb, cmd: HistoryCmd) -> Result<(), Box<dyn std::error::E
                     };
                     println!(
                         "{:<10} {} {}  enc={}  damaged={}  -> {}",
-                        detail,
-                        r.input_path,
+                        safe_text(&detail),
+                        safe_text(&r.input_path),
                         offset,
-                        r.encoding.as_deref().unwrap_or("-"),
-                        r.damaged_volumes_json.as_deref().unwrap_or("-"),
-                        r.output_path.as_deref().unwrap_or("-"),
+                        safe_text(r.encoding.as_deref().unwrap_or("-")),
+                        safe_text(r.damaged_volumes_json.as_deref().unwrap_or("-")),
+                        safe_text(r.output_path.as_deref().unwrap_or("-")),
                     );
                     print_history_test_report(r.test_report_json.as_deref());
                 }
@@ -1054,15 +1055,15 @@ fn history(db: &SmartZipDb, cmd: HistoryCmd) -> Result<(), Box<dyn std::error::E
                 });
                 println!("{}", serde_json::to_string_pretty(&output)?);
             } else {
-                println!("Task {}", task.id);
-                println!("  kind:      {}", task.kind);
-                println!("  status:    {}", task.status);
+                println!("Task {}", safe_text(&task.id));
+                println!("  kind:      {}", safe_text(&task.kind));
+                println!("  status:    {}", safe_text(&task.status));
                 if let Some(output) = &task.output_path {
-                    println!("  output:    {output}");
+                    println!("  output:    {}", safe_text(output));
                 }
-                println!("  started:   {}", task.started_at);
+                println!("  started:   {}", safe_text(&task.started_at));
                 if let Some(finished) = &task.finished_at {
-                    println!("  finished:  {finished}");
+                    println!("  finished:  {}", safe_text(finished));
                 }
                 println!("  files:");
                 for f in &files {
@@ -1072,9 +1073,9 @@ fn history(db: &SmartZipDb, cmd: HistoryCmd) -> Result<(), Box<dyn std::error::E
                     };
                     println!(
                         "    {:<10} {} -> {}",
-                        detail,
-                        f.input_path,
-                        f.output_path.as_deref().unwrap_or("-"),
+                        safe_text(&detail),
+                        safe_text(&f.input_path),
+                        safe_text(f.output_path.as_deref().unwrap_or("-")),
                     );
                     print_history_test_report(f.test_report_json.as_deref());
                 }
@@ -1082,7 +1083,10 @@ fn history(db: &SmartZipDb, cmd: HistoryCmd) -> Result<(), Box<dyn std::error::E
                 for event in &events {
                     println!(
                         "    {}  [{}] {}: {}",
-                        event.created_at, event.level, event.event_type, event.message,
+                        safe_text(&event.created_at),
+                        safe_text(&event.level),
+                        safe_text(&event.event_type),
+                        safe_text(&event.message),
                     );
                 }
             }
@@ -1318,7 +1322,7 @@ fn prompt_password_stdin(path: &Path, control: &StdinLock) -> Option<String> {
 
     eprint!(
         "\n  No matching password for \"{}\".\n  Enter password (or press Enter to skip): ",
-        path.display()
+        safe_text(&path.to_string_lossy())
     );
     let _ = io::stderr().flush();
 
@@ -1355,8 +1359,8 @@ fn prompt_output_collision_stdin(
     loop {
         eprint!(
             "\n  Output already exists for \"{}\": {}\n  Choose [s]kip, [o]verwrite, [r]ename: ",
-            archive_path.display(),
-            output_path.display()
+            safe_text(&archive_path.to_string_lossy()),
+            safe_text(&output_path.to_string_lossy())
         );
         let _ = io::stderr().flush();
 
@@ -1390,11 +1394,14 @@ fn prompt_embedded_stdin(
     }
 
     loop {
-        eprintln!("\n  Embedded archive decision required: {}", path.display());
+        eprintln!(
+            "\n  Embedded archive decision required: {}",
+            safe_text(&path.to_string_lossy())
+        );
         eprintln!(
             "  {} finding(s), reason: {}",
             decision.findings_summary.len(),
-            decision.reason
+            safe_text(&decision.reason)
         );
         eprint!("  Choose [e]xtract, [s]kip, [a]lways extract remaining ask findings: ");
         let _ = io::stderr().flush();
@@ -1439,14 +1446,17 @@ fn prompt_encoding_stdin(
     loop {
         eprintln!(
             "\n  ZIP filename encoding looks suspicious: {}",
-            path.display()
+            safe_text(&path.to_string_lossy())
         );
-        eprintln!("  detected: {detected}");
+        eprintln!("  detected: {}", safe_text(&detected));
         if !context.suspicious_reasons.is_empty() {
-            eprintln!("  reasons: {}", context.suspicious_reasons.join(", "));
+            eprintln!(
+                "  reasons: {}",
+                safe_text(&context.suspicious_reasons.join(", "))
+            );
         }
         for preview in &context.preview_names {
-            eprintln!("  preview: {preview}");
+            eprintln!("  preview: {}", safe_text(preview));
         }
         eprint!("  Choose [Enter] accept, [m]anual encoding, [s]kip archive: ");
         let _ = io::stderr().flush();

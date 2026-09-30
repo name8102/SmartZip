@@ -5,7 +5,10 @@ use smartzip_core::{AttemptId, DecisionId, NodeId, TaskId};
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
 };
 use tokio_util::sync::CancellationToken;
 
@@ -47,47 +50,74 @@ struct State {
 /// One handle per submitted batch. Controls never cancel sibling roots.
 pub struct RootManagement {
     state: Mutex<State>,
-    revision: tokio::sync::watch::Sender<u64>,
+    revision: AtomicU64,
+    changes: tokio::sync::watch::Sender<u64>,
 }
 impl Default for RootManagement {
     fn default() -> Self {
         Self {
             state: Mutex::new(State::default()),
-            revision: tokio::sync::watch::channel(0).0,
+            revision: AtomicU64::new(0),
+            changes: tokio::sync::watch::channel(0).0,
         }
     }
 }
 impl RootManagement {
-    fn changed(&self) {
-        self.revision.send_modify(|n| *n = n.wrapping_add(1));
+    // Publish while holding state so every revision identifies a complete snapshot.
+    fn changed(&self, _state: &mut State) {
+        let revision = self
+            .revision
+            .fetch_add(1, Ordering::Release)
+            .wrapping_add(1);
+        self.changes.send_replace(revision);
+    }
+    pub fn revision(&self) -> u64 {
+        self.revision.load(Ordering::Acquire)
+    }
+    /// `None` requests the initial snapshot. Unchanged polls do not clone nodes/events.
+    pub fn snapshot_if_changed(
+        &self,
+        previous: Option<u64>,
+    ) -> Option<(u64, Vec<FileTaskSnapshot>)> {
+        if previous == Some(self.revision()) {
+            return None;
+        }
+        let state = self.state.lock().unwrap();
+        let revision = self.revision();
+        (previous != Some(revision)).then(|| (revision, Self::snapshot_locked(&state)))
     }
     pub fn snapshot(&self) -> Vec<FileTaskSnapshot> {
         let state = self.state.lock().unwrap();
+        Self::snapshot_locked(&state)
+    }
+    fn snapshot_locked(state: &State) -> Vec<FileTaskSnapshot> {
+        let priority = |node: &FileTaskSnapshot| match node.state.as_str() {
+            "waiting_user" => 0,
+            "paused" => 1,
+            _ => 2,
+        };
+        let mut active_by_root: HashMap<&NodeId, &FileTaskSnapshot> = HashMap::new();
+        for node in state.nodes.iter().filter(|n| {
+            matches!(
+                n.state.as_str(),
+                "running" | "paused" | "waiting_user" | "waiting_resources"
+            )
+        }) {
+            active_by_root
+                .entry(&node.root_id)
+                .and_modify(|active| {
+                    if priority(node) < priority(active) {
+                        *active = node;
+                    }
+                })
+                .or_insert(node);
+        }
         let mut nodes = state.nodes.clone();
         for node in nodes
             .iter_mut()
             .filter(|n| n.parent_id.is_none() && n.root_outcome.is_none())
         {
-            let active = state
-                .nodes
-                .iter()
-                .filter(|n| {
-                    n.root_id == node.root_id
-                        && matches!(
-                            n.state.as_str(),
-                            "running" | "paused" | "waiting_user" | "waiting_resources"
-                        )
-                })
-                .min_by_key(|n| {
-                    if n.state == "waiting_user" {
-                        0
-                    } else if n.state == "paused" {
-                        1
-                    } else {
-                        2
-                    }
-                });
-            if let Some(active) = active {
+            if let Some(active) = active_by_root.get(&node.root_id) {
                 let name = active
                     .path
                     .file_name()
@@ -100,7 +130,7 @@ impl RootManagement {
         nodes
     }
     pub(crate) fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
-        self.revision.subscribe()
+        self.changes.subscribe()
     }
     pub fn configure_groups(
         &self,
@@ -139,6 +169,7 @@ impl RootManagement {
                 .into_iter()
                 .filter(|n| n.parent_id.is_none())
                 .collect();
+            self.changed(&mut state);
         }
     }
     pub(crate) fn register(&self, identity: &ExtractTaskIdentity, cancellation: &TaskCancellation) {
@@ -181,8 +212,7 @@ impl RootManagement {
                 state.nodes.push(snapshot);
             }
         }
-        drop(state);
-        self.changed();
+        self.changed(&mut state);
     }
     pub fn set_paused(&self, root_id: &NodeId, paused: bool) -> bool {
         let mut state = self.state.lock().unwrap();
@@ -199,8 +229,7 @@ impl RootManagement {
                 node.pause_requested = paused;
             }
         }
-        drop(state);
-        self.changed();
+        self.changed(&mut state);
         true
     }
     pub fn cancel(&self, root_id: &NodeId) -> bool {
@@ -217,8 +246,7 @@ impl RootManagement {
                 node.pause_requested = false;
             }
         }
-        drop(state);
-        self.changed();
+        self.changed(&mut state);
         true
     }
     pub(crate) fn cancellation(&self, root: &NodeId) -> TaskCancellation {
@@ -252,9 +280,8 @@ impl RootManagement {
         let mut state = self.state.lock().unwrap();
         if let Some(n) = state.nodes.iter_mut().find(|n| n.node_id == *node) {
             update(n);
+            self.changed(&mut state);
         }
-        drop(state);
-        self.changed();
     }
     pub(crate) fn finish(
         &self,
@@ -272,8 +299,7 @@ impl RootManagement {
         control.remaining -= 1;
         control.outcomes.push(outcome);
         if control.remaining > 0 {
-            drop(state);
-            self.changed();
+            self.changed(&mut state);
             return;
         }
         control.finished = true;
@@ -302,8 +328,7 @@ impl RootManagement {
                 n.state = outcome.clone();
             }
         }
-        drop(state);
-        self.changed();
+        self.changed(&mut state);
     }
     pub(crate) fn event(&self, root: &NodeId, event: &smartzip_core::TaskEvent) {
         use smartzip_core::{RouteEvent, TaskEventKind};
@@ -415,18 +440,14 @@ impl ExecutionStateRecorder for ManagedRecorder<'_> {
             None => true,
         };
         if accepted {
-            self.management
-                .state
-                .lock()
-                .unwrap()
-                .nodes
-                .push(node_snapshot(
-                    node_id,
-                    root_id,
-                    Some(parent_id.clone()),
-                    candidate,
-                ));
-            self.management.changed();
+            let mut state = self.management.state.lock().unwrap();
+            state.nodes.push(node_snapshot(
+                node_id,
+                root_id,
+                Some(parent_id.clone()),
+                candidate,
+            ));
+            self.management.changed(&mut state);
         }
         Ok(accepted)
     }
@@ -648,6 +669,86 @@ impl ExecutionStateRecorder for ManagedRecorder<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn snapshots_are_cloned_only_after_a_revision_change_including_completion() {
+        let identity = ExtractTaskIdentity::new(&["a.zip".into()]);
+        let management = RootManagement::default();
+        let (initial, files) = management.snapshot_if_changed(None).unwrap();
+        assert!(files.is_empty());
+        assert!(management.snapshot_if_changed(Some(initial)).is_none());
+        management.register(&identity, &TaskCancellation::new(CancellationToken::new()));
+        let (registered, files) = management.snapshot_if_changed(Some(initial)).unwrap();
+        assert_eq!(files[0].state, "queued");
+        assert!(management.snapshot_if_changed(Some(registered)).is_none());
+        management.finish(
+            &identity.roots[0].root_id,
+            &Err(smartzip_core::SmartZipError::Cancelled),
+        );
+        let (finished, files) = management.snapshot_if_changed(Some(registered)).unwrap();
+        assert_eq!(files[0].root_outcome.as_deref(), Some("cancelled"));
+        assert_eq!(files, management.snapshot());
+        assert_eq!(finished, management.revision());
+        assert!(management.snapshot_if_changed(Some(finished)).is_none());
+    }
+    #[test]
+    fn snapshot_revision_matches_its_state_during_concurrent_updates() {
+        let identity = ExtractTaskIdentity::new(&["a.zip".into()]);
+        let management = Arc::new(RootManagement::default());
+        management.register(&identity, &TaskCancellation::new(CancellationToken::new()));
+        let base = management.revision();
+        let writer = management.clone();
+        let node = identity.roots[0].node_id.clone();
+        let updates = std::thread::spawn(move || {
+            for sequence in 1..=512 {
+                writer.update(&node, |n| n.stage = sequence.to_string());
+            }
+        });
+        let mut previous = Some(base);
+        for _ in 0..512 {
+            if let Some((revision, files)) = management.snapshot_if_changed(previous) {
+                assert_eq!(files[0].stage, (revision - base).to_string());
+                previous = Some(revision);
+            }
+        }
+        updates.join().unwrap();
+        let (revision, files) = management.snapshot_if_changed(None).unwrap();
+        assert_eq!(revision - base, 512);
+        assert_eq!(files[0].stage, "512");
+    }
+    #[test]
+    fn root_activity_keeps_priority_and_first_node_ties_and_omits_finished_roots() {
+        let identity = ExtractTaskIdentity::new(&["a.zip".into(), "b.zip".into()]);
+        let management = RootManagement::default();
+        management.register(&identity, &TaskCancellation::new(CancellationToken::new()));
+        let root = &identity.roots[0];
+        {
+            let mut state = management.state.lock().unwrap();
+            for (name, status) in [
+                ("running.zip", "running"),
+                ("paused.zip", "paused"),
+                ("first.zip", "waiting_user"),
+                ("second.zip", "waiting_user"),
+            ] {
+                let mut node = node_snapshot(
+                    &NodeId::new(),
+                    &root.root_id,
+                    Some(root.node_id.clone()),
+                    &crate::ExtractionCandidate::root(name.into()),
+                );
+                node.state = status.into();
+                state.nodes.push(node);
+            }
+            state.nodes[1].state = "running".into();
+            state.nodes[1].root_outcome = Some("completed".into());
+            management.changed(&mut state);
+        }
+        let files = management.snapshot();
+        assert_eq!(
+            files[0].root_activity,
+            Some(("waiting_user".into(), "first.zip · 等待启动".into()))
+        );
+        assert!(files[1].root_activity.is_none());
+    }
     #[test]
     fn recovered_child_keeps_committed_parent_visible_and_partial_outcome() {
         let parent = ExtractTaskIdentity::new(&["parent.zip".into()]);

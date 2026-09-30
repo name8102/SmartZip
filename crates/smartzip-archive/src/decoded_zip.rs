@@ -165,6 +165,7 @@ fn extract(
         safe.push(path);
     }
     let mut directories = std::collections::HashSet::new();
+    crate::output_names::validate(&entries, &request.output_dir, token)?;
     let mut links = Vec::new();
     for (index, relative) in safe.iter().enumerate() {
         if token.is_cancelled() {

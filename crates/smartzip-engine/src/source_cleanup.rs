@@ -7,12 +7,12 @@ use std::path::{Path, PathBuf};
 pub(crate) type SharedCleanup = Option<std::rc::Rc<std::cell::RefCell<SourceCleanup>>>;
 
 #[derive(Clone)]
-struct SourceSnapshot {
+pub(crate) struct SourceSnapshot {
     path: PathBuf,
     metadata: std::fs::Metadata,
 }
 impl SourceSnapshot {
-    fn capture(path: &Path) -> std::io::Result<Self> {
+    pub(crate) fn capture(path: &Path) -> std::io::Result<Self> {
         let metadata = std::fs::symlink_metadata(path)?;
         if !metadata.is_file() {
             return Err(std::io::Error::new(
@@ -25,7 +25,10 @@ impl SourceSnapshot {
             metadata,
         })
     }
-    fn unchanged(&self) -> bool {
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+    pub(crate) fn unchanged(&self) -> bool {
         std::fs::symlink_metadata(&self.path).is_ok_and(|now| {
             let basic = now.is_file()
                 && now.len() == self.metadata.len()

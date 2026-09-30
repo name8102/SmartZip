@@ -2,6 +2,44 @@ use smartzip_config::*;
 use std::fs;
 
 #[test]
+fn encoding_modes_are_canonical_for_files_overrides_and_snapshots() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("config.toml");
+    for mode in [
+        "AUTO",
+        "BACKEND",
+        "UTF-8",
+        "GB18030",
+        "GBK",
+        "BiG5",
+        "SHIFT_JIS",
+        "EUC-JP",
+        "EUC-KR",
+    ] {
+        fs::write(
+            &path,
+            format!("schema_version=1\n[extraction.encoding]\nmode='{mode}'\n"),
+        )
+        .unwrap();
+        let mut resolved = ResolvedConfig::load(Some(&path)).unwrap();
+        let canonical = mode.to_ascii_lowercase();
+        assert_eq!(resolved.values.extraction.encoding.mode, canonical);
+        resolved
+            .apply(&[("extraction.encoding.mode".into(), mode.into())])
+            .unwrap();
+        assert_eq!(resolved.values.extraction.encoding.mode, canonical);
+        // Saved recovery policies are deserialized through the same Encoding field.
+        let restored: SmartZipConfig =
+            toml::from_str(&format!("[extraction.encoding]\nmode='{mode}'\n")).unwrap();
+        assert_eq!(restored.extraction.encoding.mode, canonical);
+        let mut constructed = SmartZipConfig::default();
+        constructed.extraction.encoding.mode = mode.into();
+        constructed.normalize().unwrap();
+        assert_eq!(constructed.extraction.encoding.mode, canonical);
+    }
+}
+
+#[test]
 fn precedence_preserves_false_empty_arrays_and_file_relative_paths() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("config.toml");

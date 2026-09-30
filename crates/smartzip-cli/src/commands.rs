@@ -491,7 +491,10 @@ pub(super) async fn select_list_encoding(
         use std::io::Write;
         let _guard = control.gate.lock().unwrap();
         let candidates = encoding_preview_candidates();
-        eprintln!("\n  Candidate encodings for {}:", path.display());
+        eprintln!(
+            "\n  Candidate encodings for {}:",
+            safe_text(&path.to_string_lossy())
+        );
         for (idx, candidate) in candidates.iter().enumerate() {
             eprintln!("  [{}] {}", idx + 1, candidate);
         }

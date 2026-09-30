@@ -2,16 +2,52 @@
 
 use aho_corasick::AhoCorasick;
 
+// At most 512 KiB of positions, independent of file size or findings. Dense
+// signature junk beyond this cap retains the original checked search path.
+const MAX_CACHED_EOCD: usize = 64 * 1024;
+
+#[derive(Default)]
+pub(super) struct EocdSearch {
+    positions: Vec<u64>,
+    searched_until: u64,
+}
+
 pub(super) fn checked_file_size(
     input: &mut crate::file_scan::Input<'_>,
     start: u64,
 ) -> Option<u64> {
-    let end = input.end;
-    input
-        .find(b"PK\x05\x06", start, end, |input, eocd| {
-            check_file_directory(input, start, eocd)
-        })
-        .map(|end| end - start)
+    // Candidates advance monotonically, but an earlier candidate may reject
+    // an inner directory which a later candidate needs. Cache the signatures,
+    // not a start-specific rejection, and keep checking their associations.
+    let mut search = std::mem::take(&mut input.zip_search);
+    let result = (|| {
+        for &eocd in &search.positions {
+            if eocd >= start {
+                if let Some(end) = check_file_directory(input, start, eocd) {
+                    return Some(end - start);
+                }
+            }
+        }
+        let end = input.end;
+        let result = input.find(
+            b"PK\x05\x06",
+            start.max(search.searched_until),
+            end,
+            |input, eocd| {
+                if search.positions.len() < MAX_CACHED_EOCD {
+                    search.positions.push(eocd);
+                    search.searched_until = eocd + 4;
+                }
+                check_file_directory(input, start, eocd)
+            },
+        );
+        if result.is_none() && search.positions.len() < MAX_CACHED_EOCD {
+            search.searched_until = end;
+        }
+        result.map(|end| end - start)
+    })();
+    input.zip_search = search;
+    result
 }
 
 fn check_file_directory(
@@ -270,6 +306,91 @@ mod tests {
         writer.finish().unwrap().into_inner()
     }
 
+    fn file_sizes(data: &[u8]) -> Vec<(u64, Option<u64>)> {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(data).unwrap();
+        crate::EmbeddedScanner::new(crate::ScannerConfig {
+            mode: crate::ScanMode::Deep,
+            max_scan_bytes: None,
+            ..Default::default()
+        })
+        .scan_path(file.path())
+        .unwrap()
+        .iter()
+        .map(|f| (f.offset, f.size))
+        .collect()
+    }
+
+    #[test]
+    fn file_scan_reuses_inner_eocd_after_an_unresolved_earlier_candidate() {
+        let mut data = vec![0; 64];
+        data[..4].copy_from_slice(b"PK\x03\x04");
+        data[4..6].copy_from_slice(&20u16.to_le_bytes());
+        data[26..28].copy_from_slice(&1u16.to_le_bytes());
+        data[30] = b'a';
+        let inner = archive(&[("inner.txt", b"inner")]);
+        data.extend(&inner);
+        assert_eq!(
+            file_sizes(&data),
+            vec![(0, None), (64, Some(inner.len() as u64))]
+        );
+    }
+
+    #[test]
+    fn bounded_eocd_cache_overflow_still_finds_a_later_archive() {
+        let mut data = vec![0; 64];
+        data[..4].copy_from_slice(b"PK\x03\x04");
+        data[4..6].copy_from_slice(&20u16.to_le_bytes());
+        data[26..28].copy_from_slice(&1u16.to_le_bytes());
+        data[30] = b'a';
+        let mut invalid_eocd = [0; 22];
+        invalid_eocd[..4].copy_from_slice(b"PK\x05\x06");
+        for _ in 0..MAX_CACHED_EOCD + 1 {
+            data.extend(invalid_eocd);
+        }
+        let later = archive(&[("later.txt", b"later")]);
+        let start = data.len() as u64;
+        data.extend(&later);
+        assert_eq!(
+            file_sizes(&data),
+            vec![(0, None), (start, Some(later.len() as u64))]
+        );
+    }
+
+    #[test]
+    fn file_scan_retains_zip64_directory_and_concatenated_archive_associations() {
+        let ordinary = archive(&[("a", b"a")]);
+        let eocd = ordinary.len() - 22;
+        let count = u16_at(&ordinary, eocd + 10).unwrap() as u64;
+        let size = u32_at(&ordinary, eocd + 12).unwrap() as u64;
+        let offset = u32_at(&ordinary, eocd + 16).unwrap() as u64;
+        let mut zip64 = ordinary[..eocd].to_vec();
+        zip64.extend(b"PK\x06\x06");
+        zip64.extend(44u64.to_le_bytes());
+        zip64.extend([45, 0, 45, 0]);
+        zip64.extend([0; 8]);
+        for value in [count, count, size, offset] {
+            zip64.extend(value.to_le_bytes());
+        }
+        zip64.extend(b"PK\x06\x07");
+        zip64.extend([0; 4]);
+        zip64.extend((eocd as u64).to_le_bytes());
+        zip64.extend(1u32.to_le_bytes());
+        let mut end = ordinary[eocd..].to_vec();
+        end[8..12].fill(0xff);
+        end[12..20].fill(0xff);
+        zip64.extend(end);
+        let mut joined = zip64.clone();
+        joined.extend(&ordinary);
+        assert_eq!(
+            file_sizes(&joined),
+            vec![
+                (0, Some(zip64.len() as u64)),
+                (zip64.len() as u64, Some(ordinary.len() as u64))
+            ]
+        );
+    }
+
     #[test]
     fn prefixed_writer_offsets_are_normalized_after_carving() {
         let prefix = vec![0; 317];
@@ -299,6 +420,7 @@ mod tests {
         inner[eocd + 16..eocd + 20].copy_from_slice(&((central + prefix) as u32).to_le_bytes());
         let outer = archive(&[("inner.zip", &inner), ("sibling.txt", b"sibling")]);
         assert_eq!(checked_size(&outer), Some(outer.len()));
+        assert_eq!(file_sizes(&outer), vec![(0, Some(outer.len() as u64))]);
     }
 
     #[test]
@@ -318,5 +440,12 @@ mod tests {
         assert_eq!(findings.len(), 2);
         assert_eq!(findings[0].size, Some(outer.len() as u64));
         assert_eq!(findings[1].offset, outer.len() as u64);
+        assert_eq!(
+            file_sizes(&joined),
+            vec![
+                (0, Some(outer.len() as u64)),
+                (outer.len() as u64, Some(inner.len() as u64))
+            ]
+        );
     }
 }

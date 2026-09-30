@@ -537,6 +537,118 @@ fn explicit_recovery_keeps_identity_and_does_not_run_other_pending_tasks() {
 }
 
 #[test]
+#[ignore = "requires installed 7zz or 7z; run with --include-ignored for backend acceptance"]
+fn real_backend_recovery_reuses_known_password_and_confirmed_encoding_without_prompts() {
+    use smartzip_engine::{state_store::StateStore, CompiledRunPolicy, PreparedExtractTask};
+    let dir = tempfile::tempdir().unwrap();
+    let archive = fixture(dir.path(), true);
+    let database = dir.path().join("state.db");
+    let output = dir.path().join("recovered");
+    let mut cfg = config_with_database(&database);
+    cfg.apply(&[
+        ("passwords.mode".into(), toml::Value::String("auto".into())),
+        (
+            "passwords.sources".into(),
+            toml::Value::Array(vec![toml::Value::String("known".into())]),
+        ),
+        (
+            "interaction.mode".into(),
+            toml::Value::String("never".into()),
+        ),
+        (
+            "extraction.recursion.enabled".into(),
+            toml::Value::Boolean(false),
+        ),
+        (
+            "extraction.encoding.mode".into(),
+            toml::Value::String("auto".into()),
+        ),
+        (
+            "extraction.cleanup.nested_archives".into(),
+            toml::Value::String("keep".into()),
+        ),
+    ])
+    .unwrap();
+    let (hash, size) = smartzip_db::sample_hash::sample_hash(&archive).unwrap();
+    let password_id = {
+        let db = smartzip_db::SmartZipDb::open(&database).unwrap();
+        let password_id = smartzip_db::password::PasswordRepository::new(db.connection())
+            .upsert(smartzip_db::password::NewPassword {
+                value: "RuntimeFixtureOnly",
+                source: "test",
+                pinned: false,
+            })
+            .unwrap();
+        let known = smartzip_db::known_files::KnownFileRepository::new(db.connection());
+        known
+            .upsert_password_hint(&hash, size as i64, None, Some(password_id))
+            .unwrap();
+        known
+            .upsert_confirmed_encoding(&hash, size as i64, None, "UTF-8")
+            .unwrap();
+        password_id
+    };
+    let prepared = PreparedExtractTask::new(
+        CompiledRunPolicy::compile(cfg.clone()).unwrap(),
+        smartzip_engine::ExtractWorkflowRequest {
+            inputs: vec![archive.clone()],
+            output_dir: output.clone(),
+            recursion_limit: 0,
+            encoding_mode: Default::default(),
+            scanner: Default::default(),
+            password_candidates: Default::default(),
+            layout_policy: smartzip_engine::layout::OutputLayoutPolicy::Conservative,
+            single_root_name_policy: Default::default(),
+            embedded_scan_mode: Default::default(),
+            dominant_min_ratio: 0.7,
+            confirm_large_scan: false,
+            force: true,
+            limits: cfg.values.limits.clone(),
+        },
+    )
+    .unwrap();
+    let id = prepared.identity().task_id.clone();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let store = StateStore::start(&database).unwrap();
+        store.submit(prepared.submission(0).unwrap()).await.unwrap();
+    });
+    let handle = spawn_job(JobRequest {
+        operation: TaskOperation::Recover,
+        paths: vec![archive.clone()],
+        settings: TaskSettings {
+            recovery_task_id: Some(id.to_string()),
+            ..Default::default()
+        },
+        resolved: Some(cfg),
+    })
+    .unwrap();
+    // finish rejects every prompt and enforces the worker's 30-second bound.
+    let (outcome, events) = finish(&handle);
+    assert_eq!(outcome.status, "completed", "{}", outcome.detail);
+    assert!(events.iter().all(|event| event.task_id == id));
+    assert_eq!(
+        std::fs::read(output.join("fixture/hello.txt")).unwrap(),
+        b"GUI runtime acceptance\n"
+    );
+    assert!(archive.exists());
+    let db = smartzip_db::SmartZipDb::open_read_only(&database).unwrap();
+    let rows = smartzip_db::file_extractions::FileExtractionRepository::new(db.connection())
+        .list_by_task(id.as_str())
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status, "extracted");
+    assert_eq!(rows[0].password_id, Some(password_id));
+    assert!(rows[0].has_password);
+    assert_eq!(rows[0].sample_hash.as_deref(), Some(hash.as_str()));
+    assert_eq!(rows[0].encoding.as_deref(), Some("UTF-8"));
+    assert!(rows[0].encoding_corrected);
+}
+
+#[test]
 #[ignore = "requires installed 7z; run with --include-ignored for backend acceptance"]
 fn persisted_gui_draft_is_adopted_with_its_original_identity() {
     let dir = tempfile::tempdir().unwrap();

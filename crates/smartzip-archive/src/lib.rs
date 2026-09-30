@@ -7,6 +7,7 @@ pub mod integrity;
 mod locator;
 pub mod member;
 pub mod native_zip;
+mod output_names;
 mod process;
 pub mod router;
 pub mod safety;

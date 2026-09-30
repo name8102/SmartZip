@@ -341,6 +341,9 @@ impl SevenZipBackend {
         } else if lower.contains("is not archive")
             || lower.contains("as archive")
             || lower.contains("unsupported archive")
+            || lower
+                .lines()
+                .any(|line| line == "can not open the file as [7z] archive")
         {
             SmartZipError::UnsupportedContainer {
                 backend: self.id.clone(),
@@ -490,6 +493,12 @@ impl SevenZipBackend {
                 stderr: String::new(),
             });
         }
+        crate::output_names::validate_async(
+            parse_entries(&listing.stdout),
+            request.output_dir.clone(),
+            token,
+        )
+        .await?;
         let mut args: Vec<String> = vec!["x".into(), "-y".into(), "-bsp1".into()];
         if let Some(pw) = Self::password_arg(&request.password) {
             args.push(pw);
@@ -1228,7 +1237,9 @@ mod tests {
 
     #[test]
     fn parses_report_without_fabricating_missing_fields() {
-        let report = parse_report("Type = 7z\nPhysical Size = 120\nEncrypted = +\nFiles = 3\nFolders = 1\nSize = 400\nCompressed = 120\nElapsed Time = 0.125 sec\nWARNING: one file skipped\n");
+        let report = parse_report(
+            "Type = 7z\nPhysical Size = 120\nEncrypted = +\nFiles = 3\nFolders = 1\nSize = 400\nCompressed = 120\nElapsed Time = 0.125 sec\nWARNING: one file skipped\n",
+        );
         assert_eq!(report.archive_type.as_deref(), Some("7z"));
         assert_eq!(report.physical_size, Some(120));
         assert_eq!(report.encrypted, Some(true));
@@ -1363,6 +1374,39 @@ mod tests {
         assert!(matches!(
             backend.map_failure(&output(2, "ERROR: Can not open file as archive"), path),
             SmartZipError::UnsupportedContainer { .. }
+        ));
+        assert!(matches!(
+            backend.map_failure(
+                &output(2, "ERROR: Can not open the file as [7z] archive"),
+                path
+            ),
+            SmartZipError::UnsupportedContainer { .. }
+        ));
+        assert!(matches!(
+            backend.map_failure(
+                &output(2, "Open ERROR: Can not open the file as [7z] archive"),
+                path
+            ),
+            SmartZipError::UnsupportedContainer { .. }
+        ));
+        for text in [
+            "ERROR: Can not open the file as [zip] archive",
+            "ERROR: Can not open the file as [7z] archive because of unknown corruption",
+        ] {
+            assert!(matches!(
+                backend.map_failure(&output(2, text), path),
+                SmartZipError::BackendFailed { .. }
+            ));
+        }
+        assert!(matches!(
+            backend.map_failure(
+                &output(
+                    2,
+                    "ERROR: Can not open the file as [7z] archive\nHeaders Error"
+                ),
+                path
+            ),
+            SmartZipError::CorruptedArchive { .. }
         ));
     }
 

@@ -553,6 +553,34 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
             if let Some(cleanup) = &source_cleanup {
                 cleanup.borrow_mut().capture(&source_paths);
             }
+            let nested_sources = if candidate.source == CandidateSource::ExtractedFile
+                && config.is_none_or(|c| {
+                    c.extraction.cleanup.nested_archives != smartzip_config::Cleanup::Keep
+                }) {
+                let paths = volume_set_for_candidate
+                    .as_ref()
+                    .map(|set| {
+                        set.members
+                            .iter()
+                            .map(|m| m.path.clone())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_else(|| vec![candidate.path.clone()]);
+                paths
+                    .into_iter()
+                    .filter_map(|path| {
+                        let member = ExtractionCandidate {
+                            path,
+                            ..candidate.clone()
+                        };
+                        recyclable_nested_archive_path(&member, &request.output_dir).and_then(
+                            |path| crate::source_cleanup::SourceSnapshot::capture(&path).ok(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
 
             // Header-based detection first, then scanner confirmation
             if let Some(policy) = run_policy {
@@ -2370,48 +2398,20 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                 }
             }
 
-            // For volume sets, recycle all members that are inside the managed output root; for singles, recycle the single candidate.
+            // Recheck captured inputs after commit, including every winning volume.
             if !was_cancelled
-                && candidate.source != CandidateSource::RootInput
-                && config.is_none_or(|c| {
-                    c.extraction.cleanup.nested_archives != smartzip_config::Cleanup::Keep
-                })
+                && candidate.source == CandidateSource::ExtractedFile
+                && !candidate.embedded_offset.is_some_and(|offset| offset > 0)
             {
-                if let Some(set) = volume_set_for_candidate {
-                    for member in set.members {
-                        let synthetic = ExtractionCandidate {
-                            path: member.path.clone(),
-                            relative_path: member.path.clone(),
-                            depth: candidate.depth,
-                            source: CandidateSource::ExtractedFile,
-                            detected_format: Some(set.format.clone()),
-                            embedded_offset: None,
-                            embedded_size: None,
-                        };
-                        if let Some(path) =
-                            recyclable_nested_archive_path(&synthetic, &request.output_dir)
-                        {
-                            if let Err(error) =
-                                recycle_archive(archive_recycler.clone(), path.clone()).await
-                            {
-                                events.push(TaskEvent {
-                                    task_id: task_id.clone(),
-                                    kind: TaskEventKind::Warning {
-                                        message: format!(
-                                            "failed to move processed nested archive {} to trash: {}",
-                                            path.display(),
-                                            error
-                                        ),
-                                    },
-                                });
-                            }
-                        }
-                    }
-                } else if let Some(path) =
-                    recyclable_nested_archive_path(&candidate, &request.output_dir)
-                {
-                    if let Err(error) =
-                        recycle_archive(archive_recycler.clone(), path.clone()).await
+                for source in nested_sources {
+                    let path = source.path().to_path_buf();
+                    if let Err(error) = recycle_archive(
+                        archive_recycler.clone(),
+                        source,
+                        request.output_dir.clone(),
+                        actual_output_dir.clone(),
+                    )
+                    .await
                     {
                         events.push(TaskEvent {
                             task_id: task_id.clone(),

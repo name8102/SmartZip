@@ -123,11 +123,29 @@ pub(crate) fn recyclable_nested_archive_path(
 
 pub(crate) async fn recycle_archive(
     archive_recycler: ArchiveRecycleHandler,
-    path: PathBuf,
+    source: crate::source_cleanup::SourceSnapshot,
+    managed_output_root: PathBuf,
+    published_output: PathBuf,
 ) -> std::io::Result<()> {
-    tokio::task::spawn_blocking(move || archive_recycler(path))
-        .await
-        .map_err(std::io::Error::other)?
+    tokio::task::spawn_blocking(move || {
+        // A commit can replace the archive with a same-named output. Only the
+        // captured input is recyclable, and published files are never inputs.
+        let Ok(path) = source.path().canonicalize() else {
+            return Ok(());
+        };
+        let Ok(root) = managed_output_root.canonicalize() else {
+            return Ok(());
+        };
+        let Ok(output) = published_output.canonicalize() else {
+            return Ok(());
+        };
+        if !path.starts_with(root) || path.starts_with(output) || !source.unchanged() {
+            return Ok(());
+        }
+        archive_recycler(source.path().to_path_buf())
+    })
+    .await
+    .map_err(std::io::Error::other)?
 }
 
 pub(crate) struct ArchiveInput {

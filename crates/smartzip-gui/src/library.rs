@@ -249,30 +249,18 @@ pub fn import_passwords(options: &LibraryOptions, path: &Path, source: &str) -> 
 }
 
 /// Export is an explicit reveal action. Never overwrite an existing file or symlink.
-/// tempfile creates a private (0600 on Unix) sibling and publishes it atomically.
+/// The shared password export publishes a private, complete sibling file.
 pub fn export_passwords(options: &LibraryOptions, path: &Path) -> Result<usize> {
     let db = database(options, false)?;
-    let rows = PasswordRepository::new(db.connection())
-        .ranked_candidates(i64::MAX as usize)
-        .map_err(|_| "无法读取密码库".to_string())?;
-    if rows.iter().any(|p| p.value.contains(['\n', '\r'])) {
-        return Err("存在包含换行的密码，无法无损导出为逐行文本".into());
-    }
-    let parent = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    let mut file =
-        tempfile::NamedTempFile::new_in(parent).map_err(|_| "无法创建导出文件".to_string())?;
-    for row in &rows {
-        writeln!(file, "{}", row.value).map_err(|_| "密码导出写入失败".to_string())?;
-    }
-    file.as_file()
-        .sync_all()
-        .map_err(|_| "密码导出同步失败".to_string())?;
-    file.persist_noclobber(path)
-        .map_err(|_| "密码导出失败：目标已存在或不可写，请选择新文件".to_string())?;
-    Ok(rows.len())
+    smartzip_passwords::export_passwords(&PasswordRepository::new(db.connection()), path).map_err(
+        |error| {
+            if error.kind() == std::io::ErrorKind::InvalidData {
+                "存在包含换行的密码，无法无损导出为逐行文本".into()
+            } else {
+                "密码导出失败：目标已存在、不可写或密码库不可读，请选择新文件".into()
+            }
+        },
+    )
 }
 
 /// Matches CLI ranking and stale cleanup: pinned passwords are always retained.

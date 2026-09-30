@@ -177,8 +177,16 @@ impl Default for Volumes {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Encoding {
+    #[serde(deserialize_with = "deserialize_encoding_mode")]
     pub mode: String,
     pub on_suspicious: SuspiciousEncoding,
+}
+
+fn deserialize_encoding_mode<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(String::deserialize(deserializer)?.to_ascii_lowercase())
 }
 impl Default for Encoding {
     fn default() -> Self {
@@ -373,6 +381,12 @@ impl Default for SmartZipConfig {
 impl SmartZipConfig {
     pub fn load(path: impl AsRef<Path>) -> std::io::Result<Self> {
         Ok(ResolvedConfig::load(Some(path.as_ref()))?.values)
+    }
+    /// Apply the same canonical spelling to constructed and recovered policies
+    /// that serde applies to configuration files and runtime overrides.
+    pub fn normalize(&mut self) -> std::io::Result<()> {
+        self.extraction.encoding.mode.make_ascii_lowercase();
+        self.validate()
     }
     pub fn validate(&self) -> std::io::Result<()> {
         let fail = |message: &str| {

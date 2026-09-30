@@ -13,6 +13,7 @@ pub(super) struct Input<'a> {
     pub end: u64,
     cancelled: &'a dyn Fn() -> bool,
     error: Option<io::Error>,
+    pub(super) zip_search: crate::zip::EocdSearch,
 }
 impl Input<'_> {
     pub fn read(&mut self, offset: u64, size: usize) -> Option<Vec<u8>> {
@@ -94,6 +95,7 @@ impl EmbeddedScanner {
             end,
             cancelled,
             error: None,
+            zip_search: Default::default(),
         };
         let matcher =
             aho_corasick::AhoCorasick::new(&self.binwalk.patterns).map_err(io::Error::other)?;
@@ -256,7 +258,7 @@ fn parse(
                     }
                     Err(_) => break,
                     _ if decoder.total_in() == before_in && decoder.total_out() == before_out => {
-                        break
+                        break;
                     }
                     _ => {}
                 }
@@ -565,6 +567,45 @@ mod tests {
             max_scan_bytes: None,
             ..Default::default()
         })
+    }
+
+    #[test]
+    fn zip_candidates_share_tail_search_without_losing_any_root_headers() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        let mut record = vec![0; 64 * 1024];
+        record[..4].copy_from_slice(b"PK\x03\x04");
+        record[4..6].copy_from_slice(&20u16.to_le_bytes());
+        record[26..28].copy_from_slice(&1u16.to_le_bytes());
+        record[30] = b'a';
+        for _ in 0..256 {
+            file.write_all(&record).unwrap();
+        }
+        let scanner = EmbeddedScanner::new(ScannerConfig {
+            mode: ScanMode::Deep,
+            max_scan_bytes: None,
+            max_findings: usize::MAX,
+            ..Default::default()
+        });
+        let checks = Cell::new(0);
+        let findings = scanner
+            .scan_path_cancellable(file.path(), &|| {
+                checks.set(checks.get() + 1);
+                false
+            })
+            .unwrap();
+        assert_eq!(findings.len(), 256);
+        assert!(findings.iter().all(|f| f.size.is_none()));
+        // Original per-header tail scanning used >41000 checks for this input.
+        // This generous bound verifies shared reads without timing the machine.
+        assert!(checks.get() < 15000, "{} checks", checks.get());
+        let checks = Cell::new(0);
+        let error = scanner
+            .scan_path_cancellable(file.path(), &|| {
+                checks.set(checks.get() + 1);
+                checks.get() > 40
+            })
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
     }
 
     #[test]

@@ -43,7 +43,7 @@ pub(super) fn config_command(
         ),
         ConfigCmd::Init { full } => {
             smartzip_config::init_config(path, *full)?;
-            println!("created {}", path.display());
+            println!("created {}", safe_text(&path.to_string_lossy()));
         }
         ConfigCmd::Set { key, value } => smartzip_config::edit_config(path, key, Some(value))?,
         ConfigCmd::Unset { key } => smartzip_config::edit_config(path, key, None)?,
@@ -278,9 +278,12 @@ pub(super) fn build_backend(
     }
     if verbose_routing {
         for warning in backend.warnings() {
-            eprintln!("routing warning: {warning}");
+            eprintln!("routing warning: {}", safe_text(warning));
         }
-        eprintln!("routing adapters: {}", backend.adapter_ids().join(", "));
+        eprintln!(
+            "routing adapters: {}",
+            safe_text(&backend.adapter_ids().join(", "))
+        );
     }
     Ok(backend)
 }
@@ -306,7 +309,7 @@ pub(super) fn open_state_db(
         let (path, diagnostic) =
             PlatformPaths::try_new()?.select_database(&PlatformPaths::legacy()?)?;
         if let Some(message) = diagnostic {
-            eprintln!("{message}");
+            eprintln!("{}", safe_text(&message));
         }
         path
     };

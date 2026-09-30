@@ -117,6 +117,7 @@ impl UnrarBackend {
         &self,
         archive: &Path,
         password: &Option<String>,
+        output_dir: &Path,
         token: &CancellationToken,
     ) -> Result<Option<bool>> {
         let args = vec![
@@ -138,6 +139,12 @@ impl UnrarBackend {
             .unwrap_or_else(|| self.map_failure(&output, archive)));
         }
         validate_extraction_listing(&output.stdout)?;
+        crate::output_names::validate_async(
+            parse_technical_entries(&output.stdout),
+            output_dir.into(),
+            token,
+        )
+        .await?;
         let encrypted = output.stdout.lines().any(|line| {
             line.trim_start()
                 .strip_prefix("Flags:")
@@ -345,6 +352,7 @@ impl ArchiveAdapter for UnrarBackend {
             .validate_before_extract(
                 &request.archive,
                 &request.password,
+                &request.output_dir,
                 &context.cancellation_token(),
             )
             .await?;
@@ -433,4 +441,24 @@ fn validate_extraction_listing(stdout: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn parse_technical_entries(stdout: &str) -> Vec<ArchiveEntry> {
+    let mut entries: Vec<ArchiveEntry> = Vec::new();
+    for line in stdout.lines().map(str::trim_start) {
+        if let Some(name) = line.strip_prefix("Name: ") {
+            entries.push(ArchiveEntry {
+                path: name.into(),
+                raw_name: Vec::new(),
+                compressed_size: None,
+                uncompressed_size: None,
+                is_dir: false,
+            });
+        } else if let Some(kind) = line.strip_prefix("Type: ") {
+            if let Some(entry) = entries.last_mut() {
+                entry.is_dir = kind.trim() == "Directory";
+            }
+        }
+    }
+    entries
 }

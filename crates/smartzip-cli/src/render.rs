@@ -115,7 +115,7 @@ pub(super) fn print_detect_result(
 
     println!(
         "{} [{}] status={} embedded={} encrypted={} task-id={}",
-        result.path.display(),
+        safe_text(&result.path.to_string_lossy()),
         result
             .detected_format
             .as_ref()
@@ -132,13 +132,17 @@ pub(super) fn print_detect_result(
     );
     if let Some(encoding) = &result.encoding {
         if let Some(confidence) = result.encoding_confidence {
-            println!("encoding: {encoding} ({:.0}%)", confidence * 100.0);
+            println!(
+                "encoding: {} ({:.0}%)",
+                safe_text(encoding),
+                confidence * 100.0
+            );
         } else {
-            println!("encoding: {encoding}");
+            println!("encoding: {}", safe_text(encoding));
         }
     }
     if let Some(reason) = &result.reason {
-        println!("reason: {reason}");
+        println!("reason: {}", safe_text(reason));
     }
     if result.needs_password {
         println!("password: required to continue");
@@ -147,7 +151,7 @@ pub(super) fn print_detect_result(
         println!("known password: available");
     }
     if let Some(known_encoding) = &result.known_encoding {
-        println!("known encoding: {known_encoding}");
+        println!("known encoding: {}", safe_text(known_encoding));
     }
     if !result.embedded_findings.is_empty() {
         println!("embedded findings:");
@@ -161,7 +165,7 @@ pub(super) fn print_detect_result(
                     .map(|size| size.to_string())
                     .unwrap_or_else(|| "unknown".into()),
                 finding.confidence,
-                finding.description,
+                safe_text(&finding.description),
             );
         }
     }
@@ -178,11 +182,18 @@ pub(super) fn render_extract_event(event: &smartzip_core::TaskEvent, verbose_rou
             source,
             ..
         } if stage != "task_policy" && (*action == "skip" || verbose_routing) => {
-            eprintln!("{stage}: {action} ({reason}; {policy_key}, {source})")
+            eprintln!(
+                "{}: {} ({}; {}, {})",
+                safe_text(stage),
+                safe_text(action),
+                safe_text(reason),
+                safe_text(policy_key),
+                safe_text(source)
+            )
         }
         smartzip_core::TaskEventKind::Progress(progress) => match progress.percent {
-            Some(percent) => eprintln!("  {percent:>3.0}%  {}", progress.message),
-            None => eprintln!("  {}", progress.message),
+            Some(percent) => eprintln!("  {percent:>3.0}%  {}", safe_text(&progress.message)),
+            None => eprintln!("  {}", safe_text(&progress.message)),
         },
         smartzip_core::TaskEventKind::EncodingDetected(detection) => {
             let encoding = match &detection.selected {
@@ -190,7 +201,8 @@ pub(super) fn render_extract_event(event: &smartzip_core::TaskEvent, verbose_rou
                 smartzip_core::EncodingMode::Override(s) => s.as_str(),
             };
             eprintln!(
-                "  encoding: {encoding} (confidence: {:.0}%)",
+                "  encoding: {} (confidence: {:.0}%)",
+                safe_text(encoding),
                 detection.confidence * 100.0
             );
         }
@@ -200,7 +212,7 @@ pub(super) fn render_extract_event(event: &smartzip_core::TaskEvent, verbose_rou
         } => {
             eprintln!(
                 "  embedded selection required: {} ({} finding(s))",
-                path.display(),
+                safe_text(&path.to_string_lossy()),
                 findings_count
             );
         }
@@ -211,23 +223,28 @@ pub(super) fn render_extract_event(event: &smartzip_core::TaskEvent, verbose_rou
         } => {
             eprintln!(
                 "  large embedded scan skipped without confirmation: {} ({} bytes > {} bytes)",
-                path.display(),
+                safe_text(&path.to_string_lossy()),
                 file_size,
                 threshold
             );
         }
         smartzip_core::TaskEventKind::BusinessContainerSkipped { path, kind } => {
-            eprintln!("  skipped business container {kind}: {}", path.display());
+            eprintln!(
+                "  skipped business container {kind}: {}",
+                safe_text(&path.to_string_lossy())
+            );
         }
         smartzip_core::TaskEventKind::OutputCreated { path } => {
-            eprintln!("  -> {}", path.display());
+            eprintln!("  -> {}", safe_text(&path.to_string_lossy()));
         }
         smartzip_core::TaskEventKind::Route(route) if verbose_routing => {
             render_route_event(route, true);
         }
-        smartzip_core::TaskEventKind::Failed { error } => eprintln!("  FAILED: {error}"),
+        smartzip_core::TaskEventKind::Failed { error } => {
+            eprintln!("  FAILED: {}", safe_text(error))
+        }
         smartzip_core::TaskEventKind::Warning { message } => {
-            eprintln!("  warning: {message}")
+            eprintln!("  warning: {}", safe_text(message))
         }
         _ => {}
     }
@@ -237,9 +254,9 @@ pub(super) fn render_route_event(route: &smartzip_core::RouteEvent, stderr: bool
     macro_rules! output {
         ($($args:tt)*) => {
             if stderr {
-                eprintln!($($args)*);
+                eprintln!("{}", safe_text(&format!($($args)*)));
             } else {
-                println!($($args)*);
+                println!("{}", safe_text(&format!($($args)*)));
             }
         };
     }
@@ -315,13 +332,13 @@ pub(super) fn print_list_result(
     } else {
         println!(
             "{} [{}] enc={} password={} task-id={}",
-            result.path.display(),
+            safe_text(&result.path.to_string_lossy()),
             result
                 .detected_format
                 .as_ref()
                 .map(|fmt| fmt.as_str())
                 .unwrap_or("unknown"),
-            result.encoding,
+            safe_text(&result.encoding),
             if result.used_password { "yes" } else { "no" },
             result.task_id,
         );
@@ -331,7 +348,7 @@ pub(super) fn print_list_result(
             } else {
                 Default::default()
             };
-            println!("{}{}", entry.path.display(), suffix);
+            println!("{}{}", safe_text(&entry.path.to_string_lossy()), suffix);
         }
     }
     Ok(())
@@ -371,7 +388,11 @@ pub(super) fn print_extract_result(
         if skipped_count > 0 {
             println!("skipped {} candidate(s)", skipped_count);
             for skipped in &result.skipped {
-                println!("  - {} (depth {})", skipped.path.display(), skipped.depth);
+                println!(
+                    "  - {} (depth {})",
+                    safe_text(&skipped.path.to_string_lossy()),
+                    skipped.depth
+                );
             }
         }
         if show_task_id {

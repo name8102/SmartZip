@@ -436,16 +436,11 @@ impl PreparedCommit {
 
         let mut layout_plan = layout_plan.clone();
         match commit_output_recoverable(&intent, commit_policy) {
-            Ok(residual_backup) => {
+            Ok(_) => {
                 if let Some(path) = cleanup_staging(temp) {
                     layout_plan
                         .warnings
                         .push(format!("temporary output retained at {}", path.display()));
-                }
-                if let Some(path) = residual_backup {
-                    layout_plan
-                        .warnings
-                        .push(format!("old output backup retained at {}", path.display()));
                 }
                 Ok(PublishedOutput {
                     result: MaterializeResult {
@@ -498,11 +493,13 @@ impl PublishedOutput {
     pub(crate) fn finalize(mut self) -> MaterializeResult {
         if let Some(intent) = &self.intent {
             if let Some(backup) = &intent.backup_path {
-                if path_present(backup) && std::fs::remove_dir_all(backup).is_err() {
-                    self.result.layout_plan.warnings.push(format!(
-                        "old output backup retained at {}",
-                        backup.display()
-                    ));
+                if path_present(backup) {
+                    if let Err(error) = std::fs::remove_dir_all(backup) {
+                        self.result.layout_plan.warnings.push(format!(
+                            "old output backup retained at {}: {error}",
+                            backup.display()
+                        ));
+                    }
                 }
             }
             if path_present(&intent.marker_path)
@@ -1196,6 +1193,59 @@ mod tests {
         assert!(!output.join("old.txt").exists());
         assert_eq!(std::fs::read(output.join("new.txt")).unwrap(), b"new");
         assert_eq!(std::fs::read(output.join("also.txt")).unwrap(), b"also");
+        assert!(plan
+            .warnings
+            .iter()
+            .all(|message| !message.contains("backup retained")));
+        assert!(std::fs::read_dir(root.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".smartzip-backup-")
+        }));
+    }
+
+    #[tokio::test]
+    async fn finalize_reports_backup_only_when_cleanup_fails() {
+        let root = tempfile::tempdir().unwrap();
+        let output = root.path().join("archive");
+        std::fs::create_dir(&output).unwrap();
+        let prepared = OutputMaterializer::default()
+            .prepare(
+                MaterializeRequest {
+                    output_dir: output.clone(),
+                    archive_path: output.clone(),
+                    commit_policy: CommitPolicy::Overwrite,
+                    archive_stem: None,
+                    layout_policy: OutputLayoutPolicy::Raw,
+                    single_root_name_policy: SingleRootNamePolicy::default(),
+                },
+                |temp| async move {
+                    std::fs::write(temp.join("new.txt"), b"new")
+                        .map_err(|error| SmartZipError::io(Some(temp), error))
+                },
+            )
+            .await
+            .unwrap()
+            .prepare_commit(None, crate::CommitSuccessFacts::default())
+            .unwrap();
+        let published = prepared.commit().unwrap();
+        let backup = published.intent().unwrap().backup_path.clone().unwrap();
+        assert!(backup.exists());
+        assert!(published.result.layout_plan.warnings.is_empty());
+        // A file at the backup path deterministically makes directory cleanup fail.
+        std::fs::remove_dir_all(&backup).unwrap();
+        std::fs::write(&backup, b"retained").unwrap();
+        let result = published.finalize();
+        let warnings = result.layout_plan.warnings;
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].starts_with(&format!(
+            "old output backup retained at {}: ",
+            backup.display()
+        )));
+        assert!(backup.exists());
+        assert_eq!(std::fs::read(output.join("new.txt")).unwrap(), b"new");
     }
 
     #[tokio::test]

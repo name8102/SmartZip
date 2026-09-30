@@ -10,6 +10,69 @@ struct Cli {
     root: tempfile::TempDir,
 }
 
+#[test]
+fn history_text_escapes_untrusted_controls_and_json_preserves_values() {
+    use smartzip_db::task_event::{NewTaskEvent, TaskEventLevel, TaskEventRepository};
+    let cli = Cli::new();
+    let untrusted = "file\u{1b}[2J\nforged\rline.zip";
+    let db = SmartZipDb::open(cli.root.path().join("history.db")).unwrap();
+    TaskRepository::new(db.connection())
+        .insert(NewTask {
+            id: "controls",
+            kind: "extract",
+            output_path: Some(untrusted),
+            started_at: "2026-09-30T00:00:00Z",
+        })
+        .unwrap();
+    FileExtractionRepository::new(db.connection())
+        .insert(NewFileExtraction {
+            task_id: "controls",
+            input_path: untrusted,
+            sample_hash: None,
+            file_size: None,
+            offset: None,
+            output_path: Some(untrusted),
+            has_password: false,
+            password_id: None,
+            status: "failed",
+            reason: Some(untrusted),
+            encoding: None,
+            encoding_corrected: false,
+            damaged_volumes_json: None,
+            test_report_json: None,
+            created_at: "2026-09-30T00:00:00Z",
+        })
+        .unwrap();
+    TaskEventRepository::new(db.connection())
+        .insert(NewTaskEvent {
+            task_id: "controls",
+            level: TaskEventLevel::Warn,
+            event_type: "Warning",
+            message: untrusted,
+            data_json: None,
+            created_at: "2026-09-30T00:00:00Z",
+        })
+        .unwrap();
+    drop(db);
+    for args in [
+        vec!["history", "tasks"],
+        vec!["history", "files"],
+        vec!["history", "show", "controls"],
+    ] {
+        let output = cli.run(&args, 0);
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(!text.contains('\u{1b}') && !text.contains('\r'), "{text:?}");
+        assert!(
+            text.contains("file\\u{1b}[2J\\nforged\\rline.zip"),
+            "{text:?}"
+        );
+    }
+    let json = cli.json(&["history", "show", "controls", "--json"]);
+    assert_eq!(json["task"]["output_path"], untrusted);
+    assert_eq!(json["files"][0]["input_path"], untrusted);
+    assert_eq!(json["events"][0]["message"], untrusted);
+}
+
 impl Cli {
     fn new() -> Self {
         let root = tempfile::tempdir().unwrap();

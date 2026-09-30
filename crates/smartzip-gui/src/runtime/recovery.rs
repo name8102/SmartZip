@@ -24,9 +24,9 @@ pub(super) async fn run(
         .iter()
         .find(|t| t.task_id == id)
         .ok_or("任务已经结束、正在执行，或不再可恢复")?;
-    let (plan, identity) =
-        smartzip_engine::execution_runtime::ExecutionCoordinator::decode_recovery(recovered)?;
-    for input in &plan.request.inputs {
+    let prepared = smartzip_engine::PreparedExtractTask::recover(recovered)?;
+    let identity = prepared.identity().clone();
+    for input in identity.roots.iter().map(|root| &root.candidate.path) {
         if !input.try_exists()? {
             return Err(format!(
                 "恢复所需输入不存在：{}。请还原该输入后重试，或从历史记录重新添加原始归档。",
@@ -35,26 +35,15 @@ pub(super) async fn run(
             .into());
         }
     }
-    let policy = CompiledRunPolicy::compile(smartzip_config::ResolvedConfig {
-        values: plan.policy,
-        origins: Default::default(),
-        path: None,
-        diagnostics: vec![],
-    })?;
-    let backend = smartzip_archive::BackendRouter::from_config(&policy.values().backends)?;
-    let passwords = smartzip_passwords::PasswordService::configured(
-        Some(smartzip_db::password::PasswordRepository::new(
-            db.connection(),
-        )),
-        policy.values().passwords.clone(),
-        policy.values().state.mode,
-    );
+    let backend =
+        smartzip_archive::BackendRouter::from_config(&prepared.policy().values().backends)?;
     let prompts = Prompter {
         mailbox: mailbox.clone(),
         cancellation: cancellation.clone(),
         gate: Arc::new(tokio::sync::Mutex::new(())),
     };
-    let interactive = policy.values().interaction.mode != smartzip_config::InteractionMode::Never;
+    let interactive =
+        prepared.policy().values().interaction.mode != smartzip_config::InteractionMode::Never;
     let event_mailbox = mailbox.clone();
     let listener: Option<smartzip_engine::TaskEventListener> = Some(Arc::new(move |event| {
         event_mailbox.push(JobMessage::Event(event.clone()))
@@ -98,14 +87,12 @@ pub(super) async fn run(
         .ok_or("此恢复任务已被另一操作接管")?;
     let engine = SmartZipEngine::default()
         .with_cancellation_token(cancellation.clone())
-        .with_root_management(roots)
-        .with_run_policy(policy);
-    let result = engine
-        .extract_task(
-            identity.clone(),
+        .with_root_management(roots);
+    let result = prepared
+        .run(
+            engine,
             &backend,
-            &passwords,
-            plan.request,
+            Some(db.connection()),
             smartzip_engine::ExtractInteraction {
                 password: interactive.then_some(&prompts as &dyn InteractivePasswordPrompter),
                 output: Some(&prompts),

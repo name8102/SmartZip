@@ -10,8 +10,8 @@ pub struct CompiledRunPolicy {
     resolved: config::ResolvedConfig,
 }
 impl CompiledRunPolicy {
-    pub fn compile(resolved: config::ResolvedConfig) -> std::io::Result<Self> {
-        resolved.values.validate()?;
+    pub fn compile(mut resolved: config::ResolvedConfig) -> std::io::Result<Self> {
+        resolved.values.normalize()?;
         Ok(Self { resolved })
     }
     pub fn resolved(&self) -> &config::ResolvedConfig {
@@ -63,13 +63,12 @@ impl CompiledRunPolicy {
             config::SingleRootName::Inner => SingleRootNamePolicy::PreferInnerName,
             config::SingleRootName::PreserveBoth => SingleRootNamePolicy::PreserveBoth,
         };
-        request.encoding_mode = if ["auto", "backend"]
-            .contains(&c.extraction.encoding.mode.to_ascii_lowercase().as_str())
-        {
-            smartzip_core::EncodingMode::Auto
-        } else {
-            smartzip_core::EncodingMode::Override(c.extraction.encoding.mode.clone())
-        };
+        request.encoding_mode =
+            if ["auto", "backend"].contains(&c.extraction.encoding.mode.as_str()) {
+                smartzip_core::EncodingMode::Auto
+            } else {
+                smartzip_core::EncodingMode::Override(c.extraction.encoding.mode.clone())
+            };
         request.dominant_min_ratio = c.extraction.embedded.dominant_min_ratio;
         request.limits = c.limits.clone();
         if let Some(directory) = &c.extraction.output.directory {
@@ -227,6 +226,63 @@ impl CompiledRunPolicy {
                 .cloned()
                 .unwrap_or_else(|| "defaults-v1".into()),
             detail: None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use smartzip_core::{EncodingMode, TaskEventKind};
+
+    #[test]
+    fn compiled_encoding_modes_match_detection_and_known_hint_policy() {
+        let db = smartzip_db::SmartZipDb::in_memory().unwrap();
+        for (mode, detects) in [("AUTO", true), ("BACKEND", false), ("GBK", false)] {
+            let mut resolved = config::ResolvedConfig::load(None).unwrap();
+            resolved.values.extraction.encoding.mode = mode.into();
+            let policy = CompiledRunPolicy::compile(resolved).unwrap();
+            assert_eq!(
+                policy.values().extraction.encoding.mode,
+                mode.to_ascii_lowercase()
+            );
+            let plan = policy.stage_plan();
+            assert!(plan.iter().any(|event| matches!(event,
+                TaskEventKind::Decision { stage, action, .. }
+                if stage == "encoding_detection" && action == if detects { "allow" } else { "skip" }
+            )));
+            assert_eq!(
+                policy
+                    .services(Some(db.connection()))
+                    .known
+                    .unwrap()
+                    .encoding_hint,
+                detects
+            );
+            let mut request = ExtractWorkflowRequest {
+                inputs: vec![],
+                output_dir: ".".into(),
+                recursion_limit: 0,
+                encoding_mode: EncodingMode::Auto,
+                scanner: Default::default(),
+                password_candidates: Default::default(),
+                layout_policy: Default::default(),
+                single_root_name_policy: Default::default(),
+                embedded_scan_mode: Default::default(),
+                dominant_min_ratio: 0.8,
+                confirm_large_scan: false,
+                force: false,
+                limits: Default::default(),
+            };
+            policy.apply_request(&mut request);
+            assert_eq!(
+                request.encoding_mode,
+                if mode == "GBK" {
+                    EncodingMode::Override("gbk".into())
+                } else {
+                    EncodingMode::Auto
+                }
+            );
         }
     }
 }

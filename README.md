@@ -70,12 +70,16 @@ cargo run -p smartzip-cli -- password add <password>
 
 编码预览直接使用 `smartzip enc <path>`；旧名称 `encoding-preview` 保留兼容。短别名与完整命令使用相同参数，例如 `smartzip x archive.zip`、`smartzip pw list`、`smartzip hist files`。
 
+`password export --path <新文件>` 导出完整明文密码表，Unix 文件权限为 0600；已有文件或链接会保留，需选择新路径。状态数据库的符号链接使用同一实际路径与执行锁；硬链接数据库会拒绝打开，避免 SQLite 侧文件与执行权出现歧义。
+
 `extract` 支持常见参数，例如：
 
 - `--output <dir>`：指定输出目录
 - `--deep`：启用深度扫描
 - `--encoding <name>`：指定文件名编码
 - `-p/--password <value>`：预置密码
+
+解压前会在输出卷检查成员名称。大小写、Unicode 等价名称或文件/目录冲突会使该归档失败，源文件与旧输出保留；目前不会自动重命名冲突成员。检查最多处理 100000 个文件系统组件及 16 MiB 路径元数据，大量小文件会增加探测与清理耗时。
 
 `test` 接受多个归档或任意分卷，同组输入只校验一次。默认 `--diagnose auto`，失败后追加只读校验和至多一次不同后端复核；`--diagnose off` 关闭追加诊断，`--diagnostic-timeout 30` 限制追加阶段为 30 秒，`--no-history` 不保存任务记录。JSON 模式不提示输入，可用 `-p` 提供密码。
 
@@ -125,7 +129,7 @@ python3 scripts/package-macos.py --profile release
 - 等待解压队列在启用可写历史时自动保存，重启后等待手动开始；临时密码不会保存。任务恢复页面只检查历史，点击「恢复此任务」后才继续执行。
 - 归档预览按内部目录浏览，支持面包屑和返回上级；点击文件可预览受支持的文本或图片。密码管理用于持久密码库，临时密码在排队任务详情中设置。
 
-打包与启动不会自动更改默认程序。右键菜单绑定应用当前位置，移动应用后需重新安装该菜单。当前系统集成实现针对 macOS；Windows/Linux 尚未接入。
+打包与启动不会自动更改默认程序。macOS 右键菜单绑定应用当前位置，移动应用后需重新安装该菜单。Linux 已实现桌面启动器、快速解压动作和通过 `xdg-mime` 设置默认程序，文件管理器是否显示该动作取决于桌面环境；Windows 系统集成尚未接入。本轮修复在 macOS 验证，Linux/Windows 原生验收范围见任务记录。
 
 ## 工作区结构
 
