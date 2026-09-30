@@ -86,10 +86,16 @@ impl<'a> TaskExecutionRepository<'a> {
     /// Create the task and all initially known roots atomically.
     pub fn submit(&mut self, task: NewTaskExecution<'_>, roots: &[NewNode<'_>]) -> Result<()> {
         let tx = self.conn.transaction()?;
-        tx.execute(
+        let inserted = tx.execute(
             "INSERT INTO tasks(id, kind, status, output_path, started_at, inputs_json, \
              priority, queue_position, config_snapshot_json, recoverable, owner_epoch) \
-             VALUES (?1, ?2, 'queued', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+             VALUES (?1, ?2, 'queued', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
+             ON CONFLICT(id) DO UPDATE SET kind=excluded.kind, status='queued', \
+             output_path=excluded.output_path, started_at=excluded.started_at, inputs_json=excluded.inputs_json, \
+             priority=excluded.priority, queue_position=excluded.queue_position, \
+             config_snapshot_json=excluded.config_snapshot_json, recoverable=excluded.recoverable, \
+             owner_epoch=excluded.owner_epoch, paused=0 \
+             WHERE tasks.status='queued_gui' AND tasks.recoverable=0 AND tasks.finished_at IS NULL",
             params![
                 task.id,
                 task.kind,
@@ -103,6 +109,11 @@ impl<'a> TaskExecutionRepository<'a> {
                 task.owner_epoch,
             ],
         )?;
+        if inserted != 1 {
+            return Err(
+                rusqlite::Error::InvalidParameterName("task already submitted".into()).into(),
+            );
+        }
         for root in roots {
             insert_node(&tx, task.id, root)?;
         }
@@ -756,6 +767,51 @@ mod tests {
         .unwrap();
     }
 
+    #[test]
+    fn submission_adopts_gui_draft_once_and_rejects_existing_execution() {
+        let mut db = SmartZipDb::in_memory().unwrap();
+        db.connection().execute("INSERT INTO tasks(id,kind,status,started_at,config_snapshot_json,recoverable,paused) VALUES ('task','extract','queued_gui','old','draft',0,1)",[]).unwrap();
+        let mut repo = TaskExecutionRepository::new(db.connection_mut());
+        submit(&mut repo);
+        let (status, snapshot, paused): (String, String, bool) = repo
+            .conn
+            .query_row(
+                "SELECT status,config_snapshot_json,paused FROM tasks WHERE id='task'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (status.as_str(), snapshot.as_str(), paused),
+            ("queued", "{}", false)
+        );
+        let again = repo.submit(
+            NewTaskExecution {
+                id: "task",
+                kind: "extract",
+                output_path: None,
+                started_at: "new",
+                inputs_json: "[]",
+                config_snapshot_json: "replacement",
+                priority: Priority::Normal,
+                queue_position: 0,
+                recoverable: true,
+                owner_epoch: 0,
+            },
+            &[],
+        );
+        assert!(again.is_err());
+        assert_eq!(
+            repo.conn
+                .query_row(
+                    "SELECT count(*) FROM file_extractions WHERE task_id='task'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+    }
     #[test]
     fn transition_and_reply_require_current_generation_decision_and_owner() {
         let mut db = SmartZipDb::in_memory().unwrap();

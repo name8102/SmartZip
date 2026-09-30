@@ -131,9 +131,23 @@ impl RootManagement {
         }
         Ok(())
     }
+    /// Restore read-only root history before registering the pending recovery nodes.
+    pub fn restore_root_history(&self, nodes: Vec<FileTaskSnapshot>) {
+        let mut state = self.state.lock().unwrap();
+        if state.roots.is_empty() && state.nodes.is_empty() {
+            state.nodes = nodes
+                .into_iter()
+                .filter(|n| n.parent_id.is_none())
+                .collect();
+        }
+    }
     pub(crate) fn register(&self, identity: &ExtractTaskIdentity, cancellation: &TaskCancellation) {
         let mut state = self.state.lock().unwrap();
         for root in &identity.roots {
+            let previous_success = state
+                .nodes
+                .iter()
+                .any(|n| n.root_id == root.root_id && n.committed);
             state
                 .roots
                 .entry(root.root_id.clone())
@@ -142,7 +156,11 @@ impl RootManagement {
                     paused: false,
                     finished: false,
                     remaining: 0,
-                    outcomes: vec![],
+                    outcomes: if previous_success {
+                        vec!["completed".into()]
+                    } else {
+                        vec![]
+                    },
                 });
             state.roots.get_mut(&root.root_id).unwrap().remaining += 1;
             state
@@ -153,7 +171,15 @@ impl RootManagement {
             if snapshot.parent_id.is_none() {
                 snapshot.volumes = state.volumes.get(&root.root_id).cloned();
             }
-            state.nodes.push(snapshot);
+            if let Some(existing) = state
+                .nodes
+                .iter_mut()
+                .find(|n| n.node_id == snapshot.node_id)
+            {
+                *existing = snapshot;
+            } else {
+                state.nodes.push(snapshot);
+            }
         }
         drop(state);
         self.changed();
@@ -622,6 +648,29 @@ impl ExecutionStateRecorder for ManagedRecorder<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn recovered_child_keeps_committed_parent_visible_and_partial_outcome() {
+        let parent = ExtractTaskIdentity::new(&["parent.zip".into()]);
+        let root = &parent.roots[0];
+        let mut completed = node_snapshot(&root.node_id, &root.root_id, None, &root.candidate);
+        completed.committed = true;
+        completed.state = "completed".into();
+        let management = RootManagement::default();
+        management.restore_root_history(vec![completed]);
+        let mut pending = ExtractTaskIdentity::new(&["child.zip".into()]);
+        pending.roots[0].root_id = root.root_id.clone();
+        management.register(&pending, &TaskCancellation::new(CancellationToken::new()));
+        assert_eq!(management.snapshot().len(), 2);
+        management.finish(
+            &root.root_id,
+            &Err(smartzip_core::SmartZipError::ResourceLimit {
+                detail: "child failed".into(),
+            }),
+        );
+        let files = management.snapshot();
+        assert!(files[0].committed);
+        assert_eq!(files[0].root_outcome.as_deref(), Some("partial"));
+    }
     #[tokio::test]
     async fn paused_root_releases_at_boundary_and_cancel_leaves_sibling_runnable() {
         let identity = ExtractTaskIdentity::new(&["a.zip".into(), "b.zip".into()]);

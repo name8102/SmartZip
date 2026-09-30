@@ -89,6 +89,16 @@ impl ExecutionCoordinator {
         runnable
     }
 
+    /// Claim exactly one explicitly selected task. Other recovered tasks remain dormant.
+    pub fn take_recovery(
+        &self,
+        task_id: &str,
+    ) -> Option<smartzip_db::task_execution::RecoveredTaskRecord> {
+        let mut recovery = self.recovery.lock().unwrap();
+        let index = recovery.iter().position(|task| task.task_id == task_id)?;
+        Some(recovery.remove(index))
+    }
+
     pub fn decode_recovery(
         task: &smartzip_db::task_execution::RecoveredTaskRecord,
     ) -> Result<
@@ -1450,5 +1460,34 @@ mod tests {
             .stop_task(&task_id, "cancelled", "test_complete")
             .await
             .unwrap();
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn explicit_recovery_claim_does_not_consume_other_tasks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let first = TaskId::new();
+        let second = TaskId::new();
+        {
+            let store = StateStore::start(&path).unwrap();
+            store
+                .submit(submission(&first, &NodeId::new(), dir.path()))
+                .await
+                .unwrap();
+            store
+                .submit(submission(&second, &NodeId::new(), dir.path()))
+                .await
+                .unwrap();
+        }
+        let runtime =
+            ExecutionCoordinator::for_host(Arc::new(StateStore::start(&path).unwrap())).unwrap();
+        assert!(runtime.take_recovery("missing").is_none());
+        assert_eq!(
+            runtime.take_recovery(first.as_str()).unwrap().task_id,
+            first.as_str()
+        );
+        assert!(runtime.take_recovery(first.as_str()).is_none());
+        let remaining = runtime.take_runnable_recovery();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].task_id, second.as_str());
     }
 }
