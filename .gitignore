@@ -7,6 +7,11 @@ donate
 # Rust build output
 target/
 
+# Nix build links and direnv cache
+result
+result-*
+.direnv/
+
 # Python virtual environment
 .venv/
 

@@ -12,6 +12,8 @@ GUI 快速选项“解压后删除”由共享引擎执行，实际行为是任�
 
 ## 下载与依赖
 
+NixOS 使用仓库的 Nix 构建，运行 `nix run .#smartzip-gui` 或通过 `nix profile add .#smartzip` 安装。该包同时提供 CLI、GUI、7-Zip 和运行依赖；迁移旧安装与开发方式见 [Nix 指南](nix.md)。下述 Ubuntu 下载包仍按原基线发布。
+
 桌面包名为 `smartzip-desktop-<version>-<target>.tar.gz`，包含 CLI、GUI、安装脚本、说明、版本清单和动态依赖清单。只需要 CLI 时可选择 `smartzip-<version>-<target>.tar.gz`。下载后先验证 `.sha256`：
 
 ```sh
@@ -65,7 +67,7 @@ open ~/Applications/SmartZip.app
 
 安装器验证签名，仅更新相同标识应用，失败回滚；不自动设置默认打开方式。CLI 可单独复制到用户 PATH。升级前退出应用，从新包重复安装。卸载时删除该 `.app`；配置和数据库保留。若曾在应用中安装 Finder 服务，先在系统集成页面移除，避免留下指向旧路径的服务。
 
-macOS 文件关联和 Finder 快速操作已有实现，需在真实系统由用户验收；Linux 默认关联/右键菜单管理暂未实现。
+macOS 文件关联和 Finder 快速操作已有实现，需在真实系统由用户验收。Linux 支持注册打开方式、设置默认程序和桌面快速解压操作；具体文件管理器的右键扩展未提供。
 
 ## 数据与恢复
 

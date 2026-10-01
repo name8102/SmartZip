@@ -23,7 +23,19 @@ fn quoted_executable(path: &Path) -> io::Result<String> {
     }
     Ok(format!("\"{}\"", value.replace('\\', "\\\\")))
 }
-fn contents(executable: &Path) -> io::Result<String> {
+fn contents(executable: &Path, packaged_launcher: Option<&Path>) -> io::Result<String> {
+    // A packaged launcher supplies runtime libraries and backend discovery.
+    let executable = if let Some(launcher) = packaged_launcher {
+        if !launcher.is_absolute() || !launcher.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "打包启动器必须是存在的绝对文件路径",
+            ));
+        }
+        launcher
+    } else {
+        executable
+    };
     let exec = quoted_executable(executable)?;
     let mime = archive_types()
         .iter()
@@ -40,7 +52,8 @@ pub(super) fn register() -> io::Result<PathBuf> {
         return Err(io::Error::other("拒绝替换符号链接启动器"));
     }
     let mut file = tempfile::NamedTempFile::new_in(parent)?;
-    file.write_all(contents(&std::env::current_exe()?)?.as_bytes())?;
+    let packaged_launcher = std::env::var_os("SMARTZIP_GUI_LAUNCHER").map(PathBuf::from);
+    file.write_all(contents(&std::env::current_exe()?, packaged_launcher.as_deref())?.as_bytes())?;
     file.as_file().sync_all()?;
     file.persist(&path).map_err(|e| e.error)?;
     // Optional MIME cache refresh; setting defaults is a separate explicit operation.
@@ -103,12 +116,27 @@ mod tests {
     use super::*;
     #[test]
     fn desktop_actions_preserve_literal_paths_and_multi_open() {
-        let text = contents(Path::new("/opt/中文 space/$`100%\"/smartzip-gui")).unwrap();
+        let text = contents(Path::new("/opt/中文 space/$`100%\"/smartzip-gui"), None).unwrap();
         assert!(text.contains(" -- %F\n"));
         assert!(text.contains(" --quick-extract -- %F\n"));
         assert!(text.contains("100%%"));
         assert!(text.contains("\\\\$"));
         assert!(text.contains("MimeType=application/zip;"));
-        assert!(contents(Path::new("/opt/bad\nExec=sh")).is_err());
+        assert!(contents(Path::new("/opt/bad\nExec=sh"), None).is_err());
+    }
+
+    #[test]
+    fn registration_preserves_packaged_launcher_for_both_actions() {
+        let directory = tempfile::tempdir().unwrap();
+        let launcher = directory.path().join("smartzip-gui");
+        std::fs::write(&launcher, "#!/bin/sh\n").unwrap();
+        let binary = directory.path().join(".smartzip-gui-wrapped");
+        let text = contents(&binary, Some(&launcher)).unwrap();
+        let quoted = quoted_executable(&launcher).unwrap();
+        assert!(text.contains(&format!("Exec={quoted} -- %F\n")));
+        assert!(text.contains(&format!("Exec={quoted} --quick-extract -- %F\n")));
+        assert!(!text.contains(".smartzip-gui-wrapped"));
+        assert!(contents(&binary, Some(Path::new("relative-launcher"))).is_err());
+        assert!(contents(&binary, Some(&directory.path().join("missing"))).is_err());
     }
 }

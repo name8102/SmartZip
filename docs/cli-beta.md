@@ -4,6 +4,8 @@ Beta 交付范围是 Linux x86_64（Ubuntu 24.04 基线）和 macOS arm64（macO
 
 ## 安装与后端
 
+NixOS 使用仓库的 `nix run . -- doctor` 或 `nix profile add .#smartzip`，包含运行库和 7-Zip 后端；开发环境与旧安装迁移见 [Nix 指南](nix.md)。
+
 从 GitHub Releases 下载对应的 `smartzip-<version>-<target>.tar.gz` 和 `.sha256`。在下载目录校验：Linux 使用 `sha256sum -c <文件>.sha256`，macOS 使用 `shasum -a 256 -c <文件>.sha256`。解包后把 `smartzip` 放到 PATH，例如 `~/.local/bin`；程序不是静态全依赖包。
 
 Linux 安装 `sudo apt-get install 7zip liblzma5 libbz2-1.0`；macOS 安装 `brew install sevenzip xz`。必须能通过 PATH 找到 `7z` 或 `7zz`，或在 TOML 中声明绝对路径。RAR 的额外诊断可选使用 `unrar`。程序不捆绑这些后端，不自动下载或升级它们。安装后运行：
@@ -16,7 +18,7 @@ smartzip doctor --json
 
 `doctor` 显示后端路径、版本、能力、数据库路径和资源默认值；没有后端返回 1。若加载器在启动前报告缺少动态库，先安装对应依赖；Linux 可用 `ldd smartzip`，macOS 可用 `otool -L smartzip` 排查。
 
-从源码构建：`cargo build --release --locked -p smartzip-cli`。Ubuntu 构建还需 `pkg-config liblzma-dev libbz2-dev libfontconfig1-dev libfreetype6-dev`（扫描库的间接编译依赖）。CI 固定 Rust 1.97.1，运行 workspace、真实后端、恢复与安装验收；原生 GUI 由用户另行验收。
+从源码构建：`cargo build --release --locked -p smartzip-cli`。Ubuntu 构建还需 `pkg-config liblzma-dev libbz2-dev libfontconfig1-dev libfreetype6-dev`（扫描库的间接编译依赖）。CI 使用 stable Rust 工具链，运行 workspace、真实后端、恢复与安装验收；原生 GUI 由用户另行验收。
 
 ## 日常使用
 
