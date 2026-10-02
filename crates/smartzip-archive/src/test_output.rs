@@ -27,6 +27,11 @@ pub(crate) fn diagnostic_text(combined: &str, family: &str) -> String {
         .lines()
         .filter_map(|line| {
             let line = line.trim().to_ascii_lowercase();
+            // p7zip uses this exact protocol line when a split payload cannot
+            // be opened. Do not admit arbitrary Open ERROR text or names.
+            if family == "7z" && line == "open error: can not open the file as [7z] archive" {
+                return Some("can not open the file as [7z] archive".into());
+            }
             let message = line.strip_prefix("error: ").unwrap_or(&line);
             let message = if family == "unrar" {
                 message.rsplit_once(" - ").map_or(message, |(_, tail)| tail)

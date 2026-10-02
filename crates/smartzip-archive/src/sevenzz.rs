@@ -341,6 +341,9 @@ impl SevenZipBackend {
         } else if lower.contains("is not archive")
             || lower.contains("as archive")
             || lower.contains("unsupported archive")
+            || lower
+                .lines()
+                .any(|line| line == "can not open the file as [7z] archive")
         {
             SmartZipError::UnsupportedContainer {
                 backend: self.id.clone(),
@@ -1363,6 +1366,52 @@ mod tests {
         assert!(matches!(
             backend.map_failure(&output(2, "ERROR: Can not open file as archive"), path),
             SmartZipError::UnsupportedContainer { .. }
+        ));
+    }
+
+    #[test]
+    fn p7zip_open_errors_retry_only_the_exact_protocol_message() {
+        let backend = SevenZipBackend::new(PathBuf::from("7z"));
+        let path = Path::new("payload.7z.001");
+        let output = |text: &str| BackendCommandOutput {
+            status: Some(2),
+            stdout: text.into(),
+            stderr: String::new(),
+        };
+        for text in [
+            "ERROR: Can not open the file as [7z] archive",
+            "Open ERROR: Can not open the file as [7z] archive",
+        ] {
+            assert!(matches!(
+                backend.map_failure(&output(text), path),
+                SmartZipError::UnsupportedContainer { .. }
+            ));
+        }
+        for text in [
+            "ERROR: Can not open the file as [zip] archive",
+            "Open ERROR: Can not open the file as [zip] archive",
+            "ERROR: Can not open the file as [7z] archive because of unknown corruption",
+            "Open ERROR: Can not open the file as [7z] archive because of unknown corruption",
+            "Path = Open ERROR: Can not open the file as [7z] archive",
+        ] {
+            assert!(matches!(
+                backend.map_failure(&output(text), path),
+                SmartZipError::BackendFailed { .. }
+            ));
+        }
+        assert!(matches!(
+            backend.map_failure(
+                &output("Open ERROR: Can not open the file as [7z] archive\nHeaders Error"),
+                path
+            ),
+            SmartZipError::CorruptedArchive { .. }
+        ));
+        assert!(matches!(
+            backend.map_failure(
+                &output("Open ERROR: Can not open the file as [7z] archive\nWrong password?"),
+                path
+            ),
+            SmartZipError::WrongPassword { .. }
         ));
     }
 
