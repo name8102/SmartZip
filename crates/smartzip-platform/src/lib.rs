@@ -1,6 +1,7 @@
 //! Platform-level paths and utilities (Linux, macOS, Windows).
 
 pub mod finder_service;
+pub mod path_policy;
 pub mod system_integration;
 
 use serde::{Deserialize, Serialize};

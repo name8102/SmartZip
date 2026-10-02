@@ -315,3 +315,45 @@ fn failed_batch_edits_preserve_entire_file_and_missing_file_stays_absent() {
     assert!(edit_config_fields(&path, &[valid]).is_err());
     assert_eq!(fs::read(&path).unwrap(), original);
 }
+
+#[test]
+fn path_mode_defaults_and_snapshots_share_one_validated_setting() {
+    let mut resolved = ResolvedConfig::load(None).unwrap();
+    assert_eq!(
+        resolved.values.extraction.output.path_mode,
+        PathMode::Native
+    );
+    resolved
+        .apply(&[("extraction.output.path_mode".into(), "portable".into())])
+        .unwrap();
+    assert_eq!(
+        resolved.values.extraction.output.path_mode,
+        PathMode::Portable
+    );
+    let snapshot = toml::to_string(&resolved.values).unwrap();
+    let restored: SmartZipConfig = toml::from_str(&snapshot).unwrap();
+    assert_eq!(restored.extraction.output.path_mode, PathMode::Portable);
+    assert!(resolved
+        .apply(&[("extraction.output.path_mode".into(), "unknown".into())])
+        .is_err());
+    assert_eq!(
+        resolved.values.extraction.output.path_mode,
+        PathMode::Portable
+    );
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("config.toml");
+    fs::write(
+        &path,
+        "schema_version=1\n[extraction.output]\npath_mode='portable'\n",
+    )
+    .unwrap();
+    assert_eq!(
+        ResolvedConfig::load(Some(&path))
+            .unwrap()
+            .values
+            .extraction
+            .output
+            .path_mode,
+        PathMode::Portable
+    );
+}

@@ -234,6 +234,23 @@ pub(super) fn render_extract_event(event: &smartzip_core::TaskEvent, verbose_rou
                 safe_text(&path.to_string_lossy())
             );
         }
+        smartzip_core::TaskEventKind::PathMappingApplied { renamed_count, .. } => {
+            if *renamed_count > 0 {
+                eprintln!("  adjusted {renamed_count} name(s)");
+            }
+        }
+        smartzip_core::TaskEventKind::PathConstraintFailed {
+            reason,
+            stage,
+            detail,
+        } => {
+            eprintln!(
+                "  {} ({}): {}",
+                safe_text(reason),
+                safe_text(stage),
+                safe_text(detail)
+            );
+        }
         smartzip_core::TaskEventKind::OutputCreated { path } => {
             eprintln!("  -> {}", safe_text(&path.to_string_lossy()));
         }
@@ -310,6 +327,7 @@ pub(super) fn build_extract_json_output(
         "skipped": result.skipped,
         "enqueued": result.enqueued,
         "events": result.events,
+        "path_reports": result.path_reports,
         "exit_code": result.status.exit_code(),
     })
 }

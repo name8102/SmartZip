@@ -2,7 +2,7 @@ use rusqlite::Connection;
 use rusqlite_migration::{Migrations, M};
 
 /// Latest schema version this build knows how to produce.
-pub const LATEST_VERSION: u32 = 7;
+pub const LATEST_VERSION: u32 = 8;
 
 const MIGRATIONS_SLICE: &[M<'static>] = &[
     M::up(
@@ -223,6 +223,12 @@ const MIGRATIONS_SLICE: &[M<'static>] = &[
         ALTER TABLE tasks ADD COLUMN nested_candidate_count INTEGER NOT NULL DEFAULT 0;
         "#,
     ),
+    M::up(
+        r#"
+        ALTER TABLE file_extractions ADD COLUMN path_report_json TEXT;
+        ALTER TABLE file_extractions ADD COLUMN path_reason TEXT;
+        "#,
+    ),
 ];
 
 static MIGRATIONS: Migrations<'static> = Migrations::from_slice(MIGRATIONS_SLICE);
@@ -402,6 +408,17 @@ mod tests {
         assert_eq!(current_version(&conn).unwrap(), LATEST_VERSION);
         // Legacy table should have been cleaned up.
         assert!(!table_exists(&conn, "schema_migrations"));
+    }
+
+    #[test]
+    fn v8_preserves_existing_history_and_adds_nullable_path_outcomes() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        MIGRATIONS.to_version(&mut conn, 7).unwrap();
+        conn.execute_batch("INSERT INTO tasks(id,kind,status,started_at) VALUES('old','extract','completed','2026-09-20'); INSERT INTO file_extractions(task_id,input_path,status,reason) VALUES('old','input.zip','failed','wrong_password');").unwrap();
+        migrate(&mut conn).unwrap();
+        let outcome: (String, Option<String>, Option<String>) = conn.query_row("SELECT reason,path_report_json,path_reason FROM file_extractions WHERE task_id='old'", [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
+        assert_eq!(outcome, ("wrong_password".into(), None, None));
+        assert_eq!(current_version(&conn).unwrap(), LATEST_VERSION);
     }
 
     #[test]
@@ -663,9 +680,10 @@ mod tests {
             M::up("CREATE TABLE t5 (id INTEGER PRIMARY KEY);"),
             M::up("CREATE TABLE t6 (id INTEGER PRIMARY KEY);"),
             M::up("CREATE TABLE t7 (id INTEGER PRIMARY KEY);"),
+            M::up("CREATE TABLE t8 (id INTEGER PRIMARY KEY);"),
             M::up("THIS IS NOT VALID SQL"),
         ]);
-        // The DB is at version 7, so the next migration (v8) will fail.
+        // The next migration must fail without advancing the latest version.
         let res = failing.to_latest(&mut conn);
         assert!(res.is_err(), "failing migration should error");
         let after: i64 = conn

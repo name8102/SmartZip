@@ -85,6 +85,23 @@ pub enum TaskEventKind {
     OutputCreated {
         path: PathBuf,
     },
+    PathMappingPlanned {
+        report_id: String,
+        renamed_count: usize,
+    },
+    PathMappingApplied {
+        report_id: String,
+        renamed_count: usize,
+    },
+    PathMappingFallback {
+        report_id: String,
+        reason: String,
+    },
+    PathConstraintFailed {
+        reason: String,
+        stage: String,
+        detail: String,
+    },
     Route(RouteEvent),
     Decision {
         stage: String,

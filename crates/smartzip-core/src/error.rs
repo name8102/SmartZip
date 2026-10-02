@@ -6,6 +6,12 @@ pub type Result<T> = std::result::Result<T, SmartZipError>;
 /// Domain errors shared by the CLI, GUI, and backend crates.
 #[derive(Debug, thiserror::Error)]
 pub enum SmartZipError {
+    #[error("path constraint {diagnostic:?}")]
+    PathConstraint {
+        diagnostic: Box<crate::path_policy::PathDiagnostic>,
+        #[source]
+        source: Option<std::io::Error>,
+    },
     #[error("I/O error at {path:?}: {source}")]
     Io {
         path: Option<PathBuf>,

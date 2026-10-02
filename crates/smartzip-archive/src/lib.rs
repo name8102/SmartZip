@@ -5,6 +5,7 @@ mod decoded_zip;
 pub mod diagnostic;
 pub mod integrity;
 mod locator;
+mod managed;
 pub mod member;
 pub mod native_zip;
 mod output_names;
@@ -18,7 +19,7 @@ pub mod unrar;
 pub mod volume_probe;
 pub mod volumes;
 
-pub use backend::{ArchiveAdapter, ArchiveExecutor};
+pub use backend::{ArchiveAdapter, ArchiveExecutor, ManagedSink, PreparedExtraction};
 pub use member::MemberReadRequest;
 pub use native_zip::NativeZipBackend;
 pub use router::{AdapterRegistration, BackendRouter};

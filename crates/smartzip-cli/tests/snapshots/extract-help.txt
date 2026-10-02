@@ -38,32 +38,34 @@ Options:
           Output layout policy: "conservative", "smart", "raw", "flat-single" [default: conservative] [possible values: conservative, smart, raw, flat-single]
       --password-limit <PASSWORD_LIMIT>
           Maximum stored password candidates (manual passwords are tried first) [default: 128]
+      --path-mode <PATH_MODE>
+          Target name constraints: native volume rules or portable Windows-safe UTF-8 names [possible values: native, portable]
+      --max-files <MAX_FILES>
+          Maximum total output entries, including directories and nested outputs (0 = unlimited)
       --single-root-name <SINGLE_ROOT_NAME>
           Single root name policy: "auto", "archive", "inner", "preserve-both" [default: auto] [possible values: auto, archive, inner, preserve-both]
       --dry-run
           Show planned output without extracting
-      --max-files <MAX_FILES>
-          Maximum total output entries, including directories and nested outputs (0 = unlimited)
-      --embedded <EMBEDDED>
-          Embedded scan mode: "auto", "ask", "largest", "aggressive", "all", "ignore" [default: auto] [possible values: auto, ask, largest, aggressive, all, ignore]
       --max-output-bytes <MAX_OUTPUT_BYTES>
           Maximum cumulative output bytes (0 = unlimited)
-      --dominant-min-ratio <DOMINANT_MIN_RATIO>
-          Minimum ratio for a finding to be considered dominant (0.0-1.0) [default: 0.7]
+      --embedded <EMBEDDED>
+          Embedded scan mode: "auto", "ask", "largest", "aggressive", "all", "ignore" [default: auto] [possible values: auto, ask, largest, aggressive, all, ignore]
       --min-free-bytes <MIN_FREE_BYTES>
           Minimum free disk space (0 disables capacity queries)
-      --confirm-large-scan
-          Auto-confirm large file scans (>10GB)
+      --dominant-min-ratio <DOMINANT_MIN_RATIO>
+          Minimum ratio for a finding to be considered dominant (0.0-1.0) [default: 0.7]
       --max-nested-candidates <MAX_NESTED_CANDIDATES>
           
-      --no-history
-          Do not record this extraction in the task history tables. Password statistics are still updated
+      --confirm-large-scan
+          Auto-confirm large file scans (>10GB)
       --non-interactive
           Disable all prompts, even when stdin is a terminal
-      --force
-          Re-extract even if this file was already extracted recently, bypassing the known_files dedup window
+      --no-history
+          Do not record this extraction in the task history tables. Password statistics are still updated
       --on-conflict <ON_CONFLICT>
           Existing output policy. Ask becomes skip without an interactive terminal [default: ask] [possible values: ask, skip, overwrite, rename]
+      --force
+          Re-extract even if this file was already extracted recently, bypassing the known_files dedup window
       --suspicious-encoding <SUSPICIOUS_ENCODING>
           Suspicious names policy. Ask becomes skip without an interactive terminal [default: ask] [possible values: ask, skip, accept]
   -h, --help

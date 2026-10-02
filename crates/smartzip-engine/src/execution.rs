@@ -15,6 +15,47 @@ pub struct CommitIntent {
     pub output_files: u64,
     pub output_bytes: u64,
     pub success: CommitSuccessFacts,
+    #[serde(default)]
+    pub mapping_version: Option<u32>,
+    #[serde(default)]
+    pub mapping_digest: Option<String>,
+    #[serde(default)]
+    pub path_mapping: Option<smartzip_core::PathMappingReport>,
+}
+
+impl CommitIntent {
+    pub(crate) fn verify_mapping(&self) -> smartzip_core::Result<()> {
+        use smartzip_core::path_policy::*;
+        let Some(report) = &self.path_mapping else {
+            if self.mapping_version.is_some() || self.mapping_digest.is_some() {
+                return Err(PathDiagnostic::new(
+                    PathConstraintReason::PathConstraintUnknown,
+                    PathStage::Commit,
+                    "commit mapping report is missing",
+                )
+                .error());
+            }
+            return Ok(());
+        };
+        let mut verified = report.clone();
+        verified.refresh_digest();
+        if report.version != PATH_MAPPING_VERSION
+            || self.mapping_version != Some(report.version)
+            || self.mapping_digest.as_deref() != Some(report.digest.as_str())
+            || verified.digest != report.digest
+            || report.tentative
+        {
+            return Err(PathDiagnostic::new(
+                PathConstraintReason::PathConstraintUnknown,
+                PathStage::Commit,
+                "commit mapping version/digest does not match its frozen report",
+            )
+            .error());
+        }
+        let parent = self.target_path.parent().unwrap_or_else(|| Path::new("."));
+        let root = smartzip_platform::path_policy::ControlledRoot::open(parent)?;
+        root.verify_identity(&report.policy)
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -199,6 +240,7 @@ pub struct NodeOutcome {
     pub encoding_corrected: bool,
     pub output_files: u64,
     pub output_bytes: u64,
+    pub path_report: Option<smartzip_core::PathMappingReport>,
 }
 
 impl NodeOutcome {
@@ -222,6 +264,7 @@ impl NodeOutcome {
             encoding_corrected: false,
             output_files: 0,
             output_bytes: 0,
+            path_report: None,
         }
     }
 }

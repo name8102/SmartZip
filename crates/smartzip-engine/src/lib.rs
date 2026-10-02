@@ -28,6 +28,8 @@ mod extract_workflow;
 pub mod interactive;
 mod nested;
 mod password_order;
+mod path_extract;
+pub mod path_policy;
 mod policy;
 mod prepared_extract;
 pub mod run_policy;
@@ -654,6 +656,7 @@ impl SmartZipEngine {
             let mut processed = Vec::new();
             let mut skipped = Vec::new();
             let mut enqueued = Vec::new();
+            let mut path_reports = Vec::new();
             let mut failed_count = 0;
             let mut cancelled = false;
             for (_, result) in results {
@@ -663,6 +666,7 @@ impl SmartZipEngine {
                 processed.extend(result.processed);
                 skipped.extend(result.skipped);
                 enqueued.extend(result.enqueued);
+                path_reports.extend(result.path_reports);
             }
             return Ok(ExtractWorkflowResult {
                 status: history::TaskCompletionStatus::from_counts(
@@ -676,6 +680,7 @@ impl SmartZipEngine {
                 skipped,
                 enqueued,
                 events: Vec::new(),
+                path_reports,
             });
         }
         workflow::extract_recursive_with_listener_interactive(

@@ -168,6 +168,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
     let mut processed = Vec::new();
     let mut skipped = Vec::new();
     let mut enqueued = Vec::new();
+    let mut path_reports = Vec::new();
     let output_materializer = OutputMaterializer::default();
     let root_input_total = request.inputs.len();
     let mut root_input_started = 0usize;
@@ -1520,6 +1521,8 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                 let extracted_encrypted = std::cell::Cell::new(None);
                 let committed_has_password = std::cell::Cell::new(false);
                 let committed_password_id = std::cell::Cell::new(None);
+                let attempt_path_report = std::cell::RefCell::new(None);
+                let attempt_directory_metadata = std::cell::RefCell::new(None);
                 let result = output_materializer
                     .prepare(
                         MaterializeRequest {
@@ -1554,6 +1557,8 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                             let extracted_encrypted = &extracted_encrypted;
                             let attempt_output_usage = &attempt_output_usage;
                             let attempt_output_inventory = &attempt_output_inventory;
+                            let attempt_path_report = &attempt_path_report;
+                            let attempt_directory_metadata = &attempt_directory_metadata;
                             let task_id = task_id.clone();
                             let node_id = node.id.clone();
                             let generation = node.generation;
@@ -1586,7 +1591,8 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                                         "archive-backend",
                                         "extract",
                                         &archive_path,
-                                        backend.extract_with_facts_and_context(
+                                        crate::path_extract::extract(
+                                            backend,
                                             ExtractArchiveRequest {
                                                 archive: archive_path.clone(),
                                                 format,
@@ -1595,7 +1601,11 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                                                 encoding,
                                             },
                                             facts,
+                                            config.map(|c|c.extraction.output.path_mode).unwrap_or_default(),
+                                            budget_reservation.writer_budget(limits),
                                             context.clone(),
+                                            attempt_path_report,
+                                            attempt_directory_metadata,
                                         ),
                                     ),
                                 )
@@ -1608,6 +1618,11 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                         },
                     )
                     .await;
+                let result = result.and_then(|staged| {
+                    staged
+                        .with_directory_metadata(attempt_directory_metadata.borrow_mut().take())
+                        .with_path_mapping(attempt_path_report.borrow().clone())
+                });
                 let result = match result {
                     Ok(staged) => {
                         if !enter_stage(
@@ -1742,7 +1757,13 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                                 match staged.prepare_commit(decision, success) {
                                     Ok(mut prepared) => {
                                         prepared.set_output_usage(attempt_output_usage.get());
+                                        prepared.set_mapping_owner(&node.id, node.generation);
                                         let intent = prepared.intent().cloned();
+                                        if let Some(report) =
+                                            intent.as_ref().and_then(|i| i.path_mapping.clone())
+                                        {
+                                            *attempt_path_report.borrow_mut() = Some(report);
+                                        }
                                         if let (Some(execution), Some(intent)) =
                                             (execution, intent.as_ref())
                                         {
@@ -1831,6 +1852,16 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                 };
                 match result {
                     Ok(result) => {
+                        if let Some(report) = attempt_path_report.borrow_mut().take() {
+                            events.push(TaskEvent {
+                                task_id: task_id.clone(),
+                                kind: TaskEventKind::PathMappingApplied {
+                                    report_id: report.digest.clone(),
+                                    renamed_count: report.changed_count(),
+                                },
+                            });
+                            path_reports.push(report);
+                        }
                         *committed_output_files.borrow_mut() = attempt_output_inventory
                             .borrow()
                             .as_ref()
@@ -1864,6 +1895,33 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                         break;
                     }
                     Err(failure) => {
+                        if let smartzip_core::SmartZipError::PathConstraint { diagnostic, .. } =
+                            &failure.error
+                        {
+                            let reason = serde_json::to_value(diagnostic.reason)
+                                .ok()
+                                .and_then(|v| v.as_str().map(str::to_owned))
+                                .unwrap_or_else(|| "path_constraint_unknown".into());
+                            let stage = serde_json::to_value(diagnostic.stage)
+                                .ok()
+                                .and_then(|v| v.as_str().map(str::to_owned))
+                                .unwrap_or_else(|| "create".into());
+                            events.push(TaskEvent {
+                                task_id: task_id.clone(),
+                                kind: TaskEventKind::PathConstraintFailed {
+                                    reason,
+                                    stage,
+                                    detail: diagnostic.detail.clone(),
+                                },
+                            });
+                        }
+                        if let Some(mut report) = attempt_path_report.borrow_mut().take() {
+                            report.tentative = true;
+                            report.node_id = Some(node.id.to_string());
+                            report.generation = Some(node.generation);
+                            report.refresh_digest();
+                            path_reports.push(report);
+                        }
                         group_retry_allowed = false;
                         if failure.kind == materialize::MaterializeFailureKind::CollisionSkipped {
                             terminal_skip = true;
@@ -2091,6 +2149,9 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                     // File-grain failure: classify the reason from the error so
                     // `history files --reason` can filter later.
                     let reason = match &error {
+                        smartzip_core::SmartZipError::PathConstraint { diagnostic, .. } => {
+                            diagnostic.reason.as_str()
+                        }
                         smartzip_core::SmartZipError::PasswordIndeterminate { .. } => {
                             "password_indeterminate"
                         }
@@ -2121,6 +2182,13 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                         );
                     }
                     let event = TaskEvent::failed(task_id.clone(), &error);
+                    if let Some(recorder) = legacy_history {
+                        let report = path_reports
+                            .iter()
+                            .rev()
+                            .find(|r| r.node_id.as_deref() == Some(node.id.as_str()));
+                        recorder.record_path_outcome(&task_id, report, Some(reason));
+                    }
                     events.push(event);
                 } else if let Some(recorder) = legacy_history {
                     // No error and not extracted: candidates were tried but none
@@ -2207,6 +2275,11 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                         encoding: candidate_encoding_used.clone(),
                         encoding_corrected: reused_confirmed_encoding
                             || matches!(request.encoding_mode, EncodingMode::Override(_)),
+                        path_report: path_reports
+                            .iter()
+                            .rev()
+                            .find(|r| r.node_id.as_deref() == Some(node.id.as_str()))
+                            .cloned(),
                         ..crate::NodeOutcome::terminal(
                             node_terminal_status,
                             Some(node_terminal_reason),
@@ -2248,6 +2321,11 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                         )
                     },
                 );
+                let report = path_reports
+                    .iter()
+                    .rev()
+                    .find(|r| r.node_id.as_deref() == Some(node.id.as_str()));
+                recorder.record_path_outcome(&task_id, report, None);
             }
             if let Some(recorder) = history {
                 if let (Some(hash), Some(size)) = (sample_hash.as_deref(), sample_size) {
@@ -2471,6 +2549,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
         skipped,
         enqueued,
         events: Vec::new(),
+        path_reports,
     })
 }
 

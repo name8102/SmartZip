@@ -286,12 +286,14 @@ impl<'a> TaskExecutionRepository<'a> {
         generation: i64,
         commit_json: &str,
     ) -> Result<bool> {
+        let report_json = published_path_report(commit_json)?;
         let tx = self.conn.transaction()?;
         let changed = tx.execute(
-            "UPDATE file_extractions SET execution_state='running', commit_json=?1 \
+            "UPDATE file_extractions SET execution_state='running', commit_json=?1, \
+             path_report_json=COALESCE(?5,path_report_json) \
              WHERE task_id=?2 AND node_id=?3 AND generation=?4 AND stage='commit' \
              AND execution_state='committing' AND status='pending'",
-            params![commit_json, task_id, node_id, generation],
+            params![commit_json, task_id, node_id, generation, report_json],
         )?;
         if changed == 1 {
             record_stage_event(&tx, task_id, node_id, "commit", None, "published")?;
@@ -315,6 +317,26 @@ impl<'a> TaskExecutionRepository<'a> {
         Ok(changed == 1)
     }
 
+    /// Supplemental failed-attempt history, independent of required commit records.
+    pub fn set_path_outcome(
+        &self,
+        task_id: &str,
+        node_id: &str,
+        generation: i64,
+        report_json: Option<&str>,
+        path_reason: Option<&str>,
+    ) -> Result<bool> {
+        let generation = u64::try_from(generation)
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        crate::file_extractions::FileExtractionRepository::new(self.conn).set_path_outcome(
+            task_id,
+            Some(node_id),
+            generation,
+            report_json,
+            path_reason,
+        )
+    }
+
     pub fn reset_commit_for_retry(
         &mut self,
         task_id: &str,
@@ -325,7 +347,7 @@ impl<'a> TaskExecutionRepository<'a> {
         let changed = tx.execute(
             "UPDATE file_extractions SET generation=generation + 1, \
              execution_state='ready', stage='resolve_inputs', attempt_id=NULL, \
-             decision_json=NULL, commit_json=NULL WHERE task_id=?1 AND node_id=?2 \
+             decision_json=NULL, commit_json=NULL, path_report_json=NULL, path_reason=NULL WHERE task_id=?1 AND node_id=?2 \
              AND generation=?3 AND status='pending' AND commit_json IS NOT NULL",
             params![task_id, node_id, generation],
         )?;
@@ -355,16 +377,117 @@ impl<'a> TaskExecutionRepository<'a> {
         output_files: u64,
         output_bytes: u64,
     ) -> Result<bool> {
+        self.finish_node_inner(
+            task_id,
+            node_id,
+            generation,
+            status,
+            reason,
+            output_path,
+            committed,
+            sample_hash,
+            file_size,
+            embedded_offset,
+            has_password,
+            password_id,
+            encoding,
+            encoding_corrected,
+            output_files,
+            output_bytes,
+            false,
+            None,
+        )
+    }
+
+    /// Preserve failed recovery evidence and its unverified mapping in the terminal transaction.
+    pub fn finish_failed_commit_recovery(
+        &mut self,
+        task_id: &str,
+        node_id: &str,
+        generation: i64,
+        reason: &str,
+        path_reason: Option<&str>,
+    ) -> Result<bool> {
+        self.finish_node_inner(
+            task_id,
+            node_id,
+            generation,
+            "failed",
+            Some(reason),
+            None,
+            false,
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            false,
+            0,
+            0,
+            true,
+            path_reason,
+        )
+    }
+
+    fn finish_node_inner(
+        &mut self,
+        task_id: &str,
+        node_id: &str,
+        generation: i64,
+        status: &str,
+        reason: Option<&str>,
+        output_path: Option<&str>,
+        committed: bool,
+        sample_hash: Option<&str>,
+        file_size: Option<i64>,
+        embedded_offset: Option<i64>,
+        has_password: bool,
+        password_id: Option<i64>,
+        encoding: Option<&str>,
+        encoding_corrected: bool,
+        output_files: u64,
+        output_bytes: u64,
+        recovery_failure: bool,
+        path_reason: Option<&str>,
+    ) -> Result<bool> {
         let output_files = i64::try_from(output_files)
             .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
         let output_bytes = i64::try_from(output_bytes)
             .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
         let tx = self.conn.transaction()?;
+        let report_json = if committed || recovery_failure {
+            let stored: Option<String> = tx.query_row(
+                "SELECT commit_json FROM file_extractions WHERE task_id=?1 AND node_id=?2 AND generation=?3",
+                params![task_id, node_id, generation], |row| row.get(0),
+            ).optional()?.flatten();
+            if recovery_failure {
+                // The frozen evidence may be invalid: keep its original digest and paths,
+                // but never present this diagnostic copy as an applied mapping.
+                stored.as_deref().and_then(|json| {
+                    let mut report: serde_json::Value =
+                        serde_json::from_str(&published_path_report(json).ok().flatten()?).ok()?;
+                    report
+                        .as_object_mut()?
+                        .insert("tentative".into(), true.into());
+                    serde_json::to_string(&report).ok()
+                })
+            } else {
+                stored
+                    .as_deref()
+                    .map(published_path_report)
+                    .transpose()?
+                    .flatten()
+            }
+        } else {
+            None
+        };
         let commit_json = committed.then_some("{\"published\":true}");
         let changed = tx.execute(
             "UPDATE file_extractions SET status=?1, reason=?2, output_path=?3, \
-             execution_state='terminal', stage='cleanup', attempt_id=NULL, commit_json=?4, \
-             artifact_refs_json=NULL, \
+             execution_state='terminal', stage='cleanup', attempt_id=NULL, commit_json=CASE WHEN ?4 IS NULL AND NOT ?17 THEN NULL ELSE COALESCE(commit_json,?4) END, \
+             artifact_refs_json=NULL, path_report_json=COALESCE(?15,path_report_json), \
+             path_reason=CASE WHEN ?16 IS NOT NULL THEN ?16 WHEN ?2 IN ('name_too_long','path_too_long','invalid_name','name_collision','path_remap_unsupported','path_constraint_unknown') THEN ?2 ELSE path_reason END, \
              sample_hash=?5, file_size=?6, offset=?7, has_password=?8, \
              password_id=?9, encoding=?10, encoding_corrected=?11 \
              WHERE task_id=?12 AND node_id=?13 AND generation=?14 AND status='pending'",
@@ -383,6 +506,9 @@ impl<'a> TaskExecutionRepository<'a> {
                 task_id,
                 node_id,
                 generation,
+                report_json,
+                path_reason,
+                recovery_failure,
             ],
         )?;
         if changed == 1 {
@@ -581,7 +707,7 @@ impl<'a> TaskExecutionRepository<'a> {
         )?;
         tx.execute(
             "UPDATE file_extractions SET generation=COALESCE(generation, 0) + 1, \
-             execution_state='ready', stage='resolve_inputs', attempt_id=NULL, decision_json=NULL \
+             execution_state='ready', stage='resolve_inputs', attempt_id=NULL, decision_json=NULL, path_report_json=NULL, path_reason=NULL \
              WHERE status='pending' AND commit_json IS NULL \
              AND task_id IN (SELECT id FROM tasks WHERE recoverable=1 AND finished_at IS NULL)",
             [],
@@ -733,6 +859,18 @@ fn record_stage_event(
         params![task_id, state, node_id, stage, attempt_id],
     )?;
     Ok(())
+}
+
+/// The commit record owns the frozen report; invalid JSON cannot be published.
+fn published_path_report(commit_json: &str) -> Result<Option<String>> {
+    let record: serde_json::Value = serde_json::from_str(commit_json)?;
+    record
+        .get("intent")
+        .and_then(|intent| intent.get("path_mapping"))
+        .filter(|report| !report.is_null())
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(Into::into)
 }
 
 #[cfg(test)]
@@ -1085,6 +1223,138 @@ mod tests {
         let recovered = repo.claim_recoverable(1).unwrap();
         assert_eq!(recovered.len(), 1);
         assert!(recovered[0].paused);
+    }
+
+    #[test]
+    fn published_report_and_intent_survive_terminal_history_without_events() {
+        for published_first in [false, true] {
+            let mut db = SmartZipDb::in_memory().unwrap();
+            let mut repo = TaskExecutionRepository::new(db.connection_mut());
+            submit(&mut repo);
+            assert!(repo
+                .transition("task", "root", 0, "ready", "running", "commit", None)
+                .unwrap());
+            let report = serde_json::json!({"digest":"report-digest","entries":[{"id":1,"final_relative":"mapped.txt"}]});
+            let prepared = serde_json::json!({"phase":"prepared","intent":{"path_mapping":report}})
+                .to_string();
+            let published =
+                serde_json::json!({"phase":"published","intent":{"path_mapping":report}})
+                    .to_string();
+            assert!(repo.begin_commit("task", "root", 0, &prepared).unwrap());
+            if published_first {
+                assert!(repo
+                    .commit_published("task", "root", 0, &published)
+                    .unwrap());
+            }
+            assert!(repo
+                .finish_node(
+                    "task",
+                    "root",
+                    0,
+                    "extracted",
+                    None,
+                    Some("/out"),
+                    true,
+                    None,
+                    None,
+                    None,
+                    false,
+                    None,
+                    None,
+                    false,
+                    1,
+                    10
+                )
+                .unwrap());
+            let (saved, intent): (String, String) = repo
+            .conn
+            .query_row(
+                "SELECT path_report_json,commit_json FROM file_extractions WHERE task_id='task'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&saved).unwrap(),
+                report
+            );
+            assert_eq!(intent, if published_first { published } else { prepared });
+            repo.conn.execute("DELETE FROM task_events", []).unwrap();
+            assert_eq!(
+                crate::file_extractions::FileExtractionRepository::new(repo.conn)
+                    .list_by_task("task")
+                    .unwrap()[0]
+                    .path_report_json
+                    .as_deref(),
+                Some(saved.as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn failed_commit_recovery_keeps_original_evidence_and_unverified_report() {
+        for phase in ["prepared", "published", "invalid_json"] {
+            let mut db = SmartZipDb::in_memory().unwrap();
+            let mut repo = TaskExecutionRepository::new(db.connection_mut());
+            submit(&mut repo);
+            repo.transition("task", "root", 0, "ready", "running", "commit", None)
+                .unwrap();
+            let report = serde_json::json!({
+                "digest": "original-unverified-digest", "tentative": false,
+                "entries": [{"source":"original.txt", "staging_relative":"stage.txt", "final_relative":"changed.txt"}]
+            });
+            let original = if phase == "invalid_json" {
+                "invalid commit JSON".to_owned()
+            } else {
+                serde_json::json!({"phase":phase,"intent":{
+                    "source_path":"/staging", "backup_path":"/backup",
+                    "mapping_digest":"original-unverified-digest", "path_mapping": report
+                }})
+                .to_string()
+            };
+            repo.begin_commit("task", "root", 0, &original).unwrap();
+            if phase == "published" {
+                repo.commit_published("task", "root", 0, &original).unwrap();
+            }
+            let reason = "commit_mapping_invalid: frozen digest mismatch";
+            assert!(repo
+                .finish_failed_commit_recovery(
+                    "task",
+                    "root",
+                    0,
+                    reason,
+                    Some("path_constraint_unknown")
+                )
+                .unwrap());
+            let (status, saved_reason, path_reason, evidence, saved):
+                (String, String, String, String, Option<String>) = repo.conn.query_row(
+                    "SELECT status,reason,path_reason,commit_json,path_report_json FROM file_extractions WHERE task_id='task'",
+                    [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?))
+                ).unwrap();
+            assert_eq!(status, "failed");
+            assert_eq!(saved_reason, reason);
+            assert_eq!(path_reason, "path_constraint_unknown");
+            assert_eq!(evidence, original);
+            if phase == "invalid_json" {
+                assert!(saved.is_none());
+            } else {
+                let mut expected = report;
+                expected["tentative"] = true.into();
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(saved.as_deref().unwrap()).unwrap(),
+                    expected
+                );
+            }
+            repo.conn.execute("DELETE FROM task_events", []).unwrap();
+            let history = crate::file_extractions::FileExtractionRepository::new(repo.conn)
+                .list_by_task("task")
+                .unwrap();
+            assert_eq!(history[0].path_report_json, saved);
+            assert_eq!(
+                history[0].path_reason.as_deref(),
+                Some("path_constraint_unknown")
+            );
+        }
     }
 
     #[test]

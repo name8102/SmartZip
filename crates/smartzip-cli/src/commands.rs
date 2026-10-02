@@ -224,6 +224,7 @@ pub(super) async fn extract(
         json,
         layout,
         single_root_name,
+        path_mode: _,
         dry_run: _,
         embedded,
         dominant_min_ratio,

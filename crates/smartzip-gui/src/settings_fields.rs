@@ -79,6 +79,12 @@ pub const SECTIONS: &[Section] = &[
                 Kind::Text
             ),
             field!(
+                "extraction.output.path_mode",
+                "名称兼容模式",
+                "Native 按实际目标卷约束命名；Portable 叠加 Windows 安全名称和每分量 255 UTF-8 字节预算，不保证旧应用可打开所有完整路径。",
+                Kind::Choice(&[("native", "Native · 目标卷"), ("portable", "Portable · 跨平台")])
+            ),
+            field!(
                 "extraction.output.layout",
                 "输出布局",
                 "控制目录包装与文件平铺方式。",

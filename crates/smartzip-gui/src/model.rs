@@ -45,6 +45,7 @@ pub struct Job {
     pub events: Vec<String>,
     pub outputs: Vec<PathBuf>,
     pub result: Option<serde_json::Value>,
+    pub renamed_count: usize,
     pub prompt: Option<InteractionRequest>,
     pub prompt_revision: u64,
     pub dismiss_requested: bool,
@@ -70,6 +71,7 @@ struct QuickOverrides {
     smart_layout: bool,
     delete_source: bool,
     auto_encoding: bool,
+    path_mode: bool,
 }
 impl Job {
     pub fn backend_label(&self) -> String {
@@ -100,6 +102,7 @@ impl Job {
             2 => self.quick_overrides.delete_source,
             3 => self.quick_overrides.auto_encoding,
             4 => self.quick_overrides.output,
+            5 => self.quick_overrides.path_mode,
             _ => false,
         }
     }
@@ -150,6 +153,14 @@ impl Job {
                 } else {
                     None
                 };
+            }
+            TaskEventKind::PathMappingApplied { renamed_count, .. } => {
+                self.renamed_count = self.renamed_count.saturating_add(*renamed_count);
+            }
+            TaskEventKind::PathConstraintFailed { reason, detail, .. } => {
+                let summary = format!("{}：{detail}", crate::path_reports::failure_label(reason));
+                self.failure_summary = Some(summary.clone());
+                self.current_route_failure = Some(summary);
             }
             TaskEventKind::Failed { error } => {
                 self.failure_summary = Some(
@@ -238,6 +249,7 @@ impl Queue {
             smart_layout: true,
             delete_source: true,
             auto_encoding: true,
+            path_mode: true,
         };
         id
     }
@@ -263,6 +275,7 @@ impl Queue {
             events: vec![],
             outputs: vec![],
             result: None,
+            renamed_count: 0,
             prompt: None,
             prompt_revision: 0,
             dismiss_requested: false,
@@ -336,6 +349,7 @@ impl Queue {
             job.request.settings.smart_layout,
             job.request.settings.delete_source,
             job.request.settings.auto_encoding,
+            job.request.settings.path_mode,
         );
         update(&mut job.request.settings);
         job.draft_revision = job.draft_revision.wrapping_add(1);
@@ -344,6 +358,7 @@ impl Queue {
         job.quick_overrides.smart_layout |= job.request.settings.smart_layout != before.2;
         job.quick_overrides.delete_source |= job.request.settings.delete_source != before.3;
         job.quick_overrides.auto_encoding |= job.request.settings.auto_encoding != before.4;
+        job.quick_overrides.path_mode |= job.request.settings.path_mode != before.5;
         Ok(())
     }
     pub fn set_task_password(
@@ -383,6 +398,7 @@ impl Queue {
                 job.request.settings.smart_layout,
                 job.request.settings.delete_source,
                 job.request.settings.auto_encoding,
+                job.request.settings.path_mode,
             );
             if !job.quick_overrides.output {
                 job.request.settings.output = settings.output.clone();
@@ -396,6 +412,9 @@ impl Queue {
             if !job.quick_overrides.delete_source {
                 job.request.settings.delete_source = settings.delete_source;
             }
+            if !job.quick_overrides.path_mode {
+                job.request.settings.path_mode = settings.path_mode;
+            }
             if !job.quick_overrides.auto_encoding {
                 job.request.settings.auto_encoding = settings.auto_encoding;
             }
@@ -406,6 +425,7 @@ impl Queue {
                     job.request.settings.smart_layout,
                     job.request.settings.delete_source,
                     job.request.settings.auto_encoding,
+                    job.request.settings.path_mode,
                 )
             {
                 job.draft_revision = job.draft_revision.wrapping_add(1);
@@ -429,6 +449,7 @@ impl Queue {
         job.request.settings.smart_layout = settings.smart_layout;
         job.request.settings.delete_source = settings.delete_source;
         job.request.settings.auto_encoding = settings.auto_encoding;
+        job.request.settings.path_mode = settings.path_mode;
         job.quick_overrides = QuickOverrides::default();
         job.draft_revision = job.draft_revision.wrapping_add(1);
         Ok(())
@@ -917,6 +938,55 @@ mod tests {
             detail: serde_json::Value::Null,
             warnings: vec![],
         }
+    }
+
+    #[test]
+    fn explicit_path_mode_is_retained_when_global_quick_settings_change() {
+        let mut queue = Queue::default();
+        let first = queue.enqueue(request("first.zip"));
+        queue.enqueue(request("second.zip"));
+        queue
+            .update_settings(first, |settings| {
+                settings.path_mode = Some(smartzip_core::PathMode::Portable)
+            })
+            .unwrap();
+        queue.apply_global_settings(&TaskSettings {
+            path_mode: Some(smartzip_core::PathMode::Native),
+            ..Default::default()
+        });
+        assert_eq!(
+            queue.jobs[0].request.settings.path_mode,
+            Some(smartzip_core::PathMode::Portable)
+        );
+        assert_eq!(
+            queue.jobs[1].request.settings.path_mode,
+            Some(smartzip_core::PathMode::Native)
+        );
+        assert!(queue.jobs[0].settings_overridden(5));
+    }
+
+    #[test]
+    fn path_failure_reason_survives_the_generic_failure_and_final_status() {
+        let mut queue = Queue::default();
+        queue.enqueue(request("archive.zip"));
+        let job = &mut queue.jobs[0];
+        let task_id = smartzip_core::TaskId::new();
+        job.event(TaskEvent {
+            task_id: task_id.clone(),
+            kind: TaskEventKind::PathConstraintFailed {
+                reason: "name_too_long".into(),
+                stage: "create".into(),
+                detail: "名称缩短预算已耗尽".into(),
+            },
+        });
+        job.event(TaskEvent {
+            task_id,
+            kind: TaskEventKind::Failed {
+                error: "generic backend error".into(),
+            },
+        });
+        job.finish(outcome("failed"));
+        assert_eq!(job.stage, "单个名称过长：名称缩短预算已耗尽");
     }
 
     #[test]

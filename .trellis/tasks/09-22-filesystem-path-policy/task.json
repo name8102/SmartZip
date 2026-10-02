@@ -1,4 +1,4 @@
 {
-  "title": "目标文件系统路径兼容性修复设计",
-  "status": "design-complete"
+  "title": "跨文件系统路径兼容完整实施",
+  "status": "implemented"
 }

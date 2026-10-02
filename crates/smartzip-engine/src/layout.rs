@@ -117,6 +117,7 @@ pub enum LayoutDecisionReason {
     RawPolicyForced,
     EmptyTempDir,
     DefaultConservative,
+    CompleteArchiveTree,
 }
 
 /// Scan a temp directory and categorize its visible top-level contents.

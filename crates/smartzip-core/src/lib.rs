@@ -2,6 +2,7 @@
 
 pub mod embedded;
 pub mod error;
+pub mod path_policy;
 pub mod progress;
 pub mod routing;
 pub mod task;
@@ -11,6 +12,7 @@ pub use embedded::{
     EmbeddedScanPolicy, FindingSummary, DEFAULT_MIN_EMBEDDED_FINDING_SIZE,
 };
 pub use error::{Result, SmartZipError};
+pub use path_policy::*;
 pub use progress::{
     EncodingCandidate, EncodingDetectionResult, TaskEvent, TaskEventKind, TaskEventSink,
     TaskProgress,

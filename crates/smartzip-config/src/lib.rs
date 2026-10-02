@@ -93,4 +93,5 @@ mod resolve;
 mod store;
 pub use model::*;
 pub use resolve::*;
+pub use smartzip_core::PathMode;
 pub use store::*;

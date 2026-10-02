@@ -143,6 +143,10 @@ pub(super) struct ExtractCommand {
     #[arg(long, default_value = "conservative", value_enum)]
     pub(super) layout: LayoutPolicyArg,
 
+    /// Target name constraints: native volume rules or portable Windows-safe UTF-8 names.
+    #[arg(long, value_parser = ["native", "portable"])]
+    pub(super) path_mode: Option<String>,
+
     /// Single root name policy: "auto", "archive", "inner", "preserve-both".
     #[arg(long, default_value = "auto", value_enum)]
     pub(super) single_root_name: SingleRootNameArg,

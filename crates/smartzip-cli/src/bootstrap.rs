@@ -120,6 +120,7 @@ pub(super) fn apply_cli_overrides(
     }
     for (id, key) in [
         ("layout", "extraction.output.layout"),
+        ("path_mode", "extraction.output.path_mode"),
         ("single_root_name", "extraction.output.single_root_name"),
         ("encoding", "extraction.encoding.mode"),
         ("on_conflict", "extraction.output.on_conflict"),

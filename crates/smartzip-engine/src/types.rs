@@ -167,4 +167,7 @@ pub struct ExtractWorkflowResult {
     pub skipped: Vec<ExtractionCandidate>,
     pub enqueued: Vec<ExtractionCandidate>,
     pub events: Vec<TaskEvent>,
+    /// Complete reports are kept independently of the bounded event timeline.
+    #[serde(default)]
+    pub path_reports: Vec<smartzip_core::PathMappingReport>,
 }

@@ -7,7 +7,8 @@
 //! collapses into the `encoding` / `encoding_corrected` columns and carved
 //! archives are ordinary rows disambiguated by `offset`.
 //!
-//! The table is write-once — there is no update path. Deduplication queries successful actions in this same history.
+//! Actions remain in this history; supplemental path reports and diagnostics may be
+//! attached to an existing action. Deduplication queries successful actions here.
 //! Password and encoding hints live in `known_files`. Callers treat repo errors as
 //! non-fatal (see the engine's best-effort recorder).
 
@@ -32,6 +33,8 @@ pub struct NewFileExtraction<'a> {
     pub encoding_corrected: bool,
     pub damaged_volumes_json: Option<&'a str>,
     pub test_report_json: Option<&'a str>,
+    pub path_report_json: Option<&'a str>,
+    pub path_reason: Option<&'a str>,
     pub created_at: &'a str,
 }
 
@@ -53,6 +56,8 @@ pub struct FileExtractionRecord {
     pub encoding_corrected: bool,
     pub damaged_volumes_json: Option<String>,
     pub test_report_json: Option<String>,
+    pub path_report_json: Option<String>,
+    pub path_reason: Option<String>,
     pub created_at: String,
 }
 
@@ -77,15 +82,15 @@ impl<'a> FileExtractionRepository<'a> {
         )?)
     }
 
-    /// Append one extraction action. No update path exists by design.
+    /// Append one extraction action.
     pub fn insert(&self, row: NewFileExtraction<'_>) -> Result<i64> {
         self.conn.execute(
             r#"
             INSERT INTO file_extractions(
                 task_id, input_path, sample_hash, file_size, offset, output_path,
                 has_password, password_id, status, reason, encoding,
-                encoding_corrected, damaged_volumes_json, created_at, test_report_json
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+                encoding_corrected, damaged_volumes_json, created_at, test_report_json, path_report_json, path_reason
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
             "#,
             params![
                 row.task_id,
@@ -103,9 +108,83 @@ impl<'a> FileExtractionRepository<'a> {
                 row.damaged_volumes_json,
                 row.created_at,
                 row.test_report_json,
+                row.path_report_json,
+                row.path_reason,
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Save the complete report independently of the bounded event log.
+    /// Legacy actions have no node identity; only the newest such action is updated.
+    pub fn set_path_outcome(
+        &self,
+        task_id: &str,
+        node_id: Option<&str>,
+        generation: u64,
+        report_json: Option<&str>,
+        path_reason: Option<&str>,
+    ) -> Result<bool> {
+        if let Some(report) = report_json {
+            let _: serde_json::Value = serde_json::from_str(report)?;
+        }
+        let path_reason = path_reason.filter(|reason| is_path_reason(reason));
+        let generation = i64::try_from(generation)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+        let changed = self.conn.execute(
+            "UPDATE file_extractions SET path_report_json=COALESCE(?1,path_report_json), \
+             path_reason=COALESCE(?2,path_reason) WHERE id=(SELECT id FROM file_extractions \
+             WHERE task_id=?3 AND ((?4 IS NOT NULL AND node_id=?4 AND generation=?5) \
+             OR (?4 IS NULL AND node_id IS NULL)) ORDER BY id DESC LIMIT 1)",
+            params![report_json, path_reason, task_id, node_id, generation],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Attach supplemental outcome to the exact successfully inserted history action.
+    pub fn set_path_outcome_by_id(
+        &self,
+        record_id: i64,
+        report_json: Option<&str>,
+        path_reason: Option<&str>,
+    ) -> Result<bool> {
+        if let Some(report) = report_json {
+            let _: serde_json::Value = serde_json::from_str(report)?;
+        }
+        let path_reason = path_reason.filter(|reason| is_path_reason(reason));
+        Ok(self.conn.execute(
+            "UPDATE file_extractions SET path_report_json=COALESCE(?1,path_report_json), \
+             path_reason=COALESCE(?2,path_reason) WHERE id=?3",
+            params![report_json, path_reason, record_id],
+        )? == 1)
+    }
+
+    /// A bounded page of report entries. The complete JSON remains in the database.
+    pub fn path_report_page(
+        &self,
+        record_id: i64,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<serde_json::Value>> {
+        let mut statement = self.conn.prepare(
+            "SELECT entries.value FROM file_extractions f, \
+             json_each(f.path_report_json, '$.entries') entries \
+             WHERE f.id=?1 ORDER BY CAST(entries.key AS INTEGER) LIMIT ?2 OFFSET ?3",
+        )?;
+        let texts = statement
+            .query_map(
+                params![
+                    record_id,
+                    limit.min(1000) as i64,
+                    offset.min(i64::MAX as usize) as i64
+                ],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        texts
+            .into_iter()
+            .map(|text| serde_json::from_str(&text).map_err(Into::into))
+            .collect()
     }
 
     /// Every action logged for one task, oldest first.
@@ -114,7 +193,7 @@ impl<'a> FileExtractionRepository<'a> {
             r#"
             SELECT id, task_id, input_path, sample_hash, file_size, offset,
                    output_path, has_password, password_id, status, reason,
-                   encoding, encoding_corrected, damaged_volumes_json, created_at, test_report_json
+                   encoding, encoding_corrected, damaged_volumes_json, created_at, test_report_json, path_report_json, path_reason
             FROM file_extractions
             WHERE task_id = ?1
             ORDER BY id ASC
@@ -129,7 +208,7 @@ impl<'a> FileExtractionRepository<'a> {
             r#"
             SELECT id, task_id, input_path, sample_hash, file_size, offset,
                    output_path, has_password, password_id, status, reason,
-                   encoding, encoding_corrected, damaged_volumes_json, created_at, test_report_json
+                   encoding, encoding_corrected, damaged_volumes_json, created_at, test_report_json, path_report_json, path_reason
             FROM file_extractions
             ORDER BY id DESC
             LIMIT ?1
@@ -144,7 +223,7 @@ impl<'a> FileExtractionRepository<'a> {
             r#"
             SELECT id, task_id, input_path, sample_hash, file_size, offset,
                    output_path, has_password, password_id, status, reason,
-                   encoding, encoding_corrected, damaged_volumes_json, created_at, test_report_json
+                   encoding, encoding_corrected, damaged_volumes_json, created_at, test_report_json, path_report_json, path_reason
             FROM file_extractions
             WHERE status = ?1
             ORDER BY id DESC
@@ -160,7 +239,7 @@ impl<'a> FileExtractionRepository<'a> {
             r#"
             SELECT id, task_id, input_path, sample_hash, file_size, offset,
                    output_path, has_password, password_id, status, reason,
-                   encoding, encoding_corrected, damaged_volumes_json, created_at, test_report_json
+                   encoding, encoding_corrected, damaged_volumes_json, created_at, test_report_json, path_report_json, path_reason
             FROM file_extractions
             WHERE reason = ?1
             ORDER BY id DESC
@@ -181,7 +260,7 @@ impl<'a> FileExtractionRepository<'a> {
             r#"
             SELECT id, task_id, input_path, sample_hash, file_size, offset,
                    output_path, has_password, password_id, status, reason,
-                   encoding, encoding_corrected, damaged_volumes_json, created_at, test_report_json
+                   encoding, encoding_corrected, damaged_volumes_json, created_at, test_report_json, path_report_json, path_reason
             FROM file_extractions
             WHERE status = ?1 AND reason = ?2
             ORDER BY id DESC
@@ -197,6 +276,18 @@ impl<'a> FileExtractionRepository<'a> {
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Into::into)
     }
+}
+
+fn is_path_reason(reason: &str) -> bool {
+    matches!(
+        reason,
+        "name_too_long"
+            | "path_too_long"
+            | "invalid_name"
+            | "name_collision"
+            | "path_remap_unsupported"
+            | "path_constraint_unknown"
+    )
 }
 
 fn map_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileExtractionRecord> {
@@ -216,6 +307,8 @@ fn map_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileExtractionRecord>
         encoding_corrected: row.get::<_, i64>(12)? != 0,
         damaged_volumes_json: row.get(13)?,
         test_report_json: row.get(15)?,
+        path_report_json: row.get(16)?,
+        path_reason: row.get(17)?,
         created_at: row.get(14)?,
     })
 }
@@ -253,6 +346,8 @@ mod tests {
             encoding_corrected: false,
             damaged_volumes_json: None,
             test_report_json: None,
+            path_report_json: None,
+            path_reason: None,
             created_at: "2026-07-02T00:00:01Z",
         }
     }
@@ -345,6 +440,67 @@ mod tests {
             .unwrap();
         assert_eq!(combined.len(), 1);
         assert_eq!(combined[0].input_path, "/dup.zip");
+    }
+
+    #[test]
+    fn full_mapping_survives_without_events_and_pages_without_truncation() {
+        let db = SmartZipDb::in_memory().unwrap();
+        seed_task(&db, "task");
+        let repo = FileExtractionRepository::new(db.connection());
+        let id = repo
+            .insert(base("task", "/input.zip", "extracted"))
+            .unwrap();
+        let entries = (0..4100).map(|id| serde_json::json!({"id":id,"display_name":format!("original-{id}"),"final_relative":format!("final-{id}")})).collect::<Vec<_>>();
+        let report = serde_json::json!({"entries":entries}).to_string();
+        assert!(repo
+            .set_path_outcome("task", None, 0, Some(&report), Some("name_too_long"))
+            .unwrap());
+        let record = repo.list_by_task("task").unwrap().pop().unwrap();
+        assert_eq!(record.path_report_json.as_deref(), Some(report.as_str()));
+        assert_eq!(record.path_reason.as_deref(), Some("name_too_long"));
+        let page = repo.path_report_page(id, 4095, 50).unwrap();
+        assert_eq!(page.len(), 5);
+        assert_eq!(page.last().unwrap()["id"], 4099);
+        assert!(!repo
+            .set_path_outcome("task", Some("unknown"), 0, Some(&report), None)
+            .unwrap());
+        assert!(repo
+            .set_path_outcome("task", None, 0, Some("invalid"), None)
+            .is_err());
+    }
+
+    #[test]
+    fn supplemental_path_outcome_targets_only_the_inserted_legacy_action() {
+        let db = SmartZipDb::in_memory().unwrap();
+        seed_task(&db, "task");
+        let repo = FileExtractionRepository::new(db.connection());
+        let previous = repo
+            .insert(base("task", "/previous.zip", "extracted"))
+            .unwrap();
+        let current = repo
+            .insert(base("task", "/current.zip", "extracted"))
+            .unwrap();
+        assert!(repo
+            .set_path_outcome_by_id(previous, None, Some("wrong_password"))
+            .unwrap());
+        assert!(repo
+            .set_path_outcome_by_id(current, Some("{\"digest\":\"current-report\"}"), None)
+            .unwrap());
+        assert!(repo
+            .set_path_outcome_by_id(current, None, Some("name_too_long"))
+            .unwrap());
+        assert!(!repo
+            .set_path_outcome_by_id(current + 100, Some("{}"), None)
+            .unwrap());
+        let records = repo.list_by_task("task").unwrap();
+        assert_eq!(records[0].id, previous);
+        assert!(records[0].path_report_json.is_none());
+        assert!(records[0].path_reason.is_none());
+        assert_eq!(
+            records[1].path_report_json.as_deref(),
+            Some("{\"digest\":\"current-report\"}")
+        );
+        assert_eq!(records[1].path_reason.as_deref(), Some("name_too_long"));
     }
 
     #[test]

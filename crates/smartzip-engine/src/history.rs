@@ -254,6 +254,13 @@ pub trait TaskHistoryRecorder {
 
     /// Append one row to `file_extractions` (one extraction action).
     fn record_file_extraction(&self, task_id: &TaskId, row: FileExtractionRow<'_>);
+    fn record_path_outcome(
+        &self,
+        _task_id: &TaskId,
+        _report: Option<&smartzip_core::PathMappingReport>,
+        _reason: Option<&str>,
+    ) {
+    }
 
     /// Look up the `known_files` reuse entry for a physical file.
     ///
@@ -284,6 +291,7 @@ pub trait TaskHistoryRecorder {
 pub struct DbTaskHistoryRecorder<'a> {
     conn: &'a rusqlite::Connection,
     writable: bool,
+    last_file_row: std::cell::Cell<Option<i64>>,
 }
 
 impl<'a> DbTaskHistoryRecorder<'a> {
@@ -291,6 +299,7 @@ impl<'a> DbTaskHistoryRecorder<'a> {
         Self {
             conn,
             writable: true,
+            last_file_row: std::cell::Cell::new(None),
         }
     }
 
@@ -376,13 +385,14 @@ impl<'a> TaskHistoryRecorder for DbTaskHistoryRecorder<'a> {
     }
 
     fn record_file_extraction(&self, task_id: &TaskId, row: FileExtractionRow<'_>) {
+        self.last_file_row.set(None);
         if !self.writable {
             return;
         }
         let input = row.input_path.to_string_lossy().into_owned();
         let output = row.output_path.map(|p| p.to_string_lossy().into_owned());
         let created_at = now_utc_iso8601();
-        if let Err(error) = self.file_repo().insert(NewFileExtraction {
+        match self.file_repo().insert(NewFileExtraction {
             task_id: task_id.as_str(),
             input_path: &input,
             sample_hash: row.sample_hash,
@@ -397,9 +407,43 @@ impl<'a> TaskHistoryRecorder for DbTaskHistoryRecorder<'a> {
             encoding_corrected: row.encoding_corrected,
             damaged_volumes_json: row.damaged_volumes_json,
             test_report_json: row.test_report_json,
+            path_report_json: None,
+            path_reason: row.reason.filter(|r| {
+                matches!(
+                    *r,
+                    "name_too_long"
+                        | "path_too_long"
+                        | "invalid_name"
+                        | "name_collision"
+                        | "path_remap_unsupported"
+                        | "path_constraint_unknown"
+                )
+            }),
             created_at: &created_at,
         }) {
-            Self::warn("file_extraction insert", error);
+            Ok(id) => self.last_file_row.set(Some(id)),
+            Err(error) => Self::warn("file_extraction insert", error),
+        }
+    }
+
+    fn record_path_outcome(
+        &self,
+        _task_id: &TaskId,
+        report: Option<&smartzip_core::PathMappingReport>,
+        reason: Option<&str>,
+    ) {
+        if !self.writable {
+            return;
+        }
+        let Some(id) = self.last_file_row.take() else {
+            return;
+        };
+        let serialized = report.and_then(|r| serde_json::to_string(r).ok());
+        if let Err(error) =
+            self.file_repo()
+                .set_path_outcome_by_id(id, serialized.as_deref(), reason)
+        {
+            Self::warn("path outcome", error);
         }
     }
 
@@ -435,6 +479,29 @@ impl<'a> TaskHistoryRecorder for DbTaskHistoryRecorder<'a> {
 /// Map a [`TaskEventKind`] to the row shape stored in `task_events`.
 fn describe_event(kind: &TaskEventKind) -> (TaskEventLevel, String, String, Option<String>) {
     match kind {
+        TaskEventKind::PathMappingPlanned { renamed_count, .. }
+        | TaskEventKind::PathMappingApplied { renamed_count, .. } => (
+            TaskEventLevel::Info,
+            "path_mapping".into(),
+            format!("adjusted {renamed_count} names"),
+            serde_json::to_string(kind).ok(),
+        ),
+        TaskEventKind::PathMappingFallback { reason, .. } => (
+            TaskEventLevel::Warn,
+            "path_mapping_fallback".into(),
+            reason.clone(),
+            serde_json::to_string(kind).ok(),
+        ),
+        TaskEventKind::PathConstraintFailed {
+            reason,
+            stage,
+            detail,
+        } => (
+            TaskEventLevel::Error,
+            "path_constraint_failed".into(),
+            format!("{stage}: {reason}: {detail}"),
+            serde_json::to_string(kind).ok(),
+        ),
         TaskEventKind::Decision {
             stage,
             action,
@@ -712,6 +779,16 @@ pub struct RunStores<'a> {
     pub known_files: Option<&'a dyn KnownFileStore>,
 }
 impl TaskHistoryRecorder for RunStores<'_> {
+    fn record_path_outcome(
+        &self,
+        id: &TaskId,
+        report: Option<&smartzip_core::PathMappingReport>,
+        reason: Option<&str>,
+    ) {
+        if let Some(history) = self.history {
+            history.record_path_outcome(id, report, reason);
+        }
+    }
     fn was_extracted(&self, hash: &str, size: i64) -> bool {
         self.history
             .is_some_and(|history| history.was_extracted(hash, size))

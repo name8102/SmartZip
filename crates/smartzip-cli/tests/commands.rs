@@ -40,6 +40,8 @@ fn history_text_escapes_untrusted_controls_and_json_preserves_values() {
             encoding_corrected: false,
             damaged_volumes_json: None,
             test_report_json: None,
+            path_report_json: None,
+            path_reason: None,
             created_at: "2026-09-30T00:00:00Z",
         })
         .unwrap();
@@ -193,6 +195,8 @@ fn history_dispatch_and_combined_filters_return_only_matching_actions() {
                 encoding_corrected: false,
                 damaged_volumes_json: None,
                 test_report_json: None,
+                path_report_json: None,
+                path_reason: None,
                 created_at: "2026-01-01 00:00:00",
             })
             .unwrap();

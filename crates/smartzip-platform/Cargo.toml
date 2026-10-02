@@ -13,6 +13,13 @@ trash.workspace = true
 serde_json.workspace = true
 plist = "1"
 tempfile.workspace = true
+smartzip-core.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_Security"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10"

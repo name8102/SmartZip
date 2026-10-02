@@ -169,6 +169,13 @@ impl TaskExecutionContext {
         });
     }
 
+    pub fn push_event(&self, kind: TaskEventKind) {
+        self.sink.push(TaskEvent {
+            task_id: self.task_id.clone(),
+            kind,
+        });
+    }
+
     pub fn cancellation_token(&self) -> tokio_util::sync::CancellationToken {
         self.cancellation.clone()
     }

@@ -835,6 +835,26 @@ fn run(
                     outcome.output_files,
                     outcome.output_bytes,
                 );
+                if matches!(result, Ok(true)) {
+                    if let Some(report) = &outcome.path_report {
+                        match serde_json::to_string(report) {
+                            Ok(json) => {
+                                if let Err(error) = repo.set_path_outcome(
+                                    task_id.as_str(),
+                                    node_id.as_str(),
+                                    generation,
+                                    Some(&json),
+                                    outcome.reason.as_deref(),
+                                ) {
+                                    eprintln!("SmartZip path history write failed: {error}");
+                                }
+                            }
+                            Err(error) => {
+                                eprintln!("SmartZip path history serialization failed: {error}")
+                            }
+                        }
+                    }
+                }
                 let _ = reply.send(result);
             }
             Command::FinishPendingTask {
@@ -858,6 +878,10 @@ enum CommitRecovery {
     },
     Retry,
     Failed(String),
+    MappingFailed {
+        reason: String,
+        path_reason: &'static str,
+    },
 }
 
 fn reconcile_staging(
@@ -1063,23 +1087,24 @@ fn reconcile_commits(
                     )?;
                 }
                 CommitRecovery::Failed(reason) => {
-                    repo.finish_node(
+                    repo.finish_failed_commit_recovery(
                         &node.task_id,
                         &node.node_id,
                         node.generation,
-                        "failed",
-                        Some(&reason),
+                        &reason,
                         None,
-                        false,
-                        None,
-                        None,
-                        None,
-                        false,
-                        None,
-                        None,
-                        false,
-                        0,
-                        0,
+                    )?;
+                }
+                CommitRecovery::MappingFailed {
+                    reason,
+                    path_reason,
+                } => {
+                    repo.finish_failed_commit_recovery(
+                        &node.task_id,
+                        &node.node_id,
+                        node.generation,
+                        &reason,
+                        Some(path_reason),
                     )?;
                 }
             }
@@ -1196,6 +1221,18 @@ fn recover_published_children(
 
 fn reconcile_commit_record(record: &crate::CommitRecord) -> CommitRecovery {
     let intent = record.intent();
+    if let Err(error) = intent.verify_mapping() {
+        let path_reason = match &error {
+            smartzip_core::SmartZipError::PathConstraint { diagnostic, .. } => {
+                diagnostic.reason.as_str()
+            }
+            _ => "path_constraint_unknown",
+        };
+        return CommitRecovery::MappingFailed {
+            reason: format!("commit_mapping_invalid: {error}"),
+            path_reason,
+        };
+    }
     let marker_matches = match std::fs::read_to_string(&intent.marker_path) {
         Ok(value) if value == intent.commit_id => true,
         Ok(_) => return CommitRecovery::Failed("commit_marker_changed".into()),
@@ -1278,7 +1315,7 @@ fn reconcile_commit_record(record: &crate::CommitRecord) -> CommitRecovery {
         }
     }
 
-    if let Err(error) = std::fs::remove_dir_all(&intent.staging_path) {
+    if let Err(error) = cleanup_commit_staging(intent, false) {
         if intent.staging_path.exists() {
             return CommitRecovery::Failed(format!("commit_staging_cleanup_failed: {error}"));
         }
@@ -1306,6 +1343,45 @@ fn target_matches_before(intent: &crate::CommitIntent) -> Result<bool, String> {
     }
 }
 
+fn cleanup_commit_staging(intent: &crate::CommitIntent, published: bool) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(&intent.staging_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+        Ok(metadata) if !metadata.is_dir() => {
+            return Err(std::io::Error::other(
+                "commit staging is no longer an owned directory",
+            ))
+        }
+        Ok(_) => {}
+    }
+    if let Some(report) = &intent.path_mapping {
+        let owned = intent.staging_path.parent() == intent.target_path.parent()
+            && intent
+                .staging_path
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with(".smartzip-"));
+        if !owned {
+            return Err(std::io::Error::other(
+                "mapped staging is outside its frozen output parent",
+            ));
+        }
+        // Published collapsed layouts have moved every manifest member out of
+        // staging. Only the disposable container remains; never chmod output.
+        let directories = if published {
+            Vec::new()
+        } else {
+            crate::path_extract::expected_tree(report)
+                .map_err(std::io::Error::other)?
+                .into_iter()
+                .filter_map(|(path, is_dir)| is_dir.then_some(path))
+                .collect()
+        };
+        smartzip_platform::path_policy::restore_staging_access(&intent.staging_path, &directories)
+            .map_err(std::io::Error::other)?;
+    }
+    std::fs::remove_dir_all(&intent.staging_path)
+}
+
 fn cleanup_reconciled_commit(intent: &crate::CommitIntent) -> Option<String> {
     let mut failures = Vec::new();
     if let Some(backup) = &intent.backup_path {
@@ -1320,7 +1396,7 @@ fn cleanup_reconciled_commit(intent: &crate::CommitIntent) -> Option<String> {
             failures.push(format!("{}: {error}", intent.marker_path.display()));
         }
     }
-    if let Err(error) = std::fs::remove_dir_all(&intent.staging_path) {
+    if let Err(error) = cleanup_commit_staging(intent, true) {
         if intent.staging_path.exists() {
             failures.push(format!("{}: {error}", intent.staging_path.display()));
         }
@@ -1509,6 +1585,9 @@ mod tests {
             backup_path: None,
             source_identity: crate::ArtifactIdentity::capture(&staging).unwrap(),
             target_before: None,
+            mapping_version: None,
+            mapping_digest: None,
+            path_mapping: None,
             output_files: 1,
             output_bytes: 6,
             success: crate::CommitSuccessFacts {
@@ -1671,6 +1750,9 @@ mod tests {
             backup_path: None,
             source_identity: crate::ArtifactIdentity::capture(&staging).unwrap(),
             target_before: None,
+            mapping_version: None,
+            mapping_digest: None,
+            path_mapping: None,
             output_files: 1,
             output_bytes: 6,
             success: crate::CommitSuccessFacts::default(),
@@ -1768,6 +1850,9 @@ mod tests {
             backup_path: None,
             source_identity: crate::ArtifactIdentity::capture(&staging).unwrap(),
             target_before: None,
+            mapping_version: None,
+            mapping_digest: None,
+            path_mapping: None,
             output_files: 1,
             output_bytes: 7,
             success: crate::CommitSuccessFacts::default(),
@@ -1782,5 +1867,215 @@ mod tests {
         ));
         assert_eq!(std::fs::read(target.join("file.txt")).unwrap(), b"content");
         assert!(!marker.exists());
+    }
+
+    #[tokio::test]
+    async fn failed_mapping_recovery_persists_diagnostics_and_original_intent() {
+        use smartzip_core::path_policy::*;
+        let root = tempfile::tempdir().unwrap();
+        let db_path = root.path().join("state.db");
+        let input = root.path().join("input.zip");
+        let staging = root.path().join("stage");
+        let target = root.path().join("final");
+        std::fs::write(&input, b"input").unwrap();
+        std::fs::create_dir(&staging).unwrap();
+        std::fs::write(staging.join("safe.txt"), b"payload").unwrap();
+        let policy =
+            smartzip_platform::path_policy::probe_target(root.path(), PathMode::Portable).unwrap();
+        let mut report = crate::path_policy::plan_paths(
+            &[crate::path_policy::PathEntry {
+                id: 0,
+                source: "safe.txt".into(),
+                raw_name: Some(b"safe.txt".to_vec()),
+                source_kind: SourceNameKind::ZipCentralDirectory,
+                is_dir: false,
+            }],
+            &policy,
+        )
+        .unwrap();
+        report.tentative = false;
+        report.refresh_digest();
+        let digest = report.digest.clone();
+        // Tamper without refreshing: recovery must retain evidence, never replan or repair it.
+        report.entries[0].final_relative = "unverified.txt".into();
+        let intent = crate::CommitIntent {
+            commit_id: "invalid-mapping".into(),
+            staging_path: staging.clone(),
+            source_path: staging.clone(),
+            target_path: target.clone(),
+            marker_path: root.path().join("marker"),
+            backup_path: None,
+            source_identity: crate::ArtifactIdentity::capture(&staging).unwrap(),
+            target_before: None,
+            output_files: 1,
+            output_bytes: 7,
+            success: Default::default(),
+            mapping_version: Some(report.version),
+            mapping_digest: Some(digest.clone()),
+            path_mapping: Some(report.clone()),
+        };
+        let original = serde_json::to_string(&crate::CommitRecord::Prepared { intent }).unwrap();
+        let task_id = TaskId::new();
+        let node_id = NodeId::new();
+        {
+            let store = StateStore::start(&db_path).unwrap();
+            store
+                .submit(task_submission(&task_id, &node_id, &input, root.path()))
+                .await
+                .unwrap();
+            store
+                .transition(
+                    task_id.clone(),
+                    node_id.clone(),
+                    0,
+                    "ready",
+                    "running",
+                    "commit",
+                    None,
+                )
+                .await
+                .unwrap();
+            store
+                .begin_commit(task_id.clone(), node_id.clone(), 0, original.clone())
+                .await
+                .unwrap();
+        }
+        let store = StateStore::start(&db_path).unwrap();
+        assert!(store.recovery_snapshot().is_empty());
+        let db = smartzip_db::SmartZipDb::open(&db_path).unwrap();
+        let (status, reason, path_reason, evidence, saved): (String, String, String, String, String) = db.connection().query_row(
+            "SELECT status,reason,path_reason,commit_json,path_report_json FROM file_extractions WHERE task_id=?1 AND node_id=?2",
+            rusqlite::params![task_id.as_str(), node_id.as_str()],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?))
+        ).unwrap();
+        assert_eq!(status, "failed");
+        assert!(reason.starts_with("commit_mapping_invalid:"));
+        assert_eq!(path_reason, "path_constraint_unknown");
+        assert_eq!(evidence, original);
+        let saved: smartzip_core::PathMappingReport = serde_json::from_str(&saved).unwrap();
+        assert!(saved.tentative);
+        assert_eq!(saved.digest, digest);
+        assert_eq!(saved.entries, report.entries);
+        assert!(staging.join("safe.txt").exists());
+        assert!(!target.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepared_recovery_cleans_restrictive_staging_before_retry() {
+        use smartzip_core::path_policy::*;
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let staging = root.path().join(".smartzip-permissions");
+        let target = root.path().join("final");
+        std::fs::create_dir(&staging).unwrap();
+        std::fs::create_dir(staging.join("private")).unwrap();
+        std::fs::write(staging.join("private/file"), b"complete contents").unwrap();
+        let policy =
+            smartzip_platform::path_policy::probe_target(root.path(), PathMode::Portable).unwrap();
+        let entries: Vec<_> = [("./", true), ("private/", true), ("private/file", false)]
+            .into_iter()
+            .enumerate()
+            .map(|(id, (name, is_dir))| crate::path_policy::PathEntry {
+                id: id as u64,
+                source: name.into(),
+                raw_name: None,
+                source_kind: SourceNameKind::BackendText,
+                is_dir,
+            })
+            .collect();
+        let mut report = crate::path_policy::plan_paths(&entries, &policy).unwrap();
+        report.tentative = false;
+        report.refresh_digest();
+        let intent = crate::CommitIntent {
+            commit_id: "permissions".into(),
+            staging_path: staging.clone(),
+            source_path: staging.clone(),
+            target_path: target.clone(),
+            marker_path: root.path().join("marker"),
+            backup_path: None,
+            source_identity: crate::ArtifactIdentity::capture(&staging).unwrap(),
+            target_before: None,
+            output_files: 2,
+            output_bytes: 17,
+            success: Default::default(),
+            mapping_version: Some(report.version),
+            mapping_digest: Some(report.digest.clone()),
+            path_mapping: Some(report),
+        };
+        std::fs::set_permissions(staging.join("private"), std::fs::Permissions::from_mode(0))
+            .unwrap();
+        std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0)).unwrap();
+        assert!(matches!(
+            reconcile_commit_record(&crate::CommitRecord::Prepared { intent }),
+            CommitRecovery::Retry
+        ));
+        assert!(!staging.exists());
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn recovery_keeps_frozen_mapping_and_rejects_changed_digest() {
+        use smartzip_core::path_policy::*;
+        let root = tempfile::tempdir().unwrap();
+        let staging = root.path().join("stage");
+        let target = root.path().join("final");
+        std::fs::create_dir(&staging).unwrap();
+        let policy =
+            smartzip_platform::path_policy::probe_target(root.path(), PathMode::Portable).unwrap();
+        let source = format!("{}.txt", "中文".repeat(150));
+        let mut report = crate::path_policy::plan_paths(
+            &[crate::path_policy::PathEntry {
+                id: 0,
+                source: source.clone(),
+                raw_name: Some(source.into_bytes()),
+                source_kind: SourceNameKind::ZipCentralDirectory,
+                is_dir: false,
+            }],
+            &policy,
+        )
+        .unwrap();
+        std::fs::write(
+            staging.join(&report.entries[0].staging_relative),
+            b"payload",
+        )
+        .unwrap();
+        report.entries[0].final_relative = format!("final/{}", report.entries[0].staging_relative);
+        report.tentative = false;
+        report.refresh_digest();
+        let intent = crate::CommitIntent {
+            commit_id: "mapped-commit".into(),
+            staging_path: staging.clone(),
+            source_path: staging.clone(),
+            target_path: target.clone(),
+            marker_path: root.path().join("marker"),
+            backup_path: None,
+            source_identity: crate::ArtifactIdentity::capture(&staging).unwrap(),
+            target_before: None,
+            output_files: 1,
+            output_bytes: 7,
+            success: Default::default(),
+            mapping_version: Some(report.version),
+            mapping_digest: Some(report.digest.clone()),
+            path_mapping: Some(report.clone()),
+        };
+        std::fs::write(&intent.marker_path, &intent.commit_id).unwrap();
+        std::fs::rename(&staging, &target).unwrap();
+        let mut changed = intent.clone();
+        changed.path_mapping.as_mut().unwrap().entries[0].final_relative = "wrong".into();
+        assert!(
+            matches!(reconcile_commit_record(&crate::CommitRecord::Prepared {intent:changed}),CommitRecovery::MappingFailed { reason, path_reason: "path_constraint_unknown" } if reason.starts_with("commit_mapping_invalid"))
+        );
+        assert!(matches!(
+            reconcile_commit_record(&crate::CommitRecord::Prepared {
+                intent: intent.clone()
+            }),
+            CommitRecovery::Published { .. }
+        ));
+        assert_eq!(
+            std::fs::read(root.path().join(&report.entries[0].final_relative)).unwrap(),
+            b"payload"
+        );
+        assert_eq!(intent.path_mapping.unwrap().digest, report.digest);
     }
 }

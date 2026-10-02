@@ -6,6 +6,7 @@ use desktop::*;
 mod history;
 mod interaction;
 mod passwords;
+mod path_reports;
 mod preview;
 mod settings;
 mod tasks;
@@ -447,6 +448,7 @@ pub struct View {
     expanded_roots: std::collections::HashSet<smartzip_core::NodeId>,
     queue_settings_open: bool,
     detail_state: Option<(u64, Phase)>,
+    mapping_pages: std::collections::HashMap<String, usize>,
     prompt_job: Option<(bool, u64, u64)>,
     pending_selection: Option<(bool, u64)>,
     preview_revision: u64,
@@ -807,6 +809,7 @@ impl View {
             expanded_roots: std::collections::HashSet::new(),
             queue_settings_open: preferences.queue_settings_open,
             detail_state: None,
+            mapping_pages: Default::default(),
             prompt_job: None,
             pending_selection: None,
             preview_revision: 0,
@@ -944,7 +947,12 @@ impl View {
             state.config.as_ref().map(|c| &c.resolved.values)
         };
         let editable = job.is_none_or(|job| job.phase == Phase::Queued);
-        let overrides: [bool; 5] =
+        let portable = settings
+            .path_mode
+            .or_else(|| config.map(|c| c.extraction.output.path_mode))
+            .unwrap_or_default()
+            == smartzip_core::PathMode::Portable;
+        let overrides: [bool; 6] =
             std::array::from_fn(|index| job.is_some_and(|job| job.settings_overridden(index)));
         let recursive = settings
             .recursive
@@ -1041,6 +1049,33 @@ impl View {
                                 })
                         }),
                     ),
+            )
+            .child(
+                Switch::new(("portable-names", target.unwrap_or(0)))
+                    .small()
+                    .label("Portable 名称兼容模式")
+                    .checked(portable)
+                    .disabled(!editable)
+                    .on_change(cx.listener(move |this, checked: &bool, _, cx| {
+                        this.shared.update(cx, |state, cx| {
+                            state.edit_settings(target, |settings| {
+                                settings.path_mode = Some(if *checked {
+                                    smartzip_core::PathMode::Portable
+                                } else {
+                                    smartzip_core::PathMode::Native
+                                })
+                            });
+                            cx.notify();
+                        });
+                    })),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(
+                    "关闭时按实际目标卷规则命名；开启时叠加 Windows 安全名称及 UTF-8 字节预算。",
+                ),
             )
             .child(
                 div()

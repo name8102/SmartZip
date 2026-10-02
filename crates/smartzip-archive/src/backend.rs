@@ -6,6 +6,37 @@ use smartzip_core::{
 use std::path::Path;
 use std::sync::Arc;
 
+/// Destination owned by the engine; archive code never constructs output paths.
+pub trait ManagedSink: Send + Sync {
+    fn open_file(&self, id: u64) -> Result<Box<dyn std::io::Write + Send>>;
+}
+
+/// A frozen input, member inventory and in-memory credentials for one attempt.
+#[async_trait]
+pub trait PreparedExtraction: Send {
+    fn manifest(&self) -> &ExtractionManifest;
+    fn supports_managed(&self) -> bool {
+        true
+    }
+    fn supports_bulk_original(&self) -> bool {
+        false
+    }
+    async fn execute_bulk(
+        self: Box<Self>,
+        _context: Arc<TaskExecutionContext>,
+    ) -> Result<ExtractArchiveResult> {
+        Err(crate::managed::unsupported(
+            "prepared adapter does not support bulk-original extraction",
+        ))
+    }
+    async fn verify_source(&self) -> Result<()>;
+    async fn execute(
+        self: Box<Self>,
+        sink: Arc<dyn ManagedSink>,
+        context: Arc<TaskExecutionContext>,
+    ) -> Result<ExtractArchiveResult>;
+}
+
 /// Execution seam injected into the engine. Routers implement this trait.
 /// Legacy methods remain required for source compatibility with external executors.
 /// Built-in implementations forward those entries to their context-aware execution;
@@ -88,6 +119,14 @@ pub trait ArchiveExecutor: Send + Sync {
         _context: Arc<TaskExecutionContext>,
     ) -> Result<ExtractArchiveResult> {
         self.extract_with_facts(request, facts).await
+    }
+    async fn prepare_extraction_with_facts_and_context(
+        &self,
+        _request: ExtractArchiveRequest,
+        _facts: &ArchiveFacts,
+        _context: Arc<TaskExecutionContext>,
+    ) -> Result<Option<Box<dyn PreparedExtraction>>> {
+        Ok(None)
     }
     async fn compress(&self, request: CompressArchiveRequest) -> Result<CompressArchiveResult>;
     async fn compress_with_context(

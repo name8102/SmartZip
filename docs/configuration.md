@@ -2,7 +2,7 @@
 
 CLI 与 GUI 使用 `smartzip-config` 解析配置，由 engine 编译为本次任务的固定策略。运行期间修改配置只影响后续任务；原有库调用接口保留兼容路径。
 
-GUI 启动时加载统一配置，设置页按解压与输出、扫描与编码、密码策略、历史与状态、资源预算、后端与日志分组，直接展示有效值和字段来源；开关、枚举和数值使用对应表单，密码来源顺序与后端安装列表使用高级 TOML 输入。修改经共享配置模块一次校验并原子保存，成功后立即用于新任务；保存失败保留草稿，已有任务保留其配置快照。可恢复字段继承、初始化和查看迁移预览。快速窗口和任务中心共享递归、智能布局、自动编码等全局快速配置，修改会同步到新任务及仍在排队且未单独覆盖该选项的解压任务。任务详情支持单独设置这些开关和输出目录，恢复继承后重新跟随全局快速配置；已经运行的任务固定配置不变。快速配置仍优先于配置文件。核心尚未实现的配置项显示为只读并说明原因。
+GUI 启动时加载统一配置，设置页按解压与输出、扫描与编码、密码策略、历史与状态、资源预算、后端与日志分组，直接展示有效值和字段来源；开关、枚举和数值使用对应表单，密码来源顺序与后端安装列表使用高级 TOML 输入。修改经共享配置模块一次校验并原子保存，成功后立即用于新任务；保存失败保留草稿，已有任务保留其配置快照。可恢复字段继承、初始化和查看迁移预览。快速窗口和任务中心共享递归、智能布局、自动编码、Portable 名称兼容模式等全局快速配置，修改会同步到新任务及仍在排队且未单独覆盖该选项的解压任务。任务详情支持单独设置这些开关和输出目录，恢复继承后重新跟随全局快速配置；已经运行的任务固定配置不变。快速配置仍优先于配置文件。核心尚未实现的配置项显示为只读并说明原因。
 
 GUI 的“成功后回收原包”是默认关闭的快速配置开关，不是配置文件字段。启用后，仅在整项任务成功、没有跳过、输出含文件、根归档提交记录存在且源文件未变化时尝试移入系统回收站；失败、取消、空输出、跳过或源文件变化时保留，回收失败不会降级为永久删除。
 
@@ -80,6 +80,7 @@ mode = "off"
 | `extraction.volumes.auto_discover` | 关闭解压阶段的兄弟卷枚举、自动准备；显式 `test` 的完整性校验仍有自己的分卷收集与诊断流程 |
 | `extraction.encoding.mode` | `auto/backend/utf-8/gb18030/gbk/big5/shift_jis/euc-jp/euc-kr`；`backend` 跳过 SmartZip 编码猜测 |
 | `extraction.encoding.on_suspicious` | `ask/skip/accept` |
+| `extraction.output.path_mode` | 默认 `native`；`portable` 叠加跨平台名称约束，随任务快照固定 |
 | `extraction.output.layout` | `conservative/smart/raw/flat-single` |
 | `extraction.output.single_root_name` | `auto/archive/inner/preserve-both` |
 | `extraction.output.on_conflict` | `ask/skip/rename/overwrite` |
@@ -94,6 +95,12 @@ mode = "off"
 | `interaction.mode` | `auto/always/never`；`never` 不等待输入，需要确认的操作报告 `needs_decision` |
 | `logging.level` | `off/error/warn/info/debug`，控制任务事件输出；命令结果与启动错误仍会显示 |
 | `backends.auto_discover` / 安装项 `enabled` | 沿用后端结构；禁用的安装项不探测、不启动 |
+
+`extraction.output.path_mode="native"` 按实际输出卷的名称约束处理；`portable` 叠加 Windows 安全名称、每分量不超过 255 UTF-8 字节及保守大小写/Unicode 等价检查，实际卷限制更小时取交集。合法相对路径中的超长名称、非法目标字符和目标等价冲突会确定性映射；重复文件成员、文件/目录结构矛盾和越界路径仍会拒绝。CLI 使用 `--path-mode native|portable`，GUI 设置页和排队任务详情使用同一字段；Portable 不保证完整路径可被所有旧应用打开。
+
+普通 7-Zip 归档保留固定后端的整包提取；需要映射时，ZIP 使用固定输入的按索引受控提取，7-Zip 可完整列出且验证唯一选择的普通成员使用逐成员内容流。已验证 ZIP/7z 名称映射和 RAR4、TAR/GZIP 内容读取，不启用混合批量路线；链接、设备节点、无法无歧义选择的成员及需要映射的分卷会明确报告能力不足。权限和时间处理不代表完整 xattr/ACL/ADS 恢复，solid 归档逐成员解码可能增加成本。扫描、嵌套输入、提交与恢复仍有完整路径上限，当前不承诺任意深路径；Btrfs/Linux 与 NTFS/Windows 尚未完成本轮原生验收。
+
+GUI 在当前任务及历史详情显示“已调整 N 个名称”，并分页展示原名、最终相对路径与原因；失败显示稳定路径原因。完整报告独立于有界事件记录保存，Prepared/Published 恢复沿用冻结的报告与摘要；状态关闭或未写历史时，本次结果仍含内存报告，不写进用户输出目录。
 
 后端自动发现优先使用进程的 `PATH`。macOS 还检查 Homebrew、MacPorts 和 Nix 的常见安装目录，支持从 Finder 启动时不带终端 PATH 的应用。自定义安装位置可通过 `backends.installations` 的 `executable` 指定绝对路径；关闭自动发现或显式禁用安装项仍然生效。若路由的 `candidates`、`rejected` 都为空，表示没有注册后端，并非压缩包损坏的证据；`smartzip doctor --json` 可检查实际发现的后端及配置提示。
 

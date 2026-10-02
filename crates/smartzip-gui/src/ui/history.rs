@@ -40,6 +40,8 @@ impl View {
                 let output=detail.task.output_path.clone();
                 let inputs = detail.inputs.clone();
                 let export=detail.clone();
+                let mappings = detail.files.iter().filter_map(|file| file.path_report_json.as_deref().and_then(|text| serde_json::from_str(text).ok()).map(|report| (format!("history-{}", file.id), file.input_path.clone(), report))).collect::<Vec<_>>();
+                let mapping_panels = mappings.into_iter().map(|(key, input, report)| div().flex().flex_col().gap_2().child(div().text_sm().child(input)).child(self.mapping_report(key, report, cx)).into_any_element()).collect::<Vec<_>>();
                 el.child(div().flex().flex_col().gap_3().border_t_1().border_color(cx.theme().border).pt_5()
                     .child(div().text_lg().child(format!("{} · {}",state_label(&detail.task.status),detail.task.started_at)))
                     .child(div().flex().gap_2().flex_wrap()
@@ -54,7 +56,9 @@ impl View {
                     .child(div().id("history-files").max_h(px(360.)).overflow_y_scroll().children(detail.files.iter().map(|file| div().flex().flex_col().gap_1().py_3().border_b_1().border_color(cx.theme().border)
                         .child(div().text_sm().child(format!("{} · {}",state_label(&file.status),file.input_path)))
                         .when_some(file.output_path.clone(),|el,path|el.child(div().text_xs().text_color(cx.theme().muted_foreground).child(format!("输出：{path}"))))
-                        .when_some(file.reason.clone(),|el,reason|el.child(div().text_sm().child(reason))))))
+                        .when_some(file.reason.clone(),|el,reason|el.child(div().text_sm().child(reason)))
+                        .when_some(file.path_reason.clone(),|el,reason|el.child(div().text_sm().child(format!("路径失败：{} ({reason})", crate::path_reports::failure_label(&reason))))))))
+                    .children(mapping_panels)
                     .child(control("history-events-toggle").label(if self.diagnostics_open {"收起事件记录"} else {"查看事件记录"}).on_click(cx.listener(|this,_,_,cx|{this.diagnostics_open= !this.diagnostics_open;cx.notify();})))
                     .when(self.diagnostics_open,|el|el.child(div().id("history-events").max_h(px(260.)).overflow_y_scroll().children(detail.events.iter().map(|e|div().text_xs().py_1().child(format!("{}  {}",e.created_at,e.message)))))))
             })

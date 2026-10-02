@@ -165,6 +165,7 @@ mod tests {
             skipped: vec![],
             enqueued: vec![],
             events: vec![],
+            path_reports: vec![],
         }
     }
     #[test]

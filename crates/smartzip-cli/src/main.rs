@@ -1573,6 +1573,54 @@ mod tests {
     }
 
     #[test]
+    fn extract_json_preserves_the_complete_in_memory_mapping_without_events() {
+        let entries = (0..4100).map(|id| json!({
+            "id":id,"source":format!("original-{id}.txt"),"display_name":format!("original-{id}.txt"),
+            "raw_name":null,"source_kind":"backend_text","is_dir":false,
+            "staging_relative":format!("mapped-{id}.txt"),"final_relative":format!("output/mapped-{id}.txt"),
+            "reasons":["name_too_long"]
+        })).collect::<Vec<_>>();
+        let mut report: smartzip_core::PathMappingReport = serde_json::from_value(json!({
+            "version":1,"digest":"","tentative":false,"archive_path":"input.zip",
+            "entries":entries,"manifest_digest":"manifest","archive_identity":"archive","adapter_id":"fixture",
+            "policy":{
+                "version":1,"mode":"portable","fs_kind":"test",
+                "target":{"canonical_root":"/out","volume_id":"volume","root_id":"root"},
+                "component":{"limit":255,"metric":"utf8_bytes","source":"test","confidence":"known"},
+                "access":"posix_dir_relative",
+                "comparison":{"case_sensitive":true,"normalization_sensitive":true,"confidence":"known"},
+                "windows_names":true,"full_path_limit":4096
+            }
+        })).unwrap();
+        report.refresh_digest();
+        let result = ExtractWorkflowResult {
+            status: smartzip_engine::history::TaskCompletionStatus::Completed,
+            failed_count: 0,
+            task_id: TaskId::new(),
+            processed: Vec::new(),
+            skipped: Vec::new(),
+            enqueued: Vec::new(),
+            events: Vec::new(),
+            path_reports: vec![report],
+        };
+        let output = build_extract_json_output(&result);
+        assert_eq!(output["path_reports"], json!(result.path_reports));
+        assert_eq!(
+            output["path_reports"][0]["entries"]
+                .as_array()
+                .unwrap()
+                .len(),
+            4100
+        );
+        assert_eq!(
+            output["path_reports"][0]["entries"][4099]["final_relative"],
+            "output/mapped-4099.txt"
+        );
+        assert_eq!(output["path_reports"][0]["policy"]["mode"], "portable");
+        assert_eq!(output["events"], json!([]));
+    }
+
+    #[test]
     fn extract_json_preserves_partial_results_and_status() {
         let candidate = smartzip_engine::ExtractionCandidate {
             path: "good.zip".into(),
@@ -1596,6 +1644,7 @@ mod tests {
             skipped: vec![failed],
             enqueued: Vec::new(),
             events: Vec::new(),
+            path_reports: Vec::new(),
         };
 
         let output = build_extract_json_output(&result);

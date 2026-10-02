@@ -94,14 +94,17 @@ pub struct OutputMaterializer {
 #[derive(Debug)]
 pub(crate) struct StagedOutput {
     request: MaterializeRequest,
+    directory_metadata: Option<crate::path_extract::DeferredDirectoryMetadata>,
     temp: tempfile::TempDir,
     layout_plan: LayoutPlan,
     preserve_temp_on_failure: bool,
+    path_mapping: Option<smartzip_core::PathMappingReport>,
 }
 
 #[derive(Debug)]
 pub(crate) struct PreparedCommit {
     request: MaterializeRequest,
+    directory_metadata: Option<crate::path_extract::DeferredDirectoryMetadata>,
     temp: tempfile::TempDir,
     layout_plan: LayoutPlan,
     commit_policy: CommitPolicy,
@@ -193,14 +196,108 @@ impl OutputMaterializer {
 
         Ok(StagedOutput {
             request,
+            directory_metadata: None,
             temp,
             layout_plan,
             preserve_temp_on_failure: self.preserve_temp_on_failure,
+            path_mapping: None,
         })
     }
 }
 
 impl StagedOutput {
+    pub(crate) fn with_directory_metadata(
+        mut self,
+        metadata: Option<crate::path_extract::DeferredDirectoryMetadata>,
+    ) -> Self {
+        self.directory_metadata = metadata;
+        self
+    }
+    pub(crate) fn with_path_mapping(
+        mut self,
+        report: Option<smartzip_core::PathMappingReport>,
+    ) -> std::result::Result<Self, MaterializeFailure> {
+        if let Some(mut report) = report {
+            // Folding must account for every physical member, including root
+            // declarations and metadata entries hidden from the layout heuristic.
+            let selected = match &self.layout_plan.source {
+                PlanSource::WholeTempDir => None,
+                PlanSource::SingleDir(path)
+                | PlanSource::SingleDirContents(path)
+                | PlanSource::SingleFile(path) => path.strip_prefix(self.temp.path()).ok(),
+            };
+            let preserves_whole_tree = matches!(
+                self.layout_plan.kind,
+                LayoutPlanKind::PreserveBothSingleDir | LayoutPlanKind::PreserveBothSingleFile
+            );
+            let omitted = !preserves_whole_tree
+                && selected.is_some_and(|source| {
+                    report
+                        .entries
+                        .iter()
+                        .any(|entry| !Path::new(&entry.staging_relative).starts_with(source))
+                });
+            if omitted
+                || (matches!(self.layout_plan.kind, LayoutPlanKind::Empty)
+                    && !report.entries.is_empty())
+            {
+                let name = self.request.archive_stem.clone().unwrap_or_else(|| {
+                    crate::name_score::archive_display_stem(&self.request.output_dir)
+                });
+                self.layout_plan.source = PlanSource::WholeTempDir;
+                self.layout_plan.kind =
+                    LayoutPlanKind::CommitWholeTempAsArchiveDir { name: name.clone() };
+                self.layout_plan.target = self
+                    .request
+                    .output_dir
+                    .parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .join(name);
+                self.layout_plan.reason = crate::layout::LayoutDecisionReason::CompleteArchiveTree;
+                self.layout_plan
+                    .warnings
+                    .push("archive layout retained to preserve all manifest entries".into());
+            }
+            let name = self
+                .layout_plan
+                .target
+                .file_name()
+                .and_then(|n| n.to_str())
+                .ok_or_else(|| {
+                    commit_failure(
+                        smartzip_core::path_policy::PathDiagnostic::new(
+                            smartzip_core::path_policy::PathConstraintReason::InvalidName,
+                            smartzip_core::path_policy::PathStage::Layout,
+                            "layout target is not a Unicode component",
+                        )
+                        .error(),
+                    )
+                })?;
+            let is_dir = !matches!(self.layout_plan.source, PlanSource::SingleFile(_))
+                || matches!(
+                    self.layout_plan.kind,
+                    LayoutPlanKind::PreserveBothSingleFile
+                );
+            let mapped =
+                layout_component(&self.layout_plan, self.temp.path(), name, is_dir, &report)
+                    .map_err(commit_failure)?;
+            if mapped != name {
+                for entry in &mut report.entries {
+                    if !entry
+                        .reasons
+                        .contains(&smartzip_core::path_policy::PathMappingReason::LayoutRenamed)
+                    {
+                        entry
+                            .reasons
+                            .push(smartzip_core::path_policy::PathMappingReason::LayoutRenamed);
+                    }
+                }
+            }
+            self.layout_plan.target.set_file_name(mapped);
+            self.path_mapping = Some(report);
+        }
+        Ok(self)
+    }
     pub(crate) fn collision_request(
         &self,
     ) -> std::result::Result<Option<CollisionRequest>, MaterializeFailure> {
@@ -231,12 +328,15 @@ impl StagedOutput {
             temp,
             layout_plan,
             preserve_temp_on_failure,
+            mut path_mapping,
+            mut directory_metadata,
         } = self;
 
         // Empty extraction has no filesystem publication to reconcile.
         if matches!(layout_plan.kind, LayoutPlanKind::Empty) {
             return Ok(PreparedCommit {
                 request,
+                directory_metadata,
                 temp,
                 layout_plan,
                 commit_policy: CommitPolicy::FailIfExists,
@@ -320,8 +420,27 @@ impl StagedOutput {
                 | PlanSource::SingleFile(path),
             ) => path,
         };
-        let commit_target =
-            resolve_commit_target(&layout_plan.target, commit_policy).map_err(commit_failure)?;
+        let commit_target = if let Some(report) = &path_mapping {
+            let parent = layout_plan
+                .target
+                .parent()
+                .unwrap_or_else(|| Path::new("."));
+            let root = smartzip_platform::path_policy::ControlledRoot::open(parent)
+                .map_err(commit_failure)?;
+            root.verify_identity(&report.policy)
+                .map_err(commit_failure)?;
+            resolve_policy_commit_target(
+                &layout_plan.target,
+                commit_policy,
+                report,
+                temp.path(),
+                &layout_plan,
+                source.is_dir(),
+            )
+            .map_err(commit_failure)?
+        } else {
+            resolve_commit_target(&layout_plan.target, commit_policy).map_err(commit_failure)?
+        };
         let commit_id = smartzip_core::AttemptId::new().to_string();
         let parent = commit_target
             .parent()
@@ -339,6 +458,16 @@ impl StagedOutput {
         };
         let backup_path = (commit_policy == CommitPolicy::Overwrite && target_before.is_some())
             .then(|| parent.join(format!(".smartzip-backup-{commit_id}")));
+        if let Some(report) = &mut path_mapping {
+            project_mapping(report, temp.path(), source, &commit_target, &layout_plan)
+                .map_err(commit_failure)?;
+        }
+        if let Some(metadata) = &mut directory_metadata {
+            if let Err(error) = metadata.apply_staging() {
+                let _ = metadata.restore();
+                return Err(commit_failure(error));
+            }
+        }
         let intent = crate::CommitIntent {
             commit_id: commit_id.clone(),
             staging_path: temp.path().to_path_buf(),
@@ -346,16 +475,29 @@ impl StagedOutput {
             target_path: commit_target,
             marker_path: parent.join(format!(".smartzip-commit-{commit_id}")),
             backup_path,
-            source_identity: crate::ArtifactIdentity::capture(source).map_err(|error| {
-                commit_failure(SmartZipError::io(Some(source.to_path_buf()), error))
-            })?,
+            source_identity: match crate::ArtifactIdentity::capture(source) {
+                Ok(identity) => identity,
+                Err(error) => {
+                    if let Some(metadata) = &mut directory_metadata {
+                        let _ = metadata.restore();
+                    }
+                    return Err(commit_failure(SmartZipError::io(
+                        Some(source.to_path_buf()),
+                        error,
+                    )));
+                }
+            },
             target_before,
             output_files: 0,
             output_bytes: 0,
             success,
+            mapping_version: path_mapping.as_ref().map(|r| r.version),
+            mapping_digest: path_mapping.as_ref().map(|r| r.digest.clone()),
+            path_mapping,
         };
         Ok(PreparedCommit {
             request,
+            directory_metadata,
             temp,
             layout_plan,
             commit_policy,
@@ -376,6 +518,16 @@ impl StagedOutput {
 }
 
 impl PreparedCommit {
+    pub(crate) fn set_mapping_owner(&mut self, node: &smartzip_core::NodeId, generation: u64) {
+        if let Some(intent) = &mut self.intent {
+            if let Some(report) = &mut intent.path_mapping {
+                report.node_id = Some(node.to_string());
+                report.generation = Some(generation);
+                report.refresh_digest();
+                intent.mapping_digest = Some(report.digest.clone());
+            }
+        }
+    }
     pub(crate) fn set_output_usage(&mut self, usage: crate::budget::Usage) {
         if let Some(intent) = &mut self.intent {
             intent.output_files = usage.files;
@@ -403,6 +555,7 @@ impl PreparedCommit {
             commit_policy,
             intent,
             preserve_temp_on_failure,
+            mut directory_metadata,
         } = self;
         let Some(intent) = intent else {
             let _ = std::fs::remove_dir_all(temp.path());
@@ -414,6 +567,13 @@ impl PreparedCommit {
                 intent: None,
             });
         };
+
+        if let Err(error) = intent.verify_mapping() {
+            if let Some(metadata) = &mut directory_metadata {
+                let _ = metadata.restore();
+            }
+            return Err(commit_failure(error));
+        }
 
         let marker_result = (|| -> std::io::Result<()> {
             if !persistent {
@@ -428,15 +588,28 @@ impl PreparedCommit {
             marker.sync_all()
         })();
         if let Err(error) = marker_result {
+            if let Some(metadata) = &mut directory_metadata {
+                let _ = metadata.restore();
+            }
             return Err(commit_failure(SmartZipError::io(
                 Some(intent.marker_path.clone()),
                 error,
             )));
         }
 
+        if let Some(metadata) = &mut directory_metadata {
+            if let Err(error) = metadata.apply_final_permissions() {
+                let _ = metadata.restore();
+                let _ = std::fs::remove_file(&intent.marker_path);
+                return Err(commit_failure(error));
+            }
+        }
         let mut layout_plan = layout_plan.clone();
         match commit_output_recoverable(&intent, commit_policy) {
             Ok(_) => {
+                if let Some(metadata) = &mut directory_metadata {
+                    metadata.disarm();
+                }
                 if let Some(path) = cleanup_staging(temp) {
                     layout_plan
                         .warnings
@@ -451,6 +624,20 @@ impl PreparedCommit {
                 })
             }
             Err(mut failure) => {
+                if let Some(metadata) = &mut directory_metadata {
+                    if let Err(error) = metadata.restore() {
+                        let staging = temp.keep();
+                        failure.error = SmartZipError::io(
+                            Some(staging.clone()),
+                            std::io::Error::other(format!(
+                                "{}; staging access restoration failed: {error}",
+                                failure.error
+                            )),
+                        );
+                        failure.preserved_temp_dir = Some(staging);
+                        return Err(failure);
+                    }
+                }
                 if failure.preserved_temp_dir.is_some() {
                     let staging = temp.keep();
                     failure.error = SmartZipError::io(
@@ -547,6 +734,249 @@ fn resolve_commit_target(output_dir: &Path, policy: CommitPolicy) -> Result<Path
             Ok(find_non_colliding_name(parent, file_name))
         }
     }
+}
+
+fn resolve_policy_commit_target(
+    target: &Path,
+    action: CommitPolicy,
+    report: &smartzip_core::PathMappingReport,
+    staging: &Path,
+    layout: &LayoutPlan,
+    is_dir: bool,
+) -> Result<PathBuf> {
+    if action != CommitPolicy::Rename {
+        return resolve_commit_target(target, action);
+    }
+    let parent = target.parent().unwrap_or_else(|| Path::new("."));
+    let name = target.file_name().and_then(|n| n.to_str()).ok_or_else(|| {
+        smartzip_core::path_policy::PathDiagnostic::new(
+            smartzip_core::path_policy::PathConstraintReason::InvalidName,
+            smartzip_core::path_policy::PathStage::Layout,
+            "invalid layout name",
+        )
+        .error()
+    })?;
+    for sequence in 0..1000usize {
+        let candidate = if sequence == 0 {
+            target.to_path_buf()
+        } else {
+            let mut policy = report.policy.clone();
+            let mut component =
+                crate::path_policy::collision_name(name, is_dir, sequence, &policy)?;
+            if let Some(available) = layout_available(layout, staging, report)? {
+                let windows = policy.access
+                    == smartzip_core::path_policy::PathAccessStrategy::WindowsVerbatim;
+                let measured = if windows {
+                    component.encode_utf16().count()
+                } else {
+                    component.len()
+                };
+                if measured > available {
+                    policy.component.metric = if windows {
+                        smartzip_core::path_policy::LengthMetric::Utf16Units
+                    } else {
+                        smartzip_core::path_policy::LengthMetric::Utf8Bytes
+                    };
+                    policy.component.limit = available.min(policy.component.limit);
+                    component =
+                        crate::path_policy::collision_name(name, is_dir, sequence, &policy)?;
+                }
+            }
+            parent.join(component)
+        };
+        match std::fs::symlink_metadata(&candidate) {
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(candidate),
+            Err(e) => return Err(SmartZipError::io(Some(candidate), e)),
+            Ok(_) => {}
+        }
+    }
+    Err(smartzip_core::path_policy::PathDiagnostic::new(
+        smartzip_core::path_policy::PathConstraintReason::NameCollision,
+        smartzip_core::path_policy::PathStage::Layout,
+        "collision rename attempts exhausted",
+    )
+    .error())
+}
+
+fn layout_component(
+    layout: &LayoutPlan,
+    staging: &Path,
+    name: &str,
+    is_dir: bool,
+    report: &smartzip_core::PathMappingReport,
+) -> Result<String> {
+    use smartzip_core::path_policy::*;
+    let mapped = crate::path_policy::map_component(name, is_dir, name.as_bytes(), &report.policy)?;
+    let Some(available) = layout_available(layout, staging, report)? else {
+        return Ok(mapped);
+    };
+    let windows = report.policy.access == PathAccessStrategy::WindowsVerbatim;
+    let measured = if windows {
+        mapped.encode_utf16().count()
+    } else {
+        mapped.len()
+    };
+    if measured <= available {
+        return Ok(mapped);
+    }
+    if available < 16 {
+        return Err(PathDiagnostic::new(
+            PathConstraintReason::PathTooLong,
+            PathStage::Layout,
+            "final layout has no room for the minimum container name",
+        )
+        .error());
+    }
+    let mut constrained = report.policy.clone();
+    constrained.component.metric = if windows {
+        LengthMetric::Utf16Units
+    } else {
+        LengthMetric::Utf8Bytes
+    };
+    constrained.component.limit = available.min(report.policy.component.limit);
+    crate::path_policy::map_component(name, is_dir, name.as_bytes(), &constrained)
+}
+
+fn layout_available(
+    layout: &LayoutPlan,
+    staging: &Path,
+    report: &smartzip_core::PathMappingReport,
+) -> Result<Option<usize>> {
+    use smartzip_core::path_policy::*;
+    let Some(limit) = report.policy.full_path_limit else {
+        return Ok(None);
+    };
+    let windows = report.policy.access == PathAccessStrategy::WindowsVerbatim;
+    let measure = |text: &str| {
+        if windows {
+            text.encode_utf16().count()
+        } else {
+            text.len()
+        }
+    };
+    let parent = layout.target.parent().unwrap_or_else(|| Path::new("."));
+    let root_length = measure(&parent.to_string_lossy()) + 1 + if windows { 16 } else { 1 };
+    let whole_tree = matches!(layout.source, PlanSource::WholeTempDir)
+        || matches!(
+            layout.kind,
+            LayoutPlanKind::PreserveBothSingleDir | LayoutPlanKind::PreserveBothSingleFile
+        );
+    let source = match &layout.source {
+        PlanSource::WholeTempDir => Path::new(""),
+        PlanSource::SingleDir(p) | PlanSource::SingleDirContents(p) | PlanSource::SingleFile(p) => {
+            p.strip_prefix(staging).map_err(|e| {
+                PathDiagnostic::new(
+                    PathConstraintReason::InvalidName,
+                    PathStage::Layout,
+                    e.to_string(),
+                )
+                .error()
+            })?
+        }
+    };
+    let mut longest_relative = 0usize;
+    for entry in &report.entries {
+        let path = Path::new(&entry.staging_relative);
+        let relative = if whole_tree {
+            path
+        } else {
+            path.strip_prefix(source).map_err(|e| {
+                PathDiagnostic::new(
+                    PathConstraintReason::InvalidName,
+                    PathStage::Layout,
+                    e.to_string(),
+                )
+                .error()
+            })?
+        };
+        let text = relative.to_string_lossy();
+        longest_relative = longest_relative.max(measure(&text) + usize::from(!text.is_empty()));
+    }
+    let available = limit.saturating_sub(root_length.saturating_add(longest_relative));
+    Ok(Some(available))
+}
+
+fn project_mapping(
+    report: &mut smartzip_core::PathMappingReport,
+    staging: &Path,
+    source: &Path,
+    target: &Path,
+    layout: &LayoutPlan,
+) -> Result<()> {
+    use smartzip_core::path_policy::{
+        PathConstraintReason, PathDiagnostic, PathMappingReason, PathStage,
+    };
+    let prefix = target.file_name().ok_or_else(|| {
+        PathDiagnostic::new(
+            PathConstraintReason::InvalidName,
+            PathStage::Layout,
+            "layout target lacks a name",
+        )
+        .error()
+    })?;
+    let whole_tree = source == staging
+        || matches!(
+            layout.kind,
+            LayoutPlanKind::PreserveBothSingleDir | LayoutPlanKind::PreserveBothSingleFile
+        );
+    let stripped = source.strip_prefix(staging).map_err(|e| {
+        PathDiagnostic::new(
+            PathConstraintReason::InvalidName,
+            PathStage::Layout,
+            e.to_string(),
+        )
+        .error()
+    })?;
+    for entry in &mut report.entries {
+        let staging_relative = Path::new(&entry.staging_relative);
+        let relative = if whole_tree {
+            staging_relative
+        } else {
+            staging_relative.strip_prefix(stripped).map_err(|e| {
+                PathDiagnostic::new(
+                    PathConstraintReason::InvalidName,
+                    PathStage::Layout,
+                    e.to_string(),
+                )
+                .error()
+            })?
+        };
+        let final_path = if relative.as_os_str().is_empty() {
+            PathBuf::from(prefix)
+        } else {
+            PathBuf::from(prefix).join(relative)
+        };
+        let final_relative = final_path
+            .to_str()
+            .ok_or_else(|| {
+                PathDiagnostic::new(
+                    PathConstraintReason::InvalidName,
+                    PathStage::Layout,
+                    "non-Unicode final layout",
+                )
+                .error()
+            })?
+            .replace('\\', "/");
+        let target_changed = target != layout.target;
+        if ((!whole_tree && final_relative != entry.staging_relative) || target_changed)
+            && !entry.reasons.contains(&PathMappingReason::LayoutRenamed)
+        {
+            entry.reasons.push(PathMappingReason::LayoutRenamed);
+        }
+        entry.final_relative = final_relative;
+    }
+    report.tentative = false;
+    let mut final_report = report.clone();
+    for entry in &mut final_report.entries {
+        entry.staging_relative = entry.final_relative.clone();
+    }
+    crate::path_extract::check_path_lengths(
+        target.parent().unwrap_or_else(|| Path::new(".")),
+        &final_report,
+        PathStage::Layout,
+    )?;
+    report.refresh_digest();
+    Ok(())
 }
 
 fn commit_failure(error: SmartZipError) -> MaterializeFailure {
@@ -800,6 +1230,89 @@ fn find_non_colliding_name(parent: &Path, name: &std::ffi::OsStr) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn mapped_layout_collision_reserves_complete_path_budget_and_keeps_old_output() {
+        use smartzip_core::path_policy::*;
+        let root = tempfile::tempdir().unwrap();
+        let name = "container-name-that-needs-shortening";
+        let slot = std::cell::RefCell::new(None);
+        let slot_ref = &slot;
+        let parent = root.path().to_path_buf();
+        let staged = OutputMaterializer::default()
+            .prepare(
+                MaterializeRequest {
+                    output_dir: root.path().join(name),
+                    archive_path: root.path().join("archive.zip"),
+                    commit_policy: CommitPolicy::FailIfExists,
+                    archive_stem: Some(name.into()),
+                    layout_policy: OutputLayoutPolicy::Raw,
+                    single_root_name_policy: SingleRootNamePolicy::Auto,
+                },
+                |staging| async move {
+                    std::fs::write(staging.join("x.txt"), b"new payload").unwrap();
+                    let mut policy =
+                        smartzip_platform::path_policy::probe_target(&parent, PathMode::Portable)?;
+                    policy.full_path_limit = None;
+                    let mut report = crate::path_policy::plan_paths(
+                        &[crate::path_policy::PathEntry {
+                            id: 0,
+                            source: "x.txt".into(),
+                            raw_name: Some(b"x.txt".to_vec()),
+                            source_kind: SourceNameKind::ZipCentralDirectory,
+                            is_dir: false,
+                        }],
+                        &policy,
+                    )?;
+                    report.policy.full_path_limit =
+                        Some(parent.to_string_lossy().len() + 1 + 16 + 1 + 5 + 1);
+                    report.tentative = false;
+                    report.refresh_digest();
+                    *slot_ref.borrow_mut() = Some(report);
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap()
+            .with_path_mapping(slot.borrow_mut().take())
+            .unwrap();
+        let old = staged.layout_plan.target.clone();
+        std::fs::create_dir(&old).unwrap();
+        std::fs::write(old.join("keep"), b"old payload").unwrap();
+        let collision = staged.collision_request().unwrap().unwrap();
+        let prepared = staged
+            .prepare_commit(
+                Some((collision, CollisionAction::Rename)),
+                crate::CommitSuccessFacts::default(),
+            )
+            .unwrap();
+        let intent = prepared.intent().unwrap().clone();
+        assert!(intent
+            .target_path
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .ends_with("_collided_1"));
+        assert!(
+            intent
+                .target_path
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .len()
+                <= 16
+        );
+        let published = prepared.commit().unwrap().finalize();
+        assert_eq!(std::fs::read(old.join("keep")).unwrap(), b"old payload");
+        let report = intent.path_mapping.unwrap();
+        assert_eq!(
+            std::fs::read(root.path().join(&report.entries[0].final_relative)).unwrap(),
+            b"new payload"
+        );
+        assert_eq!(published.output_dir, intent.target_path);
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

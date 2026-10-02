@@ -123,8 +123,20 @@ pub(crate) struct TaskBudgetReservation {
 }
 
 impl TaskBudgetReservation {
+    pub(crate) fn writer_budget(&self, limits: &ExtractionLimits) -> WriterBudget {
+        WriterBudget {
+            budget: self.budget.clone(),
+            id: self.id,
+            limits: limits.clone(),
+        }
+    }
     fn update(&self, usage: Usage, limits: &ExtractionLimits) -> Result<()> {
         let mut state = self.budget.state.lock().unwrap();
+        let previous = state.in_flight.get(&self.id).copied().unwrap_or_default();
+        let usage = Usage {
+            files: usage.files.max(previous.files),
+            bytes: usage.bytes.max(previous.bytes),
+        };
         let other = state
             .in_flight
             .iter()
@@ -163,6 +175,43 @@ impl TaskBudgetReservation {
         state.committed.bytes = state.committed.bytes.saturating_add(usage.bytes);
         self.committed = true;
         usage
+    }
+}
+
+/// Synchronous writers reserve bytes before touching disk, across all roots.
+pub(crate) struct WriterBudget {
+    budget: Arc<TaskBudget>,
+    id: u64,
+    limits: ExtractionLimits,
+}
+impl WriterBudget {
+    pub(crate) fn update(&self, usage: Usage) -> Result<()> {
+        let mut state = self.budget.state.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = state.in_flight.get(&self.id).copied().unwrap_or_default();
+        let usage = Usage {
+            files: usage.files.max(previous.files),
+            bytes: usage.bytes.max(previous.bytes),
+        };
+        let other = state
+            .in_flight
+            .iter()
+            .filter(|(id, _)| **id != self.id)
+            .fold(state.committed, |sum, (_, u)| Usage {
+                files: sum.files.saturating_add(u.files),
+                bytes: sum.bytes.saturating_add(u.bytes),
+            });
+        if self.limits.max_files != 0
+            && other.files.saturating_add(usage.files) > self.limits.max_files
+        {
+            return Err(exceeded("managed output entry limit exceeded"));
+        }
+        if self.limits.max_output_bytes != 0
+            && other.bytes.saturating_add(usage.bytes) > self.limits.max_output_bytes
+        {
+            return Err(exceeded("managed output byte limit exceeded"));
+        }
+        state.in_flight.insert(self.id, usage);
+        Ok(())
     }
 }
 

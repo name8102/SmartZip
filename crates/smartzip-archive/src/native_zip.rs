@@ -1,5 +1,6 @@
 use smartzip_core::{Result, SmartZipError};
 use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use zip::ZipArchive;
 
@@ -56,19 +57,34 @@ impl NativeZipBackend {
 
     /// Read the raw central-directory entries of a ZIP file.
     ///
-    /// Returns the exact filename bytes (`name_raw`) for every entry, plus
+    /// Reads the physical central-directory filename field for every entry, plus
     /// `is_dir`. No decoding, no extraction, no materialization.
     pub fn raw_entries(&self, path: &Path) -> Result<Vec<ZipRawEntry>> {
         let mut archive =
             Self::open_archive_read(path).map_err(|e| with_backend_identity(e, &self.id))?;
+        let mut headers = File::open(path).map_err(|e| SmartZipError::io(Some(path.into()), e))?;
         let mut entries = Vec::with_capacity(archive.len());
         for i in 0..archive.len() {
             let entry = archive
                 .by_index_raw(i)
                 .map_err(|source| map_zip_error(source, path))
                 .map_err(|e| with_backend_identity(e, &self.id))?;
+            headers
+                .seek(SeekFrom::Start(entry.central_header_start() + 28))
+                .map_err(|e| SmartZipError::io(Some(path.into()), e))?;
+            let mut length = [0; 2];
+            headers
+                .read_exact(&mut length)
+                .map_err(|e| SmartZipError::io(Some(path.into()), e))?;
+            headers
+                .seek(SeekFrom::Start(entry.central_header_start() + 46))
+                .map_err(|e| SmartZipError::io(Some(path.into()), e))?;
+            let mut raw_name = vec![0; u16::from_le_bytes(length) as usize];
+            headers
+                .read_exact(&mut raw_name)
+                .map_err(|e| SmartZipError::io(Some(path.into()), e))?;
             entries.push(ZipRawEntry {
-                raw_name: entry.name_raw().to_vec(),
+                raw_name,
                 is_dir: entry.is_dir(),
                 compressed_size: entry.compressed_size(),
                 uncompressed_size: entry.size(),

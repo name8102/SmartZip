@@ -93,10 +93,14 @@ fn extract_keeps_progress_encoding_password_output_and_completion_order() {
             "Started",
             "EncodingDetected",
             "PasswordTried",
+            "PathMappingPlanned",
+            "PathMappingApplied",
             "OutputCreated",
             "Finished"
         ]
     );
+    assert_eq!(result["path_reports"].as_array().unwrap().len(), 1);
+    assert_eq!(result["path_reports"][0]["tentative"], false);
     assert_eq!(result["status"], "completed");
     assert_eq!(result["exit_code"], 0);
     assert_eq!(result["processed_count"], 1);

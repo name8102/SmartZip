@@ -816,6 +816,139 @@ impl ArchiveExecutor for BackendRouter {
             .await
     }
 
+    async fn prepare_extraction_with_facts_and_context(
+        &self,
+        request: ExtractArchiveRequest,
+        facts: &ArchiveFacts,
+        context: Arc<TaskExecutionContext>,
+    ) -> Result<Option<Box<dyn crate::PreparedExtraction>>> {
+        let mut request = request;
+        if request.format.is_none() {
+            request.format = facts.container.clone();
+        }
+        let single_zip = if request.format == Some(ArchiveFormat::Zip) {
+            let volumes = crate::volumes::VolumeSet::collect(&request.archive)
+                .map_err(|e| SmartZipError::io(Some(request.archive.clone()), e))?;
+            volumes.family == crate::volumes::VolumeFamily::Single && volumes.members.len() == 1
+        } else {
+            false
+        };
+        if single_zip {
+            match crate::managed::prepare_zip(
+                request.clone(),
+                context.clone(),
+                self.forced_adapter.is_none(),
+            )
+            .await
+            {
+                Ok(session) => return Ok(Some(session)),
+                Err(SmartZipError::UnsupportedCodec { .. }) if self.forced_adapter.is_none() => {}
+                Err(SmartZipError::PathConstraint { diagnostic, .. })
+                    if self.forced_adapter.is_none()
+                        && diagnostic.reason
+                            == smartzip_core::PathConstraintReason::PathRemapUnsupported => {}
+                Err(error) => return Err(error),
+            }
+        }
+        let format = request.format.as_ref();
+        let requirements = request_requirements(
+            ArchiveOperation::Extract,
+            format,
+            request.password.as_deref(),
+            Some(&request.encoding),
+        );
+        let plan = self.plan_with_context(
+            ArchiveOperation::Extract,
+            format,
+            requirements,
+            Some(&context),
+        );
+        let mut attempted = Vec::new();
+        let mut last_error = None;
+        for candidate in &plan.candidates {
+            if context.is_cancelled() {
+                return Err(SmartZipError::Cancelled);
+            }
+            let Some(registration) = self.registration(&candidate.adapter_id) else {
+                continue;
+            };
+            let Some(executable) = registration.adapter.executable_path() else {
+                continue;
+            };
+            let family = registration.adapter.diagnostic_family();
+            if family != Some("7z") && !(self.forced_adapter.is_some() && family == Some("unrar")) {
+                continue;
+            }
+            attempted.push(candidate.adapter_id.clone());
+            self.emit(
+                context.as_ref(),
+                RouteEvent::BackendAttemptStarted {
+                    adapter_id: candidate.adapter_id.clone(),
+                },
+            );
+            let result = if family == Some("7z") {
+                crate::managed::prepare_seven(
+                    request.clone(),
+                    executable.into(),
+                    candidate.adapter_id.clone(),
+                    context.clone(),
+                )
+                .await
+            } else {
+                crate::managed::prepare_unrar(
+                    request.clone(),
+                    executable.into(),
+                    candidate.adapter_id.clone(),
+                    context.clone(),
+                )
+                .await
+            };
+            match result {
+                Ok(session) => {
+                    self.emit(
+                        context.as_ref(),
+                        RouteEvent::BackendSelected {
+                            adapter_id: candidate.adapter_id.clone(),
+                        },
+                    );
+                    return Ok(Some(session));
+                }
+                Err(error) => {
+                    self.emit(
+                        context.as_ref(),
+                        RouteEvent::BackendAttemptFailed {
+                            adapter_id: candidate.adapter_id.clone(),
+                            class: error_class(&error).into(),
+                        },
+                    );
+                    // Preparation produces no output. Each candidate freezes a
+                    // fresh manifest; reuse ordinary routing's retry categories.
+                    if !is_retryable(&error) || self.forced_adapter.is_some() {
+                        return Err(error);
+                    }
+                    self.remember_retryable(
+                        context.as_ref(),
+                        &candidate.adapter_id,
+                        ArchiveOperation::Extract,
+                        request.format.clone(),
+                        &error,
+                    );
+                    last_error = Some(error);
+                }
+            }
+        }
+        if let Some(error) = last_error {
+            self.emit(context.as_ref(), RouteEvent::RouteExhausted { attempted });
+            return Err(error);
+        }
+        if plan.candidates.is_empty() {
+            return Err(no_compatible_backend(ArchiveOperation::Extract, &plan));
+        }
+        Err(crate::managed::unsupported(
+            "no configured adapter can freeze a reliable extraction inventory",
+        ))
+    }
+
     async fn compress(&self, request: CompressArchiveRequest) -> Result<CompressArchiveResult> {
         let context = std::sync::Arc::new(TaskExecutionContext::detached());
         self.compress_with_context(request, context).await

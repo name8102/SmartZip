@@ -568,7 +568,19 @@ impl View {
             .iter()
             .find(|j| j.id == *job_id)?;
         let file = job.files.iter().find(|f| f.node_id == *node)?.clone();
+        let job_key = *job_id;
         let output = file.output.clone();
+        let reports = crate::path_reports::reports_for_file(
+            job.result.as_ref(),
+            &file.path,
+            file.node_id.as_str(),
+        );
+        let mapping_panels = reports
+            .into_iter()
+            .map(|report| {
+                self.mapping_report(format!("file-{job_key}-{}", report.digest), report, cx)
+            })
+            .collect::<Vec<_>>();
         Some(div().flex().flex_col().gap_4()
             .child(div().text_xs().text_color(cx.theme().muted_foreground).child(if file.parent_id.is_none() { "根归档详情" } else if file.depth == 0 { "候选入口详情" } else { "嵌套归档详情" }))
             .child(div().text_size(px(18.)).font_weight(gpui::FontWeight::SEMIBOLD).child(file.path.file_name().unwrap_or(file.path.as_os_str()).to_string_lossy().into_owned()))
@@ -590,6 +602,7 @@ impl View {
                     }))
                     .when(volumes.candidates.is_empty(), |el| el.children(volumes.members.iter().map(|path| div().text_xs().child(path.display().to_string())))))
             })
+            .children(mapping_panels)
             .child(control("file-output").icon(IconName::FolderOpen).label("打开输出目录").disabled(output.is_none()).on_click(move |_, _, cx| { if let Some(path) = &output { cx.reveal_path(path); } }))
             .child(div().border_t_1().border_color(cx.theme().border).pt_4().text_xs().text_color(cx.theme().muted_foreground).child("暂停在当前阶段安全结束后生效。取消会停止该根归档及其嵌套文件，并等待清理。"))
             .child(div().flex().flex_col().gap_2().child(div().text_sm().child("文件记录"))
@@ -642,6 +655,8 @@ impl View {
         let phase = job.phase;
         let has_task_password = !job.request.settings.passwords.is_empty();
         let percent = job.progress;
+        let renamed_count = job.renamed_count;
+        let reports = crate::path_reports::reports_from_result(job.result.as_ref());
         let result = job
             .result
             .as_ref()
@@ -888,6 +903,14 @@ impl View {
                         )
                     }),
             )
+            .when(renamed_count > 0 && reports.is_empty(), |el| {
+                el.child(div().text_sm().child(format!(
+                    "已调整 {renamed_count} 个名称 · 完整映射将在任务结束后显示"
+                )))
+            })
+            .children(reports.into_iter().map(|report| {
+                self.mapping_report(format!("task-{id}-{}", report.digest), report, cx)
+            }))
             .child(
                 control("toggle-diagnostics")
                     .icon(if self.diagnostics_open {

@@ -200,6 +200,7 @@ impl Default for Encoding {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Output {
+    pub path_mode: crate::PathMode,
     pub destination: Destination,
     pub directory: Option<PathBuf>,
     pub layout: Layout,
@@ -209,6 +210,7 @@ pub struct Output {
 impl Default for Output {
     fn default() -> Self {
         Self {
+            path_mode: crate::PathMode::Native,
             destination: Destination::FirstInputParent,
             directory: None,
             layout: Layout::Conservative,

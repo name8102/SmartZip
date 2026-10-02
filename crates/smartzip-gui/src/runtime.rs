@@ -34,6 +34,7 @@ pub struct TaskSettings {
     pub output: Option<PathBuf>,
     pub recursive: Option<bool>,
     pub smart_layout: Option<bool>,
+    pub path_mode: Option<smartzip_core::PathMode>,
     pub auto_encoding: Option<bool>,
     pub delete_source: bool,
     #[serde(skip)]
@@ -306,6 +307,19 @@ fn load_policy(request: &JobRequest) -> Result<CompiledRunPolicy, Box<dyn std::e
         patches.push((
             "extraction.output.layout".into(),
             toml::Value::String(if value { "smart" } else { "conservative" }.into()),
+        ));
+    }
+    if let Some(value) = request.settings.path_mode {
+        patches.push((
+            "extraction.output.path_mode".into(),
+            toml::Value::String(
+                if value == smartzip_core::PathMode::Portable {
+                    "portable"
+                } else {
+                    "native"
+                }
+                .into(),
+            ),
         ));
     }
     if let Some(value) = request.settings.auto_encoding {
@@ -801,11 +815,16 @@ mod tests {
                 recursive: Some(false),
                 auto_encoding: Some(false),
                 smart_layout: Some(true),
+                path_mode: Some(smartzip_core::PathMode::Portable),
                 ..Default::default()
             },
             resolved: Some(smartzip_config::ResolvedConfig::load(None).unwrap()),
         };
         let policy = load_policy(&request).unwrap();
+        assert_eq!(
+            policy.values().extraction.output.path_mode,
+            smartzip_core::PathMode::Portable
+        );
         assert!(!policy.values().extraction.recursion.enabled);
         assert_eq!(policy.values().extraction.encoding.mode, "backend");
         assert_eq!(

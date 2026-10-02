@@ -108,3 +108,39 @@ impl Default for ExtractionLimits {
         }
     }
 }
+
+/// The bytes used to identify a member are never synthesized from backend text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExtractionNameSource {
+    ZipCentralDirectory,
+    ZipUnicodeExtra,
+    BackendText,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExtractionMetadata {
+    pub crc32: Option<u32>,
+    pub unix_mode: Option<u32>,
+    pub modified_unix_seconds: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExtractionEntry {
+    pub id: u64,
+    pub display_name: String,
+    pub raw_name: Option<Vec<u8>>,
+    pub source_kind: ExtractionNameSource,
+    pub is_dir: bool,
+    pub size: u64,
+    pub metadata: ExtractionMetadata,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExtractionManifest {
+    pub entries: Vec<ExtractionEntry>,
+    pub digest: String,
+    pub adapter_id: String,
+    pub adapter_identity: String,
+    pub source_identity: String,
+    pub encoding: EncodingMode,
+}

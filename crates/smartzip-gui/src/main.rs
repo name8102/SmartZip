@@ -9,6 +9,7 @@ mod library;
 mod member_preview;
 mod model;
 mod new_open_request;
+mod path_reports;
 mod preferences;
 mod queue_store;
 mod runtime;

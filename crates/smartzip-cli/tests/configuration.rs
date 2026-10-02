@@ -61,7 +61,8 @@ fn disabled_backend_is_neither_probed_nor_started() {
     )
     .unwrap();
     fs::set_permissions(w.path("backend"), fs::Permissions::from_mode(0o755)).unwrap();
-    let archive = w.fixture("enc_utf8.zip");
+    // ZIP can use the built-in managed reader without an external backend.
+    let archive = w.fixture("pass_jp.7z");
     let report = w.json(
         &[
             "extract",
@@ -275,4 +276,42 @@ fn config_and_environment_select_one_file_and_never_trust_the_working_directory(
     assert_eq!(String::from_utf8(defaults.stdout).unwrap().trim(), "3");
     let explicit = run(&["--config", "config.toml", "config", "check"]);
     assert!(!explicit.status.success());
+}
+
+#[test]
+fn explicit_path_mode_overrides_file_and_remains_in_the_policy_snapshot() {
+    let workspace = Workspace::new("schema_version=1\n[extraction.output]\npath_mode='portable'\n");
+    let configured = workspace.json(&["extract", "missing.zip", "--explain"], 0);
+    assert_eq!(
+        configured["configuration"]["values"]["extraction"]["output"]["path_mode"],
+        "portable"
+    );
+    let explicit = workspace.json(
+        &[
+            "extract",
+            "missing.zip",
+            "--path-mode",
+            "native",
+            "--explain",
+        ],
+        0,
+    );
+    assert_eq!(
+        explicit["configuration"]["values"]["extraction"]["output"]["path_mode"],
+        "native"
+    );
+    assert_eq!(
+        explicit["configuration"]["origins"]["extraction.output.path_mode"],
+        "command_line"
+    );
+    workspace.run(
+        &[
+            "extract",
+            "missing.zip",
+            "--path-mode",
+            "unknown",
+            "--explain",
+        ],
+        2,
+    );
 }

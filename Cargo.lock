@@ -6919,6 +6919,7 @@ name = "smartzip-archive"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "blake3",
  "crc32fast",
  "flate2",
  "libc",
@@ -6931,6 +6932,7 @@ dependencies = [
  "smartzip-core",
  "smartzip-encoding",
  "tempfile",
+ "time",
  "tokio",
  "tokio-util",
  "which",
@@ -6966,6 +6968,7 @@ name = "smartzip-config"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "smartzip-core",
  "tempfile",
  "toml 0.8.23",
  "toml_edit 0.22.27",
@@ -6975,6 +6978,7 @@ dependencies = [
 name = "smartzip-core"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
@@ -7037,6 +7041,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "unicode-normalization",
+ "unicode-segmentation",
  "walkdir",
  "zip",
 ]
@@ -7085,13 +7090,16 @@ dependencies = [
  "block2 0.5.1",
  "core-foundation 0.10.0",
  "directories",
+ "libc",
  "objc2-app-kit 0.2.2",
  "objc2-foundation 0.2.2",
  "plist",
  "serde",
  "serde_json",
+ "smartzip-core",
  "tempfile",
  "trash",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
