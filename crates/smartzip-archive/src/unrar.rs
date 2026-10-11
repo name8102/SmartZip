@@ -169,8 +169,8 @@ impl UnrarBackend {
         .map(|(output, _)| output)
     }
 
-    fn password_arg(password: &Option<String>) -> String {
-        match password {
+    pub(crate) fn password_arg(password: &Option<String>) -> String {
+        match password.as_deref().filter(|password| !password.is_empty()) {
             Some(password) => format!("-p{password}"),
             None => "-p-".into(),
         }
@@ -254,13 +254,21 @@ impl ArchiveAdapter for UnrarBackend {
         let token = context.cancellation_token();
         let args = vec![
             "lb".to_string(),
-            "-idq".to_string(),
+            "-cfg-".to_string(),
+            "-c-".to_string(),
             Self::password_arg(&request.password),
+            "--".to_string(),
             request.archive.to_string_lossy().into_owned(),
         ];
         let output = self.run_with_token(&args, &token).await?;
         if output.status != Some(0) {
-            return Err(self.map_failure(&output, &request.archive));
+            return Err(crate::test_output::password_error(
+                &output,
+                "unrar",
+                request.password.as_deref(),
+                &request.archive,
+            )
+            .unwrap_or_else(|| self.map_failure(&output, &request.archive)));
         }
         let entries = output
             .stdout

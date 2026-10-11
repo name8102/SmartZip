@@ -37,3 +37,7 @@ The associated [test source](https://github.com/libarchive/libarchive/blob/maste
 ```
 
 SHA-256 (`rar-ordinary.rar`): `6514fbcc2ca1ca636ec20137dc864faffd13631dddb100befd92c3a9daeefa6d`.
+
+`rar5-7zip-26.slt` is a captured `7zz l -ba -slt` listing from 7-Zip 26.02
+for an encrypted RAR5 embedded after a JPEG prefix. Member names are anonymized;
+empty field values intentionally retain the trailing space required by SLT.

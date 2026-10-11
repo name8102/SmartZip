@@ -106,6 +106,84 @@ async fn unrar_legacy_entries_preserve_commands_and_results() {
 }
 
 #[tokio::test]
+async fn unrar_listing_disables_password_prompt_without_hiding_members() {
+    let (root, executable) = fake_backend();
+    let backend = smartzip_archive::UnrarBackend::new(executable);
+    let log = root.path().join("backend.log");
+    for password in [None, Some(String::new()), Some("test-value".into())] {
+        std::fs::write(&log, "").unwrap();
+        let listing = backend
+            .list(ListRequest {
+                archive: root.path().join("image.jpg"),
+                format: Some(smartzip_core::ArchiveFormat::Rar),
+                password: password.clone(),
+                encoding: EncodingMode::Auto,
+            })
+            .await
+            .unwrap();
+        assert_eq!(listing.entries.len(), 1);
+        let args = std::fs::read_to_string(&log).unwrap();
+        let args: Vec<_> = args.split_whitespace().collect();
+        assert!(!args.contains(&"-p"));
+        assert!(!args.contains(&"-idq"));
+        assert!(args.contains(&"-cfg-") && args.contains(&"-c-") && args.contains(&"--"));
+        assert!(
+            args.contains(&if password.as_deref() == Some("test-value") {
+                "-ptest-value"
+            } else {
+                "-p-"
+            })
+        );
+    }
+}
+
+#[tokio::test]
+async fn unrar_listing_classifies_password_diagnostics() {
+    use smartzip_core::SmartZipError;
+    let (root, executable) = fake_backend();
+    let backend = smartzip_archive::UnrarBackend::new(executable.clone());
+    for (password, diagnostic, expected) in [
+        (
+            None,
+            "Enter password (will not be echoed): Read error in the file stdin",
+            "required",
+        ),
+        (
+            Some(""),
+            "Enter password (will not be echoed): Read error in the file stdin",
+            "required",
+        ),
+        (Some("incorrect"), "ERROR: Wrong password", "wrong"),
+        (
+            Some("incorrect"),
+            "Checksum error in the encrypted file. Wrong password?",
+            "indeterminate",
+        ),
+    ] {
+        std::fs::write(
+            &executable,
+            format!("#!/bin/sh\nprintf '%s\\n' '{diagnostic}' >&2\nexit 12\n"),
+        )
+        .unwrap();
+        let error = backend
+            .list(ListRequest {
+                archive: root.path().join("secret.rar"),
+                format: Some(smartzip_core::ArchiveFormat::Rar),
+                password: password.map(str::to_owned),
+                encoding: EncodingMode::Auto,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            (expected, error),
+            ("required", SmartZipError::PasswordRequired { .. })
+                | ("wrong", SmartZipError::WrongPassword { .. })
+                | ("indeterminate", SmartZipError::PasswordIndeterminate { .. })
+        ));
+    }
+}
+
+#[tokio::test]
 async fn probe_preserves_legacy_and_context_diagnostic_differences() {
     use std::os::unix::fs::PermissionsExt;
     let (root, executable) = fake_backend();

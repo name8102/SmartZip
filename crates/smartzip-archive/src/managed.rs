@@ -774,6 +774,7 @@ fn seven_entries_for_format(
         "Accessed",
         "Attributes",
         "CRC",
+        "Checksum",
         "Encrypted",
         "Method",
         "Block",
@@ -787,6 +788,8 @@ fn seven_entries_for_format(
         "Characteristics",
         "Symbolic Link",
         "Hard Link",
+        "Copy Link",
+        "NT Security",
         "Mode",
         "User",
         "Group",
@@ -836,6 +839,8 @@ fn seven_entries_for_format(
         for key in [
             "Symbolic Link",
             "Hard Link",
+            "Copy Link",
+            "NT Security",
             "Comment",
             "Alternate Stream",
             "Device Major",
@@ -1688,6 +1693,45 @@ mod tests {
         .is_err());
     }
 
+    #[test]
+    fn slt_accepts_rar5_listing_with_empty_optional_metadata() {
+        // 7-Zip 26.02 output for an encrypted RAR5 embedded after a JPEG prefix.
+        let listing = include_str!("../tests/fixtures/rar5-7zip-26.slt");
+        let (entries, encrypted) = seven_entries(listing, &ExtractionLimits::default()).unwrap();
+        assert!(encrypted);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].display_name, "图片.jpg");
+        assert_eq!(entries[0].size, 904331);
+        assert_eq!(entries[1].display_name, "[归档] 内容.7z");
+        assert_eq!(entries[1].size, 379771177);
+        assert!(entries
+            .iter()
+            .all(|entry| !entry.is_dir && entry.metadata.crc32.is_none()));
+    }
+
+    #[test]
+    fn slt_optional_metadata_does_not_allow_links_or_ambiguous_records() {
+        let listing = "Path = name\nSize = 1\nAttributes = A\n";
+        for metadata in [
+            "Copy Link = target\n",
+            "NT Security = descriptor\n",
+            "Copy Link = \nCopy Link = \n",
+            "Checksum = \nChecksum = \n",
+            "NT Security = \nNT Security = \n",
+            "Unknown = \n",
+            "Checksum = \ncontinuation\n",
+        ] {
+            assert!(
+                seven_entries(
+                    &format!("{listing}{metadata}"),
+                    &ExtractionLimits::default()
+                )
+                .is_err(),
+                "accepted {metadata:?}"
+            );
+        }
+    }
+
     fn seven_tool() -> Option<PathBuf> {
         crate::SevenZipLocator::default().locate()
     }
@@ -1804,6 +1848,7 @@ mod tests {
         std::fs::write(&path, include_bytes!("../tests/fixtures/rar-ordinary.rar")).unwrap();
         let mut req = request(&path, root.path());
         req.format = Some(smartzip_core::ArchiveFormat::Rar);
+        req.password = Some(String::new());
         let session = prepare_seven(req.clone(), executable, "fixture-seven".into(), context())
             .await
             .unwrap();
@@ -2212,11 +2257,7 @@ pub(crate) async fn prepare_unrar(
             operation.into(),
             "-cfg-".into(),
             "-c-".into(),
-            if let Some(password) = &request.password {
-                format!("-p{password}")
-            } else {
-                "-p-".into()
-            },
+            crate::UnrarBackend::password_arg(&request.password),
             "--".into(),
             request.archive.to_string_lossy().into_owned(),
         ];
