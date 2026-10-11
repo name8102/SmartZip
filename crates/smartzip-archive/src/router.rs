@@ -863,9 +863,19 @@ impl ArchiveExecutor for BackendRouter {
             requirements,
             Some(&context),
         );
+        // Prefer indexed-content inventories so RAR path remapping remains
+        // available. UnRAR can still freeze ordinary paths without 7-Zip.
+        // Bulk execution uses the normal route's priorities and fallback.
+        let mut inventory_candidates = plan.candidates.clone();
+        inventory_candidates.sort_by_key(|candidate| {
+            self.registration(&candidate.adapter_id)
+                .is_some_and(|registration| {
+                    registration.adapter.diagnostic_family() == Some("unrar")
+                })
+        });
         let mut attempted = Vec::new();
         let mut last_error = None;
-        for candidate in &plan.candidates {
+        for candidate in &inventory_candidates {
             if context.is_cancelled() {
                 return Err(SmartZipError::Cancelled);
             }
@@ -876,7 +886,7 @@ impl ArchiveExecutor for BackendRouter {
                 continue;
             };
             let family = registration.adapter.diagnostic_family();
-            if family != Some("7z") && !(self.forced_adapter.is_some() && family == Some("unrar")) {
+            if !matches!(family, Some("7z" | "unrar")) {
                 continue;
             }
             attempted.push(candidate.adapter_id.clone());

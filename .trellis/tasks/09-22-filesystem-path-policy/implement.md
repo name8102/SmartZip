@@ -51,8 +51,16 @@ python3 scripts/path_policy_acceptance.py \
 | APFS Native/Portable | 本轮已在真实卷验证名称探测、受控提取、布局、预算、取消/清理和恢复 |
 | Linux/Btrfs、Windows/NTFS | 平台代码与规则已实现，Linux/Windows platform 交叉编译通过；本轮没有对应物理卷原生验收 |
 | 普通单卷 ZIP/7z，以及可完整列出并唯一选择的 7-Zip 普通成员 | 可受控映射提取；已完成上述实际格式验证 |
-| 普通无需映射的 7-Zip 分卷 | 保留固定后端批量提取，全部卷身份绑定；已回归 ZIP/7z/spanned ZIP |
+| 普通无需映射的 RAR 与 7-Zip 分卷 | 经原路由批量提取并保留后端优先级/回退，全部卷身份绑定；已回归 RAR 与 ZIP/7z/spanned ZIP |
 | 需要映射的分卷、Unrar 受控流、链接/特殊类型、选择歧义、无法完整恢复的特殊元数据 | 明确 `path_remap_unsupported`；不静默降级或丢弃成员 |
 | 任意深路径 | 不承诺；名称和祖先可确定性缩短，无法在完整 API 预算内保留最小目录树时返回 `path_too_long` |
 
 Hybrid、RAR5 映射、完整 xattr/ACL/ADS、三平台性能数据及 GUI 视觉截图验收尚未完成。solid 全受控路线可能重复解码；本次内容正确性测试不构成性能承诺。Windows 交叉检查启用 BLAKE3 pure feature，以避开本机缺失的 Windows C SDK；没有用交叉编译代替 NTFS 运行证据。
+
+## 2026-10-11：恢复普通 RAR 路由
+
+路径预检后的 `BulkOriginal` 曾直接调用固定 7-Zip session，绕过原路由的 UnRAR 优先级和 codec fallback。本机 Nix 7zz 26.02 的构建参数包含 `DISABLE_RAR_COMPRESS=true`，可列出 RAR5，但 `7zz i` 无 RAR decoder；JPEG 内嵌压缩 RAR5 因而在正确密码后报 `UnsupportedCodec`。旧 RAR4 样本验收未覆盖这一混合后端回退场景。
+
+无需映射的批量提取恢复 `extract_with_facts_and_context`，先由 `ControlledRoot` 安全移除命名空间探针遗留目录，再交原路由执行与清理后回退；完成后仍校验冻结输入及输出清单。准备阶段保留 7-Zip indexed inventory 优先，避免破坏已有映射能力；仅有 UnRAR 时也可准备普通清单，必须改名时仍拒绝，不能静默解压原名。
+
+验收：`path_compatibility` 原有 8 项及新增 2 项回归通过，覆盖 UnRAR 优先、7-Zip codec 失败后清除部分输出再回退、UnRAR-only 含目录解压及无法受控映射时拒绝。更新本机 CLI 后，用只读状态库、临时输出和保留内层归档策略验收 `R4230.jpg`：RAR5 → 7z → RAR 共 3 个归档成功，退出码 0；源 SHA-256 不变，无 `.smartzip-*` 残留。验收未修改密码库或源文件。

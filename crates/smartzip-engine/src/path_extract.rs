@@ -87,7 +87,14 @@ pub(crate) async fn extract<B: ArchiveExecutor>(
         });
     let result =
         if report.changed_count() == 0 && session.supports_bulk_original() && bulk_metadata_safe {
-            session.execute_bulk(context.clone()).await?
+            // Namespace probes leave empty directories. Ordinary routing owns
+            // an empty staging tree and cleans failed adapters before fallback.
+            root.clear_verified_namespace()?;
+            let result = backend
+                .extract_with_facts_and_context(request.clone(), facts, context.clone())
+                .await?;
+            session.verify_source().await?;
+            result
         } else if session.supports_managed() {
             let sink = Arc::new(OutputSink::new(
                 root,
@@ -124,6 +131,7 @@ pub(crate) async fn extract<B: ArchiveExecutor>(
                 d.policy = Some(policy);
                 return Err(d.error());
             }
+            root.clear_verified_namespace()?;
             let result = backend
                 .extract_with_facts_and_context(request.clone(), facts, context.clone())
                 .await?;

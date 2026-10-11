@@ -51,6 +51,18 @@ async fn run_with_layout(
     byte_limit: u64,
     layout: smartzip_config::Layout,
 ) -> smartzip_engine::ExtractWorkflowResult {
+    let backend = BackendRouter::from_config(&smartzip_config::BackendConfig::default()).unwrap();
+    run_with_backend(input, output, mode, byte_limit, layout, &backend).await
+}
+
+async fn run_with_backend(
+    input: PathBuf,
+    output: PathBuf,
+    mode: PathMode,
+    byte_limit: u64,
+    layout: smartzip_config::Layout,
+    backend: &BackendRouter,
+) -> smartzip_engine::ExtractWorkflowResult {
     let mut values = smartzip_config::SmartZipConfig::default();
     values.state.mode = smartzip_config::StateMode::Off;
     values.extraction.recursion.enabled = false;
@@ -69,7 +81,6 @@ async fn run_with_layout(
         path: None,
         diagnostics: vec![],
     };
-    let backend = BackendRouter::from_config(&resolved.values.backends).unwrap();
     let policy = CompiledRunPolicy::compile(resolved).unwrap();
     let task = PreparedExtractTask::new(
         policy,
@@ -92,13 +103,154 @@ async fn run_with_layout(
     .unwrap();
     task.run(
         SmartZipEngine::default(),
-        &backend,
+        backend,
         None,
         ExtractInteraction::default(),
         ExtractObserver::default(),
     )
     .await
     .unwrap()
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn ordinary_rar_preserves_unrar_routing_and_codec_fallback_after_path_preflight() {
+    use smartzip_archive::{
+        AdapterRegistration, SevenZipBackend, SevenZipLocator, UnrarBackend, UnrarLocator,
+    };
+    use smartzip_core::RouteEvent;
+    use std::os::unix::fs::PermissionsExt;
+    let Some(unrar) = UnrarLocator::default().locate() else {
+        return;
+    };
+    let Some(seven) = SevenZipLocator::default().locate() else {
+        return;
+    };
+    let root = tempfile::tempdir().unwrap();
+    let input = root.path().join("ordinary.rar");
+    std::fs::write(
+        &input,
+        include_bytes!("../../smartzip-archive/tests/fixtures/rar-ordinary.rar"),
+    )
+    .unwrap();
+    let wrapper = root.path().join("seven-without-rar-decoder");
+    // Real 7-Zip inventory, but a decoder failure leaves output that the router
+    // must remove before handing the same attempt to UnRAR.
+    std::fs::write(&wrapper, format!(r#"#!/bin/sh
+if [ "$1" = x ]; then
+    for arg in "$@"; do
+        case "$arg" in -o*) mkdir -p "${{arg#-o}}"; printf 'partial' > "${{arg#-o}}/partial.bin";; esac
+    done
+    printf 'ERROR: Unsupported Method : file.txt\n' >&2
+    exit 2
+fi
+exec '{}' "$@"
+"#, seven.display())).unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    for (name, priority, with_seven) in [
+        ("unrar-first", 20, true),
+        ("codec-fallback", 0, true),
+        ("unrar-only", 20, false),
+    ] {
+        let mut adapters = vec![AdapterRegistration::from_adapter(
+            UnrarBackend::new(unrar.clone()),
+            priority,
+        )];
+        if with_seven {
+            adapters.push(AdapterRegistration::from_adapter(
+                SevenZipBackend::new(wrapper.clone()),
+                10,
+            ));
+        }
+        let backend = BackendRouter::from_adapters(adapters);
+        let output = root.path().join(name);
+        let result = run_with_backend(
+            input.clone(),
+            output.clone(),
+            PathMode::Native,
+            0,
+            smartzip_config::Layout::Raw,
+            &backend,
+        )
+        .await;
+        assert_eq!(result.failed_count, 0, "{name}: {:?}", result.events);
+        assert_eq!(result.processed.len(), 1);
+        let report = &result.path_reports[0];
+        assert_eq!(report.entries.len(), 4);
+        assert_eq!(report.changed_count(), 0);
+        // Keep an indexed 7-Zip inventory available for mappings even when
+        // UnRAR has higher priority for the ordinary extraction route.
+        assert!(report
+            .adapter_id
+            .starts_with(if with_seven { "sevenzip:" } else { "unrar:" }));
+        for entry in &report.entries {
+            let path = output.join(&entry.final_relative);
+            if entry.is_dir {
+                assert!(path.is_dir());
+            } else {
+                assert_eq!(std::fs::read(path).unwrap(), b"test text document\r\n");
+            }
+        }
+        assert!(!output.join("partial.bin").exists());
+        assert!(result.events.iter().any(|event| matches!(&event.kind, TaskEventKind::Route(RouteEvent::BackendSelected { adapter_id }) if adapter_id.starts_with("unrar:"))));
+        if name == "codec-fallback" {
+            assert!(result.events.iter().any(|event| matches!(&event.kind, TaskEventKind::Route(RouteEvent::BackendAttemptFailed { class, .. }) if class == "unsupported-codec")));
+            assert!(result.events.iter().any(|event| matches!(
+                &event.kind,
+                TaskEventKind::Route(RouteEvent::BackendAttemptCleaned { .. })
+            )));
+        }
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rar_required_mapping_does_not_fall_back_to_original_names_without_indexed_content() {
+    use smartzip_archive::{AdapterRegistration, UnrarBackend};
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let input = root.path().join("mapping.rar");
+    std::fs::write(
+        &input,
+        include_bytes!("../../smartzip-archive/tests/fixtures/rar-ordinary.rar"),
+    )
+    .unwrap();
+    let unrar = root.path().join("unrar");
+    std::fs::write(
+        &unrar,
+        r#"#!/bin/sh
+case "$1" in
+lt) printf 'Name: bad:name.txt\nType: File\nSize: 1\nAttributes: A\n';;
+lb) printf 'bad:name.txt\n';;
+x) touch "$0.extracted"; exit 99;;
+esac
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&unrar, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let backend = BackendRouter::from_adapters(vec![AdapterRegistration::from_adapter(
+        UnrarBackend::new(unrar.clone()),
+        20,
+    )]);
+    let output = root.path().join("output");
+    let result = run_with_backend(
+        input,
+        output.clone(),
+        PathMode::Portable,
+        0,
+        smartzip_config::Layout::Raw,
+        &backend,
+    )
+    .await;
+    assert_eq!(result.failed_count, 1);
+    assert!(result.events.iter().any(|event| matches!(&event.kind, TaskEventKind::PathConstraintFailed { reason, .. } if reason == "path_remap_unsupported")), "{:?}", result.events);
+    assert!(!root.path().join("unrar.extracted").exists());
+    assert!(!output.join("bad:name.txt").exists());
+    assert!(!std::fs::read_dir(root.path()).unwrap().any(|entry| entry
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .starts_with(".smartzip-")));
 }
 
 #[tokio::test]
