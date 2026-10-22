@@ -64,7 +64,7 @@ pub struct ConfigLists {
     sources: Vec<PasswordSource>,
     next: usize,
     pub saving: bool,
-    pub show_backends: bool,
+    show_backends: bool,
     diagnostics: Option<Result<Vec<serde_json::Value>, String>>,
     checking: bool,
 }
@@ -80,29 +80,39 @@ fn source_label(s: PasswordSource) -> &'static str {
 impl ConfigLists {
     pub fn new(
         config: &smartzip_config::SmartZipConfig,
+        backends: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let installations = config
-            .backends
-            .installations
-            .iter()
-            .cloned()
-            .enumerate()
-            .map(|(i, b)| Installation::new(i, b, window, cx))
-            .collect();
+        let installations = if backends {
+            config
+                .backends
+                .installations
+                .iter()
+                .cloned()
+                .enumerate()
+                .map(|(i, b)| Installation::new(i, b, window, cx))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let next = installations.len();
         Self {
             installations,
-            sources: config.passwords.sources.clone(),
-            next: config.backends.installations.len(),
+            sources: if backends {
+                Vec::new()
+            } else {
+                config.passwords.sources.clone()
+            },
+            next,
             saving: false,
-            show_backends: false,
+            show_backends: backends,
             diagnostics: None,
             checking: false,
         }
     }
-    pub fn value(&self, backends: bool, cx: &App) -> String {
-        if !backends {
+    pub fn value(&self, cx: &App) -> String {
+        if !self.show_backends {
             return toml::Value::try_from(&self.sources).unwrap().to_string();
         }
         let rows: Vec<_> = self

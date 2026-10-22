@@ -31,7 +31,6 @@ pub(super) struct Workspace {
     pub(super) history_detail: Option<library::TaskDetail>,
     pub(super) history_detail_request: Option<String>,
     pub(super) passwords: Vec<PasswordSummary>,
-    pub(super) document: String,
     pub(super) library_busy: bool,
     pub(super) preferences: crate::preferences::Preferences,
     pub(super) preferences_writer: mpsc::Sender<(u64, crate::preferences::Preferences)>,
@@ -53,7 +52,7 @@ pub(super) enum LibraryMessage {
     Passwords(u64, Result<library::Page<PasswordSummary>, String>),
     TaskDetail(String, Result<library::TaskDetail, String>),
     Recovery(Result<Vec<library::RecoverySummary>, String>),
-    Document(Result<String, String>),
+    Message(Result<String, String>),
     Mutation(Result<String, String>),
 }
 impl Workspace {
@@ -237,10 +236,9 @@ impl Workspace {
                                     }
                                 }
                             }
-                            LibraryMessage::Document(result) => match result {
-                                Ok(text) => state.document = text,
-                                Err(e) => state.message = e,
-                            },
+                            LibraryMessage::Message(result) => {
+                                state.message = result.unwrap_or_else(|e| e);
+                            }
                             LibraryMessage::Mutation(result) => {
                                 let refresh = result.is_ok();
                                 state.message = result.unwrap_or_else(|e| e);
@@ -300,7 +298,6 @@ impl Workspace {
             history_detail: None,
             history_detail_request: None,
             passwords: vec![],
-            document: String::new(),
             library_busy: false,
             preferences,
             preferences_writer,

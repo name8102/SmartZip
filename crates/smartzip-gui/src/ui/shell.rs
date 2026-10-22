@@ -260,7 +260,7 @@ impl Render for View {
             .on_action(cx.listener(|this, _: &Search, window, cx| {
                 use gpui::Focusable;
                 if this.page == Page::Settings {
-                    if let Some(form) = &this.config_form {
+                    if let Some(form) = this.shared.read(cx).settings_form.clone() {
                         form.update(cx, |form, cx| form.focus_search(window, cx));
                     }
                     return;

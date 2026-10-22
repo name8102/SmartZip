@@ -78,12 +78,12 @@ impl View {
                     .icon(IconName::SlidersHorizontal)
                     .label("解压选项")
                     .on_click(cx.listener(|this, _, _, cx| {
-                        this.queue_settings_open = !this.queue_settings_open;
-                        this.shared.update(cx, |state, _| {
-                            state.preferences.queue_settings_open = this.queue_settings_open;
+                        this.shared.update(cx, |state, cx| {
+                            state.preferences.queue_settings_open =
+                                !state.preferences.queue_settings_open;
                             state.persist_preferences();
+                            cx.notify();
                         });
-                        cx.notify();
                     })),
             )
             .child(
@@ -221,10 +221,10 @@ impl View {
         let state = self.shared.read(cx);
         let empty = state.queue.jobs.is_empty();
         let detail_width = state.preferences.detail_width;
+        let queue_settings_open = state.preferences.queue_settings_open;
         let resize_workspace = self.shared.clone();
         let show_detail = state.preferences.detail_visible && state.queue.selected().is_some();
-        let inspector =
-            (self.queue_settings_open || show_detail) && self.selected_prompt(cx).is_none();
+        let inspector = (queue_settings_open || show_detail) && self.selected_prompt(cx).is_none();
         let list = div()
             .flex()
             .flex_col()
@@ -272,7 +272,7 @@ impl View {
                             div()
                                 .text_base()
                                 .font_weight(gpui::FontWeight::SEMIBOLD)
-                                .child(if self.queue_settings_open {
+                                .child(if queue_settings_open {
                                     "解压选项"
                                 } else {
                                     "详情"
@@ -283,16 +283,19 @@ impl View {
                                 .icon(IconName::X)
                                 .tooltip("关闭侧栏")
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    if this.queue_settings_open {
-                                        this.queue_settings_open = false;
-                                    } else {
-                                        this.change_appearance(|p| p.detail_visible = false, cx);
-                                    }
-                                    cx.notify();
+                                    this.shared.update(cx, |state, cx| {
+                                        if state.preferences.queue_settings_open {
+                                            state.preferences.queue_settings_open = false;
+                                        } else {
+                                            state.preferences.detail_visible = false;
+                                        }
+                                        state.persist_preferences();
+                                        cx.notify();
+                                    });
                                 })),
                         ),
                 )
-                .child(if self.queue_settings_open {
+                .child(if queue_settings_open {
                     self.quick_controls(None, cx).into_any_element()
                 } else {
                     self.detail(cx).into_any_element()

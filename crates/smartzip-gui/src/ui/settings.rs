@@ -11,17 +11,17 @@ impl View {
         let revision = state.config_revision;
         let snapshot = state.config.clone();
         let busy = state.library_busy;
-        if self.form_revision != revision || self.config_form.is_none() {
-            self.config_form = snapshot.as_ref().map(|snapshot| {
+        if state.settings_form_revision != revision || state.settings_form.is_none() {
+            let form = snapshot.as_ref().map(|snapshot| {
                 cx.new(|cx| crate::config_form::ConfigForm::new(snapshot, window, cx))
             });
-            self.form_revision = revision;
             self.shared.update(cx, |state, _| {
-                state.settings_form = self.config_form.clone();
+                state.settings_form = form;
                 state.settings_form_revision = revision;
             });
         }
-        if let Some(form) = &self.config_form {
+        let form = self.shared.read(cx).settings_form.clone();
+        if let Some(form) = &form {
             form.update(cx, |form, _| form.saving = busy);
         }
         let path = snapshot
@@ -50,9 +50,9 @@ impl View {
                         control("save-config")
                             .primary()
                             .label("保存修改")
-                            .disabled(busy || self.config_form.is_none())
+                            .disabled(busy || form.is_none())
                             .on_click(cx.listener(|this, _, _, cx| {
-                                let Some(form) = &this.config_form else {
+                                let Some(form) = &this.shared.read(cx).settings_form else {
                                     return;
                                 };
                                 let patches = form.read(cx).patches(cx);
@@ -82,7 +82,6 @@ impl View {
                             .on_click(cx.listener(|this, _, window, cx| {
                                 let answer = confirm(
                                     window,
-                                    gpui::PromptLevel::Warning,
                                     "放弃未保存的修改？",
                                     Some("重新加载磁盘上的配置，当前表单修改将丢失。"),
                                     &["继续编辑", "放弃并重新加载"],
@@ -136,7 +135,7 @@ impl View {
                                     PopupMenuItem::new("迁移预览").on_click(move |_, _, cx| {
                                         migrate.update(cx, |state, cx| {
                                             state.background(|| {
-                                                LibraryMessage::Document(library::migrate_config(
+                                                LibraryMessage::Message(library::migrate_config(
                                                     &LibraryOptions::default(),
                                                     false,
                                                 ))
@@ -148,6 +147,6 @@ impl View {
                             }),
                     ),
             )
-            .children(self.config_form.clone())
+            .children(form)
     }
 }

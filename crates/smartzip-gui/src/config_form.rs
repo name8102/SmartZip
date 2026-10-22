@@ -55,7 +55,7 @@ impl ConfigForm {
                         .to_owned(),
                     _ => current.map(ToString::to_string).unwrap_or_default(),
                 };
-                let input = matches!(field.kind, Kind::Text | Kind::Number | Kind::Toml)
+                let input = matches!(field.kind, Kind::Text | Kind::Number)
                     .then(|| cx.new(|cx| InputState::new(window, cx).default_value(text.clone())));
                 let select = if let Kind::Choice(options) = field.kind {
                     let labels: Vec<SharedString> =
@@ -87,13 +87,11 @@ impl ConfigForm {
             .collect();
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("搜索设置…"));
         let backend_list = cx.new(|cx| {
-            let mut list =
-                crate::config_lists::ConfigLists::new(&snapshot.resolved.values, window, cx);
-            list.show_backends = true;
-            list
+            crate::config_lists::ConfigLists::new(&snapshot.resolved.values, true, window, cx)
         });
-        let source_list = cx
-            .new(|cx| crate::config_lists::ConfigLists::new(&snapshot.resolved.values, window, cx));
+        let source_list = cx.new(|cx| {
+            crate::config_lists::ConfigLists::new(&snapshot.resolved.values, false, window, cx)
+        });
         let mut subscriptions = vec![
             cx.observe(&search, |_, _, cx| cx.notify()),
             cx.observe(&backend_list, |_, _, cx| cx.notify()),
@@ -132,10 +130,7 @@ impl ConfigForm {
                 if draft.reset {
                     return Some((draft.field.key.into(), None));
                 }
-                let value = if matches!(
-                    draft.field.key,
-                    "backends.installations" | "passwords.sources"
-                ) {
+                let value = if draft.field.kind == Kind::List {
                     let backends = draft.field.key == "backends.installations";
                     (if backends {
                         &self.backend_list
@@ -143,7 +138,7 @@ impl ConfigForm {
                         &self.source_list
                     })
                     .read(cx)
-                    .value(backends, cx)
+                    .value(cx)
                 } else if let (Kind::Choice(options), Some(select)) =
                     (draft.field.kind, &draft.select)
                 {
@@ -178,16 +173,17 @@ impl ConfigForm {
                 .text_color(cx.theme().muted_foreground)
                 .child("保存后恢复继承值")
                 .into_any_element()
-        } else if matches!(field.key, "backends.installations" | "passwords.sources") {
-            let list = if field.key == "backends.installations" {
-                &self.backend_list
-            } else {
-                &self.source_list
-            };
-            list.update(cx, |list, _| list.saving = self.saving);
-            list.clone().into_any_element()
         } else {
             match field.kind {
+                Kind::List => {
+                    let list = if field.key == "backends.installations" {
+                        &self.backend_list
+                    } else {
+                        &self.source_list
+                    };
+                    list.update(cx, |list, _| list.saving = self.saving);
+                    list.clone().into_any_element()
+                }
                 Kind::Bool => Switch::new(("setting-switch", index))
                     .accessibility_label(field.label)
                     .large()
@@ -207,7 +203,7 @@ impl ConfigForm {
                 .large()
                 .disabled(self.saving)
                 .into_any_element(),
-                Kind::Text | Kind::Number | Kind::Toml => Input::new(
+                Kind::Text | Kind::Number => Input::new(
                     draft
                         .input
                         .as_ref()
@@ -223,7 +219,11 @@ impl ConfigForm {
                     .into_any_element(),
             }
         };
-        let is_list = matches!(field.key, "backends.installations" | "passwords.sources");
+        let (inline_editor, list_editor) = if field.kind == Kind::List {
+            (None, Some(editor))
+        } else {
+            (Some(editor), None)
+        };
         let help = format!(
             "{}\n{} · 来源：{}{}",
             field.help,
@@ -264,7 +264,7 @@ impl ConfigForm {
                                     .tooltip(help),
                             ),
                     )
-                    .when(!is_list, |row| {
+                    .when_some(inline_editor, |row, editor| {
                         row.child(div().flex_1().min_w(gpui::px(160.)).child(editor))
                     })
                     .when(field.kind != Kind::ReadOnly, |row| {
@@ -286,24 +286,8 @@ impl ConfigForm {
                         )
                     }),
             )
-            .when(is_list, |row| {
-                // The ordered editors need the full content width.
-                let list = if field.key == "backends.installations" {
-                    &self.backend_list
-                } else {
-                    &self.source_list
-                };
-                if draft.reset {
-                    row.child(
-                        div()
-                            .text_base()
-                            .text_color(cx.theme().muted_foreground)
-                            .child("保存后恢复继承值"),
-                    )
-                } else {
-                    row.child(list.clone())
-                }
-            })
+            // The ordered editors need the full content width.
+            .when_some(list_editor, |row, editor| row.child(editor))
     }
 }
 
@@ -387,28 +371,5 @@ mod tests {
         let encoded = encode_edit(Kind::Text, path.into()).unwrap();
         let parsed = format!("value = {encoded}").parse::<toml::Value>().unwrap();
         assert_eq!(parsed["value"].as_str(), Some(path));
-    }
-
-    #[test]
-    fn advanced_arrays_round_trip_as_editable_toml() {
-        let mut config = smartzip_config::SmartZipConfig::default();
-        config
-            .backends
-            .installations
-            .push(smartzip_config::BackendInstallation {
-                id: "custom".into(),
-                family: smartzip_config::AdapterFamily::SevenZipCli,
-                executable: "/Applications/7 Zip/7zz".into(),
-                declared_version: None,
-                enabled: true,
-                priority: 10,
-            });
-        let config = toml::Value::try_from(&config).unwrap();
-        for key in ["passwords.sources", "backends.installations"] {
-            let value = smartzip_config::value_at(&config, key).unwrap();
-            let edited = encode_edit(Kind::Toml, value.to_string()).unwrap();
-            let parsed = format!("value = {edited}").parse::<toml::Value>().unwrap();
-            assert_eq!(&parsed["value"], value, "{key}");
-        }
     }
 }

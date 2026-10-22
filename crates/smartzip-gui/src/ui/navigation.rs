@@ -26,7 +26,7 @@ impl View {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let collapsed = self.sidebar_collapsed || narrow;
+        let collapsed = self.shared.read(cx).preferences.sidebar_collapsed || narrow;
         let queue = &self.shared.read(cx).queue;
         let active = queue.jobs.iter().filter(|job| job.phase.active()).count();
         Sidebar::new("main-sidebar")
@@ -132,13 +132,12 @@ impl View {
                                 .when(!collapsed, |el| el.justify_end())
                                 .child(SidebarToggleButton::new().collapsed(collapsed).on_click(
                                     cx.listener(|this, _, _, cx| {
-                                        this.sidebar_collapsed = !this.sidebar_collapsed;
-                                        this.shared.update(cx, |state, _| {
+                                        this.shared.update(cx, |state, cx| {
                                             state.preferences.sidebar_collapsed =
-                                                this.sidebar_collapsed;
+                                                !state.preferences.sidebar_collapsed;
                                             state.persist_preferences();
+                                            cx.notify();
                                         });
-                                        cx.notify();
                                     }),
                                 )),
                         )

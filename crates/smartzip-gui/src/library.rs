@@ -124,14 +124,6 @@ fn database(options: &LibraryOptions, write: bool) -> Result<SmartZipDb> {
     }
 }
 
-#[cfg(test)]
-pub fn load_history(options: &LibraryOptions, limit: usize) -> Result<Vec<TaskRecord>> {
-    let db = database(options, false)?;
-    TaskRepository::new(db.connection())
-        .recent(limit.min(i64::MAX as usize))
-        .map_err(|e| e.to_string())
-}
-
 pub fn load_task_detail(options: &LibraryOptions, id: &str) -> Result<TaskDetail> {
     let db = database(options, false)?;
     let task = TaskRepository::new(db.connection())
@@ -160,48 +152,6 @@ pub fn load_task_detail(options: &LibraryOptions, id: &str) -> Result<TaskDetail
     })
 }
 
-#[cfg(test)]
-pub fn load_file_history(
-    options: &LibraryOptions,
-    status: Option<&str>,
-    reason: Option<&str>,
-    limit: usize,
-) -> Result<Vec<FileExtractionRecord>> {
-    let db = database(options, false)?;
-    let repo = FileExtractionRepository::new(db.connection());
-    let limit = limit.min(i64::MAX as usize);
-    match (status, reason) {
-        (Some(s), Some(r)) => repo.list_by_status_and_reason(s, r, limit),
-        (Some(s), None) => repo.list_by_status(s, limit),
-        (None, Some(r)) => repo.list_by_reason(r, limit),
-        (None, None) => repo.recent(limit),
-    }
-    .map_err(|e| e.to_string())
-}
-
-#[cfg(test)]
-pub fn list_passwords(options: &LibraryOptions, limit: usize) -> Result<Vec<PasswordSummary>> {
-    let db = database(options, false)?;
-    PasswordRepository::new(db.connection())
-        .ranked_candidates(limit.min(i64::MAX as usize))
-        .map(|rows| {
-            rows.into_iter()
-                .map(|p| PasswordSummary {
-                    id: p.id,
-                    masked: "••••••••",
-                    source: p.source,
-                    pinned: p.pinned,
-                    disabled: p.disabled,
-                    success_count: p.success_count,
-                    failure_count: p.failure_count,
-                    last_success_at: p.last_success_at,
-                    last_failure_at: p.last_failure_at,
-                })
-                .collect()
-        })
-        .map_err(|_| "无法读取密码库".into())
-}
-
 pub fn read_password(options: &LibraryOptions, id: i64) -> Result<String> {
     let db = database(options, false)?;
     PasswordRepository::new(db.connection())
@@ -228,14 +178,6 @@ pub fn add_password(
             pinned,
         })
         .map_err(|_| "无法保存密码".into())
-}
-
-#[cfg(test)]
-pub fn remove_password(options: &LibraryOptions, id: i64) -> Result<()> {
-    let db = database(options, true)?;
-    PasswordRepository::new(db.connection())
-        .delete(id)
-        .map_err(|_| "无法删除密码".into())
 }
 
 pub fn import_passwords(options: &LibraryOptions, path: &Path, source: &str) -> Result<u64> {
@@ -319,15 +261,6 @@ pub fn cleanup_passwords(
     Ok(ids)
 }
 
-#[cfg(test)]
-pub fn set_config(
-    options: &LibraryOptions,
-    key: &str,
-    toml_value: Option<&str>,
-) -> Result<ConfigSnapshot> {
-    set_config_fields(options, &[(key.to_owned(), toml_value.map(str::to_owned))])
-}
-
 pub fn set_config_fields(
     options: &LibraryOptions,
     patches: &[(String, Option<String>)],
@@ -377,14 +310,27 @@ mod tests {
     fn state_policy_prevents_writes_and_reading_never_creates_database() {
         let root = tempfile::tempdir().unwrap();
         let options = options(root.path(), "read-write");
-        assert!(load_history(&options, 10).unwrap().is_empty());
+        assert!(history_page(&options, &Query::default())
+            .unwrap()
+            .rows
+            .is_empty());
         assert!(!options.database_path.as_ref().unwrap().exists());
         let id = add_password(&options, "secret", "manual", true).unwrap();
-        set_config(&options, "state.mode", Some("\"read-only\"")).unwrap();
-        assert_eq!(list_passwords(&options, 10).unwrap().len(), 1);
-        assert!(remove_password(&options, id).is_err());
-        set_config(&options, "state.mode", Some("\"off\"")).unwrap();
-        assert!(list_passwords(&options, 10).is_err());
+        set_config_fields(
+            &options,
+            &[("state.mode".into(), Some("\"read-only\"".into()))],
+        )
+        .unwrap();
+        assert_eq!(
+            password_page(&options, &Query::default())
+                .unwrap()
+                .rows
+                .len(),
+            1
+        );
+        assert!(change_passwords(&options, &[id], PasswordAction::Delete).is_err());
+        set_config_fields(&options, &[("state.mode".into(), Some("\"off\"".into()))]).unwrap();
+        assert!(password_page(&options, &Query::default()).is_err());
         assert!(add_password(&options, "secret", "manual", false).is_err());
     }
     #[test]
@@ -392,12 +338,18 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let options = options(root.path(), "read-write");
         let id = add_password(&options, "private-value", "manual", true).unwrap();
-        let rows = list_passwords(&options, 10).unwrap();
+        let rows = password_page(&options, &Query::default()).unwrap().rows;
         assert!(!format!("{rows:?}").contains("private-value"));
         let input = root.path().join("input.txt");
         std::fs::write(&input, b"rolled-back\n\xff").unwrap();
         assert!(import_passwords(&options, &input, "import").is_err());
-        assert_eq!(list_passwords(&options, 10).unwrap().len(), 1);
+        assert_eq!(
+            password_page(&options, &Query::default())
+                .unwrap()
+                .rows
+                .len(),
+            1
+        );
         let output = root.path().join("output.txt");
         assert_eq!(export_passwords(&options, &output).unwrap(), 1);
         assert_eq!(std::fs::read_to_string(&output).unwrap(), "private-value\n");
@@ -414,8 +366,11 @@ mod tests {
         assert!(cleanup_passwords(&options, 0, Some(1), true)
             .unwrap()
             .is_empty());
-        remove_password(&options, id).unwrap();
-        assert!(list_passwords(&options, 10).unwrap().is_empty());
+        change_passwords(&options, &[id], PasswordAction::Delete).unwrap();
+        assert!(password_page(&options, &Query::default())
+            .unwrap()
+            .rows
+            .is_empty());
     }
 
     #[test]
@@ -423,15 +378,19 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let options = options(root.path(), "read-write");
         let id = add_password(&options, "private-value", "manual", true).unwrap();
-        let rows = list_passwords(&options, 1).unwrap();
+        let rows = password_page(&options, &Query::default()).unwrap().rows;
         assert_eq!(rows[0].id, id);
         assert_eq!(rows[0].masked, "••••••••");
         assert_eq!(read_password(&options, id).unwrap(), "private-value");
         assert!(read_password(&options, id + 100).is_err());
 
-        set_config(&options, "state.mode", Some("\"read-only\"")).unwrap();
+        set_config_fields(
+            &options,
+            &[("state.mode".into(), Some("\"read-only\"".into()))],
+        )
+        .unwrap();
         assert_eq!(read_password(&options, id).unwrap(), "private-value");
-        set_config(&options, "state.mode", Some("\"off\"")).unwrap();
+        set_config_fields(&options, &[("state.mode".into(), Some("\"off\"".into()))]).unwrap();
         assert!(read_password(&options, id).is_err());
     }
 
@@ -460,16 +419,15 @@ mod tests {
             .unwrap();
         db.connection().execute("INSERT INTO file_extractions(task_id, input_path, status, created_at) VALUES ('recorded', '/input.zip', 'extracted', '2026-09-12T01:00:00Z')", []).unwrap();
         drop(db);
-        assert_eq!(load_history(&options, 10).unwrap()[0].id, "recorded");
+        assert_eq!(
+            history_page(&options, &Query::default()).unwrap().rows[0]
+                .task
+                .id,
+            "recorded"
+        );
         let detail = load_task_detail(&options, "recorded").unwrap();
         assert_eq!(detail.files[0].input_path, "/input.zip");
         assert_eq!(detail.events[0].message, "开始");
-        assert_eq!(
-            load_file_history(&options, Some("extracted"), None, 10)
-                .unwrap()
-                .len(),
-            1
-        );
     }
     #[test]
     fn initialization_works_for_an_explicit_missing_file() {
@@ -493,12 +451,26 @@ mod tests {
             cleanup_passwords(&options, 100, Some(1), false).unwrap(),
             vec![stale]
         );
-        assert_eq!(list_passwords(&options, 10).unwrap().len(), 2);
+        assert_eq!(
+            password_page(&options, &Query::default())
+                .unwrap()
+                .rows
+                .len(),
+            2
+        );
         assert_eq!(
             cleanup_passwords(&options, 100, Some(1), true).unwrap(),
             vec![stale]
         );
-        let remaining = list_passwords(&options, 10).unwrap();
+        let remaining = password_page(
+            &options,
+            &Query {
+                status: "enabled".into(),
+                ..Query::default()
+            },
+        )
+        .unwrap()
+        .rows;
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].id, pinned);
         assert!(cleanup_passwords(&options, 0, Some(u64::MAX), true).is_err());
@@ -546,7 +518,11 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let options = options(root.path(), "read-write");
         let original = std::fs::read(options.config_path.as_ref().unwrap()).unwrap();
-        assert!(set_config(&options, "state.mode", Some("\"invalid\"")).is_err());
+        assert!(set_config_fields(
+            &options,
+            &[("state.mode".into(), Some("\"invalid\"".into()))]
+        )
+        .is_err());
         assert_eq!(
             std::fs::read(options.config_path.as_ref().unwrap()).unwrap(),
             original

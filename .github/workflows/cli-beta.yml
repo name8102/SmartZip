@@ -42,7 +42,7 @@ jobs:
       - name: Workspace and GUI worker tests (no native windows)
         run: |
           cargo test --workspace --locked
-          cargo test --locked -p smartzip-gui --test runtime_worker -- --ignored
+          cargo test --locked -p smartzip-gui runtime::worker_tests -- --ignored
           python3 -m unittest discover -s scripts -p 'test_*.py'
       - name: Build CLI and GUI
         run: cargo build --release --locked -p smartzip-cli -p smartzip-gui --target ${{ matrix.target }}

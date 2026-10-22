@@ -1,8 +1,4 @@
-#[allow(dead_code)]
-#[path = "../src/runtime.rs"]
-mod runtime;
-
-use runtime::*;
+use super::*;
 use std::{
     path::Path,
     time::{Duration, Instant},

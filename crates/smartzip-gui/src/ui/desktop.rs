@@ -1,6 +1,6 @@
 use super::*;
 use crate::preferences::{ColorMode, Density};
-use gpui::{KeyBinding, Menu, MenuItem, PromptLevel};
+use gpui::{KeyBinding, Menu, MenuItem};
 
 gpui::actions!(
     smartzip,
@@ -104,10 +104,14 @@ pub(super) fn request_exit(shared: Entity<Workspace>, window: &mut Window, cx: &
         "队列保存失败。退出会取消当前任务并等待清理，但未保存的变更可能丢失，下次启动可能再次显示旧队列。可以继续使用并重试保存。"
     } else {
         match (dirty, work) {
-        (true, true) => "偏好设置有未保存的修改，仍有任务正在执行或等待。退出会放弃设置修改、取消任务，并等待后端退出与临时文件清理。",
-        (true, false) => "偏好设置有未保存的修改。可以返回设置保存，或放弃修改并退出。",
-        _ => "仍有任务正在执行或等待。退出会取消当前任务与等待队列，并等待后端退出与临时文件清理。",
-    }
+            (true, true) => {
+                "偏好设置有未保存的修改，仍有任务正在执行或等待。退出会放弃设置修改、取消任务，并等待后端退出与临时文件清理。"
+            }
+            (true, false) => "偏好设置有未保存的修改。可以返回设置保存，或放弃修改并退出。",
+            _ => {
+                "仍有任务正在执行或等待。退出会取消当前任务与等待队列，并等待后端退出与临时文件清理。"
+            }
+        }
     };
     let mut choices = vec![
         "继续使用",
@@ -122,14 +126,7 @@ pub(super) fn request_exit(shared: Entity<Workspace>, window: &mut Window, cx: &
     if can_save_queue && work {
         choices.push("保存等待队列并退出");
     }
-    let answer = confirm(
-        window,
-        PromptLevel::Warning,
-        "退出 SmartZip？",
-        Some(detail),
-        &choices,
-        cx,
-    );
+    let answer = confirm(window, "退出 SmartZip？", Some(detail), &choices, cx);
     cx.spawn(async move |cx| {
         let choice = answer.await.ok();
         shared.update(cx, |state, cx| {

@@ -667,6 +667,9 @@ async fn run_job_inner(
 }
 
 #[cfg(test)]
+mod worker_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     #[test]

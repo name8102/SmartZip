@@ -109,7 +109,6 @@ impl View {
         if matches!(action, library::PasswordAction::Delete) {
             let answer = confirm(
                 window,
-                gpui::PromptLevel::Warning,
                 "删除密码记录？",
                 Some(&format!(
                     "将从本地密码库删除 {} 条记录。已有归档和输出不受影响，此操作无法撤销。",
@@ -227,7 +226,6 @@ impl View {
                             .on_click(cx.listener(|_, _, window, cx| {
                                 let answer = confirm(
                                     window,
-                                    gpui::PromptLevel::Warning,
                                     "导出明文密码？",
                                     Some(
                                         "所有启用的密码将写入本地文本文件，请选择可信的保存位置。",

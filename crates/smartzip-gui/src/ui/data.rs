@@ -87,7 +87,6 @@ pub(super) fn size_label(bytes: u64) -> String {
 /// Enter/Escape never accepts a destructive choice by accident.
 pub(super) fn confirm(
     window: &mut Window,
-    _level: gpui::PromptLevel,
     title: &str,
     detail: Option<&str>,
     choices: &[&str],

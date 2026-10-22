@@ -6,7 +6,7 @@ pub enum Kind {
     Choice(&'static [(&'static str, &'static str)]),
     Text,
     Number,
-    Toml,
+    List,
     ReadOnly,
 }
 
@@ -200,7 +200,7 @@ pub const SECTIONS: &[Section] = &[
                 "passwords.sources",
                 "候选来源顺序",
                 "按列表顺序尝试密码来源，可以添加、移除或上移。这里不保存密码明文。",
-                Kind::Toml
+                Kind::List
             ),
             field!(
                 "passwords.database_limit",
@@ -311,7 +311,7 @@ pub const SECTIONS: &[Section] = &[
                 "backends.installations",
                 "后端安装列表",
                 "添加已安装的 7-Zip 或 UnRAR，填写唯一名称与可执行文件路径。优先级越高越先尝试；禁用后保留配置。",
-                Kind::Toml
+                Kind::List
             ),
             field!(
                 "interaction.mode",

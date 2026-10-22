@@ -58,14 +58,12 @@ pub struct View {
     shared: Entity<Workspace>,
     quick: bool,
     page: Page,
-    sidebar_collapsed: bool,
     diagnostics_open: bool,
     task_config_open: bool,
     task_filter: usize,
     selected_file: Option<(u64, smartzip_core::NodeId)>,
     task_selection: std::collections::HashSet<(u64, smartzip_core::NodeId)>,
     expanded_roots: std::collections::HashSet<smartzip_core::NodeId>,
-    queue_settings_open: bool,
     detail_state: Option<(u64, Phase)>,
     prompt_job: Option<(bool, u64, u64)>,
     pending_selection: Option<(bool, u64)>,
@@ -76,7 +74,6 @@ pub struct View {
     password_reveal_generation: u64,
     task_password: Entity<InputState>,
     task_password_target: Option<u64>,
-    config_form: Option<Entity<crate::config_form::ConfigForm>>,
     member_preview: Entity<crate::member_preview::MemberPreview>,
     member_archive: Option<u64>,
     archive_dir: Vec<String>,
@@ -88,7 +85,6 @@ pub struct View {
     archive_sort_size: bool,
     preview_visible: bool,
     integration: Entity<crate::integration_ui::SystemIntegration>,
-    form_revision: u64,
     prompt_secret: Entity<InputState>,
     focus: gpui::FocusHandle,
     search: Entity<InputState>,
@@ -375,7 +371,6 @@ impl View {
         cx: &mut Context<Self>,
     ) -> Self {
         let subscription = cx.observe(&shared, |_, _, cx| cx.notify());
-        let preferences = shared.read(cx).preferences.clone();
         let appearance = cx.observe_window_appearance(window, |this, window, cx| {
             let preferences = this.shared.read(cx).preferences.clone();
             crate::appearance::apply(&preferences, Some(window), cx);
@@ -412,20 +407,16 @@ impl View {
         let cleanup_limit = cx.new(|cx| InputState::new(window, cx).default_value("128"));
         let focus = cx.focus_handle();
         window.focus(&focus, cx);
-        let retained_form = shared.read(cx).settings_form.clone();
-        let retained_revision = shared.read(cx).settings_form_revision;
         Self {
             shared,
             quick,
             page: Page::Tasks,
-            sidebar_collapsed: preferences.sidebar_collapsed,
             diagnostics_open: false,
             task_config_open: false,
             task_filter: 0,
             selected_file: None,
             task_selection: Default::default(),
             expanded_roots: std::collections::HashSet::new(),
-            queue_settings_open: preferences.queue_settings_open,
             detail_state: None,
             prompt_job: None,
             pending_selection: None,
@@ -444,7 +435,6 @@ impl View {
                     .placeholder("输入仅此任务使用的密码")
             }),
             task_password_target: None,
-            config_form: retained_form,
             member_preview: cx.new(|cx| crate::member_preview::MemberPreview::new(window, cx)),
             member_archive: None,
             archive_dir: Vec::new(),
@@ -453,7 +443,6 @@ impl View {
             archive_sort_size: false,
             preview_visible: true,
             integration: cx.new(crate::integration_ui::SystemIntegration::new),
-            form_revision: retained_revision,
             prompt_secret: cx.new(|cx| {
                 InputState::new(window, cx)
                     .masked(true)
