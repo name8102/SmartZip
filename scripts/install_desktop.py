@@ -56,6 +56,8 @@ def install_linux(binaries, destination):
     with tempfile.TemporaryDirectory(prefix='smartzip-package-') as temporary:
         source = Path(temporary)
         (source / 'bin').mkdir()
+        (source / 'licenses').mkdir()
+        shutil.copy2(ROOT / 'resources/fonts/OFL.txt', source / 'licenses/NotoSansCJK-OFL.txt')
         for name, binary in binaries.items():
             shutil.copy2(binary, source / 'bin' / name)
         version = subprocess.check_output([str(binaries['smartzip']), '--version'], text=True).strip()

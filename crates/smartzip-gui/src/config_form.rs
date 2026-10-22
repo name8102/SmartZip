@@ -9,6 +9,7 @@ use gpui::component::{
     input::{Input, InputState},
     select::{Select, SelectState},
     switch::Switch,
+    tab::{Tab, TabBar},
     ActiveTheme, IndexPath, Sizable,
 };
 use gpui::Focusable;
@@ -84,8 +85,7 @@ impl ConfigForm {
                 }
             })
             .collect();
-        let search =
-            cx.new(|cx| InputState::new(window, cx).placeholder("搜索设置名称、说明或配置键…"));
+        let search = cx.new(|cx| InputState::new(window, cx).placeholder("搜索设置…"));
         let backend_list = cx.new(|cx| {
             let mut list =
                 crate::config_lists::ConfigLists::new(&snapshot.resolved.values, window, cx);
@@ -174,7 +174,7 @@ impl ConfigForm {
         let field = draft.field;
         let editor = if draft.reset {
             div()
-                .text_sm()
+                .text_base()
                 .text_color(cx.theme().muted_foreground)
                 .child("保存后恢复继承值")
                 .into_any_element()
@@ -189,7 +189,8 @@ impl ConfigForm {
         } else {
             match field.kind {
                 Kind::Bool => Switch::new(("setting-switch", index))
-                    .small()
+                    .accessibility_label(field.label)
+                    .large()
                     .disabled(self.saving)
                     .checked(draft.value == "true")
                     .on_change(cx.listener(move |this, checked: &bool, _, cx| {
@@ -203,7 +204,7 @@ impl ConfigForm {
                         .as_ref()
                         .expect("choice field has select state"),
                 )
-                .small()
+                .large()
                 .disabled(self.saving)
                 .into_any_element(),
                 Kind::Text | Kind::Number | Kind::Toml => Input::new(
@@ -212,35 +213,60 @@ impl ConfigForm {
                         .as_ref()
                         .expect("editable text field has an input"),
                 )
-                .small()
+                .large()
                 .disabled(self.saving)
                 .into_any_element(),
                 Kind::ReadOnly => div()
-                    .text_sm()
+                    .text_base()
                     .text_color(cx.theme().muted_foreground)
                     .child(format!("{} · 暂不可用", draft.value))
                     .into_any_element(),
             }
         };
+        let is_list = matches!(field.key, "backends.installations" | "passwords.sources");
+        let help = format!(
+            "{}\n{} · 来源：{}{}",
+            field.help,
+            field.key,
+            draft.origin,
+            draft
+                .explanation
+                .as_ref()
+                .map(|text| format!("\n{text}"))
+                .unwrap_or_default(),
+        );
         div()
-            .p_3()
+            .py_3()
             .flex()
             .flex_col()
-            .gap_2()
+            .gap_3()
             .border_b_1()
             .border_color(cx.theme().border)
             .child(
                 div()
                     .flex()
+                    .flex_wrap()
                     .items_center()
-                    .justify_between()
                     .gap_3()
                     .child(
                         div()
-                            .text_sm()
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .child(field.label),
+                            .w(gpui::px(190.))
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .text_base()
+                            .child(field.label)
+                            .child(
+                                Button::new(("setting-help", index))
+                                    .ghost()
+                                    .xsmall()
+                                    .label("?")
+                                    .tooltip(help),
+                            ),
                     )
+                    .when(!is_list, |row| {
+                        row.child(div().flex_1().min_w(gpui::px(160.)).child(editor))
+                    })
                     .when(field.kind != Kind::ReadOnly, |row| {
                         row.child(
                             Button::new(("setting-reset", index))
@@ -248,10 +274,11 @@ impl ConfigForm {
                                 .xsmall()
                                 .disabled(self.saving)
                                 .label(if draft.reset {
-                                    "撤销恢复"
+                                    "撤销重置"
                                 } else {
-                                    "恢复继承"
+                                    "重置"
                                 })
+                                .tooltip("移除此项覆盖，恢复继承值")
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.fields[index].reset = !this.fields[index].reset;
                                     cx.notify();
@@ -259,26 +286,23 @@ impl ConfigForm {
                         )
                     }),
             )
-            .child(editor)
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(field.help),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(format!("{} · 来源：{}", field.key, draft.origin)),
-            )
-            .when_some(draft.explanation.clone(), |row, explanation| {
-                row.child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(explanation),
-                )
+            .when(is_list, |row| {
+                // The ordered editors need the full content width.
+                let list = if field.key == "backends.installations" {
+                    &self.backend_list
+                } else {
+                    &self.source_list
+                };
+                if draft.reset {
+                    row.child(
+                        div()
+                            .text_base()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("保存后恢复继承值"),
+                    )
+                } else {
+                    row.child(list.clone())
+                }
             })
     }
 }
@@ -295,32 +319,31 @@ impl Render for ConfigForm {
         div()
             .flex()
             .flex_col()
-            .gap_2()
+            .gap_4()
             .w_full()
             .child(Input::new(&self.search).cleanable(true))
             .when(dirty > 0, |el| {
                 el.child(
                     div()
-                        .text_sm()
+                        .text_base()
                         .text_color(cx.theme().primary)
-                        .child(format!("{dirty} 项未保存修改 · 切换页面会保留草稿")),
+                        .child(format!("{dirty} 项未保存")),
                 )
             })
-            .when(self.saving, |el| el.child("正在保存，表单暂时锁定…"))
+            .when(self.saving, |el| el.child("正在保存…"))
             .child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .gap_1()
-                    .children(SECTIONS.iter().enumerate().map(|(index, section)| {
-                        Button::new(("config-section", index))
-                            .small()
-                            .label(section.label)
-                            .when(index == self.section, |button| button.primary())
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.section = index;
-                                cx.notify();
-                            }))
+                TabBar::new("config-sections")
+                    .underline()
+                    .menu(true)
+                    .selected_index(self.section)
+                    .children(
+                        SECTIONS
+                            .iter()
+                            .map(|section| Tab::new().label(section.label)),
+                    )
+                    .on_click(cx.listener(|this, index: &usize, _, cx| {
+                        this.section = *index;
+                        cx.notify();
                     })),
             )
             .children(

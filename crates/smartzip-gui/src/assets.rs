@@ -7,6 +7,8 @@ gpui::assets::icon_assets!(
         ChevronLeft,
         Clock,
         Cpu,
+        Ellipsis,
+        X,
         FileArchive,
         FolderOpen,
         FolderSearch,
@@ -56,6 +58,8 @@ mod tests {
             IconName::ChevronLeft,
             IconName::Clock,
             IconName::Cpu,
+            IconName::Ellipsis,
+            IconName::X,
             IconName::FileArchive,
             IconName::ChevronDown,
             IconName::ChevronRight,
@@ -76,5 +80,14 @@ mod tests {
                 icon.path()
             );
         }
+    }
+}
+
+/// A static regular face avoids platform variable-font weight differences.
+pub(crate) fn load_fonts(cx: &mut gpui::App) {
+    if let Err(error) = cx.text_system().add_fonts(vec![std::borrow::Cow::Borrowed(
+        include_bytes!("../../../resources/fonts/NotoSansCJKsc-Regular.otf").as_slice(),
+    )]) {
+        eprintln!("无法加载界面字体：{error}");
     }
 }

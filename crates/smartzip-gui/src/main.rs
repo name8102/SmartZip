@@ -62,6 +62,7 @@ fn main() {
     });
     app.run(move |cx| {
         gpui::init(cx);
+        assets::load_fonts(cx);
         ui::start(cx, open_receiver);
     });
 }

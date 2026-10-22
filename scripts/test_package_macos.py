@@ -22,6 +22,8 @@ class PackageTests(unittest.TestCase):
             self.assertEqual(info["CFBundleURLTypes"][0]["CFBundleURLSchemes"], ["smartzip"])
             self.assertEqual({ext for item in info["CFBundleDocumentTypes"] for ext in item["CFBundleTypeExtensions"]}, {"zip", "7z", "rar", "tar", "gz", "bz2", "xz", "zst"})
             self.assertTrue(all(item["LSHandlerRank"] == "Alternate" for item in info["CFBundleDocumentTypes"]))
+            self.assertEqual((target / "Contents/Resources/licenses/NotoSansCJK-OFL.txt").read_bytes(),
+                             (module.ROOT / "resources/fonts/OFL.txt").read_bytes())
             executable = target / "Contents/MacOS/smartzip-gui"
             self.assertFalse(executable.is_symlink())
             self.assertEqual(executable.read_bytes(), binary.read_bytes())

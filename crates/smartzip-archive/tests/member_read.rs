@@ -208,3 +208,37 @@ async fn leading_dot_member_selector_is_preserved_for_zip_and_tar() {
         assert_eq!(bytes, b"exact member contents");
     }
 }
+
+#[tokio::test]
+async fn reads_unicode_member_with_utf8_process_locale() {
+    // Cover p7zip as well as current 7-Zip: p7zip decodes selectors using LC_ALL.
+    for command in ["7z", "7zz"] {
+        let Ok(executable) = which::which(command) else {
+            continue;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let member = dir.path().join("项目说明.txt");
+        let archive = dir.path().join("unicode.zip");
+        std::fs::write(&member, b"Unicode member contents\n").unwrap();
+        assert!(Command::new(&executable)
+            .args(["a", "-tzip", "-y"])
+            .arg(&archive)
+            .arg(&member)
+            .status()
+            .unwrap()
+            .success());
+        let router = BackendRouter::from_adapters(vec![AdapterRegistration::from_adapter(
+            SevenZipBackend::new(executable).with_id("unicode-seven"),
+            10,
+        )]);
+        let bytes = router
+            .read_member(
+                "unicode-seven",
+                request(&archive, "项目说明.txt", None, 1024),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bytes, b"Unicode member contents\n", "{command}");
+    }
+}

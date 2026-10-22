@@ -77,13 +77,13 @@ impl Default for Preferences {
         Self {
             color_mode: ColorMode::System,
             density: Density::Comfortable,
-            font_size: 14.,
+            font_size: 16.,
             reduced_motion: false,
             notifications: true,
             sidebar_collapsed: false,
             detail_visible: true,
             detail_width: 340.,
-            queue_settings_open: true,
+            queue_settings_open: false,
             full_window: None,
             quick_window: None,
         }
@@ -104,7 +104,7 @@ impl Preferences {
         self.font_size = if self.font_size.is_finite() {
             self.font_size.clamp(12., 18.)
         } else {
-            14.
+            16.
         };
         self.detail_width = if self.detail_width.is_finite() {
             self.detail_width.clamp(280., 520.)

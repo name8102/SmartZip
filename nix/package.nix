@@ -56,6 +56,7 @@ rustPlatform.buildRustPackage {
   # Workspace tests remain available through `nix develop -c cargo test --workspace --locked`.
   doCheck = false;
   postInstall = ''
+    install -Dm644 ${../resources/fonts/OFL.txt} "$out/share/licenses/smartzip/NotoSansCJK-OFL.txt"
     install -Dm644 ${desktop}/share/applications/*.desktop \
       "$out/share/applications/org.smartzip.SmartZip.desktop"
   '';

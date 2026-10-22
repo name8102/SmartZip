@@ -48,6 +48,8 @@ def package(cli, gui, target, destination):
             shutil.copy2(ROOT/'scripts/install_linux.py', root/'install-linux.py')
         for source in ['README.md', 'LICENSE', 'CHANGELOG.md', 'docs/cli-beta.md', 'docs/desktop-beta.md']:
             shutil.copy2(ROOT/source, root/Path(source).name)
+        (root / 'licenses').mkdir()
+        shutil.copy2(ROOT / 'resources/fonts/OFL.txt', root / 'licenses/NotoSansCJK-OFL.txt')
         dependency_command = ['otool', '-L'] if sys.platform == 'darwin' else ['ldd']
         dependencies = []
         for binary in (cli, gui):

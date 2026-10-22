@@ -1,12 +1,18 @@
 use super::*;
-use gpui::component::menu::{DropdownMenu, PopupMenuItem};
+use gpui::component::{
+    h_resizable,
+    menu::{DropdownMenu, PopupMenuItem},
+    resizable_panel,
+    tab::{Tab, TabBar},
+    v_resizable,
+};
 
 impl View {
     fn archive_actions(&self, paths: &[PathBuf]) -> impl IntoElement {
         let paths = paths.to_vec();
         let shared = self.shared.clone();
         control("archive-actions")
-            .label("归档操作")
+            .label("更多")
             .icon(IconName::ChevronDown)
             .disabled(paths.is_empty())
             .dropdown_menu(move |mut menu, _, cx| {
@@ -60,18 +66,21 @@ impl View {
             })
             .collect();
         div()
+            .id("archive-operation-results")
+            .max_h(px(180.))
+            .overflow_y_scroll()
+            .flex_shrink_0()
             .flex()
             .flex_col()
-            .gap_2()
             .children(
                 reports
                     .into_iter()
                     .map(|(id, operation, phase, stage, report)| {
                         div()
-                            .p_3()
-                            .border_1()
+                            .px_3()
+                            .py_2()
+                            .border_b_1()
                             .border_color(cx.theme().border)
-                            .rounded_md()
                             .flex()
                             .flex_col()
                             .gap_2()
@@ -80,7 +89,7 @@ impl View {
                                     .flex()
                                     .items_center()
                                     .gap_3()
-                                    .child(div().flex_1().text_sm().child(
+                                    .child(div().flex_1().text_base().child(
                                         if operation == TaskOperation::Test {
                                             "完整性校验"
                                         } else {
@@ -89,7 +98,7 @@ impl View {
                                     ))
                                     .child(
                                         div()
-                                            .text_xs()
+                                            .text_sm()
                                             .text_color(phase_color(phase, cx))
                                             .child(phase.label()),
                                     )
@@ -135,25 +144,26 @@ impl View {
                             })
                             .child(
                                 div()
-                                    .text_xs()
+                                    .text_sm()
                                     .text_color(cx.theme().muted_foreground)
                                     .child(stage),
                             )
-                            .children(report.into_iter().map(|line| div().text_sm().child(line)))
+                            .children(report.into_iter().map(|line| div().text_base().child(line)))
                     }),
             )
     }
 
-    pub(super) fn preview(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(super) fn preview(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let state = self.shared.read(cx);
         let selected = state.previews.selected();
         let id = selected.map(|j| j.id);
         let paths = selected
             .map(|j| j.request.paths.clone())
             .unwrap_or_default();
-        let name = selected
-            .map(|j| j.name())
-            .unwrap_or_else(|| "打开归档，查看内容".into());
         let phase = selected.map(|j| j.phase);
         let stage = selected.map(|j| j.stage.clone()).unwrap_or_default();
         let count = selected
@@ -204,8 +214,7 @@ impl View {
                 )
             });
         }
-        let height = state.preferences.density.row_height();
-        let list_height = (rows.len() as f32 * height).clamp(height, 360.);
+        let height = state.preferences.density.row_height().max(40.);
         let source = selected.and_then(|job| {
             let result = job.result.as_ref()?;
             let resolved = job.request.resolved.as_ref()?;
@@ -226,10 +235,7 @@ impl View {
                     .filter(|v| !["auto", "backend"].contains(v))
                     .map(|v| smartzip_core::EncodingMode::Override(v.into()))
                     .unwrap_or(smartzip_core::EncodingMode::Auto),
-                unavailable: result
-                    .get("embedded_offset")
-                    .filter(|v| !v.is_null())
-                    .map(|_| "内嵌归档内容暂需解压后查看".into()),
+                unavailable: embedded_preview_notice(result),
             })
         });
         let tabs: Vec<_> = state
@@ -240,47 +246,365 @@ impl View {
             .map(|j| (j.id, j.name()))
             .collect();
         let active = phase.is_some_and(|p| p.active() || p == Phase::Queued);
+        let ready = browser.is_some_and(|result| result.is_ok());
+        let wide = window.viewport_size().width >= px(1050.);
+        let root = div()
+            .id("preview-page")
+            .size_full()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
+                this.shared.update(cx, |state, cx| {
+                    state.enqueue(paths.paths().to_vec(), TaskOperation::List);
+                    cx.notify();
+                });
+            }));
+        if id.is_none() {
+            return root
+                .items_center()
+                .justify_center()
+                .gap_4()
+                .child(
+                    Icon::new(IconName::FileArchive)
+                        .size(px(36.))
+                        .text_color(cx.theme().muted_foreground),
+                )
+                .child(div().text_lg().child("打开归档"))
+                .child(
+                    control("open-archive")
+                        .primary()
+                        .icon(IconName::FolderOpen)
+                        .label("打开归档…")
+                        .on_click(cx.listener(|this, _, _, cx| this.pick(TaskOperation::List, cx))),
+                )
+                .into_any_element();
+        }
+        let selected_index = tabs
+            .iter()
+            .position(|(tab, _)| Some(*tab) == id)
+            .unwrap_or(0);
+        let tab_bar = TabBar::new("archive-tabs")
+            .folder()
+            .large()
+            .menu(true)
+            .max_width(px(230.))
+            .selected_index(selected_index)
+            .children(tabs.into_iter().map(|(tab, name)| {
+                Tab::new()
+                    .label(name)
+                    .prefix(Icon::new(IconName::FileArchive).size(px(18.)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.shared.update(cx, |state, cx| {
+                            state.previews.selected = Some(tab);
+                            cx.notify();
+                        });
+                    }))
+                    .suffix(
+                        control(("close-tab", tab))
+                            .label("×")
+                            .tooltip("关闭归档")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.archive_cache.remove(&tab);
+                                this.archive_positions.remove(&tab);
+                                this.shared.update(cx, |state, cx| {
+                                    state.previews.close(tab);
+                                    cx.notify();
+                                });
+                            })),
+                    )
+            }));
         let actions = self.archive_actions(&paths);
         let operation_results = self.archive_operation_results(&paths, cx);
-        div().flex().flex_col().gap_4().id("preview-page")
-            .on_drop(cx.listener(|this,paths:&ExternalPaths,_,cx|this.shared.update(cx,|s,cx|{s.enqueue(paths.paths().to_vec(),TaskOperation::List);cx.notify();})))
-            .child(div().flex().gap_2().flex_wrap()
-                .child(control("open-archive").primary().icon(IconName::FolderOpen).label("打开归档…").on_click(cx.listener(|this,_,_,cx|this.pick(TaskOperation::List,cx))))
-                .child(control("extract-preview").icon(IconName::PackageOpen).label("解压并配置…").disabled(paths.is_empty()).on_click(cx.listener(move|this,_,_,cx|{this.shared.update(cx,|s,cx|{s.enqueue_with_hold(paths.clone(),TaskOperation::Extract,true);cx.notify();});this.page=Page::Tasks;this.selected_file=None;})))
-                .child(actions)
-                .child(control("stop-preview").label("停止读取").disabled(!active).on_click(cx.listener(move|this,_,_,cx|this.shared.update(cx,|s,cx|{if let Some(id)=id{s.previews.cancel(id);}cx.notify();}))))
-                .child(control("toggle-member-preview").label(if self.preview_visible{"收起内容预览"}else{"显示内容预览"}).on_click(cx.listener(|this,_,_,cx|{this.preview_visible= !this.preview_visible;cx.notify();}))))
-            .child(div().id("archive-tabs").flex().gap_2().overflow_x_scroll().children(tabs.into_iter().map(|(tab,name)|div().flex().items_center().gap_1().border_1().border_color(if Some(tab)==id{cx.theme().primary}else{cx.theme().border}).rounded_md()
-                .child(control(("archive-tab",tab)).label(name).on_click(cx.listener(move|this,_,_,cx|this.shared.update(cx,|s,cx|{s.previews.selected=Some(tab);cx.notify();}))))
-                .child(control(("close-tab",tab)).label("×").on_click(cx.listener(move|this,_,_,cx|{this.archive_cache.remove(&tab);this.archive_positions.remove(&tab);this.shared.update(cx,|s,cx|{s.previews.close(tab);cx.notify();});}))))))
-            .child(div().flex().items_center().gap_3().child(Icon::new(IconName::FileArchive).size(px(28.))).child(div().flex_1().min_w_0().text_lg().text_ellipsis().child(name)).child(div().text_xs().text_color(cx.theme().muted_foreground).child(format!("{count} 个条目"))))
-            .when(!stage.is_empty(),|el|el.child(div().text_sm().text_color(if matches!(phase,Some(Phase::Failed|Phase::Partial)){cx.theme().danger}else{cx.theme().muted_foreground}).child(stage)))
-            .when(active,|el|el.child(Progress::new("listing-progress").loading(true)))
-            .when_some(error,|el,error|el.child(div().text_color(cx.theme().danger).child(error)))
+        let toolbar = div()
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_2()
+            .border_b_1()
+            .border_color(cx.theme().border)
+            .child(
+                control("extract-preview")
+                    .primary()
+                    .icon(IconName::PackageOpen)
+                    .label("解压…")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.shared.update(cx, |state, cx| {
+                            state.enqueue_with_hold(paths.clone(), TaskOperation::Extract, true);
+                            cx.notify();
+                        });
+                        this.selected_file = None;
+                        this.page(Page::Tasks, cx);
+                    })),
+            )
+            .child(actions)
+            .when(active, |el| {
+                el.child(
+                    control("stop-preview")
+                        .label("停止读取")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.shared.update(cx, |state, cx| {
+                                if let Some(id) = id {
+                                    state.previews.cancel(id);
+                                }
+                                cx.notify();
+                            });
+                        })),
+                )
+            })
+            .child(div().flex_1())
+            .child(
+                control("toggle-member-preview")
+                    .label(if self.preview_visible {
+                        "收起预览"
+                    } else {
+                        "内容预览"
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.preview_visible = !this.preview_visible;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                control("open-archive")
+                    .icon(IconName::FolderOpen)
+                    .label("打开…")
+                    .on_click(cx.listener(|this, _, _, cx| this.pick(TaskOperation::List, cx))),
+            );
+        let navigation = div()
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_2()
+            .border_b_1()
+            .border_color(cx.theme().border)
+            .child(
+                control("archive-up")
+                    .icon(IconName::ChevronLeft)
+                    .tooltip("返回上级")
+                    .disabled(self.archive_dir.is_empty())
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.archive_dir.pop();
+                        this.member_preview
+                            .update(cx, |preview, cx| preview.clear(window, cx));
+                        cx.notify();
+                    })),
+            )
+            .child(
+                div()
+                    .id("archive-breadcrumbs")
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .overflow_x_scroll()
+                    .child(
+                        control("archive-root")
+                            .label("根目录")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.archive_dir.clear();
+                                this.member_preview
+                                    .update(cx, |preview, cx| preview.clear(window, cx));
+                                cx.notify();
+                            })),
+                    )
+                    .children(self.archive_dir.iter().enumerate().map(|(index, part)| {
+                        let path = self.archive_dir[..=index].to_vec();
+                        div()
+                            .flex()
+                            .items_center()
+                            .flex_shrink_0()
+                            .child(
+                                Icon::new(IconName::ChevronRight)
+                                    .large()
+                                    .text_color(cx.theme().muted_foreground),
+                            )
+                            .child(control(("breadcrumb", index)).label(part.clone()).on_click(
+                                cx.listener(move |this, _, window, cx| {
+                                    this.archive_dir = path.clone();
+                                    this.member_preview
+                                        .update(cx, |preview, cx| preview.clear(window, cx));
+                                    cx.notify();
+                                }),
+                            ))
+                    })),
+            )
+            .child(
+                div()
+                    .w(px(if wide { 220. } else { 150. }))
+                    .child(Input::new(&self.archive_search).large().cleanable(true)),
+            )
+            .child(
+                control("sort-archive")
+                    .label(if self.archive_sort_size {
+                        "大小 ↓"
+                    } else {
+                        "名称 ↑"
+                    })
+                    .tooltip("切换排序")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.archive_sort_size = !this.archive_sort_size;
+                        cx.notify();
+                    })),
+            );
+        let row_count = rows.len();
+        let mut files = div().size_full().min_h_0().flex().flex_col();
+        if ready && !rows.is_empty() {
+            files = files
+                .child(div().flex().items_center().px_3().py_2().gap_3().text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .border_b_1().border_color(cx.theme().border)
+                    .child(div().flex_1().child("名称"))
+                    .child(div().w(px(90.)).child("大小"))
+                    .child(div().w(px(34.))))
+                .child(gpui::uniform_list("archive-entries", rows.len(), cx.processor(move |_, range: std::ops::Range<usize>, _, cx| {
+                    range.map(|index| {
+                        let entry = &rows[index];
+                        let path = entry.path.clone();
+                        let copy_path = path.clone();
+                        let member_source = source.clone();
+                        let is_dir = entry.is_dir;
+                        div().id(("member-row", index)).w_full().h(px(height)).flex().items_center().gap_3().px_3()
+                            .hover(|el| el.bg(cx.theme().accent))
+                            .child(Icon::new(if is_dir { IconName::FolderOpen } else { IconName::FileArchive }).large()
+                                .text_color(cx.theme().muted_foreground))
+                            .child(control(("open-member", index)).flex_1().min_w_0().accessibility_label(entry.name.clone())
+                                .child(div().w_full().min_w_0().text_ellipsis().child(entry.name.clone()))
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    if is_dir {
+                                        if let Some(parts) = crate::archive_browser::ArchiveBrowser::path_parts(&path) {
+                                            this.archive_dir = parts;
+                                        }
+                                        this.member_preview.update(cx, |preview, cx| preview.clear(window, cx));
+                                    } else if let Some(mut source) = member_source.clone() {
+                                        source.member = path.clone().into();
+                                        this.preview_visible = true;
+                                        this.member_preview.update(cx, |preview, cx| preview.open(source, window, cx));
+                                    }
+                                    cx.notify();
+                                })))
+                            .child(div().w(px(90.)).text_sm().text_color(cx.theme().muted_foreground)
+                                .child(entry.size.map(size_label).unwrap_or_else(|| "—".into())))
+                            .child(control(("copy-member", index)).w(px(34.)).icon(IconName::Copy).tooltip("复制路径")
+                                .on_click(move |_, _, cx| cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy_path.clone()))))
+                    }).collect::<Vec<_>>()
+                })).flex_1().min_h_0().w_full());
+        } else {
+            files = files.child(
+                div()
+                    .flex_1()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_base()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(if ready {
+                        "当前目录没有匹配项"
+                    } else if active {
+                        "正在读取归档…"
+                    } else {
+                        phase.map(Phase::label).unwrap_or("打开归档")
+                    }),
+            );
+        }
+        let contents = if self.preview_visible && ready {
+            let group = if wide {
+                h_resizable("archive-content-horizontal")
+            } else {
+                v_resizable("archive-content-vertical")
+            };
+            group
+                .child(
+                    resizable_panel()
+                        .size_range(px(140.)..px(10000.))
+                        .child(files),
+                )
+                .child(
+                    resizable_panel()
+                        .size(px(if wide { 360. } else { 260. }))
+                        .size_range(px(140.)..px(10000.))
+                        .child(
+                            div()
+                                .size_full()
+                                .min_h_0()
+                                .when(wide, |el| el.border_l_1())
+                                .when(!wide, |el| el.border_t_1())
+                                .border_color(cx.theme().border)
+                                .child(self.member_preview.clone()),
+                        ),
+                )
+                .into_any_element()
+        } else {
+            files.into_any_element()
+        };
+        root.child(tab_bar)
+            .child(toolbar)
+            .when(!stage.is_empty() && phase != Some(Phase::Completed), |el| {
+                el.child(
+                    div()
+                        .px_3()
+                        .py_2()
+                        .text_base()
+                        .text_color(if matches!(phase, Some(Phase::Failed | Phase::Partial)) {
+                            cx.theme().danger
+                        } else {
+                            cx.theme().muted_foreground
+                        })
+                        .child(stage),
+                )
+            })
+            .when(active, |el| {
+                el.child(Progress::new("listing-progress").loading(true))
+            })
+            .when_some(error, |el, error| {
+                el.child(
+                    div()
+                        .px_3()
+                        .py_2()
+                        .text_base()
+                        .text_color(cx.theme().danger)
+                        .child(error),
+                )
+            })
             .child(operation_results)
-            .when(id.is_none(),|el|el.child(empty_state("拖入归档以预览内容","此页面只读取目录；点击「解压并配置」开始解压。",cx)))
-            .child(div().flex().items_center().gap_2().flex_wrap()
-                .child(control("archive-up").label("返回上级").disabled(self.archive_dir.is_empty()).on_click(cx.listener(|this,_,window,cx|{this.archive_dir.pop();this.member_preview.update(cx,|p,cx|p.clear(window,cx));cx.notify();})))
-                .child(control("archive-root").label("根目录").on_click(cx.listener(|this,_,window,cx|{this.archive_dir.clear();this.member_preview.update(cx,|p,cx|p.clear(window,cx));cx.notify();})))
-                .children(self.archive_dir.iter().enumerate().map(|(i,part)|{let path=self.archive_dir[..=i].to_vec();control(("breadcrumb",i)).label(part.clone()).on_click(cx.listener(move|this,_,window,cx|{this.archive_dir=path.clone();this.member_preview.update(cx,|p,cx|p.clear(window,cx));cx.notify();}))})))
-            .child(div().flex().items_center().gap_2().child(div().flex_1().child(Input::new(&self.archive_search).cleanable(true)))
-                .child(control("sort-archive").label(if self.archive_sort_size{"按名称排序"}else{"按大小排序"}).on_click(cx.listener(|this,_,_,cx|{this.archive_sort_size= !this.archive_sort_size;cx.notify();}))))
-            .when(rows.is_empty()&&id.is_some()&&phase==Some(Phase::Completed),|el|el.child(empty_state("当前目录没有匹配项","返回上级目录，或清空搜索条件。",cx)))
-            .child(div().flex().px_3().py_2().bg(cx.theme().sidebar).child(div().flex_1().child("名称")).child(div().w(px(100.)).child("大小")).child(div().w(px(90.))))
-            .child(gpui::uniform_list("archive-entries",rows.len(),cx.processor(move|_this,range:std::ops::Range<usize>,_,cx|range.map(|index|{
-                let entry=&rows[index];let path=entry.path.clone();let member_source=source.clone();let is_dir=entry.is_dir;
-                let copy_path=path.clone();
-                div().id(("member-row",index)).w_full().flex().h(px(height)).items_center().gap_3().px_3().border_b_1().border_color(cx.theme().border).hover(|el|el.bg(cx.theme().sidebar_accent))
-                    .child(Icon::new(if is_dir{IconName::FolderOpen}else{IconName::FileArchive}).small())
-                    .child(div().flex_1().min_w_0().flex().items_center().child(control(("open-member",index)).label(entry.name.clone()).on_click(cx.listener(move|this,_,window,cx|{
-                        if is_dir {if let Some(parts)=crate::archive_browser::ArchiveBrowser::path_parts(&path){this.archive_dir=parts;}this.member_preview.update(cx,|p,cx|p.clear(window,cx));}
-                        else if let Some(mut source)=member_source.clone(){source.member=path.clone().into();this.preview_visible=true;this.member_preview.update(cx,|p,cx|p.open(source,window,cx));}cx.notify();
-                    }))))
-                    .child(div().w(px(100.)).text_xs().child(entry.size.map(size_label).unwrap_or_else(||"—".into())))
-                    .child(control(("copy-member",index)).label("复制路径").on_click(move|_,_,cx|cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy_path.clone()))))
-            }).collect::<Vec<_>>())).h(px(list_height)).w_full())
-            .when(self.preview_visible,|el|el.child(self.member_preview.clone()))
+            .when(ready, |el| el.child(navigation))
+            .child(div().flex_1().min_h_0().overflow_hidden().child(contents))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .px_3()
+                    .py_1()
+                    .border_t_1()
+                    .border_color(cx.theme().border)
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(if ready {
+                        format!("{row_count} 项 · 共 {count} 个条目")
+                    } else {
+                        phase
+                            .map(|phase| phase.label().to_owned())
+                            .unwrap_or_default()
+                    }),
+            )
+            .into_any_element()
     }
+}
+
+// A scanner may select an ordinary archive at byte zero. It is still readable
+// through the original file; only nonzero embedded offsets need materialization.
+fn embedded_preview_notice(result: &serde_json::Value) -> Option<String> {
+    result
+        .get("embedded_offset")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|offset| *offset > 0)
+        .map(|_| "内嵌归档内容暂需解压后查看".into())
 }
 
 fn operation_report(operation: TaskOperation, result: Option<&serde_json::Value>) -> Vec<String> {
@@ -348,6 +672,13 @@ fn operation_report(operation: TaskOperation, result: Option<&serde_json::Value>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn byte_zero_archive_can_preview_members() {
+        assert!(embedded_preview_notice(&serde_json::json!({"embedded_offset": 0})).is_none());
+        assert!(embedded_preview_notice(&serde_json::json!({"embedded_offset": null})).is_none());
+        assert!(embedded_preview_notice(&serde_json::json!({"embedded_offset": 512})).is_some());
+    }
 
     #[test]
     fn unknown_integrity_does_not_promote_suspect_volumes_to_confirmed_damage() {

@@ -1,4 +1,5 @@
 use super::*;
+use gpui::component::menu::{DropdownMenu, PopupMenuItem};
 
 impl View {
     pub(super) fn settings(
@@ -27,14 +28,15 @@ impl View {
             .as_ref()
             .map(|s| s.edit_path.display().to_string())
             .unwrap_or_else(|| "配置加载失败，请解决错误后重新加载".into());
+        let shared = self.shared.clone();
         div()
             .flex()
             .flex_col()
-            .gap_3()
-            .child(div().text_sm().child("全局配置 · 与 CLI 共用"))
+            .gap_5()
+            .max_w(px(960.))
             .child(
                 div()
-                    .text_xs()
+                    .text_sm()
                     .text_color(cx.theme().muted_foreground)
                     .child(path),
             )
@@ -42,10 +44,12 @@ impl View {
                 div()
                     .flex()
                     .gap_2()
+                    .items_center()
+                    .flex_wrap()
                     .child(
                         control("save-config")
                             .primary()
-                            .label("保存全部修改")
+                            .label("保存修改")
                             .disabled(busy || self.config_form.is_none())
                             .on_click(cx.listener(|this, _, _, cx| {
                                 let Some(form) = &this.config_form else {
@@ -72,7 +76,8 @@ impl View {
                     )
                     .child(
                         control("reload-config")
-                            .label("放弃修改并重新加载")
+                            .ghost()
+                            .label("重新加载")
                             .disabled(busy)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 let answer = confirm(
@@ -103,43 +108,45 @@ impl View {
                             })),
                     )
                     .child(
-                        control("init-config")
-                            .label("初始化配置")
+                        control("config-actions")
+                            .ghost()
+                            .label("更多")
+                            .icon(IconName::ChevronDown)
                             .disabled(busy)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.shared.update(cx, |state, cx| {
-                                    state.background(|| {
-                                        LibraryMessage::ConfigSaved(
-                                            library::init_config(&LibraryOptions::default(), false)
-                                                .map(Box::new),
-                                        )
-                                    });
-                                    cx.notify();
-                                })
-                            })),
-                    )
-                    .child(
-                        control("migrate-preview")
-                            .label("迁移预览")
-                            .disabled(busy)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.shared.update(cx, |state, cx| {
-                                    state.background(|| {
-                                        LibraryMessage::Document(library::migrate_config(
-                                            &LibraryOptions::default(),
-                                            false,
-                                        ))
-                                    });
-                                    cx.notify();
-                                })
-                            })),
+                            .dropdown_menu(move |menu, _, _| {
+                                let initialize = shared.clone();
+                                let migrate = shared.clone();
+                                menu.item(PopupMenuItem::new("初始化配置").on_click(
+                                    move |_, _, cx| {
+                                        initialize.update(cx, |state, cx| {
+                                            state.background(|| {
+                                                LibraryMessage::ConfigSaved(
+                                                    library::init_config(
+                                                        &LibraryOptions::default(),
+                                                        false,
+                                                    )
+                                                    .map(Box::new),
+                                                )
+                                            });
+                                            cx.notify();
+                                        });
+                                    },
+                                ))
+                                .item(
+                                    PopupMenuItem::new("迁移预览").on_click(move |_, _, cx| {
+                                        migrate.update(cx, |state, cx| {
+                                            state.background(|| {
+                                                LibraryMessage::Document(library::migrate_config(
+                                                    &LibraryOptions::default(),
+                                                    false,
+                                                ))
+                                            });
+                                            cx.notify();
+                                        });
+                                    }),
+                                )
+                            }),
                     ),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child("保存后用于新任务；已排队任务保留原配置。快速模式的显式覆盖优先。"),
             )
             .children(self.config_form.clone())
     }

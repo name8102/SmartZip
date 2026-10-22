@@ -42,11 +42,9 @@ impl View {
         .unwrap();
         let mut encodings = vec![];
         let (title, kind, details) = match job.prompt.as_ref().unwrap() {
-            InteractionRequest::Password { path, .. } => (
-                "需要归档密码",
-                0,
-                format!("{}\n输入密码继续尝试，或跳过此归档。", path.display()),
-            ),
+            InteractionRequest::Password { path, .. } => {
+                ("需要归档密码", 0, path.display().to_string())
+            }
             InteractionRequest::Output { path, output, .. } => (
                 "输出位置已存在",
                 1,
@@ -101,7 +99,7 @@ impl View {
                 )
             }
         };
-        let mut choices: Vec<(String, u8)> = match kind {
+        let choices: Vec<(String, u8)> = match kind {
             0 => vec![("尝试密码".into(), 0), ("跳过归档".into(), 1)],
             1 => vec![
                 ("自动重命名".into(), 0),
@@ -115,23 +113,35 @@ impl View {
             ],
             _ => vec![("接受检测结果".into(), 0), ("跳过归档".into(), 1)],
         };
-        if kind == 3 {
-            choices.extend(
-                encodings
-                    .iter()
-                    .enumerate()
-                    .take(200)
-                    .map(|(i, name)| (format!("使用 {name}"), (i + 2) as u8)),
-            );
-        }
-        div().border_1().border_color(cx.theme().primary).rounded_lg().p_4().flex().flex_col().gap_3()
+        let view = cx.entity();
+        let encoding_menu = control("prompt-encoding-menu").label("其他编码")
+            .dropdown_menu(move |mut menu, _, _| {
+                for encoding in &encodings {
+                    let encoding = encoding.clone();
+                    let view = view.clone();
+                    menu = menu.item(gpui::component::menu::PopupMenuItem::new(encoding.clone())
+                        .on_click(move |_, _, cx| view.update(cx, |this, cx| {
+                            this.shared.update(cx, |state, cx| {
+                                let queue = if is_preview { &mut state.previews } else { &mut state.queue };
+                                let Some(job) = queue.jobs.iter_mut().find(|job| job.id == id && job.prompt_revision == revision) else { return; };
+                                if let Some(InteractionRequest::Encoding { respond, .. }) = job.prompt.take() {
+                                    let _ = respond.send(smartzip_engine::EncodingConfirmationChoice::Override(encoding.clone()));
+                                    job.phase = Phase::Running; job.stage = "继续处理".into();
+                                }
+                                cx.notify();
+                            });
+                        })));
+                }
+                menu
+            });
+        div().id("pending-interaction").flex_shrink_0().max_h(px(300.)).overflow_y_scroll().border_b_1().border_color(cx.theme().primary).px_5().py_4().flex().flex_col().gap_3()
             .child(div().flex().items_center().justify_between().child(div().text_base().font_weight(gpui::FontWeight::SEMIBOLD).child(format!("待处理 {} · {title}",pending.len())))
                 .child(control("locate-prompt").label("定位任务").on_click(cx.listener(move|this,_,_,cx|{this.page=if is_preview{Page::Preview}else{Page::Tasks};this.selected_file=None;this.shared.update(cx,|s,cx|{(if is_preview{&mut s.previews}else{&mut s.queue}).selected=Some(id);cx.notify();});}))))
             .when(pending.len()>1,|el|el.child(div().flex().gap_2().flex_wrap().children(pending.into_iter().enumerate().map(|(i,(preview,job,name))|control(("pending",i)).label(format!("{} · {name}",if preview{"预览"}else{"解压"})).when((preview,job)==(is_preview,id),|b|b.primary()).on_click(cx.listener(move|this,_,_,cx|{this.pending_selection=Some((preview,job));cx.notify();}))))))
-            .child(div().id("prompt-evidence").max_h(px(180.)).overflow_y_scroll().text_sm().child(details))
-            .when(kind==0,|el|el.child(Input::new(&self.prompt_secret).mask_toggle()))
-            .child(div().flex().gap_2().flex_wrap().children(choices.into_iter().enumerate().map(|(index,(label,choice))|{
-                let encodings=encodings.clone();
+            .child(div().id("prompt-evidence").max_h(px(180.)).overflow_y_scroll().text_base().child(details))
+            .when(kind==0,|el|el.child(Input::new(&self.prompt_secret).large().mask_toggle()))
+            .child(div().flex().gap_2().flex_wrap().when(kind == 3, |el| el.child(encoding_menu)).children(choices.into_iter().enumerate().map(|(index,(label,choice))|{
+
                 control(("prompt-choice",index)).label(label).when(choice==0,|b|b.primary()).on_click(cx.listener(move|this,_,window,cx|{
                     let password=this.prompt_secret.read(cx).value().to_string();
                     if kind==0&&choice==0&&password.is_empty(){return;}
@@ -143,7 +153,7 @@ impl View {
                             InteractionRequest::Password{respond,..}=>{let _=respond.send(if choice==0{Some(password)}else{None});},
                             InteractionRequest::Output{respond,..}=>{let _=respond.send(match choice{0=>smartzip_engine::OutputCollisionStrategy::Rename,1=>smartzip_engine::OutputCollisionStrategy::Overwrite,_=>smartzip_engine::OutputCollisionStrategy::Skip});},
                             InteractionRequest::Embedded{respond,..}=>{let _=respond.send(match choice{0=>smartzip_engine::EmbeddedSelectionChoice::Extract,1=>smartzip_engine::EmbeddedSelectionChoice::ExtractAll,_=>smartzip_engine::EmbeddedSelectionChoice::Skip});},
-                            InteractionRequest::Encoding{respond,..}=>{let _=respond.send(match choice{0=>smartzip_engine::EncodingConfirmationChoice::AcceptDetected,1=>smartzip_engine::EncodingConfirmationChoice::SkipArchive,_=>encodings.get(choice as usize-2).map(|v|smartzip_engine::EncodingConfirmationChoice::Override(v.clone())).unwrap_or(smartzip_engine::EncodingConfirmationChoice::SkipArchive)});},
+                            InteractionRequest::Encoding{respond,..}=>{let _=respond.send(match choice{0=>smartzip_engine::EncodingConfirmationChoice::AcceptDetected,1=>smartzip_engine::EncodingConfirmationChoice::SkipArchive,_=>smartzip_engine::EncodingConfirmationChoice::SkipArchive});},
                         }job.phase=Phase::Running;job.stage="继续处理".into();}cx.notify();
                     });
                 }))

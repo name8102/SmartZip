@@ -3,12 +3,12 @@ use gpui::base::Disableable;
 use gpui::component::{
     button::{Button, ButtonVariants},
     input::{Input, InputState},
+    menu::{DropdownMenu, PopupMenuItem},
+    radio::RadioGroup,
     switch::Switch,
     ActiveTheme, Sizable,
 };
-use gpui::{
-    div, prelude::*, App, AppContext, Context, Entity, IntoElement, Render, SharedString, Window,
-};
+use gpui::{div, prelude::*, App, AppContext, Context, Entity, IntoElement, Render, Window};
 use smartzip_config::{AdapterFamily, BackendInstallation, PasswordSource};
 struct Installation {
     identity: usize,
@@ -30,7 +30,11 @@ impl Installation {
         let mut row = Self {
             identity,
             _subscriptions: vec![],
-            id: cx.new(|cx| InputState::new(window, cx).default_value(b.id)),
+            id: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .default_value(b.id)
+                    .placeholder("后端名称")
+            }),
             path: cx.new(|cx| {
                 InputState::new(window, cx)
                     .default_value(b.executable.to_string_lossy().to_string())
@@ -150,7 +154,7 @@ impl Render for ConfigLists {
                         .child(
                             Button::new(("source-up", i))
                                 .ghost()
-                                .small()
+                                .large()
                                 .label("上移")
                                 .disabled(self.saving || i == 0)
                                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -161,7 +165,7 @@ impl Render for ConfigLists {
                         .child(
                             Button::new(("source-remove", i))
                                 .ghost()
-                                .small()
+                                .large()
                                 .label("移除")
                                 .disabled(self.saving)
                                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -170,29 +174,38 @@ impl Render for ConfigLists {
                                 })),
                         )
                 }))
-                .child(
-                    div().flex().gap_2().flex_wrap().children(
-                        [
-                            PasswordSource::Manual,
-                            PasswordSource::Known,
-                            PasswordSource::Batch,
-                            PasswordSource::Empty,
-                            PasswordSource::Database,
-                        ]
-                        .into_iter()
-                        .filter(|s| !self.sources.contains(s))
-                        .map(|s| {
-                            Button::new(SharedString::from(format!("source-add-{s:?}")))
-                                .small()
-                                .label(format!("添加{}", source_label(s)))
-                                .disabled(self.saving)
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.sources.push(s);
-                                    cx.notify();
-                                }))
-                        }),
-                    ),
-                )
+                .child({
+                    let entity = cx.entity();
+                    let sources = self.sources.clone();
+                    Button::new("source-add")
+                        .large()
+                        .label("添加来源")
+                        .disabled(self.saving || sources.len() == 5)
+                        .dropdown_menu(move |mut menu, _, _| {
+                            for source in [
+                                PasswordSource::Manual,
+                                PasswordSource::Known,
+                                PasswordSource::Batch,
+                                PasswordSource::Empty,
+                                PasswordSource::Database,
+                            ] {
+                                if sources.contains(&source) {
+                                    continue;
+                                }
+                                let entity = entity.clone();
+                                menu =
+                                    menu.item(PopupMenuItem::new(source_label(source)).on_click(
+                                        move |_, _, cx| {
+                                            entity.update(cx, |this, cx| {
+                                                this.sources.push(source);
+                                                cx.notify();
+                                            });
+                                        },
+                                    ));
+                            }
+                            menu
+                        })
+                })
                 .into_any_element();
         }
         div()
@@ -204,10 +217,9 @@ impl Render for ConfigLists {
                     .flex()
                     .flex_col()
                     .gap_2()
-                    .p_3()
-                    .border_1()
+                    .py_4()
+                    .border_b_1()
                     .border_color(cx.theme().border)
-                    .rounded_md()
                     .child(
                         div()
                             .flex()
@@ -231,7 +243,7 @@ impl Render for ConfigLists {
                             .child(
                                 Button::new(("backend-remove", b.identity))
                                     .ghost()
-                                    .small()
+                                    .large()
                                     .label("移除")
                                     .disabled(self.saving)
                                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -241,37 +253,37 @@ impl Render for ConfigLists {
                             ),
                     )
                     .child(
-                        div().flex().gap_2().children(
-                            [
-                                (AdapterFamily::SevenZipCli, "7-Zip"),
-                                (AdapterFamily::UnrarCli, "UnRAR"),
-                            ]
-                            .into_iter()
-                            .enumerate()
-                            .map(|(j, (family, label))| {
-                                Button::new((
-                                    SharedString::from(format!("family-{}", b.identity)),
-                                    j,
-                                ))
-                                .small()
-                                .label(label)
-                                .when(b.family == family, |b| b.primary())
-                                .disabled(self.saving)
-                                .on_click(cx.listener(
-                                    move |this, _, _, cx| {
-                                        this.installations[i].family = family.clone();
-                                        cx.notify();
-                                    },
-                                ))
-                            }),
-                        ),
+                        RadioGroup::horizontal(("backend-family", b.identity))
+                            .selected_index(Some(usize::from(b.family == AdapterFamily::UnrarCli)))
+                            .children(["7-Zip", "UnRAR"])
+                            .disabled(self.saving)
+                            .on_change(cx.listener(move |this, index: &usize, _, cx| {
+                                this.installations[i].family = if *index == 0 {
+                                    AdapterFamily::SevenZipCli
+                                } else {
+                                    AdapterFamily::UnrarCli
+                                };
+                                cx.notify();
+                            })),
                     )
-                    .child(Input::new(&b.path).disabled(self.saving))
+                    .child(
+                        div()
+                            .flex()
+                            .gap_3()
+                            .items_center()
+                            .child(div().w(gpui::px(72.)).text_base().child("程序路径"))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .child(Input::new(&b.path).disabled(self.saving)),
+                            ),
+                    )
                     .child(
                         div()
                             .flex()
                             .gap_2()
                             .items_center()
+                            .child(div().w(gpui::px(72.)).text_base().child("声明版本"))
                             .child(
                                 div()
                                     .flex_1()
@@ -287,7 +299,7 @@ impl Render for ConfigLists {
             }))
             .child(
                 Button::new("backend-add")
-                    .small()
+                    .large()
                     .label("添加后端")
                     .disabled(self.saving)
                     .on_click(cx.listener(|this, _, window, cx| {
@@ -311,13 +323,14 @@ impl Render for ConfigLists {
             )
             .child(
                 Button::new("backend-check")
-                    .small()
+                    .large()
                     .ghost()
                     .label(if self.checking {
                         "检测中…"
                     } else {
-                        "检测已保存的后端配置"
+                        "检测后端"
                     })
+                    .tooltip("检测已保存的配置，请先保存修改")
                     .disabled(self.checking)
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.checking = true;
@@ -346,7 +359,7 @@ impl Render for ConfigLists {
             .when_some(self.diagnostics.clone(), |el, result| match result {
                 Err(e) => el.child(
                     div()
-                        .text_sm()
+                        .text_base()
                         .text_color(cx.theme().danger)
                         .child(format!("检测失败：{e}")),
                 ),
@@ -355,7 +368,7 @@ impl Render for ConfigLists {
                         .flex()
                         .flex_col()
                         .gap_1()
-                        .text_sm()
+                        .text_base()
                         .p_2()
                         .bg(cx.theme().secondary)
                         .rounded_md()

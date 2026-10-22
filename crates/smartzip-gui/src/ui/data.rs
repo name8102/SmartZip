@@ -62,7 +62,7 @@ pub(super) fn empty_state(
         .child(div().text_base().child(title.into()))
         .child(
             div()
-                .text_sm()
+                .text_base()
                 .text_color(cx.theme().muted_foreground)
                 .child(detail.into()),
         )
@@ -108,7 +108,7 @@ pub(super) fn confirm(
             .child(
                 div()
                     .w_full()
-                    .text_sm()
+                    .text_base()
                     .whitespace_normal()
                     .child(detail.clone()),
             )

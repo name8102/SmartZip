@@ -181,176 +181,88 @@ impl View {
     }
 
     pub(super) fn appearance(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        use gpui::component::radio::RadioGroup;
+
         let p = self.shared.read(cx).preferences.clone();
+        let row = |label: &'static str, editor: gpui::AnyElement| {
+            div()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap_4()
+                .py_4()
+                .border_b_1()
+                .border_color(cx.theme().border)
+                .child(div().w(px(160.)).text_base().child(label))
+                .child(div().flex_1().min_w(px(260.)).child(editor))
+        };
         div()
             .flex()
             .flex_col()
-            .gap_6()
             .max_w(px(820.))
-            .child(
-                div()
-                    .text_size(px(24.))
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .child("外观与主题"),
-            )
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child("调整适合你的工作空间，立即生效。快速模式与完整模式共用外观偏好。"),
-            )
-            .child(div().flex().gap_3().flex_wrap().children(
-                ColorMode::ALL.into_iter().enumerate().map(|(i, mode)| {
-                    div()
-                        .flex_1()
-                        .min_w(px(160.))
-                        .border_1()
-                        .border_color(if mode == p.color_mode {
-                            cx.theme().primary
-                        } else {
-                            cx.theme().border
-                        })
-                        .rounded_lg()
-                        .p_4()
-                        .flex()
-                        .flex_col()
-                        .gap_3()
-                        .child(
-                            div()
-                                .h(px(76.))
-                                .rounded_md()
-                                .border_1()
-                                .border_color(cx.theme().border)
-                                .bg(match mode {
-                                    ColorMode::Dark => gpui::rgb(0x181c24),
-                                    ColorMode::Light => gpui::rgb(0xf3f5f9),
-                                    ColorMode::System => gpui::rgb(0x526586),
-                                })
-                                .flex()
-                                .p_3()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .w(px(24.))
-                                        .h_full()
-                                        .rounded_sm()
-                                        .bg(gpui::rgb(0x8caaff)),
-                                )
-                                .child(div().flex_1().h(px(16.)).rounded_sm().bg(gpui::rgb(
-                                    if mode == ColorMode::Dark {
-                                        0x364151
-                                    } else {
-                                        0xdce3ee
-                                    },
-                                ))),
-                        )
-                        .child(
-                            control(("theme-mode", i))
-                                .label(mode.label())
-                                .when(mode == p.color_mode, |b| b.primary())
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.change_appearance(|p| p.color_mode = mode, cx)
-                                })),
-                        )
-                }),
+            .child(row(
+                "主题",
+                RadioGroup::horizontal("theme-mode")
+                    .selected_index(ColorMode::ALL.iter().position(|mode| *mode == p.color_mode))
+                    .children(ColorMode::ALL.into_iter().map(|mode| mode.label()))
+                    .on_change(cx.listener(|this, index: &usize, _, cx| {
+                        this.change_appearance(|p| p.color_mode = ColorMode::ALL[*index], cx);
+                    }))
+                    .into_any_element(),
             ))
-            .child(
-                div()
-                    .border_t_1()
-                    .border_color(cx.theme().border)
-                    .pt_5()
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .child("列表密度")
-                    .child(
-                        div().flex().gap_2().children(
-                            [(Density::Comfortable, "标准"), (Density::Compact, "紧凑")]
-                                .into_iter()
-                                .enumerate()
-                                .map(|(i, (density, label))| {
-                                    control(("density", i))
-                                        .label(label)
-                                        .when(p.density == density, |b| b.primary())
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.change_appearance(|p| p.density = density, cx)
-                                        }))
-                                }),
-                        ),
-                    ),
-            )
-            .child(
-                div().flex().flex_col().gap_3().child("界面字号").child(
-                    div()
-                        .flex()
-                        .gap_2()
-                        .children([12u32, 14, 16, 18].into_iter().map(|value| {
-                            control(("font-size", value))
-                                .label(format!("{value} px"))
-                                .when(p.font_size == value as f32, |b| b.primary())
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.change_appearance(|p| p.font_size = value as f32, cx)
-                                }))
-                        })),
-                ),
-            )
-            .child(
-                div().flex().flex_col().gap_3().child("详情栏宽度").child(
-                    div()
-                        .flex()
-                        .gap_2()
-                        .children([280u32, 340, 420, 500].into_iter().map(|width| {
-                            control(("detail-width", width))
-                                .label(format!("{width} px"))
-                                .when(p.detail_width == width as f32, |b| b.primary())
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.change_appearance(|p| p.detail_width = width as f32, cx)
-                                }))
-                        })),
-                ),
-            )
-            .child(
+            .child(row(
+                "列表密度",
+                RadioGroup::horizontal("density")
+                    .selected_index(Some(usize::from(p.density == Density::Compact)))
+                    .children(["标准", "紧凑"])
+                    .on_change(cx.listener(|this, index: &usize, _, cx| {
+                        this.change_appearance(
+                            |p| {
+                                p.density = if *index == 0 {
+                                    Density::Comfortable
+                                } else {
+                                    Density::Compact
+                                }
+                            },
+                            cx,
+                        );
+                    }))
+                    .into_any_element(),
+            ))
+            .child(row(
+                "界面字号",
+                RadioGroup::horizontal("font-size")
+                    .selected_index(
+                        [12., 14., 16., 18.]
+                            .iter()
+                            .position(|value| *value == p.font_size),
+                    )
+                    .children(["12 px", "14 px", "16 px", "18 px"])
+                    .on_change(cx.listener(|this, index: &usize, _, cx| {
+                        this.change_appearance(|p| p.font_size = [12., 14., 16., 18.][*index], cx);
+                    }))
+                    .into_any_element(),
+            ))
+            .child(row(
+                "减少动态效果",
                 Switch::new("reduced-motion")
-                    .label("减少动态效果")
+                    .accessibility_label("减少动态效果")
                     .checked(p.reduced_motion)
                     .on_change(cx.listener(|this, value: &bool, _, cx| {
                         this.change_appearance(|p| p.reduced_motion = *value, cx)
-                    })),
-            )
-            .child(
+                    }))
+                    .into_any_element(),
+            ))
+            .child(row(
+                "系统通知",
                 Switch::new("desktop-notifications")
-                    .label("任务完成或需要处理时发送系统通知")
+                    .accessibility_label("系统通知")
                     .checked(p.notifications)
                     .on_change(cx.listener(|this, value: &bool, _, cx| {
                         this.change_appearance(|p| p.notifications = *value, cx)
-                    })),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .border_1()
-                    .border_color(cx.theme().border)
-                    .rounded_lg()
-                    .p_4()
-                    .child("效果预览")
-                    .child(
-                        div()
-                            .flex()
-                            .gap_2()
-                            .child(control("sample-primary").primary().label("主要操作"))
-                            .child(control("sample-secondary").label("次要操作"))
-                            .child(control("sample-disabled").label("不可用").disabled(true)),
-                    )
-                    .child(Progress::new("sample-progress").value(68.))
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(cx.theme().muted_foreground)
-                            .child("归档正在解压 · 68%"),
-                    ),
-            )
+                    }))
+                    .into_any_element(),
+            ))
     }
 
     pub(super) fn help(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -366,6 +278,6 @@ impl View {
             .child("快速模式在当前窗口内切换，返回完整模式会保留原页面和输入。完整性校验和内嵌检测位于归档预览的「归档操作」菜单。")
             .child("暂停自动启动只影响新任务。归档暂停在阶段边界生效；取消会等待后端退出和清理。密码库供后续任务使用，临时密码仅用于当前任务。")
             .children([("O", "打开归档预览"), ("Shift+O", "添加解压"), (",", "偏好设置"), ("F", "搜索当前页面"), ("1", "任务中心"), ("2", "历史记录"), ("Shift+D", "显示 / 隐藏详情"), ("Shift+M", "切换快速 / 完整模式"), ("Q", "安全退出")].into_iter().map(|(key, label)| div().flex().gap_4().py_2().border_b_1().border_color(cx.theme().border).child(div().w(px(150.)).child(format!("{modifier}+{key}"))).child(label)))
-            .child(div().text_sm().text_color(cx.theme().muted_foreground).child("内容预览支持 UTF-8 文本、PNG 和 JPEG，并设有大小与时间限制。其他内容可解压后查看。"))
+            .child(div().text_base().text_color(cx.theme().muted_foreground).child("内容预览支持 UTF-8 文本、PNG 和 JPEG，并设有大小与时间限制。其他内容可解压后查看。"))
     }
 }

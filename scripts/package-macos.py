@@ -66,6 +66,9 @@ def package(binary, output, sign=True):
         executable.parent.mkdir(parents=True)
         shutil.copy2(binary, executable)
         executable.chmod(0o755)
+        licenses = staging / "Contents/Resources/licenses"
+        licenses.mkdir(parents=True)
+        shutil.copy2(ROOT / "resources/fonts/OFL.txt", licenses / "NotoSansCJK-OFL.txt")
         with (staging / "Contents/Info.plist").open("wb") as target:
             plistlib.dump(info_plist(), target)
         if sign and sys.platform == "darwin":

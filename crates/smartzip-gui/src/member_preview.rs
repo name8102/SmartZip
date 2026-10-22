@@ -1,8 +1,8 @@
 //! Bounded, passive member viewing; never writes or executes archive contents.
-use gpui::base::Disableable;
 use gpui::component::{
     button::{Button, ButtonVariants},
     input::{Input, InputState},
+    progress::Progress,
     ActiveTheme, Sizable,
 };
 use gpui::{
@@ -212,90 +212,119 @@ impl Render for MemberPreview {
             .source
             .as_ref()
             .map(|source| source.member.display().to_string())
-            .unwrap_or_else(|| "文件内容".into());
-        div()
-            .id("member-content")
+            .unwrap_or_else(|| "内容预览".into());
+        let password_retry = self
+            .source
+            .as_ref()
+            .is_some_and(|source| source.unavailable.is_none() && source.allow_password)
+            && !self.busy
+            && self.content.is_none();
+        let body = div()
+            .id("member-preview-body")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
             .p_3()
-            .border_1()
-            .border_color(cx.theme().border)
-            .rounded_md()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .child(div().text_base().child(title))
             .when(!self.message.is_empty(), |el| {
-                el.child(div().text_sm().child(self.message.clone()))
+                el.child(
+                    div()
+                        .text_base()
+                        .text_color(if self.source.is_some() && !self.busy {
+                            cx.theme().danger
+                        } else {
+                            cx.theme().muted_foreground
+                        })
+                        .child(self.message.clone()),
+                )
             })
             .when_some(self.content.as_ref(), |el, content| match content {
-                Content::Text(text) => el.child(
-                    div()
-                        .id("member-text")
-                        .max_h(px(360.))
-                        .overflow_y_scroll()
-                        .text_sm()
-                        .child(text.clone()),
-                ),
+                Content::Text(text) => el.child(div().text_base().child(text.clone())),
                 Content::Image(image) => el.child(
                     img(image.clone())
-                        .w_full()
-                        .h(px(360.))
+                        .size_full()
                         .object_fit(ObjectFit::Contain),
                 ),
-            })
-            .when(
-                self.source
-                    .as_ref()
-                    .is_some_and(|source| source.unavailable.is_none()),
-                |el| {
-                    el.child(
+            });
+        div()
+            .id("member-content")
+            .size_full()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .py_2()
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .child(
                         div()
-                            .flex()
-                            .gap_2()
-                            .child(div().w(px(230.)).child(Input::new(&self.password).small()))
-                            .child(
-                                Button::new("member-retry")
-                                    .small()
-                                    .ghost()
-                                    .label("使用密码重试")
-                                    .disabled(
-                                        self.busy
-                                            || !self
-                                                .source
-                                                .as_ref()
-                                                .is_some_and(|source| source.allow_password),
-                                    )
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        let password = this.password.read(cx).value().to_string();
-                                        this.password.update(cx, |input, cx| {
-                                            input.set_value("", window, cx)
-                                        });
-                                        this.read(
-                                            if password.is_empty() {
-                                                None
-                                            } else {
-                                                Some(password)
-                                            },
-                                            cx,
-                                        );
-                                    })),
-                            )
-                            .child(
-                                Button::new("member-stop")
-                                    .small()
-                                    .ghost()
-                                    .label("停止")
-                                    .disabled(!self.busy)
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.cancel.cancel();
-                                        this.generation += 1;
-                                        this.busy = false;
-                                        this.message = "已停止预览".into();
-                                        cx.notify();
-                                    })),
-                            ),
+                            .flex_1()
+                            .min_w_0()
+                            .text_base()
+                            .text_ellipsis()
+                            .child(title),
                     )
-                },
+                    .when(self.busy, |el| {
+                        el.child(
+                            Button::new("member-stop")
+                                .large()
+                                .ghost()
+                                .label("停止")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.cancel.cancel();
+                                    this.generation += 1;
+                                    this.busy = false;
+                                    this.message = "已停止预览".into();
+                                    cx.notify();
+                                })),
+                        )
+                    }),
             )
+            .when(self.busy, |el| {
+                el.child(Progress::new("member-read-progress").loading(true))
+            })
+            .child(body)
+            .when(password_retry, |el| {
+                el.child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .gap_2()
+                        .p_3()
+                        .border_t_1()
+                        .border_color(cx.theme().border)
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(140.))
+                                .child(Input::new(&self.password).large()),
+                        )
+                        .child(
+                            Button::new("member-retry")
+                                .large()
+                                .ghost()
+                                .label("使用密码重试")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    let password = this.password.read(cx).value().to_string();
+                                    this.password
+                                        .update(cx, |input, cx| input.set_value("", window, cx));
+                                    this.read(
+                                        if password.is_empty() {
+                                            None
+                                        } else {
+                                            Some(password)
+                                        },
+                                        cx,
+                                    );
+                                })),
+                        ),
+                )
+            })
     }
 }
 #[cfg(test)]

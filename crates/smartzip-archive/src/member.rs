@@ -84,7 +84,7 @@ async fn run_bytes(
     let mut command = CommandWrap::with_new(executable, |command| {
         command
             .args(args)
-            .env("LC_ALL", "C")
+            .env("LC_ALL", "C.UTF-8")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
