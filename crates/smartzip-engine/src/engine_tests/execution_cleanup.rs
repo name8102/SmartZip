@@ -124,12 +124,6 @@ impl ArchiveExecutor for InterleavingBackend {
     ) -> smartzip_core::Result<ExtractArchiveResult> {
         self.inner.extract(request).await
     }
-    async fn compress(
-        &self,
-        request: CompressArchiveRequest,
-    ) -> smartzip_core::Result<CompressArchiveResult> {
-        self.inner.compress(request).await
-    }
 }
 
 #[rstest]

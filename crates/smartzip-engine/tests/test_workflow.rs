@@ -44,7 +44,6 @@ impl ArchiveAdapter for Adapter {
                 smartzip_core::ArchiveFormat::Rar,
                 smartzip_core::ArchiveFormat::SevenZip,
             ],
-            compress_containers: vec![],
             supports_passwords: true,
             supports_charset_override: true,
         }
@@ -58,9 +57,7 @@ impl ArchiveAdapter for Adapter {
     async fn extract(&self, _: ExtractArchiveRequest) -> Result<ExtractArchiveResult> {
         unreachable!()
     }
-    async fn compress(&self, _: CompressArchiveRequest) -> Result<CompressArchiveResult> {
-        unreachable!()
-    }
+
     async fn test(&self, request: TestRequest) -> Result<TestResult> {
         self.calls.lock().unwrap().push(request.archive.clone());
         if matches!(self.behavior, Behavior::Slow) {

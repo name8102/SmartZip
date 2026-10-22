@@ -1,7 +1,5 @@
 #![cfg(unix)]
-use smartzip_archive::{
-    ArchiveAdapter, CompressArchiveRequest, ExtractArchiveRequest, ListRequest,
-};
+use smartzip_archive::{ArchiveAdapter, ExtractArchiveRequest, ListRequest};
 use smartzip_core::{EncodingMode, TaskExecutionContext};
 use std::{
     path::PathBuf,
@@ -22,7 +20,6 @@ l) printf 'Path = archive.7z\nType = 7z\n\nPath = file.txt\nSize = 1\nPacked Siz
 lb) printf 'file.txt\n';;
 lt) printf 'Name: file.txt\nType: File\nSize: 1\n';;
 x) printf '50%% 1 - file.txt\rFiles: 1\n';;
-a) printf 'Everything is Ok\n';;
 esac
 "#).unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -76,26 +73,6 @@ async fn seven_zip_legacy_entries_preserve_commands_results_and_observer_deliver
         });
     check_compatibility(&backend, root.path()).await;
     assert_eq!(delivered.load(Ordering::SeqCst), 2);
-    let request = CompressArchiveRequest {
-        inputs: vec![root.path().join("file.txt")],
-        output: root.path().join("new.7z"),
-        format: smartzip_core::ArchiveFormat::SevenZip,
-        level: Default::default(),
-        password: None,
-    };
-    std::fs::write(root.path().join("backend.log"), "").unwrap();
-    let a = backend.compress(request.clone()).await.unwrap();
-    let first = std::fs::read(root.path().join("backend.log")).unwrap();
-    std::fs::write(root.path().join("backend.log"), "").unwrap();
-    let b = backend
-        .compress_with_context(request, Arc::new(TaskExecutionContext::detached()))
-        .await
-        .unwrap();
-    assert_eq!(a, b);
-    assert_eq!(
-        std::fs::read(root.path().join("backend.log")).unwrap(),
-        first
-    );
 }
 
 #[tokio::test]

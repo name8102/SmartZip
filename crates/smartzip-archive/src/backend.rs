@@ -89,14 +89,6 @@ pub trait ArchiveExecutor: Send + Sync {
     ) -> Result<ExtractArchiveResult> {
         self.extract_with_facts(request, facts).await
     }
-    async fn compress(&self, request: CompressArchiveRequest) -> Result<CompressArchiveResult>;
-    async fn compress_with_context(
-        &self,
-        request: CompressArchiveRequest,
-        _context: Arc<TaskExecutionContext>,
-    ) -> Result<CompressArchiveResult> {
-        self.compress(request).await
-    }
 }
 
 /// Independent native-library or external-program instance used by a router.
@@ -145,14 +137,6 @@ pub trait ArchiveAdapter: Send + Sync {
         _context: std::sync::Arc<TaskExecutionContext>,
     ) -> Result<ExtractArchiveResult> {
         self.extract(request).await
-    }
-    async fn compress(&self, request: CompressArchiveRequest) -> Result<CompressArchiveResult>;
-    async fn compress_with_context(
-        &self,
-        request: CompressArchiveRequest,
-        _context: std::sync::Arc<TaskExecutionContext>,
-    ) -> Result<CompressArchiveResult> {
-        self.compress(request).await
     }
     /// Concrete capabilities consumed by the router.
     fn capabilities(&self) -> AdapterCapabilities;

@@ -595,15 +595,6 @@ impl ArchiveExecutor for EncodingAwareBackend {
             encrypted: None,
         })
     }
-
-    async fn compress(
-        &self,
-        request: CompressArchiveRequest,
-    ) -> smartzip_core::Result<CompressArchiveResult> {
-        Ok(CompressArchiveResult {
-            output: request.output,
-        })
-    }
 }
 
 #[tokio::test]
@@ -694,15 +685,6 @@ impl ArchiveExecutor for FailingExtractBackend {
             stderr: format!("i/o failure while extracting {}", request.archive.display()),
         })
     }
-
-    async fn compress(
-        &self,
-        request: CompressArchiveRequest,
-    ) -> smartzip_core::Result<CompressArchiveResult> {
-        Ok(CompressArchiveResult {
-            output: request.output,
-        })
-    }
 }
 
 #[derive(Default)]
@@ -752,15 +734,6 @@ impl ArchiveExecutor for FailFirstExtractBackend {
         Ok(ExtractArchiveResult {
             output_dir: request.output_dir,
             encrypted: Some(false),
-        })
-    }
-
-    async fn compress(
-        &self,
-        request: CompressArchiveRequest,
-    ) -> smartzip_core::Result<CompressArchiveResult> {
-        Ok(CompressArchiveResult {
-            output: request.output,
         })
     }
 }
@@ -838,15 +811,6 @@ impl ArchiveExecutor for NestedThenFailBackend {
             other => panic!("unexpected archive {other}"),
         }
     }
-
-    async fn compress(
-        &self,
-        request: CompressArchiveRequest,
-    ) -> smartzip_core::Result<CompressArchiveResult> {
-        Ok(CompressArchiveResult {
-            output: request.output,
-        })
-    }
 }
 
 struct ScanThenFailBackend {
@@ -889,15 +853,6 @@ impl ArchiveExecutor for ScanThenFailBackend {
             backend: "scan-then-fail".into(),
             exit_code: Some(2),
             stderr: "root failed while its sibling was scanning".into(),
-        })
-    }
-
-    async fn compress(
-        &self,
-        request: CompressArchiveRequest,
-    ) -> smartzip_core::Result<CompressArchiveResult> {
-        Ok(CompressArchiveResult {
-            output: request.output,
         })
     }
 }
@@ -1628,15 +1583,6 @@ impl ArchiveExecutor for BatchPasswordBackend {
             encrypted: Some(true),
         })
     }
-
-    async fn compress(
-        &self,
-        request: CompressArchiveRequest,
-    ) -> smartzip_core::Result<CompressArchiveResult> {
-        Ok(CompressArchiveResult {
-            output: request.output,
-        })
-    }
 }
 
 struct CountingPasswordPrompter {
@@ -1775,15 +1721,6 @@ impl ArchiveExecutor for FakeBackend {
         Ok(ExtractArchiveResult {
             output_dir: request.output_dir,
             encrypted: Some(true),
-        })
-    }
-
-    async fn compress(
-        &self,
-        request: CompressArchiveRequest,
-    ) -> smartzip_core::Result<CompressArchiveResult> {
-        Ok(CompressArchiveResult {
-            output: request.output,
         })
     }
 }
@@ -2108,15 +2045,6 @@ impl ArchiveExecutor for EmbeddedAwareFakeBackend {
             encrypted: None,
         })
     }
-
-    async fn compress(
-        &self,
-        request: CompressArchiveRequest,
-    ) -> smartzip_core::Result<CompressArchiveResult> {
-        Ok(CompressArchiveResult {
-            output: request.output,
-        })
-    }
 }
 
 struct PasswordListingBackend {
@@ -2156,12 +2084,6 @@ impl ArchiveExecutor for PasswordListingBackend {
         _: ExtractArchiveRequest,
     ) -> smartzip_core::Result<ExtractArchiveResult> {
         panic!("listing must not extract")
-    }
-    async fn compress(
-        &self,
-        _: CompressArchiveRequest,
-    ) -> smartzip_core::Result<CompressArchiveResult> {
-        panic!("listing must not compress")
     }
 }
 

@@ -116,15 +116,6 @@ impl ArchiveFormat {
     }
 }
 
-/// User-facing compression level preset.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub enum CompressionLevel {
-    Fast,
-    #[default]
-    Balanced,
-    Best,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

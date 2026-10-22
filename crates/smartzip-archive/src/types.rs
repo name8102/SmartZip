@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use smartzip_core::{ArchiveFormat, CompressionLevel, EncodingMode};
+use smartzip_core::{ArchiveFormat, EncodingMode};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -67,20 +67,6 @@ pub struct ExtractArchiveResult {
     /// Encryption evidence from the extraction's existing metadata/preflight.
     #[serde(default)]
     pub encrypted: Option<bool>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CompressArchiveRequest {
-    pub inputs: Vec<PathBuf>,
-    pub output: PathBuf,
-    pub format: ArchiveFormat,
-    pub level: CompressionLevel,
-    pub password: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CompressArchiveResult {
-    pub output: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

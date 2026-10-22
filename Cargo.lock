@@ -6924,7 +6924,6 @@ dependencies = [
  "libc",
  "lzma-rust2",
  "process-wrap",
- "rstest",
  "serde",
  "serde_json",
  "smartzip-config",
@@ -7046,7 +7045,6 @@ version = "0.1.0-beta.1"
 dependencies = [
  "async-trait",
  "chrono",
- "futures-util",
  "gpui-kit",
  "image 0.25.10",
  "libc",

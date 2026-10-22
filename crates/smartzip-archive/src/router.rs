@@ -815,37 +815,6 @@ impl ArchiveExecutor for BackendRouter {
         self.extract_with_facts_in_context(request, facts, context)
             .await
     }
-
-    async fn compress(&self, request: CompressArchiveRequest) -> Result<CompressArchiveResult> {
-        let context = std::sync::Arc::new(TaskExecutionContext::detached());
-        self.compress_with_context(request, context).await
-    }
-
-    async fn compress_with_context(
-        &self,
-        request: CompressArchiveRequest,
-        context: std::sync::Arc<TaskExecutionContext>,
-    ) -> Result<CompressArchiveResult> {
-        let container = Some(request.format.clone());
-        let requirements = request_requirements(
-            ArchiveOperation::Compress,
-            container.as_ref(),
-            request.password.as_deref(),
-            None,
-        );
-        self.route(
-            std::sync::Arc::clone(&context),
-            ArchiveOperation::Compress,
-            container,
-            requirements,
-            |adapter| {
-                let request = request.clone();
-                let context = std::sync::Arc::clone(&context);
-                Box::pin(async move { adapter.compress_with_context(request, context).await })
-            },
-        )
-        .await
-    }
 }
 
 fn discovered_registration<A: ArchiveAdapter + 'static>(
@@ -871,7 +840,6 @@ pub(crate) fn seven_zip_capabilities() -> AdapterCapabilities {
             ArchiveOperation::List,
             ArchiveOperation::Test,
             ArchiveOperation::Extract,
-            ArchiveOperation::Compress,
         ],
         read_containers: vec![
             ArchiveFormat::Zip,
@@ -884,7 +852,6 @@ pub(crate) fn seven_zip_capabilities() -> AdapterCapabilities {
             ArchiveFormat::Zstd,
             ArchiveFormat::Cab,
         ],
-        compress_containers: vec![ArchiveFormat::Zip, ArchiveFormat::SevenZip],
         supports_passwords: true,
         supports_charset_override: true,
     }
@@ -899,7 +866,6 @@ pub(crate) fn unrar_capabilities() -> AdapterCapabilities {
             ArchiveOperation::Extract,
         ],
         read_containers: vec![ArchiveFormat::Rar],
-        compress_containers: Vec::new(),
         supports_passwords: true,
         supports_charset_override: false,
     }
@@ -1238,14 +1204,6 @@ mod tests {
             })
         }
 
-        async fn compress(&self, request: CompressArchiveRequest) -> Result<CompressArchiveResult> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            self.fail(&request.output)?;
-            Ok(CompressArchiveResult {
-                output: request.output,
-            })
-        }
-
         fn capabilities(&self) -> smartzip_core::AdapterCapabilities {
             crate::router::seven_zip_capabilities()
         }
@@ -1337,28 +1295,6 @@ mod tests {
         );
         assert!(plan.candidates.is_empty());
         assert!(plan.rejected[0].reasons[0].contains("unsupported"));
-    }
-
-    #[test]
-    fn compress_only_uses_compressible_containers() {
-        let router = BackendRouter::from_adapters(vec![AdapterRegistration::new(
-            FakeAdapter::new("7z", None),
-            seven_zip_capabilities(),
-            10,
-        )]);
-        let zip = router.plan(
-            ArchiveOperation::Compress,
-            Some(&ArchiveFormat::Zip),
-            ArchiveRequirements::default(),
-        );
-        assert_eq!(zip.candidates.len(), 1);
-
-        let rar = router.plan(
-            ArchiveOperation::Compress,
-            Some(&ArchiveFormat::Rar),
-            ArchiveRequirements::default(),
-        );
-        assert!(rar.candidates.is_empty());
     }
 
     #[test]

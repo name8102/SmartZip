@@ -13,7 +13,6 @@ pub enum ArchiveOperation {
     List,
     Test,
     Extract,
-    Compress,
 }
 
 /// Concrete adapter metadata used by the router. This is deliberately limited
@@ -22,19 +21,14 @@ pub enum ArchiveOperation {
 pub struct AdapterCapabilities {
     pub operations: Vec<ArchiveOperation>,
     pub read_containers: Vec<ArchiveFormat>,
-    pub compress_containers: Vec<ArchiveFormat>,
     pub supports_passwords: bool,
     pub supports_charset_override: bool,
 }
 
 impl AdapterCapabilities {
     pub fn supports(&self, operation: ArchiveOperation, container: Option<&ArchiveFormat>) -> bool {
-        let containers = match operation {
-            ArchiveOperation::Compress => &self.compress_containers,
-            _ => &self.read_containers,
-        };
         self.operations.contains(&operation)
-            && container.is_none_or(|container| containers.contains(container))
+            && container.is_none_or(|container| self.read_containers.contains(container))
     }
 }
 

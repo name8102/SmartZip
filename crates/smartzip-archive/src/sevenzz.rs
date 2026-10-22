@@ -694,40 +694,6 @@ impl ArchiveAdapter for SevenZipBackend {
         }
     }
 
-    async fn compress(&self, request: CompressArchiveRequest) -> Result<CompressArchiveResult> {
-        self.compress_with_context(
-            request,
-            std::sync::Arc::new(TaskExecutionContext::detached()),
-        )
-        .await
-    }
-
-    async fn compress_with_context(
-        &self,
-        request: CompressArchiveRequest,
-        context: std::sync::Arc<TaskExecutionContext>,
-    ) -> Result<CompressArchiveResult> {
-        let token = context.cancellation_token();
-        let mut args: Vec<String> = vec!["a".into()];
-        if let Some(pw) = Self::password_arg(&request.password) {
-            args.push(pw);
-        }
-        args.push(request.output.to_string_lossy().into_owned());
-        args.extend(
-            request
-                .inputs
-                .iter()
-                .map(|input| input.to_string_lossy().into_owned()),
-        );
-        let output = self.run_with_token(&args, &token).await?;
-        if output.status != Some(0) {
-            return Err(self.map_failure(&output, &request.output));
-        }
-        Ok(CompressArchiveResult {
-            output: request.output,
-        })
-    }
-
     fn capabilities(&self) -> smartzip_core::AdapterCapabilities {
         crate::router::seven_zip_capabilities()
     }

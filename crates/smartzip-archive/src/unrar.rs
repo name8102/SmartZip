@@ -378,21 +378,6 @@ impl ArchiveAdapter for UnrarBackend {
         })
     }
 
-    async fn compress(&self, request: CompressArchiveRequest) -> Result<CompressArchiveResult> {
-        Err(SmartZipError::UnsupportedFormat {
-            path: request.output,
-            format: Some(request.format.as_str().to_string()),
-        })
-    }
-
-    async fn compress_with_context(
-        &self,
-        request: CompressArchiveRequest,
-        _context: std::sync::Arc<TaskExecutionContext>,
-    ) -> Result<CompressArchiveResult> {
-        self.compress(request).await
-    }
-
     fn capabilities(&self) -> smartzip_core::AdapterCapabilities {
         crate::router::unrar_capabilities()
     }
