@@ -307,12 +307,7 @@ pub(super) fn open_state_db(
     let path = if let Some(path) = path {
         path
     } else {
-        let (path, diagnostic) =
-            PlatformPaths::try_new()?.select_database(&PlatformPaths::legacy()?)?;
-        if let Some(message) = diagnostic {
-            eprintln!("{}", safe_text(&message));
-        }
-        path
+        PlatformPaths::try_new()?.db_path()
     };
     let db = if mode == smartzip_config::StateMode::ReadOnly {
         SmartZipDb::open_read_only(&path)?

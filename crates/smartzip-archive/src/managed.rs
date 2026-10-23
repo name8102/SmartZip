@@ -630,6 +630,7 @@ struct SevenSession {
     encrypted: bool,
     limits: ExtractionLimits,
     managed: bool,
+    single_stream: bool,
     sources: Vec<PathBuf>,
     stats: Vec<SourceStat>,
     token: CancellationToken,
@@ -836,19 +837,30 @@ fn seven_entries_for_format(
         if !seen.insert(name.to_owned()) {
             return Err(collision("duplicate 7-Zip member selector"));
         }
+        // Single-line comments (including TAR PAX header names) carry no output
+        // semantics. Continuations and duplicate/injected fields are rejected above.
         for key in [
             "Symbolic Link",
             "Hard Link",
             "Copy Link",
             "NT Security",
-            "Comment",
             "Alternate Stream",
-            "Device Major",
-            "Device Minor",
         ] {
             if fields
                 .get(key)
                 .is_some_and(|value| !value.is_empty() && *value != "-")
+            {
+                return Err(unsupported(format!(
+                    "managed extraction does not support 7-Zip {key} metadata"
+                )));
+            }
+        }
+        // TAR emits zero device numbers even for ordinary files/directories.
+        // Nonzero devices and special permission modes remain unsupported.
+        for key in ["Device Major", "Device Minor"] {
+            if fields
+                .get(key)
+                .is_some_and(|value| !matches!(*value, "" | "-" | "0"))
             {
                 return Err(unsupported(format!(
                     "managed extraction does not support 7-Zip {key} metadata"
@@ -944,6 +956,53 @@ fn seven_args(operation: &str, request: &ExtractArchiveRequest) -> Vec<String> {
         args.push(encoding);
     }
     args
+}
+
+fn single_stream_format(format: Option<&smartzip_core::ArchiveFormat>) -> Option<&'static str> {
+    use smartzip_core::ArchiveFormat;
+    match format? {
+        ArchiveFormat::Gzip => Some("gzip"),
+        ArchiveFormat::Bzip2 => Some("bzip2"),
+        ArchiveFormat::Xz => Some("xz"),
+        ArchiveFormat::Zstd => Some("zstd"),
+        _ => None,
+    }
+}
+
+fn stream_entry(
+    request: &ExtractArchiveRequest,
+    limits: &ExtractionLimits,
+) -> Result<ExtractionEntry> {
+    let filename = request
+        .archive
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| unsupported("compressed stream requires a UTF-8 input filename"))?;
+    let (stem, extension) = filename.rsplit_once('.').unwrap_or((filename, ""));
+    let name = match extension.to_ascii_lowercase().as_str() {
+        "tgz" | "tbz" | "tbz2" | "txz" | "tzst" => format!("{stem}.tar"),
+        "gz" | "gzip" | "bz2" | "bzip2" | "xz" | "zst" | "zstd" if !stem.is_empty() => stem.into(),
+        _ => format!("{filename}.out"),
+    };
+    Ok(ExtractionEntry {
+        id: 0,
+        display_name: name,
+        raw_name: None,
+        source_kind: ExtractionNameSource::StreamFilename,
+        is_dir: false,
+        // A bounded decoding pass replaces this ceiling before publishing the inventory.
+        size: limits
+            .max_single_entry_bytes
+            .min(limits.max_total_output_bytes),
+        metadata: ExtractionMetadata::default(),
+    })
+}
+
+struct DiscardSink;
+impl ManagedSink for DiscardSink {
+    fn open_file(&self, _id: u64) -> Result<Box<dyn Write + Send>> {
+        Ok(Box::new(std::io::sink()))
+    }
 }
 fn seven_failure(
     output: &BackendCommandOutput,
@@ -1079,25 +1138,41 @@ pub(crate) async fn prepare_seven(
     let executable_identity = format!("7z:{}", hash_path(executable.clone(), token.clone()).await?);
     let source = hash_sources(&sources, &token).await?;
     let limits = ExtractionLimits::default();
-    let listing = seven_listing(&executable, &adapter_id, &request, None, &token).await?;
-    let (entries, encrypted) =
-        seven_entries_for_format(&listing, &limits, request.format.as_ref())?;
-    verify_seven_counts(&executable, &adapter_id, &request, &entries, &token).await?;
-    verify_seven_selectors(
-        &executable,
-        &adapter_id,
-        &request,
-        &entries,
-        &limits,
-        &token,
-    )
-    .await?;
-    if source != hash_sources(&sources, &token).await?
-        || executable_identity
-            != format!("7z:{}", hash_path(executable.clone(), token.clone()).await?)
-    {
-        return Err(changed());
-    }
+    let single_stream = single_stream_format(request.format.as_ref()).is_some();
+    let (entries, encrypted) = if single_stream {
+        let mut entry = stream_entry(&request, &limits)?;
+        if request.format == Some(smartzip_core::ArchiveFormat::Gzip) {
+            // Preserve a losslessly represented GZIP header name/mtime. If the
+            // header cannot be represented, use the input filename instead;
+            // it is never passed as a member selector to the stream decoder.
+            let listing = seven_listing(&executable, &adapter_id, &request, None, &token).await?;
+            if let Ok((mut listed, false)) =
+                seven_entries_for_format(&listing, &limits, request.format.as_ref())
+            {
+                if listed.len() == 1 && !listed[0].is_dir {
+                    let ceiling = entry.size;
+                    entry = listed.remove(0);
+                    entry.size = ceiling;
+                }
+            }
+        }
+        (vec![entry], false)
+    } else {
+        let listing = seven_listing(&executable, &adapter_id, &request, None, &token).await?;
+        let (entries, encrypted) =
+            seven_entries_for_format(&listing, &limits, request.format.as_ref())?;
+        verify_seven_counts(&executable, &adapter_id, &request, &entries, &token).await?;
+        verify_seven_selectors(
+            &executable,
+            &adapter_id,
+            &request,
+            &entries,
+            &limits,
+            &token,
+        )
+        .await?;
+        (entries, encrypted)
+    };
     let manifest = make_manifest(
         entries,
         &request,
@@ -1105,7 +1180,7 @@ pub(crate) async fn prepare_seven(
         executable_identity.clone(),
         source,
     )?;
-    Ok(Box::new(SevenSession {
+    let mut session = SevenSession {
         request,
         manifest,
         executable,
@@ -1113,10 +1188,38 @@ pub(crate) async fn prepare_seven(
         encrypted,
         limits,
         managed: single_volume,
+        single_stream,
         sources,
         stats,
         token,
-    }))
+    };
+    if single_stream {
+        // Stream handlers may omit both Path and Size (including valid zstd
+        // frames without content size). Measure with constant memory, without
+        // writing output, under the same byte budget and cancellation lifecycle.
+        let (size, crc32) = Box::pin(stream_seven(
+            &session,
+            &session.manifest.entries[0],
+            Arc::new(DiscardSink),
+            &session.token,
+            &mut 0,
+            false,
+        ))
+        .await?;
+        let mut entries = session.manifest.entries.clone();
+        entries[0].size = size;
+        entries[0].metadata.crc32 = Some(crc32);
+        check_entries(&entries, &session.limits)?;
+        session.manifest = make_manifest(
+            entries,
+            &session.request,
+            session.manifest.adapter_id.clone(),
+            session.executable_identity.clone(),
+            session.manifest.source_identity.clone(),
+        )?;
+    }
+    session.verify_source().await?;
+    Ok(Box::new(session))
 }
 
 #[async_trait]
@@ -1125,7 +1228,8 @@ impl PreparedExtraction for SevenSession {
         self.managed
     }
     fn supports_bulk_original(&self) -> bool {
-        self.executable_identity.starts_with("7z:")
+        !self.single_stream
+            && self.executable_identity.starts_with("7z:")
             && !self.manifest.entries.iter().any(|entry| {
                 entry.is_dir && smartzip_core::is_root_directory_alias(&entry.display_name)
             })
@@ -1197,7 +1301,7 @@ impl PreparedExtraction for SevenSession {
             if source_stats(&self.sources)? != self.stats {
                 return Err(changed());
             }
-            stream_seven(&self, entry, sink.clone(), &token, &mut total).await?;
+            stream_seven(&self, entry, sink.clone(), &token, &mut total, true).await?;
             if source_stats(&self.sources)? != self.stats {
                 return Err(changed());
             }
@@ -1235,11 +1339,19 @@ async fn stream_seven(
     sink: Arc<dyn ManagedSink>,
     token: &CancellationToken,
     total: &mut u64,
-) -> Result<()> {
+    verify: bool,
+) -> Result<(u64, u32)> {
     use process_wrap::tokio::{CommandWrap, KillOnDrop};
     use std::process::Stdio;
     use tokio::io::AsyncReadExt;
     let mut args = seven_args("x", &session.request);
+    if session.single_stream {
+        // Force the decoder: a ZIP renamed to .zst must not concatenate arbitrary
+        // members into the synthetic single-file inventory.
+        let format = single_stream_format(session.request.format.as_ref())
+            .ok_or_else(|| protocol("missing compressed stream format"))?;
+        args.push(format!("-t{format}"));
+    }
     args.extend([
         "-so".into(),
         "-y".into(),
@@ -1251,8 +1363,10 @@ async fn stream_seven(
             .to_str()
             .ok_or_else(|| unsupported("non-UTF-8 archive path"))?
             .into(),
-        entry.display_name.clone(),
     ]);
+    if !session.single_stream {
+        args.push(entry.display_name.clone());
+    }
     let output = sink.open_file(entry.id)?;
     let mut command = CommandWrap::with_new(&session.executable, |command| {
         command
@@ -1357,18 +1471,20 @@ async fn stream_seven(
     let written = writer.await.map_err(|e| protocol(e.to_string()))?;
     written?;
     result?;
-    if count != entry.size
-        || entry
-            .metadata
-            .crc32
-            .is_some_and(|expected| expected != crc.finalize())
+    let crc32 = crc.finalize();
+    if verify
+        && (count != entry.size
+            || entry
+                .metadata
+                .crc32
+                .is_some_and(|expected| expected != crc32))
     {
         return Err(SmartZipError::CorruptedArchive {
             path: session.request.archive.clone(),
             detail: "managed 7-Zip member size/CRC mismatch".into(),
         });
     }
-    Ok(())
+    Ok((count, crc32))
 }
 
 #[cfg(test)]
@@ -1728,6 +1844,30 @@ mod tests {
                 )
                 .is_err(),
                 "accepted {metadata:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn slt_accepts_pax_comments_without_accepting_continuations_or_forged_records() {
+        let entry = "Path = file.txt\nSize = 1\nFolder = -\nMode = -rw-r--r--\nComment = ./PaxHeaders/file.txt\nDevice Major = 0\nDevice Minor = 0\n";
+        let (entries, _) = seven_entries(entry, &ExtractionLimits::default()).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].display_name, "file.txt");
+        for unsafe_entry in [
+            entry.replace("Device Major = 0", "Device Major = 1"),
+            entry.replace("Device Minor = 0", "Device Minor = 1"),
+            entry.replace("-rw-r--r--", "crw-r--r--"),
+        ] {
+            assert!(seven_entries(&unsafe_entry, &ExtractionLimits::default()).is_err());
+        }
+        for suffix in [
+            "continuation\n",
+            "Path = injected.txt\n",
+            "Comment = duplicate\n",
+        ] {
+            assert!(
+                seven_entries(&format!("{entry}{suffix}"), &ExtractionLimits::default()).is_err()
             );
         }
     }
@@ -2117,6 +2257,141 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn single_stream_formats_without_member_names_or_sizes() {
+        let tools = crate::SevenZipLocator::default().locate_all();
+        assert!(!tools.is_empty(), "7z/7zz must be available");
+        for executable in tools {
+            for (extension, format) in [
+                ("gz", smartzip_core::ArchiveFormat::Gzip),
+                ("bz2", smartzip_core::ArchiveFormat::Bzip2),
+                ("xz", smartzip_core::ArchiveFormat::Xz),
+                ("zst", smartzip_core::ArchiveFormat::Zstd),
+            ] {
+                let root = tempfile::tempdir().unwrap();
+                let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join(format!("tests/fixtures/single-stream.tar.{extension}"));
+                let mut req = request(&path, root.path());
+                req.format = Some(format);
+                let session =
+                    prepare_seven(req, executable.clone(), "fixture-seven".into(), context())
+                        .await
+                        .unwrap_or_else(|error| {
+                            panic!("{}: {extension}: {error:?}", executable.display())
+                        });
+                assert_eq!(session.manifest().entries.len(), 1);
+                let entry = &session.manifest().entries[0];
+                assert_eq!(entry.display_name, "single-stream.tar");
+                assert_eq!(entry.size, 10240);
+                assert!(!session.supports_bulk_original());
+                session.execute(sink(root.path()), context()).await.unwrap();
+                let content = std::fs::read(root.path().join("0")).unwrap();
+                assert_eq!(&content[..15], b"leaf_stream.txt");
+                assert_eq!(&content[512..527], b"stream payload\n");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn single_stream_measurement_enforces_the_output_budget() {
+        let executable = seven_tool().expect("7z/7zz must be available");
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/single-stream.tar.zst");
+        let mut req = request(&path, Path::new("unused-output"));
+        req.format = Some(smartzip_core::ArchiveFormat::Zstd);
+        let limits = ExtractionLimits {
+            max_single_entry_bytes: 8,
+            ..Default::default()
+        };
+        let entry = stream_entry(&req, &limits).unwrap();
+        let manifest = make_manifest(
+            vec![entry.clone()],
+            &req,
+            "fixture-seven".into(),
+            String::new(),
+            String::new(),
+        )
+        .unwrap();
+        let session = SevenSession {
+            request: req,
+            manifest,
+            executable,
+            executable_identity: String::new(),
+            encrypted: false,
+            limits,
+            managed: true,
+            single_stream: true,
+            sources: Vec::new(),
+            stats: Vec::new(),
+            token: CancellationToken::new(),
+        };
+        let result = stream_seven(
+            &session,
+            &entry,
+            Arc::new(DiscardSink),
+            &session.token,
+            &mut 0,
+            false,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(SmartZipError::ResourceLimit { .. })),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn single_stream_rejects_corruption_and_wrong_container_before_output() {
+        let executable = seven_tool().expect("7z/7zz must be available");
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("fixture.zst");
+        let output = root.path().join("output");
+        let bytes = include_bytes!("../tests/fixtures/single-stream.tar.zst");
+        std::fs::write(&path, &bytes[..bytes.len() / 2]).unwrap();
+        let mut req = request(&path, &output);
+        req.format = Some(smartzip_core::ArchiveFormat::Zstd);
+        assert!(prepare_seven(
+            req.clone(),
+            executable.clone(),
+            "fixture-seven".into(),
+            context()
+        )
+        .await
+        .is_err());
+        raw_zip(
+            &path,
+            &[
+                (b"first", b"one", 0, Vec::new()),
+                (b"second", b"two", 0, Vec::new()),
+            ],
+        );
+        assert!(
+            prepare_seven(req, executable, "fixture-seven".into(), context())
+                .await
+                .is_err()
+        );
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn single_stream_names_keep_tar_aliases_and_unicode() {
+        for (filename, expected) in [
+            ("归档.TGZ", "归档.tar"),
+            ("archive.tbz2", "archive.tar"),
+            ("archive.txz", "archive.tar"),
+            ("archive.tzst", "archive.tar"),
+            ("逆境強化のスージー.tar.zst", "逆境強化のスージー.tar"),
+            ("payload.bin", "payload.bin.out"),
+        ] {
+            let entry = stream_entry(
+                &request(Path::new(filename), Path::new("output")),
+                &ExtractionLimits::default(),
+            )
+            .unwrap();
+            assert_eq!(entry.display_name, expected);
+        }
+    }
+
+    #[tokio::test]
     async fn tar_and_gzip_use_managed_content_when_sizes_are_available() {
         let Some(executable) = seven_tool() else {
             return;
@@ -2432,6 +2707,7 @@ pub(crate) async fn prepare_unrar(
         encrypted,
         limits,
         managed: false,
+        single_stream: false,
         sources,
         stats,
         token,

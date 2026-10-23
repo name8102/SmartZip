@@ -143,18 +143,6 @@ async fn extract_records_task_events_and_file_row() {
             root.file_size.unwrap()
         )
         .unwrap());
-    // Completion is recorded only in canonical history; hints do not duplicate it.
-    let known_repo = KnownFileRepository::new(db.connection());
-    let hash = root.sample_hash.as_deref().unwrap();
-    let size = root.file_size.unwrap();
-    let known = known_repo
-        .find(hash, size)
-        .unwrap()
-        .expect("known_files should have an entry after a successful extract");
-    assert!(
-        known.last_extract_at.is_none(),
-        "hint cache must not duplicate completion history"
-    );
 }
 
 #[tokio::test]

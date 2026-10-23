@@ -102,13 +102,9 @@ fn database(options: &LibraryOptions, write: bool) -> Result<SmartZipDb> {
     }
     let path = match options.database_path.as_ref().or(state.database.as_ref()) {
         Some(path) => path.clone(),
-        None => {
-            PlatformPaths::try_new()
-                .map_err(|e| e.to_string())?
-                .select_database(&PlatformPaths::legacy().map_err(|e| e.to_string())?)
-                .map_err(|e| e.to_string())?
-                .0
-        }
+        None => PlatformPaths::try_new()
+            .map_err(|e| e.to_string())?
+            .db_path(),
     };
     if write {
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {

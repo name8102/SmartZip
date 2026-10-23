@@ -48,6 +48,7 @@ pub(crate) async fn extract<B: ArchiveExecutor>(
                 ExtractionNameSource::ZipCentralDirectory => SourceNameKind::ZipCentralDirectory,
                 ExtractionNameSource::ZipUnicodeExtra => SourceNameKind::ZipUnicodeExtra,
                 ExtractionNameSource::BackendText => SourceNameKind::BackendText,
+                ExtractionNameSource::StreamFilename => SourceNameKind::Decoded,
             },
             is_dir: e.is_dir,
         })

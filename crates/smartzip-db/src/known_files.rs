@@ -1,6 +1,5 @@
 //! Password and confirmed-encoding hints keyed by file identity.
 //! Successful extraction and deduplication use `file_extractions` history.
-//! The legacy `last_extract_at` column is retained for database compatibility only.
 
 use crate::Result;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -26,7 +25,6 @@ pub struct KnownFile {
     pub names_offsets: Vec<NameOffset>,
     pub password_id: Option<i64>,
     pub confirmed_encoding: Option<String>,
-    pub last_extract_at: Option<String>,
 }
 
 pub struct KnownFileRepository<'a> {
@@ -39,14 +37,13 @@ impl<'a> KnownFileRepository<'a> {
     }
 
     /// Look up the single index entry for a physical file. One query returns
-    /// everything the extract hot path needs: reuse password, reuse confirmed
-    /// encoding, and the dedup timestamp.
+    /// password and confirmed-encoding hints for the extract hot path.
     pub fn find(&self, sample_hash: &str, size: i64) -> Result<Option<KnownFile>> {
         self.conn
             .query_row(
                 r#"
                 SELECT sample_hash, size, names_offsets_json, password_id,
-                       confirmed_encoding, last_extract_at
+                       confirmed_encoding
                 FROM known_files
                 WHERE sample_hash = ?1 AND size = ?2
                 "#,
@@ -85,8 +82,7 @@ impl<'a> KnownFileRepository<'a> {
     }
 
     /// Record a user-confirmed encoding: overwrite `confirmed_encoding` and
-    /// append the name/offset pair. Never writes `last_extract_at` — a
-    /// confirmation is not an extraction.
+    /// append the name/offset pair without recording extraction completion.
     pub fn upsert_confirmed_encoding(
         &self,
         sample_hash: &str,
@@ -137,7 +133,6 @@ fn map_known_file(row: &rusqlite::Row<'_>) -> rusqlite::Result<KnownFile> {
         names_offsets,
         password_id: row.get(3)?,
         confirmed_encoding: row.get(4)?,
-        last_extract_at: row.get(5)?,
     })
 }
 
@@ -181,7 +176,6 @@ mod tests {
         );
         // password_id is preserved from the first write via COALESCE.
         assert_eq!(got.password_id, Some(1));
-        assert!(got.last_extract_at.is_none());
     }
 
     #[test]
@@ -206,7 +200,6 @@ mod tests {
         repo.upsert_password_hint("h", 1, None, Some(pw)).unwrap();
         let got = repo.find("h", 1).unwrap().unwrap();
         assert_eq!(got.confirmed_encoding.as_deref(), Some("gb18030"));
-        assert!(got.last_extract_at.is_none());
         assert_eq!(got.password_id, Some(pw));
     }
 
@@ -219,14 +212,5 @@ mod tests {
             .unwrap();
         let got = repo.find("h", 1).unwrap().unwrap();
         assert_eq!(got.confirmed_encoding.as_deref(), Some("gb18030"));
-    }
-
-    #[test]
-    fn confirmed_encoding_does_not_set_last_extract_at() {
-        let db = SmartZipDb::in_memory().unwrap();
-        let repo = KnownFileRepository::new(db.connection());
-        repo.upsert_confirmed_encoding("h", 1, None, "gbk").unwrap();
-        let got = repo.find("h", 1).unwrap().unwrap();
-        assert!(got.last_extract_at.is_none());
     }
 }

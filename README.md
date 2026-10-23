@@ -72,6 +72,8 @@ cargo run -p smartzip-cli -- password add <password>
 
 `password export --path <新文件>` 导出完整明文密码表，Unix 文件权限为 0600；已有文件或链接会保留，需选择新路径。状态数据库的符号链接使用同一实际路径与执行锁；硬链接数据库会拒绝打开，避免 SQLite 侧文件与执行权出现歧义。
 
+默认数据库只使用当前平台数据目录，不再探测或回退到旧版嵌套目录。升级前退出 SmartZip CLI/GUI，再运行 `python3 scripts/migrate_database.py <旧库路径> <当前库路径>` 做一次性迁移；脚本包含已提交的 WAL 数据，拒绝覆盖目标，保留原库作备份。macOS 当前路径为 `~/Library/Application Support/SmartZip/smartzip.db`，旧路径为其下的 `smartzip/smartzip.db`。迁移后使用更新后的 CLI 和 GUI。
+
 `extract` 支持常见参数，例如：
 
 - `--output <dir>`：指定输出目录
@@ -82,7 +84,7 @@ cargo run -p smartzip-cli -- password add <password>
 
 解压前会在实际输出卷规划名称。默认 `native` 使用目标卷约束；`portable` 叠加 Windows 安全名称和每分量 255 UTF-8 字节等约束。超长名称和目标等价冲突可确定性映射，重复文件成员、文件/目录结构矛盾及越界路径仍会拒绝。GUI 任务和历史详情分页显示原名 → 最终名，完整报告独立于事件记录保存；关闭状态存储时仍可查看本次报告。
 
-普通 7-Zip 归档保留固定后端的整包提取；需要映射时，ZIP 按索引读取，7-Zip 普通成员经唯一选择验证后受控写入。已验证 ZIP、7z solid、RAR4、TAR/GZIP 内容读取；不启用混合批量路线。链接、特殊文件、选择歧义及需要映射的分卷会明确报告能力不足；权限/时间支持不等于完整 xattr/ACL/ADS 恢复。solid 逐成员提取可能重复解码，任意深路径及 Btrfs/NTFS 原生验收尚未完成。Portable 不保证所有旧应用能打开完整路径，具体配置与限制见[统一配置](docs/configuration.md)。
+普通 7-Zip 归档保留固定后端的整包提取；需要映射时，ZIP 按索引读取，7-Zip 普通成员经唯一选择验证后受控写入。已验证 ZIP、7z solid、RAR4、TAR，以及 GZIP/BZIP2/XZ/Zstandard 单流与内层 TAR 递归解压；不启用混合批量路线。单流先在字节预算内解码计数，再按冻结大小受控写入，支持缺少成员名或解压大小的流；无成员名时按输入文件名去掉压缩后缀，TAR 简写后缀展开为 `.tar`。TAR 的单行 PAX 注释可读取，链接、特殊文件、选择歧义及需要映射的分卷仍明确报告能力不足；元数据恢复覆盖权限和时间，不包含完整 xattr/ACL/ADS。solid 逐成员提取可能重复解码，任意深路径及 Btrfs/NTFS 原生验收尚未完成。Portable 的完整路径对旧应用仍有约束，具体配置与限制见[统一配置](docs/configuration.md)。
 
 `test` 接受多个归档或任意分卷，同组输入只校验一次。默认 `--diagnose auto`，失败后追加只读校验和至多一次不同后端复核；`--diagnose off` 关闭追加诊断，`--diagnostic-timeout 30` 限制追加阶段为 30 秒，`--no-history` 不保存任务记录。JSON 模式不提示输入，可用 `-p` 提供密码。
 

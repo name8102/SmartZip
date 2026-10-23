@@ -115,6 +115,7 @@ pub enum ExtractionNameSource {
     ZipCentralDirectory,
     ZipUnicodeExtra,
     BackendText,
+    StreamFilename,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

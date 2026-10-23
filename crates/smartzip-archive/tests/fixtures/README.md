@@ -41,3 +41,12 @@ SHA-256 (`rar-ordinary.rar`): `6514fbcc2ca1ca636ec20137dc864faffd13631dddb100bef
 `rar5-7zip-26.slt` is a captured `7zz l -ba -slt` listing from 7-Zip 26.02
 for an encrypted RAR5 embedded after a JPEG prefix. Member names are anonymized;
 empty field values intentionally retain the trailing space required by SLT.
+
+## Single-stream fixtures
+
+`single-stream.tar.{gz,bz2,xz,zst}` wrap the same 10,240-byte USTAR archive:
+one regular member, `leaf_stream.txt`, containing `stream payload\n`, mode 0644,
+mtime 0. Generated with Python's `tarfile` (`USTAR_FORMAT`), `gzip` (mtime 0),
+`bz2`, and `lzma`; the zstd fixture uses `zstd --no-content-size` so decoding
+must discover the output size. GZIP has no stored original filename.
+These exercise nameless/unknown-size listings and recursive TAR extraction.

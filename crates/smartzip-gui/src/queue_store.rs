@@ -196,11 +196,7 @@ pub fn database_path(config: &ResolvedConfig) -> Result<Option<PathBuf>, String>
         return Ok(Some(path.clone()));
     }
     let paths = smartzip_platform::PlatformPaths::try_new().map_err(|e| e.to_string())?;
-    let legacy = smartzip_platform::PlatformPaths::legacy().map_err(|e| e.to_string())?;
-    paths
-        .select_database(&legacy)
-        .map(|p| Some(p.0))
-        .map_err(|e| e.to_string())
+    Ok(Some(paths.db_path()))
 }
 fn save(w: &Write) -> Result<(), String> {
     let result = (|| -> Result<(), Box<dyn std::error::Error>> {

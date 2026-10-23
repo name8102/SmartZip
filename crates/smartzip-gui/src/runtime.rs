@@ -385,11 +385,7 @@ fn open_database(
     }
     let path = match &policy.values().state.database {
         Some(path) => path.clone(),
-        None => {
-            smartzip_platform::PlatformPaths::try_new()?
-                .select_database(&smartzip_platform::PlatformPaths::legacy()?)?
-                .0
-        }
+        None => smartzip_platform::PlatformPaths::try_new()?.db_path(),
     };
     let db = if policy.values().state.mode == smartzip_config::StateMode::ReadOnly {
         smartzip_db::SmartZipDb::open_read_only(&path)?

@@ -377,6 +377,57 @@ fn test_scanner_does_not_panic_on_archive_fixtures(#[case] fixture_name: &str) {
 
 // ── Nested archive path collision (TDD: red before P0-2 fix) ──────────────
 
+#[rstest]
+#[case("gz")]
+#[case("bz2")]
+#[case("xz")]
+#[case("zst")]
+#[tokio::test]
+async fn single_stream_tar_wrappers_extract_recursively(#[case] extension: &str) {
+    let root = TempDir::new().unwrap();
+    let archive = root.path().join(format!("single-stream.tar.{extension}"));
+    std::fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join(format!(
+            "../smartzip-archive/tests/fixtures/single-stream.tar.{extension}"
+        )),
+        &archive,
+    )
+    .unwrap();
+    let db = SmartZipDb::in_memory().unwrap();
+    let service = PasswordService::new(PasswordRepository::new(db.connection()));
+    let (engine, _) = engine_with_test_recycler();
+    let output = root.path().join("output");
+    let result = engine
+        .extract_recursive(
+            &backend(),
+            &service,
+            ExtractWorkflowRequest {
+                inputs: vec![archive.clone()],
+                output_dir: output.clone(),
+                recursion_limit: 2,
+                encoding_mode: EncodingMode::Auto,
+                scanner: ScannerConfig::default(),
+                password_candidates: PasswordCandidateRequest::default(),
+                layout_policy: Default::default(),
+                single_root_name_policy: Default::default(),
+                embedded_scan_mode: Default::default(),
+                dominant_min_ratio: 0.70,
+                confirm_large_scan: false,
+                force: false,
+                limits: Default::default(),
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.processed.len(), 2, "{result:?}");
+    assert!(result.skipped.is_empty(), "{result:?}");
+    let leaf = find_file(&output, "leaf_stream.txt").expect("inner TAR payload must be extracted");
+    assert_eq!(std::fs::read(leaf).unwrap(), b"stream payload\n");
+    assert!(archive.exists(), "root archive must be retained");
+}
+
 /// TDD regression: `.tar.gz -> .tar -> leaf` path collision.
 ///
 /// Current failure (P0-1): when `CommitSingleFileAsInnerName` commits the

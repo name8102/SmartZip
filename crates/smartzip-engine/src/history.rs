@@ -211,9 +211,8 @@ pub struct KnownFileUpsert<'a> {
     pub password_id: Option<i64>,
 }
 
-/// A user-confirmed encoding for an exact known file. Unlike an extract
-/// upsert, this overwrites `confirmed_encoding` and does not touch
-/// `last_extract_at`.
+/// A user-confirmed encoding for an exact known file. Unlike a password-hint
+/// upsert, this overwrites `confirmed_encoding`.
 #[derive(Debug, Clone)]
 pub struct KnownFileEncodingUpsert<'a> {
     pub sample_hash: &'a str,
