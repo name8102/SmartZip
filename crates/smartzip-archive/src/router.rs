@@ -132,9 +132,8 @@ impl BackendRouter {
             }
             check_declared_version(installation, &mut warnings);
             let registration = match &installation.family {
-                AdapterFamily::SevenZipCli => AdapterRegistration::new(
+                AdapterFamily::SevenZipCli => AdapterRegistration::from_adapter(
                     SevenZipBackend::new(executable).with_id(installation.id.clone()),
-                    seven_zip_capabilities(),
                     installation.priority,
                 ),
                 AdapterFamily::UnrarCli => AdapterRegistration::new(
@@ -1553,7 +1552,11 @@ mod tests {
     fn sevenzip_is_final_fallback_for_non_rar_formats() {
         let router = BackendRouter::from_adapters(vec![
             AdapterRegistration::from_adapter(UnrarBackend::new(PathBuf::from("unrar")), 20),
-            AdapterRegistration::from_adapter(SevenZipBackend::new(PathBuf::from("7z")), 10),
+            AdapterRegistration::new(
+                SevenZipBackend::new(PathBuf::from("7z")),
+                seven_zip_capabilities(),
+                10,
+            ),
         ]);
 
         let zstd_plan = router.plan(

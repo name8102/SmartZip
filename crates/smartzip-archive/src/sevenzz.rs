@@ -695,8 +695,61 @@ impl ArchiveAdapter for SevenZipBackend {
     }
 
     fn capabilities(&self) -> smartzip_core::AdapterCapabilities {
-        crate::router::seven_zip_capabilities()
+        let mut capabilities = crate::router::seven_zip_capabilities();
+        // Builds of the same 7z version can omit handlers (notably RAR in
+        // free-only p7zip packages). Query each installation, not its family.
+        if let Some(containers) = std::process::Command::new(&self.executable)
+            .arg("i")
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .and_then(|output| parse_read_containers(&String::from_utf8_lossy(&output.stdout)))
+        {
+            capabilities.read_containers = containers;
+        }
+        capabilities
     }
+}
+
+fn parse_read_containers(output: &str) -> Option<Vec<ArchiveFormat>> {
+    let mut lines = output.lines();
+    lines.find(|line| line.trim() == "Formats:")?;
+    let supported = crate::router::seven_zip_capabilities().read_containers;
+    let mut containers = Vec::new();
+    // Both p7zip and current 7-Zip separate the format table from Codecs with
+    // a blank line. Flag columns differ, so match the supported format names.
+    for line in lines
+        .skip_while(|line| line.trim().is_empty())
+        .take_while(|line| !line.trim().is_empty() && !line.trim_end().ends_with(':'))
+    {
+        if let Some(format) = line
+            .split_whitespace()
+            .map(parse_archive_format)
+            .find(|format| supported.contains(format))
+        {
+            if !containers.contains(&format) {
+                containers.push(format);
+            }
+        }
+    }
+    // Free-only 7zz can list RAR headers while omitting the non-free decoder.
+    // A readable header alone is insufficient for test/extract routing.
+    let has_rar_decoder = output.split_once("Codecs:").is_some_and(|(_, codecs)| {
+        codecs
+            .lines()
+            .skip_while(|line| line.trim().is_empty())
+            .take_while(|line| !line.trim().is_empty() && !line.trim_end().ends_with(':'))
+            .any(|line| {
+                line.split_whitespace().any(|field| field.contains('D'))
+                    && line
+                        .split_whitespace()
+                        .any(|field| matches!(field, "Rar1" | "Rar2" | "Rar3" | "Rar5"))
+            })
+    });
+    if !has_rar_decoder {
+        containers.retain(|format| *format != ArchiveFormat::Rar);
+    }
+    Some(containers)
 }
 
 fn extract_unsupported_method(output: &str) -> Option<String> {
@@ -973,7 +1026,7 @@ fn parse_archive_format(value: &str) -> ArchiveFormat {
     match value.to_ascii_lowercase().as_str() {
         "zip" => ArchiveFormat::Zip,
         "7z" => ArchiveFormat::SevenZip,
-        "rar" => ArchiveFormat::Rar,
+        "rar" | "rar5" => ArchiveFormat::Rar,
         "tar" => ArchiveFormat::Tar,
         "gzip" | "gz" => ArchiveFormat::Gzip,
         "bzip2" | "bz2" => ArchiveFormat::Bzip2,
@@ -1390,13 +1443,20 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_declare_zstd_extract_support() {
-        let backend = SevenZipBackend::new(PathBuf::from("7z"));
-        let capabilities = backend.capabilities();
-        assert!(capabilities.supports(
-            smartzip_core::ArchiveOperation::Extract,
-            Some(&ArchiveFormat::Zstd),
-        ));
+    fn capabilities_follow_reported_formats() {
+        assert_eq!(
+            parse_read_containers("7-Zip 26.04\nFormats:\n ...F.... Rar rar r00\n ...F.... Rar5 rar r00\n CK...... zstd zst\n\nCodecs:\n D 40305 Rar5\n"),
+            Some(vec![ArchiveFormat::Rar, ArchiveFormat::Zstd]),
+        );
+        assert_eq!(
+            parse_read_containers("Formats:\n\nCodecs:\n 0 ED Rar5\n"),
+            Some(vec![])
+        );
+        assert_eq!(parse_read_containers("7-Zip 26.04\n"), None);
+        assert_eq!(
+            parse_read_containers("Formats:\n ...F.... Rar5 rar r00\n CK...... zip zip\n\nCodecs:\n ED 40108 Deflate\n\nHashers:\n D 40305 Rar5\n"),
+            Some(vec![ArchiveFormat::Zip]),
+        );
     }
 
     #[test]

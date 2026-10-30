@@ -28,6 +28,8 @@ SmartZip 是一个用 Rust 重写的跨平台压缩包辅助工具，目标是�
 
 NixOS 使用仓库的 Nix 包，包含 CLI、GUI、运行库、7-Zip 后端和应用菜单入口：
 
+后端使用带 RAR 解码器的 `_7zz-rar`（包含 unRAR 许可代码）；默认的 `_7zz` 可列出 RAR 内容，但缺少解压所需的解码器。
+
 ```bash
 nix run . -- --help
 nix run .#smartzip-gui

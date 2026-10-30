@@ -4,7 +4,7 @@
   dependencies,
   makeWrapper,
   makeDesktopItem,
-  _7zz,
+  _7zz-rar,
   xdg-utils,
   desktop-file-utils,
 }:
@@ -62,12 +62,12 @@ rustPlatform.buildRustPackage {
   '';
   postFixup = ''
     wrapProgram "$out/bin/smartzip" \
-      --suffix PATH : ${lib.makeBinPath [ _7zz ]}
+      --suffix PATH : ${lib.makeBinPath [ _7zz-rar ]}
     wrapProgram "$out/bin/smartzip-gui" \
       --set SMARTZIP_GUI_LAUNCHER "$out/bin/smartzip-gui" \
       --suffix PATH : ${
         lib.makeBinPath [
-          _7zz
+          _7zz-rar
           xdg-utils
           desktop-file-utils
         ]

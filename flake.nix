@@ -26,6 +26,13 @@
         let
           pkgs = import nixpkgs {
             inherit system;
+            # RAR decoding and its assembler carry non-free licenses.
+            config.allowUnfreePredicate =
+              pkg:
+              builtins.elem (nixpkgs.lib.getName pkg) [
+                "7zz"
+                "uasm"
+              ];
             overlays = [ rust-overlay.overlays.default ];
           };
           rustToolchain = pkgs.rust-bin.stable."1.98.1".minimal.override {
@@ -96,7 +103,7 @@
               python314
               git
               ripgrep
-              _7zz
+              _7zz-rar
               zip
               unzip
             ];
@@ -121,7 +128,7 @@
               {
                 nativeBuildInputs = [
                   smartzip
-                  pkgs._7zz
+                  pkgs._7zz-rar
                 ];
               }
               ''
@@ -130,6 +137,9 @@
                 export XDG_DATA_HOME="$HOME/data"
                 export XDG_CACHE_HOME="$HOME/cache"
                 mkdir -p "$HOME" "$TMPDIR/input"
+                # RAR headers remain listable even when the decoder is omitted.
+                7zz i > "$TMPDIR/sevenzip-info.txt"
+                grep -Eq 'D.* Rar5$' "$TMPDIR/sevenzip-info.txt"
                 printf 'SmartZip Nix smoke test\n' > "$TMPDIR/input/payload.txt"
                 7zz a "$TMPDIR/archive.zip" "$TMPDIR/input/payload.txt" > /dev/null
                 smartzip --version

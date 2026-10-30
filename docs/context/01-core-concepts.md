@@ -5,6 +5,7 @@
 | **ArchiveBackend** | 旧后端抽象名称，历史任务中仍有引用；当前接口见 `ArchiveExecutor` 与 `ArchiveAdapter`。 |
 | **ArchiveExecutor** | 面向 `SmartZipEngine` 的归档执行接口，定义 `probe` / `list` / `test` / `extract`。`BackendRouter` 实现此接口，封装 adapter 发现、能力选择和 fallback。 |
 | **ArchiveAdapter** | 面向 `BackendRouter` 的后端 adapter seam。每个 Rust 原生实现或外部程序实例（包括不同路径或版本的 `7z`、`7zz`）都是独立 adapter，并保留自己的身份和能力，不在进入路由前合并。 |
+| **7-Zip 格式能力** | 注册时读取各安装的 `7z i` / `7zz i` 格式表与 RAR 解码器；缺少 RAR handler 或解码器的构建不参与 RAR 路由。7-Zip 的 `Rar`、`Rar5` 均映射为 `ArchiveFormat::Rar`。 |
 | **AdapterCapabilities** | 路由实际消费的 adapter 元数据：支持的 operation、读取容器，以及密码和字符集覆盖能力。运行时 UnsupportedCodec/UnsupportedContainer 仅进入任务级负面缓存，不持久化假设性的 profile 规则。 |
 | **ArchiveFacts** | 路由需要的归档事实：容器和可选 codec 字符串。事实不包含假设性的后端策略。 |
 | **ArchiveRequirements** | 当前调用方的具体路由要求：是否提供密码、是否覆盖文件名字符集，以及已观察的 codec 字符串。 |
