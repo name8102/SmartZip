@@ -4,11 +4,11 @@ linker = "clang"
 [env]
 RUST_TEST_THREADS = "1"
 
-# Keep backtrace line numbers without full debug info or incremental caches.
+# Keep backtrace line numbers and incremental state without full debug info.
 # Tests inherit dev; release/bench profiles retain their existing settings.
 [profile.dev]
 debug = "line-tables-only"
-incremental = false
+incremental = true
 
 [profile.dev.package."*"]
 debug = false
