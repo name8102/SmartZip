@@ -3,6 +3,9 @@ use super::*;
 
 impl Render for View {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(glass) = &self.glass {
+            glass.prepare(window.viewport_size(), window, cx);
+        }
         let requested_mode = self.shared.update(cx, |s, _| s.requested_mode.take());
         if let Some(quick) = requested_mode {
             self.switch_mode(quick, window, cx);
@@ -76,42 +79,81 @@ impl Render for View {
             self.member_preview
                 .update(cx, |preview, cx| preview.clear(window, cx));
         }
-        let header =
-            div()
-                .flex()
-                .flex_shrink_0()
-                .items_center()
-                .justify_between()
-                .h(px(56.))
-                .px_5()
-                .border_b_1()
-                .border_color(cx.theme().border)
-                .child(
-                    div()
-                        .text_size(px(20.))
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .child(if quick {
-                            "快速解压"
-                        } else {
-                            self.page.title()
-                        }),
-                )
-                .child(
-                    control("toggle-mode")
-                        .icon(if quick {
-                            IconName::PanelLeftOpen
-                        } else {
-                            IconName::AppWindow
-                        })
-                        .label(if quick {
-                            "完整模式"
-                        } else {
-                            "快速模式"
-                        })
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.switch_mode(!quick, window, cx)
-                        })),
-                );
+        let header = div()
+            .flex()
+            .flex_shrink_0()
+            .items_center()
+            .justify_between()
+            .h(px(if self.glass.is_some() { 80. } else { 56. }))
+            .px_5()
+            .when(self.glass.is_some(), |header| header.px_1())
+            .when(self.glass.is_none(), |header| {
+                header.border_b_1().border_color(cx.theme().border)
+            })
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_size(px(20.))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .child(if quick {
+                                "快速解压"
+                            } else {
+                                self.page.title()
+                            }),
+                    )
+                    .when(
+                        self.glass.is_some() && !quick && self.page == Page::Tasks,
+                        |el| {
+                            el.child(
+                                div()
+                                    .text_size(px(13.))
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child("添加文件、调整设置并查看处理进度"),
+                            )
+                        },
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .when(self.glass.is_some(), |el| {
+                        el.child(
+                            Button::new("glass-backdrop")
+                                .large()
+                                .ghost()
+                                .icon(IconName::Layers)
+                                .tooltip("切换应用内背景，观察玻璃的取样与边缘折射")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if let Some(glass) = &this.glass {
+                                        glass.next_backdrop();
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                    })
+                    .child(
+                        control("toggle-mode")
+                            .icon(if quick {
+                                IconName::PanelLeftOpen
+                            } else {
+                                IconName::AppWindow
+                            })
+                            .label(if quick {
+                                "完整模式"
+                            } else {
+                                "快速模式"
+                            })
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.switch_mode(!quick, window, cx)
+                            })),
+                    ),
+            );
         let body = if quick {
             self.quick_page(cx).into_any_element()
         } else {
@@ -226,18 +268,71 @@ impl Render for View {
                         }),
                 )
             });
-        let main = div()
-            .flex_1()
-            .min_w_0()
-            .h_full()
-            .flex()
-            .flex_col()
-            .child(header)
-            .child(body)
-            .child(footer);
+        let main = if let Some(glass) = &self.glass {
+            div()
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .flex()
+                .flex_col()
+                .gap(px(14.))
+                .child(header)
+                .child(
+                    if !quick
+                        && self.page == Page::Tasks
+                        && self.shared.read(cx).queue.jobs.is_empty()
+                    {
+                        div()
+                            .flex_1()
+                            .min_h_0()
+                            .flex()
+                            .flex_col()
+                            .child(body)
+                            .child(footer)
+                            .into_any_element()
+                    } else {
+                        glass
+                            .surface("workspace", 26., 0.78, cx)
+                            .flex_1()
+                            .min_h_0()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .overflow_hidden()
+                            .child(body)
+                            .child(footer)
+                            .into_any_element()
+                    },
+                )
+                .child(
+                    div()
+                        .h(px(20.))
+                        .flex_shrink_0()
+                        .px_3()
+                        .text_size(px(11.))
+                        .text_color(cx.theme().muted_foreground)
+                        .child("Liquid Glass  ·  跨平台材质原型"),
+                )
+        } else {
+            div()
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .flex()
+                .flex_col()
+                .child(header)
+                .child(body)
+                .child(footer)
+        };
         div()
             .size_full()
             .bg(cx.theme().background)
+            .when(self.glass.is_some(), |el| {
+                el.relative()
+                    .p(px(20.))
+                    .gap(px(20.))
+                    .child(self.glass.as_ref().unwrap().background())
+            })
             .text_color(cx.theme().foreground)
             .font_family(cx.theme().font_family.clone())
             .text_size(px(preferences.font_size))

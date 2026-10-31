@@ -13,6 +13,9 @@ enum TaskRow {
 
 impl View {
     pub(super) fn drop_area(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.glass.is_some() {
+            return self.glass_drop_area(cx);
+        }
         use gpui::component::empty::{Empty, EmptyHeader, EmptyMedia, EmptyTitle};
         div()
             .id("archive-drop")
@@ -49,6 +52,7 @@ impl View {
                             ),
                     ),
             )
+            .into_any_element()
     }
 
     pub(super) fn actions(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -198,6 +202,7 @@ impl View {
         }
         TabBar::new("task-filter")
             .underline()
+            .when(self.glass.is_some(), |tabs| tabs.segmented())
             .small()
             .selected_index(self.task_filter)
             .children(
@@ -217,6 +222,9 @@ impl View {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        if self.glass.is_some() && self.shared.read(cx).queue.jobs.is_empty() {
+            return self.glass_start_page(window, cx);
+        }
         use gpui::component::resizable::v_resizable;
         let state = self.shared.read(cx);
         let empty = state.queue.jobs.is_empty();
@@ -350,6 +358,7 @@ impl View {
             .child(div().px_5().py_3().flex_shrink_0().child(self.actions(cx)))
             .child(self.prompt(cx))
             .child(div().flex_1().min_h_0().child(panes))
+            .into_any_element()
     }
 
     pub(super) fn quick_page(&mut self, cx: &mut Context<Self>) -> impl IntoElement {

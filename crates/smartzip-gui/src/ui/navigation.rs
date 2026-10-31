@@ -26,6 +26,9 @@ impl View {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        if self.glass.is_some() {
+            return self.glass_sidebar(narrow, cx);
+        }
         let collapsed = self.shared.read(cx).preferences.sidebar_collapsed || narrow;
         let queue = &self.shared.read(cx).queue;
         let active = queue.jobs.iter().filter(|job| job.phase.active()).count();
@@ -143,6 +146,7 @@ impl View {
                         )
                     }),
             )
+            .into_any_element()
     }
 
     pub(super) fn section_tabs(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
@@ -163,6 +167,7 @@ impl View {
             .unwrap_or(0);
         TabBar::new("section-tabs")
             .underline()
+            .when(self.glass.is_some(), |tabs| tabs.segmented())
             .selected_index(selected)
             .children(pages.iter().map(|(_, label)| Tab::new().label(*label)))
             .on_click(cx.listener(move |this, index: &usize, _, cx| this.page(pages[*index].0, cx)))

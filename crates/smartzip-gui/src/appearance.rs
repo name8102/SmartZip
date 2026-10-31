@@ -56,6 +56,9 @@ pub fn apply(preferences: &Preferences, mut window: Option<&mut Window>, cx: &mu
     c.accent_foreground = c.foreground;
     c.popover = rgb(if dark { 0x20272a } else { 0xffffff }).into();
     c.popover_foreground = c.foreground;
+    if crate::liquid_glass::enabled() {
+        crate::liquid_glass::adapt_theme(theme);
+    }
     theme.tokens = (&theme.colors).into();
     theme.motion = Default::default();
     if preferences.reduced_motion {

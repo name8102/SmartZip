@@ -1,6 +1,7 @@
 mod workspace;
 use workspace::*;
 mod data;
+mod glass;
 mod navigation;
 mod quick_settings;
 mod recovery;
@@ -56,6 +57,7 @@ enum Page {
 }
 pub struct View {
     shared: Entity<Workspace>,
+    glass: Option<crate::liquid_glass::Glass>,
     quick: bool,
     page: Page,
     diagnostics_open: bool,
@@ -305,7 +307,11 @@ fn open_view_now(shared: Entity<Workspace>, quick: bool, cx: &mut App) {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             window_min_size: Some(size(px(360.), px(480.))),
             titlebar: Some(gpui::TitlebarOptions {
-                title: Some("SmartZip".into()),
+                title: Some(if crate::liquid_glass::enabled() {
+                    "SmartZip · Liquid Glass 原型".into()
+                } else {
+                    "SmartZip".into()
+                }),
                 ..Default::default()
             }),
             ..Default::default()
@@ -409,6 +415,7 @@ impl View {
         window.focus(&focus, cx);
         Self {
             shared,
+            glass: crate::liquid_glass::enabled().then(Default::default),
             quick,
             page: Page::Tasks,
             diagnostics_open: false,

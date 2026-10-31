@@ -6,6 +6,7 @@ mod config_lists;
 mod instance;
 mod integration_ui;
 mod library;
+mod liquid_glass;
 mod member_preview;
 mod model;
 mod new_open_request;
