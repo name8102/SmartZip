@@ -1,5 +1,5 @@
 //! Fault cases captured against the original runners before centralization.
-use crate::{ArchiveAdapter, ListRequest, SevenZipBackend, TestRequest};
+use crate::{ArchiveAdapter, ListRequest, SevenZipBackend};
 use smartzip_core::{EncodingMode, SmartZipError, TaskExecutionContext};
 use std::{
     path::{Path, PathBuf},
@@ -24,14 +24,6 @@ fn list() -> ListRequest {
         encoding: EncodingMode::Auto,
     }
 }
-fn test() -> TestRequest {
-    TestRequest {
-        archive: "fixture.7z".into(),
-        format: None,
-        password: None,
-        encoding: EncodingMode::Auto,
-    }
-}
 async fn ready(path: &Path) {
     tokio::time::timeout(Duration::from_secs(5), async {
         while !path.exists() {
@@ -44,17 +36,25 @@ async fn ready(path: &Path) {
 
 #[tokio::test]
 async fn process_output_limits_preserve_three_distinct_contracts() {
-    let (_root, path) = executable("dd if=/dev/zero bs=1048576 count=17 2>/dev/null &\n(dd if=/dev/zero bs=1048576 count=17 2>/dev/null) >&2\nwait");
+    let (_root, path) = executable(
+        "dd if=/dev/zero bs=1048576 count=17 2>/dev/null &\n(dd if=/dev/zero bs=1048576 count=17 2>/dev/null) >&2\nwait",
+    );
     let backend = SevenZipBackend::new(path.clone());
-    let ordinary = tokio::time::timeout(Duration::from_secs(15), backend.list(list()))
-        .await
-        .unwrap();
+    let ordinary = tokio::time::timeout(
+        Duration::from_secs(15),
+        backend.list_with_context(list(), Arc::new(TaskExecutionContext::detached())),
+    )
+    .await
+    .unwrap();
     assert!(matches!(ordinary, Err(SmartZipError::ResourceLimit { .. })));
-    let streaming = tokio::time::timeout(Duration::from_secs(15), backend.test_with_report(test()))
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(streaming.value.is_some());
+    let streaming = tokio::time::timeout(
+        Duration::from_secs(15),
+        backend.run_streaming_with_context(&[], Arc::new(TaskExecutionContext::detached()), false),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(streaming.status, Some(0));
     assert_eq!(streaming.stdout.len(), crate::process::MAX_OUTPUT);
     assert_eq!(streaming.stderr.len(), crate::process::MAX_OUTPUT);
     let (diagnostic, truncated) = tokio::time::timeout(
@@ -76,7 +76,7 @@ async fn process_start_errors_preserve_backend_identity_and_io_path() {
     let missing = root.path().join("missing");
     let error = SevenZipBackend::new(missing.clone())
         .with_id("selected")
-        .list(list())
+        .list_with_context(list(), Arc::new(TaskExecutionContext::detached()))
         .await
         .unwrap_err();
     assert!(
@@ -90,7 +90,7 @@ async fn process_start_errors_preserve_backend_identity_and_io_path() {
     );
     let expected_path = root.path().canonicalize().unwrap();
     let error = SevenZipBackend::new(root.path().to_path_buf())
-        .list(list())
+        .list_with_context(list(), Arc::new(TaskExecutionContext::detached()))
         .await
         .unwrap_err();
     assert!(matches!(error, SmartZipError::Io { path: Some(path), .. } if path == expected_path));
@@ -123,7 +123,11 @@ async fn process_cancellation_before_start_and_after_pipe_eof_remains_bounded() 
                     .await
                     .map(|_| ()),
                 1 => backend
-                    .test_with_report_and_token(test(), &child_token)
+                    .run_streaming_with_context(
+                        &[],
+                        Arc::new(TaskExecutionContext::detached().with_cancellation(child_token)),
+                        false,
+                    )
                     .await
                     .map(|_| ()),
                 _ => crate::test_output::run(&executable, "fault-test", &[], &child_token)
@@ -176,7 +180,7 @@ async fn diagnostic_cancellation_stops_descendants_and_reaps_parent() {
                         .rsplit_once(')')
                         .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z')) =>
                 {
-                    break
+                    break;
                 }
                 _ => tokio::time::sleep(Duration::from_millis(5)).await,
             }
@@ -238,7 +242,7 @@ async fn diagnostic_cancellation_keeps_group_identity_after_parent_exit() {
                         .rsplit_once(')')
                         .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z')) =>
                 {
-                    break
+                    break;
                 }
                 _ => tokio::time::sleep(Duration::from_millis(5)).await,
             }

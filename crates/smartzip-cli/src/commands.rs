@@ -6,7 +6,7 @@ pub(super) async fn detect(
     db: Option<&SmartZipDb>,
     request: DetectCommand,
     verbose_routing: bool,
-    safety: &SafetyOptions,
+    policy: &smartzip_engine::CompiledRunPolicy,
     cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let DetectCommand {
@@ -21,10 +21,9 @@ pub(super) async fn detect(
         min_confidence: min_confidence.into(),
         ..scanner_config(deep, max_scan_bytes)
     };
-    let policy = safety.policy.as_ref().unwrap();
     let engine = SmartZipEngine::with_scanner_config(config.clone())
         .with_cancellation_token(cancellation.clone())
-        .with_run_policy(policy.as_ref().clone());
+        .with_run_policy(policy.clone());
     let services = policy.services(db.map(SmartZipDb::connection));
     let recorder = services.stores();
     let result = engine
@@ -34,7 +33,7 @@ pub(super) async fn detect(
                 path,
                 scanner: config,
             },
-            task_listener(json, verbose_routing, safety),
+            task_listener(json, verbose_routing, policy),
             services
                 .has_stores()
                 .then_some(&recorder as &dyn smartzip_engine::history::TaskHistoryRecorder),
@@ -50,14 +49,14 @@ pub(super) async fn test_archives(
     db: Option<&SmartZipDb>,
     request: TestCommand,
     verbose_routing: bool,
-    safety: &SafetyOptions,
+    policy: &smartzip_engine::CompiledRunPolicy,
     cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let TestCommand {
         paths,
         password,
         no_empty,
-        encoding,
+        encoding: _,
         json,
         deep,
         max_scan_bytes,
@@ -65,20 +64,17 @@ pub(super) async fn test_archives(
         diagnose,
         diagnostic_timeout,
         no_history,
-        use_clipboard: _,
     } = request;
     let request = smartzip_engine::TestWorkflowRequest {
         paths,
-        encoding: parse_encoding_mode(&encoding),
+        encoding: parse_encoding_mode(&policy.values().extraction.encoding.mode),
         scanner: ScannerConfig {
             min_confidence: min_confidence.into(),
             ..scanner_config(deep, max_scan_bytes)
         },
         password_candidates: PasswordCandidateRequest {
             manual: password,
-            clipboard: None,
             include_empty: !no_empty,
-            limit: safety.password_limit,
         },
         diagnose: match diagnose {
             DiagnoseArg::Auto => smartzip_engine::DiagnoseMode::Auto,
@@ -90,15 +86,14 @@ pub(super) async fn test_archives(
         ),
     };
 
-    let policy = safety.policy.as_ref().unwrap();
     let engine = SmartZipEngine::with_scanner_config(request.scanner.clone())
-        .with_run_policy(policy.as_ref().clone());
+        .with_run_policy(policy.clone());
     let services = policy.services(db.map(SmartZipDb::connection));
     let recorder = services.stores();
     let prompter = StdinPrompter {
-        lock: StdinLock::configured(cancellation.clone(), safety, json),
+        lock: StdinLock::configured(cancellation.clone(), policy, json),
     };
-    let level = safety.policy.as_ref().unwrap().values().logging.level;
+    let level = policy.values().logging.level;
     let listener = (!json && level != smartzip_config::LogLevel::Off).then(|| {
         Arc::new(move |event: &TaskEvent| match &event.kind {
             smartzip_core::TaskEventKind::TestPhase { path, phase, .. }
@@ -144,14 +139,14 @@ pub(super) async fn list_archive(
     db: Option<&SmartZipDb>,
     request: ListCommand,
     verbose_routing: bool,
-    safety: &SafetyOptions,
+    policy: &smartzip_engine::CompiledRunPolicy,
     cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let ListCommand {
         path,
         password: manual_passwords,
         no_empty,
-        encoding,
+        encoding: _,
         pick_encoding,
         json,
         deep,
@@ -163,18 +158,22 @@ pub(super) async fn list_archive(
         min_confidence: min_confidence.into(),
         ..scanner_config(deep, max_scan_bytes)
     };
-    let policy = safety.policy.as_ref().unwrap();
     let engine = SmartZipEngine::with_scanner_config(config.clone())
         .with_cancellation_token(cancellation.clone())
-        .with_run_policy(policy.as_ref().clone());
+        .with_run_policy(policy.clone());
     let services = policy.services(db.map(SmartZipDb::connection));
     let recorder = services.stores();
-    let stdin_lock = StdinLock::configured(cancellation.clone(), safety, json);
+    let stdin_lock = StdinLock::configured(cancellation.clone(), policy, json);
     let password_prompter = StdinPrompter {
         lock: stdin_lock.clone(),
     };
-    let encoding_mode =
-        select_list_encoding(path.clone(), &encoding, pick_encoding, stdin_lock.clone()).await?;
+    let encoding_mode = select_list_encoding(
+        path.clone(),
+        &policy.values().extraction.encoding.mode,
+        pick_encoding,
+        stdin_lock.clone(),
+    )
+    .await?;
     let result = engine
         .list_archive_with_listener_interactive(
             backend,
@@ -185,9 +184,7 @@ pub(super) async fn list_archive(
                 encoding_mode,
                 password_candidates: PasswordCandidateRequest {
                     manual: manual_passwords,
-                    clipboard: None,
                     include_empty: !no_empty,
-                    limit: safety.password_limit,
                 },
             },
             if stdin_lock.interactive {
@@ -196,7 +193,7 @@ pub(super) async fn list_archive(
                 None
             },
             Some(&StdinEncodingPrompter { lock: stdin_lock }),
-            task_listener(json, verbose_routing, safety),
+            task_listener(json, verbose_routing, policy),
             services
                 .has_stores()
                 .then_some(&recorder as &dyn smartzip_engine::history::TaskHistoryRecorder),
@@ -212,7 +209,7 @@ pub(super) async fn extract(
     db: Option<&SmartZipDb>,
     request: ExtractCommand,
     verbose_routing: bool,
-    safety: &SafetyOptions,
+    policy: &smartzip_engine::CompiledRunPolicy,
     cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let ExtractCommand {
@@ -223,7 +220,7 @@ pub(super) async fn extract(
         no_empty,
         deep,
         max_scan_bytes,
-        encoding,
+        encoding: _,
         json,
         layout,
         single_root_name,
@@ -246,12 +243,7 @@ pub(super) async fn extract(
         .collect::<Result<Vec<_>, _>>()?;
     let output = output.map(std::path::absolute).transpose()?;
 
-    let encoding_mode =
-        if encoding.eq_ignore_ascii_case("auto") || encoding.eq_ignore_ascii_case("backend") {
-            EncodingMode::Auto
-        } else {
-            EncodingMode::Override(encoding.to_string())
-        };
+    let encoding_mode = parse_encoding_mode(&policy.values().extraction.encoding.mode);
 
     let output_dir = output.unwrap_or_else(|| default_output_dir(paths.first().unwrap()));
     let workflow_request = ExtractWorkflowRequest {
@@ -262,9 +254,7 @@ pub(super) async fn extract(
         encoding_mode,
         password_candidates: PasswordCandidateRequest {
             manual: manual_passwords,
-            clipboard: None,
             include_empty: !no_empty,
-            limit: safety.password_limit,
         },
         layout_policy,
         single_root_name_policy,
@@ -272,16 +262,12 @@ pub(super) async fn extract(
         dominant_min_ratio,
         confirm_large_scan,
         force,
-        limits: safety.limits(),
+        limits: policy.values().limits.clone(),
     };
-    let prepared = smartzip_engine::PreparedExtractTask::new(
-        safety.policy.as_ref().unwrap().as_ref().clone(),
-        workflow_request,
-    )?;
+    let prepared = smartzip_engine::PreparedExtractTask::new(policy.clone(), workflow_request)?;
     let task_id = prepared.identity().task_id.clone();
-    let execution = if safety.policy.as_ref().unwrap().values().state.mode
-        == smartzip_config::StateMode::ReadWrite
-        && safety.policy.as_ref().unwrap().values().state.history
+    let execution = if policy.values().state.mode == smartzip_config::StateMode::ReadWrite
+        && policy.values().state.history
     {
         db.and_then(SmartZipDb::db_path)
             .map(|path| {
@@ -294,7 +280,7 @@ pub(super) async fn extract(
     } else {
         None
     };
-    let stdin_lock = StdinLock::configured(cancellation.clone(), safety, json);
+    let stdin_lock = StdinLock::configured(cancellation.clone(), policy, json);
     let password_prompter = StdinPrompter {
         lock: stdin_lock.clone(),
     };
@@ -308,7 +294,7 @@ pub(super) async fn extract(
         lock: stdin_lock.clone(),
     };
     let engine = SmartZipEngine::default().with_cancellation_token(cancellation.clone());
-    let event_listener = task_listener(json, verbose_routing, safety);
+    let event_listener = task_listener(json, verbose_routing, policy);
 
     if let Some(execution) = &execution {
         execution.submit(prepared.submission(0)?).await?;
@@ -413,9 +399,9 @@ pub(super) async fn extract(
         smartzip_engine::ExtractObserver {
             listener: event_listener.clone(),
             history: None,
-            execution: execution.as_ref().map(|execution| {
-                execution.as_ref() as &dyn smartzip_engine::ExecutionStateRecorder
-            }),
+            execution: execution
+                .as_ref()
+                .map(|execution| execution.as_ref() as &dyn smartzip_engine::ExecutionControl),
         },
     );
     let (_, result) = tokio::join!(recovery_work, current_work);
@@ -446,11 +432,7 @@ pub(super) async fn extract(
     };
 
     let exit_code = result.status.exit_code() as i32;
-    print_extract_result(
-        &result,
-        json,
-        db.is_some() && safety.policy.as_ref().unwrap().reads_state(),
-    )?;
+    print_extract_result(&result, json, db.is_some() && policy.reads_state())?;
     command_exit(exit_code)
 }
 

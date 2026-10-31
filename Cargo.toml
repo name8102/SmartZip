@@ -29,7 +29,6 @@ clap = { version = "4.5", features = ["derive"] }
 directories = "6"
 gpui = { package = "gpui-kit", version = "0.8.0" }
 rusqlite = { version = "0.40", features = ["bundled"] }
-rusqlite_migration = "2.6"
 process-wrap = { version = "9.1", features = ["tokio1"] }
 which = "8.0"
 walkdir = "2.5"

@@ -126,7 +126,7 @@ async fn test_extract_aes_zip_from_video_carrier_with_trailing_data() {
     let service = PasswordService::new(PasswordRepository::new(db.connection()));
     let output = TempDir::new().unwrap();
     let result = SmartZipEngine::default()
-        .extract_recursive(
+        .extract(
             &backend,
             &service,
             ExtractWorkflowRequest {
@@ -147,8 +147,14 @@ async fn test_extract_aes_zip_from_video_carrier_with_trailing_data() {
                 force: false,
                 limits: Default::default(),
             },
-            None,
-            None,
+            smartzip_engine::ExtractInteraction {
+                password: None,
+                output: None,
+                ..Default::default()
+            },
+            smartzip_engine::ExtractObserver {
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -181,13 +187,17 @@ async fn test_extract_archive_no_password(#[case] fixture_name: &str) {
     let output = TempDir::new().unwrap();
 
     backend
-        .extract(ExtractArchiveRequest {
-            archive: archive.clone(),
-            format: None,
-            output_dir: output.path().to_path_buf(),
-            password: None,
-            encoding: EncodingMode::Auto,
-        })
+        .extract_with_facts_and_context(
+            ExtractArchiveRequest {
+                archive: archive.clone(),
+                format: None,
+                output_dir: output.path().to_path_buf(),
+                password: None,
+                encoding: EncodingMode::Auto,
+            },
+            &smartzip_core::ArchiveFacts::default(),
+            std::sync::Arc::new(smartzip_core::TaskExecutionContext::detached()),
+        )
         .await
         .expect("extract should succeed");
 
@@ -222,13 +232,17 @@ async fn test_extract_with_unicode_password(
     let output = TempDir::new().unwrap();
 
     let result = backend
-        .extract(ExtractArchiveRequest {
-            archive: archive.clone(),
-            format: None,
-            output_dir: output.path().to_path_buf(),
-            password: Some(password.to_string()),
-            encoding: EncodingMode::Auto,
-        })
+        .extract_with_facts_and_context(
+            ExtractArchiveRequest {
+                archive: archive.clone(),
+                format: None,
+                output_dir: output.path().to_path_buf(),
+                password: Some(password.to_string()),
+                encoding: EncodingMode::Auto,
+            },
+            &smartzip_core::ArchiveFacts::default(),
+            std::sync::Arc::new(smartzip_core::TaskExecutionContext::detached()),
+        )
         .await;
 
     assert!(
@@ -259,13 +273,17 @@ async fn test_extract_7z_unicode_password(
     let output = TempDir::new().unwrap();
 
     let result = backend
-        .extract(ExtractArchiveRequest {
-            archive: archive.clone(),
-            format: None,
-            output_dir: output.path().to_path_buf(),
-            password: Some(password.to_string()),
-            encoding: EncodingMode::Auto,
-        })
+        .extract_with_facts_and_context(
+            ExtractArchiveRequest {
+                archive: archive.clone(),
+                format: None,
+                output_dir: output.path().to_path_buf(),
+                password: Some(password.to_string()),
+                encoding: EncodingMode::Auto,
+            },
+            &smartzip_core::ArchiveFacts::default(),
+            std::sync::Arc::new(smartzip_core::TaskExecutionContext::detached()),
+        )
         .await;
 
     assert!(
@@ -298,13 +316,17 @@ async fn test_extract_wrong_password_fails(
     let output = TempDir::new().unwrap();
 
     let result = backend
-        .extract(ExtractArchiveRequest {
-            archive: archive.clone(),
-            format: None,
-            output_dir: output.path().to_path_buf(),
-            password: Some(wrong_password.to_string()),
-            encoding: EncodingMode::Auto,
-        })
+        .extract_with_facts_and_context(
+            ExtractArchiveRequest {
+                archive: archive.clone(),
+                format: None,
+                output_dir: output.path().to_path_buf(),
+                password: Some(wrong_password.to_string()),
+                encoding: EncodingMode::Auto,
+            },
+            &smartzip_core::ArchiveFacts::default(),
+            std::sync::Arc::new(smartzip_core::TaskExecutionContext::detached()),
+        )
         .await;
 
     assert!(
@@ -328,12 +350,15 @@ async fn test_list_archive_entries(
 
     let backend = backend();
     let listing = backend
-        .list(ListRequest {
-            archive: archive.clone(),
-            format: None,
-            password: None,
-            encoding: EncodingMode::Auto,
-        })
+        .list_with_context(
+            ListRequest {
+                archive: archive.clone(),
+                format: None,
+                password: None,
+                encoding: EncodingMode::Auto,
+            },
+            std::sync::Arc::new(smartzip_core::TaskExecutionContext::detached()),
+        )
         .await
         .expect("list should succeed");
 
@@ -371,12 +396,15 @@ async fn test_list_archive_entries_with_explicit_encoding_override(
 
     let backend = backend();
     let listing = backend
-        .list(ListRequest {
-            archive,
-            format: None,
-            password: None,
-            encoding: EncodingMode::Override(encoding.to_string()),
-        })
+        .list_with_context(
+            ListRequest {
+                archive,
+                format: None,
+                password: None,
+                encoding: EncodingMode::Override(encoding.to_string()),
+            },
+            std::sync::Arc::new(smartzip_core::TaskExecutionContext::detached()),
+        )
         .await
         .expect("list with explicit encoding override should succeed");
 
@@ -406,12 +434,15 @@ async fn test_archive_integrity_check(#[case] fixture_name: &str, #[case] passwo
 
     let backend = backend();
     let result = backend
-        .test(TestRequest {
-            archive: archive.clone(),
-            format: None,
-            password: password.map(str::to_string),
-            encoding: EncodingMode::Auto,
-        })
+        .test_with_context(
+            TestRequest {
+                archive: archive.clone(),
+                format: None,
+                password: password.map(str::to_string),
+                encoding: EncodingMode::Auto,
+            },
+            std::sync::Arc::new(smartzip_core::TaskExecutionContext::detached()),
+        )
         .await;
 
     assert!(result.is_ok(), "archive integrity test failed: {result:?}");
@@ -469,7 +500,7 @@ async fn test_TDD_tar_gz_name_equivalent_to_inner_tar_collision() {
     let output = TempDir::new().unwrap();
 
     let result = engine
-        .extract_recursive(
+        .extract(
             &backend,
             &service,
             ExtractWorkflowRequest {
@@ -487,8 +518,14 @@ async fn test_TDD_tar_gz_name_equivalent_to_inner_tar_collision() {
                 force: false,
                 limits: Default::default(),
             },
-            None,
-            None,
+            smartzip_engine::ExtractInteraction {
+                password: None,
+                output: None,
+                ..Default::default()
+            },
+            smartzip_engine::ExtractObserver {
+                ..Default::default()
+            },
         )
         .await;
 
@@ -548,7 +585,7 @@ async fn test_TDD_zip_containing_tar_gz_three_level_collision() {
     let output = TempDir::new().unwrap();
 
     let result = engine
-        .extract_recursive(
+        .extract(
             &backend,
             &service,
             ExtractWorkflowRequest {
@@ -566,8 +603,14 @@ async fn test_TDD_zip_containing_tar_gz_three_level_collision() {
                 force: false,
                 limits: Default::default(),
             },
-            None,
-            None,
+            smartzip_engine::ExtractInteraction {
+                password: None,
+                output: None,
+                ..Default::default()
+            },
+            smartzip_engine::ExtractObserver {
+                ..Default::default()
+            },
         )
         .await;
 
@@ -622,7 +665,7 @@ async fn test_TDD_zip_inner_zip_single_file_path_collision() {
     let output = TempDir::new().unwrap();
 
     let result = engine
-        .extract_recursive(
+        .extract(
             &backend,
             &service,
             ExtractWorkflowRequest {
@@ -640,8 +683,14 @@ async fn test_TDD_zip_inner_zip_single_file_path_collision() {
                 force: false,
                 limits: Default::default(),
             },
-            None,
-            None,
+            smartzip_engine::ExtractInteraction {
+                password: None,
+                output: None,
+                ..Default::default()
+            },
+            smartzip_engine::ExtractObserver {
+                ..Default::default()
+            },
         )
         .await;
 
@@ -695,7 +744,7 @@ async fn test_TDD_tar_gz_name_equivalent_variant_collision() {
     let output = TempDir::new().unwrap();
 
     let result = engine
-        .extract_recursive(
+        .extract(
             &backend,
             &service,
             ExtractWorkflowRequest {
@@ -713,8 +762,14 @@ async fn test_TDD_tar_gz_name_equivalent_variant_collision() {
                 force: false,
                 limits: Default::default(),
             },
-            None,
-            None,
+            smartzip_engine::ExtractInteraction {
+                password: None,
+                output: None,
+                ..Default::default()
+            },
+            smartzip_engine::ExtractObserver {
+                ..Default::default()
+            },
         )
         .await;
 
@@ -762,7 +817,7 @@ async fn test_nested_archive_recycle_failure_warns_and_preserves_success() {
     let output = TempDir::new().unwrap();
 
     let result = engine
-        .extract_recursive(
+        .extract(
             &backend,
             &service,
             ExtractWorkflowRequest {
@@ -780,8 +835,14 @@ async fn test_nested_archive_recycle_failure_warns_and_preserves_success() {
                 force: false,
                 limits: Default::default(),
             },
-            None,
-            None,
+            smartzip_engine::ExtractInteraction {
+                password: None,
+                output: None,
+                ..Default::default()
+            },
+            smartzip_engine::ExtractObserver {
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -813,7 +874,7 @@ async fn test_engine_extract_simple_utf8() {
     let output = TempDir::new().unwrap();
 
     let result = engine
-        .extract_recursive(
+        .extract(
             &backend,
             &service,
             ExtractWorkflowRequest {
@@ -831,8 +892,14 @@ async fn test_engine_extract_simple_utf8() {
                 force: false,
                 limits: Default::default(),
             },
-            None,
-            None,
+            smartzip_engine::ExtractInteraction {
+                password: None,
+                output: None,
+                ..Default::default()
+            },
+            smartzip_engine::ExtractObserver {
+                ..Default::default()
+            },
         )
         .await;
 
@@ -862,7 +929,7 @@ async fn test_engine_extract_password_archive() {
     let output = TempDir::new().unwrap();
 
     let result = engine
-        .extract_recursive(
+        .extract(
             &backend,
             &service,
             ExtractWorkflowRequest {
@@ -880,8 +947,14 @@ async fn test_engine_extract_password_archive() {
                 force: false,
                 limits: Default::default(),
             },
-            None,
-            None,
+            smartzip_engine::ExtractInteraction {
+                password: None,
+                output: None,
+                ..Default::default()
+            },
+            smartzip_engine::ExtractObserver {
+                ..Default::default()
+            },
         )
         .await;
 
@@ -916,7 +989,7 @@ async fn test_engine_wrong_manual_password_is_not_saved_to_database() {
     let output = TempDir::new().unwrap();
 
     let result = engine
-        .extract_recursive(
+        .extract(
             &backend,
             &service,
             ExtractWorkflowRequest {
@@ -927,9 +1000,7 @@ async fn test_engine_wrong_manual_password_is_not_saved_to_database() {
                 scanner: ScannerConfig::default(),
                 password_candidates: PasswordCandidateRequest {
                     manual: vec!["wrong-password".into()],
-                    clipboard: None,
                     include_empty: false,
-                    limit: 8,
                 },
                 layout_policy: smartzip_engine::layout::OutputLayoutPolicy::default(),
                 single_root_name_policy: smartzip_engine::layout::SingleRootNamePolicy::default(),
@@ -939,8 +1010,14 @@ async fn test_engine_wrong_manual_password_is_not_saved_to_database() {
                 force: false,
                 limits: Default::default(),
             },
-            None,
-            None,
+            smartzip_engine::ExtractInteraction {
+                password: None,
+                output: None,
+                ..Default::default()
+            },
+            smartzip_engine::ExtractObserver {
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -964,7 +1041,7 @@ async fn test_engine_successful_manual_password_is_saved_to_database() {
     let output = TempDir::new().unwrap();
 
     let result = engine
-        .extract_recursive(
+        .extract(
             &backend,
             &service,
             ExtractWorkflowRequest {
@@ -975,9 +1052,7 @@ async fn test_engine_successful_manual_password_is_saved_to_database() {
                 scanner: ScannerConfig::default(),
                 password_candidates: PasswordCandidateRequest {
                     manual: vec!["中文密码123".into()],
-                    clipboard: None,
                     include_empty: false,
-                    limit: 8,
                 },
                 layout_policy: smartzip_engine::layout::OutputLayoutPolicy::default(),
                 single_root_name_policy: smartzip_engine::layout::SingleRootNamePolicy::default(),
@@ -987,8 +1062,14 @@ async fn test_engine_successful_manual_password_is_saved_to_database() {
                 force: false,
                 limits: Default::default(),
             },
-            None,
-            None,
+            smartzip_engine::ExtractInteraction {
+                password: None,
+                output: None,
+                ..Default::default()
+            },
+            smartzip_engine::ExtractObserver {
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -1043,7 +1124,7 @@ async fn test_engine_interactive_password_reuses_carved_embedded_archive_path() 
     let embedded_prompter = ExtractEmbeddedPrompter;
 
     let result = engine
-        .extract_recursive_interactive(
+        .extract(
             &backend,
             &service,
             ExtractWorkflowRequest {
@@ -1054,9 +1135,7 @@ async fn test_engine_interactive_password_reuses_carved_embedded_archive_path() 
                 scanner: ScannerConfig::default(),
                 password_candidates: PasswordCandidateRequest {
                     manual: Vec::new(),
-                    clipboard: None,
                     include_empty: false,
-                    limit: 8,
                 },
                 layout_policy: smartzip_engine::layout::OutputLayoutPolicy::default(),
                 single_root_name_policy: smartzip_engine::layout::SingleRootNamePolicy::default(),
@@ -1066,10 +1145,15 @@ async fn test_engine_interactive_password_reuses_carved_embedded_archive_path() 
                 force: false,
                 limits: Default::default(),
             },
-            Some(&prompter),
-            None,
-            Some(&embedded_prompter),
-            None,
+            smartzip_engine::ExtractInteraction {
+                password: Some(&prompter),
+                output: None,
+                embedded: Some(&embedded_prompter),
+                encoding: None,
+            },
+            smartzip_engine::ExtractObserver {
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -1117,7 +1201,7 @@ async fn test_router_extracts_split_encrypted_zip_with_manual_password() {
         let output = TempDir::new().unwrap();
 
         let result = engine
-            .extract_recursive(
+            .extract(
                 &backend,
                 &service,
                 ExtractWorkflowRequest {
@@ -1128,9 +1212,7 @@ async fn test_router_extracts_split_encrypted_zip_with_manual_password() {
                     scanner: ScannerConfig::default(),
                     password_candidates: PasswordCandidateRequest {
                         manual: vec!["secret".into()],
-                        clipboard: None,
                         include_empty: false,
-                        limit: 8,
                     },
                     layout_policy: smartzip_engine::layout::OutputLayoutPolicy::default(),
                     single_root_name_policy: smartzip_engine::layout::SingleRootNamePolicy::default(
@@ -1141,8 +1223,14 @@ async fn test_router_extracts_split_encrypted_zip_with_manual_password() {
                     force: false,
                     limits: Default::default(),
                 },
-                None,
-                None,
+                smartzip_engine::ExtractInteraction {
+                    password: None,
+                    output: None,
+                    ..Default::default()
+                },
+                smartzip_engine::ExtractObserver {
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -1176,7 +1264,7 @@ async fn test_router_prompts_for_split_encrypted_zip_password_when_missing() {
     };
 
     let result = engine
-        .extract_recursive(
+        .extract(
             &backend,
             &service,
             ExtractWorkflowRequest {
@@ -1187,9 +1275,7 @@ async fn test_router_prompts_for_split_encrypted_zip_password_when_missing() {
                 scanner: ScannerConfig::default(),
                 password_candidates: PasswordCandidateRequest {
                     manual: Vec::new(),
-                    clipboard: None,
                     include_empty: true,
-                    limit: 8,
                 },
                 layout_policy: smartzip_engine::layout::OutputLayoutPolicy::default(),
                 single_root_name_policy: smartzip_engine::layout::SingleRootNamePolicy::default(),
@@ -1199,8 +1285,14 @@ async fn test_router_prompts_for_split_encrypted_zip_password_when_missing() {
                 force: false,
                 limits: Default::default(),
             },
-            Some(&prompter),
-            None,
+            smartzip_engine::ExtractInteraction {
+                password: Some(&prompter),
+                output: None,
+                ..Default::default()
+            },
+            smartzip_engine::ExtractObserver {
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -1236,7 +1328,7 @@ async fn test_engine_respects_recursion_limit() {
     let output = TempDir::new().unwrap();
 
     let result = engine
-        .extract_recursive(
+        .extract(
             &backend,
             &service,
             ExtractWorkflowRequest {
@@ -1254,8 +1346,14 @@ async fn test_engine_respects_recursion_limit() {
                 force: false,
                 limits: Default::default(),
             },
-            None,
-            None,
+            smartzip_engine::ExtractInteraction {
+                password: None,
+                output: None,
+                ..Default::default()
+            },
+            smartzip_engine::ExtractObserver {
+                ..Default::default()
+            },
         )
         .await;
 
@@ -1297,7 +1395,7 @@ async fn test_engine_extracts_nested_multi_level_without_path_collision() {
     let output = TempDir::new().unwrap();
 
     let result = engine
-        .extract_recursive(
+        .extract(
             &backend,
             &service,
             ExtractWorkflowRequest {
@@ -1315,8 +1413,14 @@ async fn test_engine_extracts_nested_multi_level_without_path_collision() {
                 force: false,
                 limits: Default::default(),
             },
-            None,
-            None,
+            smartzip_engine::ExtractInteraction {
+                password: None,
+                output: None,
+                ..Default::default()
+            },
+            smartzip_engine::ExtractObserver {
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -1362,7 +1466,7 @@ async fn test_engine_reports_wrong_password_as_failure() {
     let output = TempDir::new().unwrap();
 
     let result = engine
-        .extract_recursive(
+        .extract(
             &backend,
             &service,
             ExtractWorkflowRequest {
@@ -1373,9 +1477,7 @@ async fn test_engine_reports_wrong_password_as_failure() {
                 scanner: ScannerConfig::default(),
                 password_candidates: PasswordCandidateRequest {
                     manual: vec!["wrong-password".into()],
-                    clipboard: None,
                     include_empty: false,
-                    limit: 8,
                 },
                 layout_policy: smartzip_engine::layout::OutputLayoutPolicy::default(),
                 single_root_name_policy: smartzip_engine::layout::SingleRootNamePolicy::default(),
@@ -1385,8 +1487,14 @@ async fn test_engine_reports_wrong_password_as_failure() {
                 force: false,
                 limits: Default::default(),
             },
-            None,
-            None,
+            smartzip_engine::ExtractInteraction {
+                password: None,
+                output: None,
+                ..Default::default()
+            },
+            smartzip_engine::ExtractObserver {
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -1416,7 +1524,7 @@ async fn test_engine_preserves_nested_archive_paths() {
     let output = TempDir::new().unwrap();
 
     let result = engine
-        .extract_recursive(
+        .extract(
             &backend,
             &service,
             ExtractWorkflowRequest {
@@ -1434,8 +1542,14 @@ async fn test_engine_preserves_nested_archive_paths() {
                 force: false,
                 limits: Default::default(),
             },
-            None,
-            None,
+            smartzip_engine::ExtractInteraction {
+                password: None,
+                output: None,
+                ..Default::default()
+            },
+            smartzip_engine::ExtractObserver {
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -1647,7 +1761,7 @@ async fn ambiguous_volume_groups_use_first_successful_extraction() {
             password: "secret".into(),
         };
         let result = SmartZipEngine::default()
-            .extract_recursive_interactive(
+            .extract(
                 &router(),
                 &service,
                 ExtractWorkflowRequest {
@@ -1662,9 +1776,7 @@ async fn ambiguous_volume_groups_use_first_successful_extraction() {
                         } else {
                             vec!["secret".into()]
                         },
-                        clipboard: None,
                         include_empty: prompt,
-                        limit: 0,
                     },
                     layout_policy: Default::default(),
                     single_root_name_policy: Default::default(),
@@ -1677,10 +1789,15 @@ async fn ambiguous_volume_groups_use_first_successful_extraction() {
                         ..Default::default()
                     },
                 },
-                if prompt { Some(&prompter) } else { None },
-                None,
-                None,
-                None,
+                smartzip_engine::ExtractInteraction {
+                    password: if prompt { Some(&prompter) } else { None },
+                    output: None,
+                    embedded: None,
+                    encoding: None,
+                },
+                smartzip_engine::ExtractObserver {
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();

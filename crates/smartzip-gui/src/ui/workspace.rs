@@ -52,7 +52,6 @@ pub(super) enum LibraryMessage {
     Passwords(u64, Result<library::Page<PasswordSummary>, String>),
     TaskDetail(String, Result<library::TaskDetail, String>),
     Recovery(Result<Vec<library::RecoverySummary>, String>),
-    Message(Result<String, String>),
     Mutation(Result<String, String>),
 }
 impl Workspace {
@@ -159,7 +158,7 @@ impl Workspace {
                             }
                             LibraryMessage::Config(result) => match result {
                                 Ok(config) => {
-                                    state.message = config.diagnostics.join("\n");
+                                    state.message.clear();
                                     if !state.drafts_loaded {
                                         let config = config.resolved.clone();
                                         let tx = state.sender.clone();
@@ -235,9 +234,6 @@ impl Workspace {
                                         Err(e) => state.message = e,
                                     }
                                 }
-                            }
-                            LibraryMessage::Message(result) => {
-                                state.message = result.unwrap_or_else(|e| e);
                             }
                             LibraryMessage::Mutation(result) => {
                                 let refresh = result.is_ok();

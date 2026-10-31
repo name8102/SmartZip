@@ -82,8 +82,12 @@ impl ArchiveExecutor for InterleavingBackend {
         self.starts.fetch_add(1, Ordering::SeqCst);
         Arc::new(TaskExecutionContext::new(task_id, events).with_cancellation(cancellation))
     }
-    async fn probe(&self, path: &Path) -> smartzip_core::Result<ArchiveProbe> {
-        self.inner.probe(path).await
+    async fn probe_with_context(
+        &self,
+        path: &Path,
+        _context: std::sync::Arc<smartzip_core::TaskExecutionContext>,
+    ) -> smartzip_core::Result<ArchiveProbe> {
+        self.inner.probe_with_context(path, _context).await
     }
     async fn extract_with_facts_and_context(
         &self,
@@ -110,19 +114,23 @@ impl ArchiveExecutor for InterleavingBackend {
         for i in 0..self.flood {
             context.emit_progress(TaskProgress::indeterminate(format!("diagnostic-{i}")));
         }
-        self.inner.extract(request).await
+        self.inner
+            .extract_with_facts_and_context(request, &ArchiveFacts::default(), context)
+            .await
     }
-    async fn list(&self, request: ListRequest) -> smartzip_core::Result<ArchiveListing> {
-        self.inner.list(request).await
-    }
-    async fn test(&self, request: TestRequest) -> smartzip_core::Result<TestResult> {
-        self.inner.test(request).await
-    }
-    async fn extract(
+    async fn list_with_context(
         &self,
-        request: ExtractArchiveRequest,
-    ) -> smartzip_core::Result<ExtractArchiveResult> {
-        self.inner.extract(request).await
+        request: ListRequest,
+        _context: std::sync::Arc<smartzip_core::TaskExecutionContext>,
+    ) -> smartzip_core::Result<ArchiveListing> {
+        self.inner.list_with_context(request, _context).await
+    }
+    async fn test_with_context(
+        &self,
+        request: TestRequest,
+        _context: std::sync::Arc<smartzip_core::TaskExecutionContext>,
+    ) -> smartzip_core::Result<TestResult> {
+        self.inner.test_with_context(request, _context).await
     }
 }
 
@@ -261,7 +269,6 @@ async fn prepared_submission_and_recovery_preserve_identity_budget_and_redact_pa
     raw.password_candidates
         .manual
         .push("synthetic-manual-secret".into());
-    raw.password_candidates.clipboard = Some("synthetic-clipboard-secret".into());
     let prepared = PreparedExtractTask::new(policy(), raw).unwrap();
     let submission = prepared.submission(3).unwrap();
     assert!(submission.roots[0].input_path.is_absolute());
@@ -269,7 +276,6 @@ async fn prepared_submission_and_recovery_preserve_identity_budget_and_redact_pa
     let saved: crate::state_store::PersistedExtractPlan =
         serde_json::from_str(&submission.config_snapshot_json).unwrap();
     assert!(saved.request.password_candidates.manual.is_empty());
-    assert!(saved.request.password_candidates.clipboard.is_none());
     let db_path = temp.path().join("execution.db");
     {
         let store = crate::state_store::StateStore::start(&db_path).unwrap();
@@ -357,41 +363,4 @@ fn shared_services_keep_history_reuse_when_writes_are_disabled() {
             );
         }
     }
-}
-
-#[tokio::test]
-async fn legacy_and_prepared_entrypoints_resolve_relative_inputs_consistently() {
-    let temp = tempfile::tempdir().unwrap();
-    let raw = request(
-        vec!["missing-relative-input.zip".into()],
-        temp.path().join("out"),
-    );
-    let backend = FakeBackend::default();
-    let services = policy().services(None);
-    let legacy = SmartZipEngine::default()
-        .with_run_policy(policy())
-        .extract(
-            &backend,
-            &services.passwords,
-            raw.clone(),
-            ExtractInteraction::default(),
-            ExtractObserver::default(),
-        )
-        .await
-        .unwrap();
-    let prepared = PreparedExtractTask::new(policy(), raw)
-        .unwrap()
-        .run(
-            SmartZipEngine::default(),
-            &backend,
-            None,
-            ExtractInteraction::default(),
-            ExtractObserver::default(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(legacy.status, prepared.status);
-    assert_eq!(legacy.skipped, prepared.skipped);
-    assert_eq!(legacy.skipped.len(), 1);
-    assert!(legacy.skipped[0].path.is_absolute());
 }

@@ -76,14 +76,38 @@ async fn successful_source_recycling_handles_single_first_middle_and_all_volumes
             let mut limited = request.clone();
             limited.limits.max_output_bytes = 1;
             let failed = engine
-                .extract_recursive(&backend, &passwords, limited, None, None)
+                .extract(
+                    &backend,
+                    &passwords,
+                    limited,
+                    smartzip_engine::ExtractInteraction {
+                        password: None,
+                        output: None,
+                        ..Default::default()
+                    },
+                    smartzip_engine::ExtractObserver {
+                        ..Default::default()
+                    },
+                )
                 .await
                 .unwrap();
             assert!(failed.failed_count > 0);
             assert!(members.iter().all(|p| p.exists()));
             assert!(recycled.lock().unwrap().is_empty());
             let result = engine
-                .extract_recursive(&backend, &passwords, request, None, None)
+                .extract(
+                    &backend,
+                    &passwords,
+                    request,
+                    smartzip_engine::ExtractInteraction {
+                        password: None,
+                        output: None,
+                        ..Default::default()
+                    },
+                    smartzip_engine::ExtractObserver {
+                        ..Default::default()
+                    },
+                )
                 .await
                 .unwrap();
             assert_eq!(
@@ -115,7 +139,6 @@ fn request(inputs: Vec<PathBuf>, output_dir: PathBuf) -> ExtractWorkflowRequest 
         scanner: Default::default(),
         password_candidates: PasswordCandidateRequest {
             include_empty: true,
-            limit: 0,
             ..Default::default()
         },
         layout_policy: Default::default(),
@@ -159,12 +182,18 @@ async fn discarded_volume_hypothesis_is_not_recycled() {
         .with_source_recycling(true)
         .with_archive_recycler(Arc::new(std::fs::remove_file));
     let result = engine
-        .extract_recursive(
+        .extract(
             &backend,
             &passwords,
             request(vec![seed.clone()], root.path().join("out")),
-            None,
-            None,
+            smartzip_engine::ExtractInteraction {
+                password: None,
+                output: None,
+                ..Default::default()
+            },
+            smartzip_engine::ExtractObserver {
+                ..Default::default()
+            },
         )
         .await
         .unwrap();

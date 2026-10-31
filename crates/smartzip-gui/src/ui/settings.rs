@@ -114,7 +114,6 @@ impl View {
                             .disabled(busy)
                             .dropdown_menu(move |menu, _, _| {
                                 let initialize = shared.clone();
-                                let migrate = shared.clone();
                                 menu.item(PopupMenuItem::new("初始化配置").on_click(
                                     move |_, _, cx| {
                                         initialize.update(cx, |state, cx| {
@@ -131,19 +130,6 @@ impl View {
                                         });
                                     },
                                 ))
-                                .item(
-                                    PopupMenuItem::new("迁移预览").on_click(move |_, _, cx| {
-                                        migrate.update(cx, |state, cx| {
-                                            state.background(|| {
-                                                LibraryMessage::Message(library::migrate_config(
-                                                    &LibraryOptions::default(),
-                                                    false,
-                                                ))
-                                            });
-                                            cx.notify();
-                                        });
-                                    }),
-                                )
                             }),
                     ),
             )

@@ -69,10 +69,6 @@ struct SafetyOptions {
     /// Maximum stored password candidates (manual passwords are tried first).
     #[arg(long, global = true, default_value_t = smartzip_config::DEFAULT_PASSWORD_LIMIT)]
     password_limit: usize,
-    #[arg(skip)]
-    defaults: smartzip_config::ExtractionLimits,
-    #[arg(skip)]
-    policy: Option<Arc<smartzip_engine::CompiledRunPolicy>>,
 
     /// Maximum total output entries, including directories and nested outputs (0 = unlimited).
     #[arg(long, global = true)]
@@ -94,20 +90,6 @@ struct SafetyOptions {
     /// Suspicious names policy. Ask becomes skip without an interactive terminal.
     #[arg(long, global = true, value_enum, default_value_t = SuspiciousEncodingArg::Ask)]
     suspicious_encoding: SuspiciousEncodingArg,
-}
-impl SafetyOptions {
-    fn limits(&self) -> smartzip_engine::budget::ExtractionLimits {
-        smartzip_engine::budget::ExtractionLimits {
-            max_files: self.max_files.unwrap_or(self.defaults.max_files),
-            max_output_bytes: self
-                .max_output_bytes
-                .unwrap_or(self.defaults.max_output_bytes),
-            min_free_bytes: self.min_free_bytes.unwrap_or(self.defaults.min_free_bytes),
-            max_nested_candidates: self
-                .max_nested_candidates
-                .unwrap_or(self.defaults.max_nested_candidates),
-        }
-    }
 }
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum ConflictArg {
@@ -190,7 +172,7 @@ enum Command {
     Extract(ExtractCommand),
 
     /// Preview archive entry names under several encodings.
-    #[command(name = "enc", alias = "encoding-preview")]
+    #[command(name = "enc")]
     EncodingPreview {
         path: PathBuf,
 
@@ -255,12 +237,6 @@ enum ConfigCmd {
         key: String,
     },
     Check,
-    Migrate {
-        #[arg(long, conflicts_with = "dry_run")]
-        apply: bool,
-        #[arg(long)]
-        dry_run: bool,
-    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -437,36 +413,15 @@ async fn main() -> std::process::ExitCode {
     std::process::ExitCode::SUCCESS
 }
 
-async fn run(mut cli: Cli, matches: &clap::ArgMatches) -> Result<(), Box<dyn std::error::Error>> {
-    let (selected, default_path, diagnostics) = config_selection(&cli)?;
+async fn run(cli: Cli, matches: &clap::ArgMatches) -> Result<(), Box<dyn std::error::Error>> {
+    let (selected, default_path) = config_selection(&cli)?;
     if let Command::Config(command) = &cli.command {
-        return config_command(command, selected.as_deref(), &default_path, &diagnostics);
+        return config_command(command, selected.as_deref(), &default_path);
     }
     let mut resolved = smartzip_config::ResolvedConfig::load(selected.as_deref())?;
-    resolved.diagnostics.extend(diagnostics);
     apply_cli_overrides(&cli, matches, &mut resolved)?;
     let policy = smartzip_engine::CompiledRunPolicy::compile(resolved)?;
     let c = policy.values();
-    match &mut cli.command {
-        Command::List(request) => request.encoding = c.extraction.encoding.mode.clone(),
-        Command::Test(request) => request.encoding = c.extraction.encoding.mode.clone(),
-        Command::Extract(request) => request.encoding = c.extraction.encoding.mode.clone(),
-        _ => {}
-    }
-    cli.safety.defaults = c.limits.clone();
-    cli.safety.password_limit = c.passwords.database_limit;
-    cli.safety.non_interactive = c.interaction.mode == smartzip_config::InteractionMode::Never;
-    cli.safety.on_conflict = match c.extraction.output.on_conflict {
-        smartzip_config::Conflict::Ask => ConflictArg::Ask,
-        smartzip_config::Conflict::Skip => ConflictArg::Skip,
-        smartzip_config::Conflict::Rename => ConflictArg::Rename,
-        smartzip_config::Conflict::Overwrite => ConflictArg::Overwrite,
-    };
-    cli.safety.suspicious_encoding = match c.extraction.encoding.on_suspicious {
-        smartzip_config::SuspiciousEncoding::Ask => SuspiciousEncodingArg::Ask,
-        smartzip_config::SuspiciousEncoding::Skip => SuspiciousEncodingArg::Skip,
-        smartzip_config::SuspiciousEncoding::Accept => SuspiciousEncodingArg::Accept,
-    };
     if cli.explain || matches!(&cli.command, Command::Extract(request) if request.dry_run) {
         println!(
             "{}",
@@ -482,9 +437,7 @@ async fn run(mut cli: Cli, matches: &clap::ArgMatches) -> Result<(), Box<dyn std
             return Err("interaction.mode=always requires an interactive terminal".into());
         }
     }
-    cli.db = cli.db.or_else(|| c.state.database.clone());
-    cli.safety.policy = Some(Arc::new(policy));
-    let policy = cli.safety.policy.as_ref().unwrap();
+    let db_path = c.state.database.clone();
     if !matches!(
         policy.values().logging.level,
         smartzip_config::LogLevel::Off | smartzip_config::LogLevel::Error
@@ -509,14 +462,14 @@ async fn run(mut cli: Cli, matches: &clap::ArgMatches) -> Result<(), Box<dyn std
     }
     match cli.command {
         Command::Password(command) => {
-            let db = open_state_db(cli.db, policy.values().state.mode)?;
+            let db = open_state_db(db_path, policy.values().state.mode)?;
             return password(&db, command);
         }
         Command::History { command } => {
             if !policy.reads_state() {
                 return Err("history unavailable with state.mode=off".into());
             }
-            let db = open_state_db(cli.db, policy.values().state.mode)?;
+            let db = open_state_db(db_path, policy.values().state.mode)?;
             return history(
                 &db,
                 command.unwrap_or(HistoryCmd::Tasks {
@@ -543,7 +496,7 @@ async fn run(mut cli: Cli, matches: &clap::ArgMatches) -> Result<(), Box<dyn std
 
     let result = match cli.command {
         Command::Doctor { json } => {
-            let db_path = if let Some(path) = cli.db {
+            let db_path = if let Some(path) = db_path {
                 path
             } else {
                 PlatformPaths::try_new()?.db_path()
@@ -554,7 +507,7 @@ async fn run(mut cli: Cli, matches: &clap::ArgMatches) -> Result<(), Box<dyn std
                 .any(|a| a["family"] == "7z" && a["version"].is_string());
             let result = serde_json::json!({"schema_version": 1, "version": env!("CARGO_PKG_VERSION"), "database": db_path,
                 "backends": adapters, "warnings": backend.warnings(), "status": if healthy { "completed" } else { "failed" },
-                "exit_code": if healthy { 0 } else { 1 }, "extraction_limits": cli.safety.limits(), "scan_default_bytes": smartzip_scanner::DEFAULT_SCAN_BYTES,
+                "exit_code": if healthy { 0 } else { 1 }, "extraction_limits": policy.values().limits, "scan_default_bytes": smartzip_scanner::DEFAULT_SCAN_BYTES,
                 "scan_hard_limit_bytes": null, "root_scan_strategy": "bounded_metadata_scan_to_eof"});
             if json {
                 println!("{}", serde_json::to_string_pretty(&result)?);
@@ -577,49 +530,49 @@ async fn run(mut cli: Cli, matches: &clap::ArgMatches) -> Result<(), Box<dyn std
             command_exit(if healthy { 0 } else { 1 })
         }
         Command::Detect(request) => {
-            let db = open_task_db(cli.db, policy)?;
+            let db = open_task_db(db_path, &policy)?;
             detect(
                 &backend,
                 db.as_ref(),
                 request,
                 verbose_routing,
-                &cli.safety,
+                &policy,
                 cancellation.clone(),
             )
             .await
         }
         Command::List(request) => {
-            let db = open_task_db(cli.db, policy)?;
+            let db = open_task_db(db_path, &policy)?;
             list_archive(
                 &backend,
                 db.as_ref(),
                 request,
                 verbose_routing,
-                &cli.safety,
+                &policy,
                 cancellation.clone(),
             )
             .await
         }
         Command::Test(request) => {
-            let db = open_task_db(cli.db, policy)?;
+            let db = open_task_db(db_path, &policy)?;
             test_archives(
                 &backend,
                 db.as_ref(),
                 request,
                 verbose_routing,
-                &cli.safety,
+                &policy,
                 cancellation.clone(),
             )
             .await
         }
         Command::Extract(request) => {
-            let db = open_task_db(cli.db, policy)?;
+            let db = open_task_db(db_path, &policy)?;
             extract(
                 &backend,
                 db.as_ref(),
                 request,
                 verbose_routing,
-                &cli.safety,
+                &policy,
                 cancellation.clone(),
             )
             .await
@@ -629,11 +582,11 @@ async fn run(mut cli: Cli, matches: &clap::ArgMatches) -> Result<(), Box<dyn std
             password,
             json,
         } => {
-            let db = open_task_db(cli.db, policy)?;
+            let db = open_task_db(db_path, &policy)?;
             preview_encodings(
                 &backend,
                 db.as_ref(),
-                &cli.safety,
+                &policy,
                 path,
                 password,
                 json,
@@ -653,14 +606,10 @@ async fn run(mut cli: Cli, matches: &clap::ArgMatches) -> Result<(), Box<dyn std
 fn task_listener(
     json: bool,
     verbose: bool,
-    safety: &SafetyOptions,
+    policy: &smartzip_engine::CompiledRunPolicy,
 ) -> Option<smartzip_engine::TaskEventListener> {
     use smartzip_config::LogLevel;
-    let level = safety
-        .policy
-        .as_ref()
-        .map(|p| p.values().logging.level)
-        .unwrap_or(LogLevel::Info);
+    let level = policy.values().logging.level;
     if level == LogLevel::Off {
         return None;
     }
@@ -705,7 +654,7 @@ struct EncodingPreviewEntry {
 async fn preview_encodings(
     backend: &BackendRouter,
     db: Option<&SmartZipDb>,
-    safety: &SafetyOptions,
+    policy: &smartzip_engine::CompiledRunPolicy,
     path: PathBuf,
     password: Option<String>,
     json: bool,
@@ -726,17 +675,16 @@ async fn preview_encodings(
     }
     let candidates = encoding_preview_candidates();
     let mut previews = Vec::new();
-    let policy = safety.policy.as_ref().unwrap();
     let mut services = policy.services(db.map(SmartZipDb::connection));
     let engine = SmartZipEngine::default()
         .with_cancellation_token(cancellation.clone())
-        .with_run_policy(policy.as_ref().clone());
+        .with_run_policy(policy.clone());
     services.history = None;
     if let Some(store) = &mut services.known {
         store.writable = false;
     }
     let recorder = services.stores();
-    let control = StdinLock::configured(cancellation.clone(), safety, json);
+    let control = StdinLock::configured(cancellation.clone(), policy, json);
     let prompt = PreviewPrompter {
         delegate: StdinPrompter {
             lock: control.clone(),
@@ -764,7 +712,6 @@ async fn preview_encodings(
                     password_candidates: PasswordCandidateRequest {
                         manual: manual.clone(),
                         include_empty: true,
-                        limit: safety.password_limit,
                         ..Default::default()
                     },
                 },
@@ -772,7 +719,7 @@ async fn preview_encodings(
                     .interactive
                     .then_some(&prompt as &dyn InteractivePasswordPrompter),
                 None,
-                task_listener(json, verbose_routing, safety),
+                task_listener(json, verbose_routing, policy),
                 services
                     .has_stores()
                     .then_some(&recorder as &dyn smartzip_engine::history::TaskHistoryRecorder),
@@ -1103,23 +1050,23 @@ struct StdinLock {
     gate: Arc<Mutex<()>>,
     cancellation: tokio_util::sync::CancellationToken,
     interactive: bool,
-    conflict: ConflictArg,
-    encoding: SuspiciousEncodingArg,
+    conflict: smartzip_config::Conflict,
+    encoding: smartzip_config::SuspiciousEncoding,
 }
 impl StdinLock {
     fn configured(
         cancellation: tokio_util::sync::CancellationToken,
-        safety: &SafetyOptions,
+        policy: &smartzip_engine::CompiledRunPolicy,
         json: bool,
     ) -> Self {
-        use std::io::IsTerminal;
-        Self {
+        let lock = Self {
             gate: Arc::new(Mutex::new(())),
             cancellation,
-            interactive: !json && !safety.non_interactive && std::io::stdin().is_terminal(),
-            conflict: safety.on_conflict,
-            encoding: safety.suspicious_encoding,
-        }
+            interactive: false,
+            conflict: policy.values().extraction.output.on_conflict,
+            encoding: policy.values().extraction.encoding.on_suspicious,
+        };
+        lock.for_policy(policy, json)
     }
 
     fn for_policy(&self, policy: &smartzip_engine::CompiledRunPolicy, json: bool) -> Self {
@@ -1131,17 +1078,8 @@ impl StdinLock {
             interactive: !json
                 && c.interaction.mode != smartzip_config::InteractionMode::Never
                 && std::io::stdin().is_terminal(),
-            conflict: match c.extraction.output.on_conflict {
-                smartzip_config::Conflict::Ask => ConflictArg::Ask,
-                smartzip_config::Conflict::Skip => ConflictArg::Skip,
-                smartzip_config::Conflict::Rename => ConflictArg::Rename,
-                smartzip_config::Conflict::Overwrite => ConflictArg::Overwrite,
-            },
-            encoding: match c.extraction.encoding.on_suspicious {
-                smartzip_config::SuspiciousEncoding::Ask => SuspiciousEncodingArg::Ask,
-                smartzip_config::SuspiciousEncoding::Skip => SuspiciousEncodingArg::Skip,
-                smartzip_config::SuspiciousEncoding::Accept => SuspiciousEncodingArg::Accept,
-            },
+            conflict: c.extraction.output.on_conflict,
+            encoding: c.extraction.encoding.on_suspicious,
         }
     }
 }
@@ -1343,10 +1281,10 @@ fn prompt_output_collision_stdin(
         return OutputCollisionStrategy::Skip;
     }
     match control.conflict {
-        ConflictArg::Overwrite => return OutputCollisionStrategy::Overwrite,
-        ConflictArg::Rename => return OutputCollisionStrategy::Rename,
-        ConflictArg::Skip => return OutputCollisionStrategy::Skip,
-        ConflictArg::Ask => {}
+        smartzip_config::Conflict::Overwrite => return OutputCollisionStrategy::Overwrite,
+        smartzip_config::Conflict::Rename => return OutputCollisionStrategy::Rename,
+        smartzip_config::Conflict::Skip => return OutputCollisionStrategy::Skip,
+        smartzip_config::Conflict::Ask => {}
     }
     if !control.interactive {
         return OutputCollisionStrategy::Skip;
@@ -1423,9 +1361,13 @@ fn prompt_encoding_stdin(
         return EncodingConfirmationChoice::SkipArchive;
     }
     match control.encoding {
-        SuspiciousEncodingArg::Accept => return EncodingConfirmationChoice::AcceptDetected,
-        SuspiciousEncodingArg::Skip => return EncodingConfirmationChoice::SkipArchive,
-        SuspiciousEncodingArg::Ask => {}
+        smartzip_config::SuspiciousEncoding::Accept => {
+            return EncodingConfirmationChoice::AcceptDetected
+        }
+        smartzip_config::SuspiciousEncoding::Skip => {
+            return EncodingConfirmationChoice::SkipArchive
+        }
+        smartzip_config::SuspiciousEncoding::Ask => {}
     }
     if !control.interactive {
         return EncodingConfirmationChoice::SkipArchive;
@@ -1477,9 +1419,7 @@ fn prompt_encoding_stdin(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        build_extract_json_output, Arc, Cli, Command, ConflictArg, StdinLock, SuspiciousEncodingArg,
-    };
+    use super::{build_extract_json_output, Arc, Cli, Command, StdinLock};
     use clap::Parser;
     use serde_json::json;
     use smartzip_core::TaskId;
@@ -1487,12 +1427,12 @@ mod tests {
 
     #[test]
     fn recovered_prompt_policy_keeps_host_gate_and_uses_its_own_decisions() {
-        let safety =
-            Cli::try_parse_from(["smartzip", "--non-interactive", "extract", "archive.zip"])
-                .unwrap()
-                .safety;
+        let initial = smartzip_engine::CompiledRunPolicy::compile(
+            smartzip_config::ResolvedConfig::load(None).unwrap(),
+        )
+        .unwrap();
         let lock =
-            StdinLock::configured(tokio_util::sync::CancellationToken::new(), &safety, false);
+            StdinLock::configured(tokio_util::sync::CancellationToken::new(), &initial, false);
         let mut resolved = smartzip_config::ResolvedConfig::load(None).unwrap();
         resolved.values.extraction.output.on_conflict = smartzip_config::Conflict::Overwrite;
         resolved.values.extraction.encoding.on_suspicious =
@@ -1504,8 +1444,14 @@ mod tests {
             !recovered.interactive,
             "JSON mode must not ask for terminal input"
         );
-        assert!(matches!(recovered.conflict, ConflictArg::Overwrite));
-        assert!(matches!(recovered.encoding, SuspiciousEncodingArg::Accept));
+        assert!(matches!(
+            recovered.conflict,
+            smartzip_config::Conflict::Overwrite
+        ));
+        assert!(matches!(
+            recovered.encoding,
+            smartzip_config::SuspiciousEncoding::Accept
+        ));
         lock.cancellation.cancel();
         assert!(recovered.cancellation.is_cancelled());
     }

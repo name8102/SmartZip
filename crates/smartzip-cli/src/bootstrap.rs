@@ -3,9 +3,9 @@ use super::*;
 
 pub(super) fn config_selection(
     cli: &Cli,
-) -> Result<(Option<PathBuf>, PathBuf, Vec<String>), Box<dyn std::error::Error>> {
+) -> Result<(Option<PathBuf>, PathBuf), Box<dyn std::error::Error>> {
     if cli.no_config && !matches!(cli.command, Command::Config(_)) {
-        return Ok((None, PathBuf::new(), Vec::new()));
+        return Ok((None, PathBuf::new()));
     }
     let environment = std::env::var_os("SMARTZIP_CONFIG").map(PathBuf::from);
     if let Some(path) = cli
@@ -14,32 +14,34 @@ pub(super) fn config_selection(
         .or(environment.as_ref())
         .filter(|_| !cli.no_config)
     {
-        return Ok((Some(path.clone()), path.clone(), Vec::new()));
+        let selected = smartzip_config::selected_config(
+            cli.config.as_deref(),
+            cli.no_config,
+            environment.as_deref(),
+            path,
+        )?;
+        return Ok((selected, path.clone()));
     }
-    let paths = PlatformPaths::try_new()?;
-    let legacy = PlatformPaths::legacy()?;
-    let default = paths.config_path();
-    let (selected, warnings) = smartzip_config::selected_config(
-        None,
+    let default = PlatformPaths::try_new()?.config_path();
+    let selected = smartzip_config::selected_config(
+        cli.config.as_deref(),
         cli.no_config,
-        None,
+        environment.as_deref(),
         &default,
-        &legacy.config_path(),
     )?;
-    Ok((selected, default, warnings))
+    Ok((selected, default))
 }
 
 pub(super) fn config_command(
     command: &ConfigCmd,
     selected: Option<&Path>,
     default: &Path,
-    diagnostics: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let path = selected.unwrap_or(default);
     match command {
         ConfigCmd::Path => println!(
             "{}",
-            serde_json::json!({"selected": selected, "default": default, "diagnostics": diagnostics, "managed": std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink() || m.permissions().readonly())})
+            serde_json::json!({"selected": selected, "default": default, "managed": std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink() || m.permissions().readonly())})
         ),
         ConfigCmd::Init { full } => {
             smartzip_config::init_config(path, *full)?;
@@ -47,16 +49,10 @@ pub(super) fn config_command(
         }
         ConfigCmd::Set { key, value } => smartzip_config::edit_config(path, key, Some(value))?,
         ConfigCmd::Unset { key } => smartzip_config::edit_config(path, key, None)?,
-        ConfigCmd::Migrate { apply, .. } => {
-            println!("{}", smartzip_config::migrate_config(path, *apply)?)
-        }
         _ => {
             let defaults = matches!(command, ConfigCmd::Show { defaults: true, .. });
-            let mut resolved =
+            let resolved =
                 smartzip_config::ResolvedConfig::load(if defaults { None } else { selected })?;
-            if !defaults {
-                resolved.diagnostics.extend_from_slice(diagnostics);
-            }
             match command {
                 ConfigCmd::Show { sources: true, .. } => println!(
                     "{}",
@@ -203,9 +199,6 @@ pub(super) fn apply_cli_overrides(
         }
         patches.push((key.trim().into(), parsed["value"].clone()));
     }
-    if explicit("use_clipboard").is_some() {
-        return Err("unsupported_option: clipboard source is not implemented".into());
-    }
     resolved.apply(&patches)?;
     if resolved.values.passwords.mode == smartzip_config::PasswordMode::Off
         && explicit("password").is_some()
@@ -259,15 +252,9 @@ pub(super) fn open_state_db(
     path: Option<PathBuf>,
     mode: smartzip_config::StateMode,
 ) -> Result<SmartZipDb, Box<dyn std::error::Error>> {
-    let path = if let Some(path) = path {
-        path
-    } else {
-        let (path, diagnostic) =
-            PlatformPaths::try_new()?.select_database(&PlatformPaths::legacy()?)?;
-        if let Some(message) = diagnostic {
-            eprintln!("{message}");
-        }
-        path
+    let path = match path {
+        Some(path) => path,
+        None => PlatformPaths::try_new()?.db_path(),
     };
     let db = if mode == smartzip_config::StateMode::ReadOnly {
         SmartZipDb::open_read_only(&path)?

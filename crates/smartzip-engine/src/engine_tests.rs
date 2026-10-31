@@ -184,7 +184,7 @@ async fn embedded_ask_without_prompter_skips_archive() {
 
     let result = SmartZipEngine::default()
         .with_min_embedded_size_bytes(0)
-        .extract_recursive(
+        .extract(
             &backend,
             &service,
             ExtractWorkflowRequest {
@@ -195,9 +195,7 @@ async fn embedded_ask_without_prompter_skips_archive() {
                 scanner: ScannerConfig::default(),
                 password_candidates: PasswordCandidateRequest {
                     manual: Vec::new(),
-                    clipboard: None,
                     include_empty: false,
-                    limit: 8,
                 },
                 layout_policy: Default::default(),
                 single_root_name_policy: Default::default(),
@@ -207,8 +205,14 @@ async fn embedded_ask_without_prompter_skips_archive() {
                 force: false,
                 limits: Default::default(),
             },
-            None,
-            None,
+            crate::ExtractInteraction {
+                password: None,
+                output: None,
+                ..Default::default()
+            },
+            crate::ExtractObserver {
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -344,7 +348,7 @@ async fn recursive_extract_enqueues_nested_archives_and_skips_non_first_volume()
 
     let engine = engine_with_test_recycler();
     let result = engine
-        .extract_recursive(
+        .extract(
             &backend,
             &service,
             ExtractWorkflowRequest {
@@ -355,7 +359,6 @@ async fn recursive_extract_enqueues_nested_archives_and_skips_non_first_volume()
                 scanner: ScannerConfig::default(),
                 password_candidates: PasswordCandidateRequest {
                     include_empty: false,
-                    limit: 10,
                     ..PasswordCandidateRequest::default()
                 },
                 layout_policy: crate::layout::OutputLayoutPolicy::default(),
@@ -366,8 +369,14 @@ async fn recursive_extract_enqueues_nested_archives_and_skips_non_first_volume()
                 force: false,
                 limits: Default::default(),
             },
-            None,
-            None,
+            crate::ExtractInteraction {
+                password: None,
+                output: None,
+                ..Default::default()
+            },
+            crate::ExtractObserver {
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -423,7 +432,7 @@ async fn extract_fails_when_output_target_already_exists() {
 
     let engine = SmartZipEngine::default();
     let result = engine
-        .extract_recursive(
+        .extract(
             &backend,
             &service,
             ExtractWorkflowRequest {
@@ -441,8 +450,14 @@ async fn extract_fails_when_output_target_already_exists() {
                 force: false,
                 limits: Default::default(),
             },
-            None,
-            None,
+            crate::ExtractInteraction {
+                password: None,
+                output: None,
+                ..Default::default()
+            },
+            crate::ExtractObserver {
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -507,7 +522,7 @@ async fn extract_keeps_other_archives_moving_while_prompt_waits() {
 
     let engine = SmartZipEngine::default();
     let result = engine
-        .extract_recursive(
+        .extract(
             &backend,
             &service,
             ExtractWorkflowRequest {
@@ -525,8 +540,14 @@ async fn extract_keeps_other_archives_moving_while_prompt_waits() {
                 force: false,
                 limits: Default::default(),
             },
-            None,
-            Some(&output_prompter),
+            crate::ExtractInteraction {
+                password: None,
+                output: Some(&output_prompter),
+                ..Default::default()
+            },
+            crate::ExtractObserver {
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -550,7 +571,11 @@ struct EncodingAwareBackend {
 
 #[async_trait]
 impl ArchiveExecutor for EncodingAwareBackend {
-    async fn probe(&self, path: &std::path::Path) -> smartzip_core::Result<ArchiveProbe> {
+    async fn probe_with_context(
+        &self,
+        path: &std::path::Path,
+        _context: std::sync::Arc<smartzip_core::TaskExecutionContext>,
+    ) -> smartzip_core::Result<ArchiveProbe> {
         Ok(ArchiveProbe {
             path: path.to_path_buf(),
             format: Some(ArchiveFormat::Zip),
@@ -559,14 +584,22 @@ impl ArchiveExecutor for EncodingAwareBackend {
         })
     }
 
-    async fn list(&self, _request: ListRequest) -> smartzip_core::Result<ArchiveListing> {
+    async fn list_with_context(
+        &self,
+        _request: ListRequest,
+        _context: std::sync::Arc<smartzip_core::TaskExecutionContext>,
+    ) -> smartzip_core::Result<ArchiveListing> {
         Ok(ArchiveListing {
             format: Some(ArchiveFormat::Zip),
             entries: Vec::new(),
         })
     }
 
-    async fn test(&self, request: TestRequest) -> smartzip_core::Result<TestResult> {
+    async fn test_with_context(
+        &self,
+        request: TestRequest,
+        _context: std::sync::Arc<smartzip_core::TaskExecutionContext>,
+    ) -> smartzip_core::Result<TestResult> {
         self.seen_test_encodings
             .lock()
             .unwrap()
@@ -578,9 +611,11 @@ impl ArchiveExecutor for EncodingAwareBackend {
         })
     }
 
-    async fn extract(
+    async fn extract_with_facts_and_context(
         &self,
         request: ExtractArchiveRequest,
+        _facts: &smartzip_core::ArchiveFacts,
+        _context: std::sync::Arc<smartzip_core::TaskExecutionContext>,
     ) -> smartzip_core::Result<ExtractArchiveResult> {
         self.seen_extract_encodings
             .lock()
@@ -611,7 +646,7 @@ async fn extraction_preserves_encoding_without_full_test_prepass() {
 
     let engine = SmartZipEngine::default();
     let result = engine
-        .extract_recursive(
+        .extract(
             &backend,
             &service,
             ExtractWorkflowRequest {
@@ -629,8 +664,14 @@ async fn extraction_preserves_encoding_without_full_test_prepass() {
                 force: false,
                 limits: Default::default(),
             },
-            None,
-            None,
+            crate::ExtractInteraction {
+                password: None,
+                output: None,
+                ..Default::default()
+            },
+            crate::ExtractObserver {
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -650,7 +691,11 @@ struct FailingExtractBackend;
 
 #[async_trait]
 impl ArchiveExecutor for FailingExtractBackend {
-    async fn probe(&self, path: &std::path::Path) -> smartzip_core::Result<ArchiveProbe> {
+    async fn probe_with_context(
+        &self,
+        path: &std::path::Path,
+        _context: std::sync::Arc<smartzip_core::TaskExecutionContext>,
+    ) -> smartzip_core::Result<ArchiveProbe> {
         Ok(ArchiveProbe {
             path: path.to_path_buf(),
             format: Some(ArchiveFormat::Zip),
@@ -659,14 +704,22 @@ impl ArchiveExecutor for FailingExtractBackend {
         })
     }
 
-    async fn list(&self, _request: ListRequest) -> smartzip_core::Result<ArchiveListing> {
+    async fn list_with_context(
+        &self,
+        _request: ListRequest,
+        _context: std::sync::Arc<smartzip_core::TaskExecutionContext>,
+    ) -> smartzip_core::Result<ArchiveListing> {
         Ok(ArchiveListing {
             format: Some(ArchiveFormat::Zip),
             entries: Vec::new(),
         })
     }
 
-    async fn test(&self, request: TestRequest) -> smartzip_core::Result<TestResult> {
+    async fn test_with_context(
+        &self,
+        request: TestRequest,
+        _context: std::sync::Arc<smartzip_core::TaskExecutionContext>,
+    ) -> smartzip_core::Result<TestResult> {
         Err(smartzip_core::SmartZipError::BackendFailed {
             backend: "test-backend".into(),
             exit_code: Some(2),
@@ -674,9 +727,11 @@ impl ArchiveExecutor for FailingExtractBackend {
         })
     }
 
-    async fn extract(
+    async fn extract_with_facts_and_context(
         &self,
         request: ExtractArchiveRequest,
+        _facts: &smartzip_core::ArchiveFacts,
+        _context: std::sync::Arc<smartzip_core::TaskExecutionContext>,
     ) -> smartzip_core::Result<ExtractArchiveResult> {
         Err(smartzip_core::SmartZipError::BackendFailed {
             backend: "extract-backend".into(),
@@ -693,7 +748,11 @@ struct FailFirstExtractBackend {
 
 #[async_trait]
 impl ArchiveExecutor for FailFirstExtractBackend {
-    async fn probe(&self, path: &Path) -> smartzip_core::Result<ArchiveProbe> {
+    async fn probe_with_context(
+        &self,
+        path: &Path,
+        _context: std::sync::Arc<smartzip_core::TaskExecutionContext>,
+    ) -> smartzip_core::Result<ArchiveProbe> {
         Ok(ArchiveProbe {
             path: path.to_path_buf(),
             format: Some(ArchiveFormat::Zip),
@@ -702,20 +761,30 @@ impl ArchiveExecutor for FailFirstExtractBackend {
         })
     }
 
-    async fn list(&self, _request: ListRequest) -> smartzip_core::Result<ArchiveListing> {
+    async fn list_with_context(
+        &self,
+        _request: ListRequest,
+        _context: std::sync::Arc<smartzip_core::TaskExecutionContext>,
+    ) -> smartzip_core::Result<ArchiveListing> {
         Ok(ArchiveListing {
             format: Some(ArchiveFormat::Zip),
             entries: Vec::new(),
         })
     }
 
-    async fn test(&self, _request: TestRequest) -> smartzip_core::Result<TestResult> {
+    async fn test_with_context(
+        &self,
+        _request: TestRequest,
+        _context: std::sync::Arc<smartzip_core::TaskExecutionContext>,
+    ) -> smartzip_core::Result<TestResult> {
         unreachable!("extraction does not run a full test pass")
     }
 
-    async fn extract(
+    async fn extract_with_facts_and_context(
         &self,
         request: ExtractArchiveRequest,
+        _facts: &smartzip_core::ArchiveFacts,
+        _context: std::sync::Arc<smartzip_core::TaskExecutionContext>,
     ) -> smartzip_core::Result<ExtractArchiveResult> {
         let call = self.calls.fetch_add(1, Ordering::SeqCst);
         if call == 0 {
@@ -744,7 +813,11 @@ struct NestedThenFailBackend {
 
 #[async_trait]
 impl ArchiveExecutor for NestedThenFailBackend {
-    async fn probe(&self, path: &Path) -> smartzip_core::Result<ArchiveProbe> {
+    async fn probe_with_context(
+        &self,
+        path: &Path,
+        _context: std::sync::Arc<smartzip_core::TaskExecutionContext>,
+    ) -> smartzip_core::Result<ArchiveProbe> {
         Ok(ArchiveProbe {
             path: path.to_path_buf(),
             format: Some(ArchiveFormat::Zip),
@@ -753,20 +826,30 @@ impl ArchiveExecutor for NestedThenFailBackend {
         })
     }
 
-    async fn list(&self, _request: ListRequest) -> smartzip_core::Result<ArchiveListing> {
+    async fn list_with_context(
+        &self,
+        _request: ListRequest,
+        _context: std::sync::Arc<smartzip_core::TaskExecutionContext>,
+    ) -> smartzip_core::Result<ArchiveListing> {
         Ok(ArchiveListing {
             format: Some(ArchiveFormat::Zip),
             entries: Vec::new(),
         })
     }
 
-    async fn test(&self, _request: TestRequest) -> smartzip_core::Result<TestResult> {
+    async fn test_with_context(
+        &self,
+        _request: TestRequest,
+        _context: std::sync::Arc<smartzip_core::TaskExecutionContext>,
+    ) -> smartzip_core::Result<TestResult> {
         unreachable!("extraction does not run a full test pass")
     }
 
-    async fn extract(
+    async fn extract_with_facts_and_context(
         &self,
         request: ExtractArchiveRequest,
+        _facts: &smartzip_core::ArchiveFacts,
+        _context: std::sync::Arc<smartzip_core::TaskExecutionContext>,
     ) -> smartzip_core::Result<ExtractArchiveResult> {
         let name = request
             .archive
@@ -819,7 +902,11 @@ struct ScanThenFailBackend {
 
 #[async_trait]
 impl ArchiveExecutor for ScanThenFailBackend {
-    async fn probe(&self, path: &Path) -> smartzip_core::Result<ArchiveProbe> {
+    async fn probe_with_context(
+        &self,
+        path: &Path,
+        _context: std::sync::Arc<smartzip_core::TaskExecutionContext>,
+    ) -> smartzip_core::Result<ArchiveProbe> {
         Ok(ArchiveProbe {
             path: path.to_path_buf(),
             format: Some(ArchiveFormat::Zip),
@@ -828,20 +915,30 @@ impl ArchiveExecutor for ScanThenFailBackend {
         })
     }
 
-    async fn list(&self, _request: ListRequest) -> smartzip_core::Result<ArchiveListing> {
+    async fn list_with_context(
+        &self,
+        _request: ListRequest,
+        _context: std::sync::Arc<smartzip_core::TaskExecutionContext>,
+    ) -> smartzip_core::Result<ArchiveListing> {
         Ok(ArchiveListing {
             format: Some(ArchiveFormat::Zip),
             entries: Vec::new(),
         })
     }
 
-    async fn test(&self, _request: TestRequest) -> smartzip_core::Result<TestResult> {
+    async fn test_with_context(
+        &self,
+        _request: TestRequest,
+        _context: std::sync::Arc<smartzip_core::TaskExecutionContext>,
+    ) -> smartzip_core::Result<TestResult> {
         unreachable!("extraction does not run a full test pass")
     }
 
-    async fn extract(
+    async fn extract_with_facts_and_context(
         &self,
         request: ExtractArchiveRequest,
+        _facts: &smartzip_core::ArchiveFacts,
+        _context: std::sync::Arc<smartzip_core::TaskExecutionContext>,
     ) -> smartzip_core::Result<ExtractArchiveResult> {
         assert_eq!(request.archive.file_name().unwrap(), "fail.zip");
         self.calls.fetch_add(1, Ordering::SeqCst);
@@ -866,7 +963,7 @@ struct StageWaitRecorder {
 }
 
 #[async_trait(?Send)]
-impl crate::ExecutionStateRecorder for StageWaitRecorder {
+impl crate::ExecutionControl for StageWaitRecorder {
     async fn enqueue_child(
         &self,
         _task_id: &TaskId,
@@ -1021,9 +1118,7 @@ async fn stop_on_error_cancels_other_roots_waiting_for_backend_capacity() {
             scanner: ScannerConfig::default(),
             password_candidates: PasswordCandidateRequest {
                 manual: Vec::new(),
-                clipboard: None,
                 include_empty: true,
-                limit: 8,
             },
             layout_policy: Default::default(),
             single_root_name_policy: Default::default(),
@@ -1168,9 +1263,7 @@ async fn stop_on_error_finishes_waiting_nested_node_without_rewriting_its_root()
             scanner: ScannerConfig::default(),
             password_candidates: PasswordCandidateRequest {
                 manual: Vec::new(),
-                clipboard: None,
                 include_empty: true,
-                limit: 8,
             },
             layout_policy: Default::default(),
             single_root_name_policy: Default::default(),
@@ -1275,9 +1368,7 @@ async fn stop_on_error_finishes_a_root_whose_scan_is_running() {
             scanner: ScannerConfig::default(),
             password_candidates: PasswordCandidateRequest {
                 manual: Vec::new(),
-                clipboard: None,
                 include_empty: true,
-                limit: 8,
             },
             layout_policy: Default::default(),
             single_root_name_policy: Default::default(),
@@ -1365,7 +1456,7 @@ async fn backend_failures_do_not_record_password_failures() {
 
     let engine = SmartZipEngine::default();
     let result = engine
-        .extract_recursive(
+        .extract(
             &backend,
             &service,
             ExtractWorkflowRequest {
@@ -1376,9 +1467,7 @@ async fn backend_failures_do_not_record_password_failures() {
                 scanner: ScannerConfig::default(),
                 password_candidates: PasswordCandidateRequest {
                     manual: Vec::new(),
-                    clipboard: None,
                     include_empty: false,
-                    limit: 8,
                 },
                 layout_policy: crate::layout::OutputLayoutPolicy::default(),
                 single_root_name_policy: crate::layout::SingleRootNamePolicy::default(),
@@ -1388,8 +1477,14 @@ async fn backend_failures_do_not_record_password_failures() {
                 force: false,
                 limits: Default::default(),
             },
-            None,
-            None,
+            crate::ExtractInteraction {
+                password: None,
+                output: None,
+                ..Default::default()
+            },
+            crate::ExtractObserver {
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -1418,7 +1513,7 @@ struct CancelAfterPublish {
 }
 
 #[async_trait(?Send)]
-impl crate::ExecutionStateRecorder for CancelAfterPublish {
+impl crate::ExecutionControl for CancelAfterPublish {
     async fn enqueue_child(
         &self,
         _task_id: &TaskId,
@@ -1533,7 +1628,11 @@ struct BatchPasswordBackend {
 
 #[async_trait]
 impl ArchiveExecutor for BatchPasswordBackend {
-    async fn probe(&self, path: &Path) -> smartzip_core::Result<ArchiveProbe> {
+    async fn probe_with_context(
+        &self,
+        path: &Path,
+        _context: std::sync::Arc<smartzip_core::TaskExecutionContext>,
+    ) -> smartzip_core::Result<ArchiveProbe> {
         Ok(ArchiveProbe {
             path: path.to_path_buf(),
             format: Some(ArchiveFormat::Zip),
@@ -1542,20 +1641,30 @@ impl ArchiveExecutor for BatchPasswordBackend {
         })
     }
 
-    async fn list(&self, _request: ListRequest) -> smartzip_core::Result<ArchiveListing> {
+    async fn list_with_context(
+        &self,
+        _request: ListRequest,
+        _context: std::sync::Arc<smartzip_core::TaskExecutionContext>,
+    ) -> smartzip_core::Result<ArchiveListing> {
         Ok(ArchiveListing {
             format: Some(ArchiveFormat::Zip),
             entries: Vec::new(),
         })
     }
 
-    async fn test(&self, _request: TestRequest) -> smartzip_core::Result<TestResult> {
+    async fn test_with_context(
+        &self,
+        _request: TestRequest,
+        _context: std::sync::Arc<smartzip_core::TaskExecutionContext>,
+    ) -> smartzip_core::Result<TestResult> {
         panic!("password attempts must extract directly, never run a full test");
     }
 
-    async fn extract(
+    async fn extract_with_facts_and_context(
         &self,
         request: ExtractArchiveRequest,
+        _facts: &smartzip_core::ArchiveFacts,
+        _context: std::sync::Arc<smartzip_core::TaskExecutionContext>,
     ) -> smartzip_core::Result<ExtractArchiveResult> {
         self.attempted_passwords
             .lock()
@@ -1619,7 +1728,7 @@ async fn interactive_password_is_reused_for_later_files_in_same_batch() {
     };
 
     let result = SmartZipEngine::default()
-        .extract_recursive_interactive(
+        .extract(
             &backend,
             &service,
             ExtractWorkflowRequest {
@@ -1630,9 +1739,7 @@ async fn interactive_password_is_reused_for_later_files_in_same_batch() {
                 scanner: ScannerConfig::default(),
                 password_candidates: PasswordCandidateRequest {
                     manual: Vec::new(),
-                    clipboard: None,
                     include_empty: false,
-                    limit: 8,
                 },
                 layout_policy: Default::default(),
                 single_root_name_policy: Default::default(),
@@ -1642,10 +1749,15 @@ async fn interactive_password_is_reused_for_later_files_in_same_batch() {
                 force: false,
                 limits: Default::default(),
             },
-            Some(&prompter),
-            None,
-            None,
-            None,
+            crate::ExtractInteraction {
+                password: Some(&prompter),
+                output: None,
+                embedded: None,
+                encoding: None,
+            },
+            crate::ExtractObserver {
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -1673,7 +1785,11 @@ async fn interactive_password_is_reused_for_later_files_in_same_batch() {
 
 #[async_trait]
 impl ArchiveExecutor for FakeBackend {
-    async fn probe(&self, path: &std::path::Path) -> smartzip_core::Result<ArchiveProbe> {
+    async fn probe_with_context(
+        &self,
+        path: &std::path::Path,
+        _context: std::sync::Arc<smartzip_core::TaskExecutionContext>,
+    ) -> smartzip_core::Result<ArchiveProbe> {
         Ok(ArchiveProbe {
             path: path.to_path_buf(),
             format: format_from_extension(path),
@@ -1682,14 +1798,22 @@ impl ArchiveExecutor for FakeBackend {
         })
     }
 
-    async fn list(&self, _request: ListRequest) -> smartzip_core::Result<ArchiveListing> {
+    async fn list_with_context(
+        &self,
+        _request: ListRequest,
+        _context: std::sync::Arc<smartzip_core::TaskExecutionContext>,
+    ) -> smartzip_core::Result<ArchiveListing> {
         Ok(ArchiveListing {
             format: Some(ArchiveFormat::Zip),
             entries: Vec::new(),
         })
     }
 
-    async fn test(&self, _request: TestRequest) -> smartzip_core::Result<TestResult> {
+    async fn test_with_context(
+        &self,
+        _request: TestRequest,
+        _context: std::sync::Arc<smartzip_core::TaskExecutionContext>,
+    ) -> smartzip_core::Result<TestResult> {
         Ok(TestResult {
             ok: true,
             encrypted: Some(true),
@@ -1697,9 +1821,11 @@ impl ArchiveExecutor for FakeBackend {
         })
     }
 
-    async fn extract(
+    async fn extract_with_facts_and_context(
         &self,
         request: ExtractArchiveRequest,
+        _facts: &smartzip_core::ArchiveFacts,
+        _context: std::sync::Arc<smartzip_core::TaskExecutionContext>,
     ) -> smartzip_core::Result<ExtractArchiveResult> {
         self.calls
             .lock()
@@ -1813,7 +1939,7 @@ async fn extract_via_real_seven_zip_with_smart_output() {
 
     let engine = SmartZipEngine::default();
     let result = engine
-        .extract_recursive(
+        .extract(
             &backend,
             &service,
             ExtractWorkflowRequest {
@@ -1831,8 +1957,14 @@ async fn extract_via_real_seven_zip_with_smart_output() {
                 force: false,
                 limits: Default::default(),
             },
-            None,
-            None,
+            crate::ExtractInteraction {
+                password: None,
+                output: None,
+                ..Default::default()
+            },
+            crate::ExtractObserver {
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -1883,7 +2015,7 @@ async fn embedded_archive_is_carved_before_extraction_and_recurses() {
 
     let engine = engine_with_test_recycler().with_min_embedded_size_bytes(0);
     let result = engine
-        .extract_recursive(
+        .extract(
             &backend,
             &service,
             ExtractWorkflowRequest {
@@ -1901,8 +2033,14 @@ async fn embedded_archive_is_carved_before_extraction_and_recurses() {
                 force: false,
                 limits: Default::default(),
             },
-            None,
-            None,
+            crate::ExtractInteraction {
+                password: None,
+                output: None,
+                ..Default::default()
+            },
+            crate::ExtractObserver {
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -1986,7 +2124,11 @@ struct EmbeddedAwareFakeBackend {
 
 #[async_trait]
 impl ArchiveExecutor for EmbeddedAwareFakeBackend {
-    async fn probe(&self, path: &std::path::Path) -> smartzip_core::Result<ArchiveProbe> {
+    async fn probe_with_context(
+        &self,
+        path: &std::path::Path,
+        _context: std::sync::Arc<smartzip_core::TaskExecutionContext>,
+    ) -> smartzip_core::Result<ArchiveProbe> {
         Ok(ArchiveProbe {
             path: path.to_path_buf(),
             format: format_from_extension(path),
@@ -1995,7 +2137,11 @@ impl ArchiveExecutor for EmbeddedAwareFakeBackend {
         })
     }
 
-    async fn list(&self, request: ListRequest) -> smartzip_core::Result<ArchiveListing> {
+    async fn list_with_context(
+        &self,
+        request: ListRequest,
+        _context: std::sync::Arc<smartzip_core::TaskExecutionContext>,
+    ) -> smartzip_core::Result<ArchiveListing> {
         let starts_with_zip = std::fs::read(&request.archive)
             .map(|bytes| bytes.starts_with(b"PK"))
             .unwrap_or(false);
@@ -2009,7 +2155,11 @@ impl ArchiveExecutor for EmbeddedAwareFakeBackend {
         })
     }
 
-    async fn test(&self, _request: TestRequest) -> smartzip_core::Result<TestResult> {
+    async fn test_with_context(
+        &self,
+        _request: TestRequest,
+        _context: std::sync::Arc<smartzip_core::TaskExecutionContext>,
+    ) -> smartzip_core::Result<TestResult> {
         Ok(TestResult {
             ok: true,
             encrypted: Some(true),
@@ -2017,9 +2167,11 @@ impl ArchiveExecutor for EmbeddedAwareFakeBackend {
         })
     }
 
-    async fn extract(
+    async fn extract_with_facts_and_context(
         &self,
         request: ExtractArchiveRequest,
+        _facts: &smartzip_core::ArchiveFacts,
+        _context: std::sync::Arc<smartzip_core::TaskExecutionContext>,
     ) -> smartzip_core::Result<ExtractArchiveResult> {
         let starts_with_zip = std::fs::read(&request.archive)
             .map(|bytes| bytes.starts_with(b"PK"))
@@ -2052,7 +2204,11 @@ struct PasswordListingBackend {
 
 #[async_trait]
 impl ArchiveExecutor for PasswordListingBackend {
-    async fn probe(&self, path: &Path) -> smartzip_core::Result<ArchiveProbe> {
+    async fn probe_with_context(
+        &self,
+        path: &Path,
+        _context: std::sync::Arc<smartzip_core::TaskExecutionContext>,
+    ) -> smartzip_core::Result<ArchiveProbe> {
         Ok(ArchiveProbe {
             path: path.into(),
             format: Some(ArchiveFormat::Zip),
@@ -2061,7 +2217,11 @@ impl ArchiveExecutor for PasswordListingBackend {
         })
     }
 
-    async fn list(&self, request: ListRequest) -> smartzip_core::Result<ArchiveListing> {
+    async fn list_with_context(
+        &self,
+        request: ListRequest,
+        _context: std::sync::Arc<smartzip_core::TaskExecutionContext>,
+    ) -> smartzip_core::Result<ArchiveListing> {
         let accepted = request.password.as_deref() == Some("correct");
         let path = request.archive.clone();
         self.requests.lock().unwrap().push(request);
@@ -2075,12 +2235,18 @@ impl ArchiveExecutor for PasswordListingBackend {
         }
     }
 
-    async fn test(&self, _: TestRequest) -> smartzip_core::Result<TestResult> {
+    async fn test_with_context(
+        &self,
+        _: TestRequest,
+        _context: std::sync::Arc<smartzip_core::TaskExecutionContext>,
+    ) -> smartzip_core::Result<TestResult> {
         panic!("listing must not test data")
     }
-    async fn extract(
+    async fn extract_with_facts_and_context(
         &self,
         _: ExtractArchiveRequest,
+        _facts: &smartzip_core::ArchiveFacts,
+        _context: std::sync::Arc<smartzip_core::TaskExecutionContext>,
     ) -> smartzip_core::Result<ExtractArchiveResult> {
         panic!("listing must not extract")
     }
@@ -2225,7 +2391,7 @@ async fn configured_cleanup_keep_never_calls_recycler_and_policy_is_a_snapshot()
     next_task_policy.values.extraction.recursion.enabled = false;
     let backend = FakeBackend::default();
     let result = engine
-        .extract_recursive(
+        .extract(
             &backend,
             &service,
             ExtractWorkflowRequest {
@@ -2243,8 +2409,14 @@ async fn configured_cleanup_keep_never_calls_recycler_and_policy_is_a_snapshot()
                 force: false,
                 limits: Default::default(),
             },
-            None,
-            None,
+            crate::ExtractInteraction {
+                password: None,
+                output: None,
+                ..Default::default()
+            },
+            crate::ExtractObserver {
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -2477,7 +2649,6 @@ async fn multi_input_starts_extracting_before_scanning_the_entire_batch() {
                 scanner: ScannerConfig::default(),
                 password_candidates: PasswordCandidateRequest {
                     include_empty: true,
-                    limit: 0,
                     ..Default::default()
                 },
                 layout_policy: Default::default(),
@@ -2561,7 +2732,6 @@ async fn stateless_embedded_inputs_extract_before_scanning_later_carriers() {
                 scanner: ScannerConfig::default(),
                 password_candidates: PasswordCandidateRequest {
                     include_empty: true,
-                    limit: 0,
                     ..Default::default()
                 },
                 layout_policy: Default::default(),

@@ -80,7 +80,7 @@ cargo run -p smartzip-cli -- password add <password>
 | `password` | `pw` |
 | `history` | `hist` |
 
-编码预览直接使用 `smartzip enc <path>`；旧名称 `encoding-preview` 保留兼容。短别名与完整命令使用相同参数，例如 `smartzip x archive.zip`、`smartzip pw list`、`smartzip hist files`。
+编码预览使用 `smartzip enc <path>`。短别名与完整命令使用相同参数，例如 `smartzip x archive.zip`、`smartzip pw list`、`smartzip hist files`。
 
 `extract` 支持常见参数，例如：
 
@@ -99,7 +99,7 @@ RAR5 的独立局部校验可以确认具体坏卷；跨卷 ZIP 数据、7z soli
 cargo run -p smartzip-cli -- --db ./smartzip.db extract <path>
 ```
 
-当前 `--use-clipboard` 尚未接线，显式使用会报错；`list --pick-encoding` 只显示编码名称。需要文件名对照时先使用 `enc`，再通过 `--encoding` 指定。
+`list --pick-encoding` 只显示编码名称。需要文件名对照时先使用 `enc`，再通过 `--encoding` 指定。
 
 启动原生 GUI：
 

@@ -19,71 +19,18 @@ pub fn selected_config(
     no_config: bool,
     environment: Option<&Path>,
     default: &Path,
-    legacy: &Path,
-) -> io::Result<(Option<PathBuf>, Vec<String>)> {
+) -> io::Result<Option<PathBuf>> {
     if no_config {
-        return Ok((None, Vec::new()));
+        return Ok(None);
     }
     if let Some(path) = explicit.or(environment) {
-        return Ok((Some(path.to_path_buf()), Vec::new()));
+        return Ok(Some(path.to_path_buf()));
     }
-    let present = |path: &Path| match std::fs::metadata(path) {
-        Ok(_) => Ok(true),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(e) => Err(e),
-    };
-    let current = present(default)?;
-    let old = default != legacy && present(legacy)?;
-    Ok(if current {
-        (
-            Some(default.into()),
-            if old {
-                vec![format!(
-                    "using {}; legacy configuration also exists at {}; files are not merged",
-                    default.display(),
-                    legacy.display()
-                )]
-            } else {
-                vec![]
-            },
-        )
-    } else if old {
-        (
-            Some(legacy.into()),
-            vec![format!(
-                "using legacy configuration at {}",
-                legacy.display()
-            )],
-        )
-    } else {
-        (None, vec![])
-    })
+    Ok(default.try_exists()?.then(|| default.to_path_buf()))
 }
 
 pub(crate) fn invalid(message: impl ToString) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.to_string())
-}
-
-/// Only recognized v0 routing/limit keys migrate. Unknown keys remain errors.
-pub fn migrate_value(mut value: toml::Value) -> io::Result<(toml::Value, bool)> {
-    let root = value
-        .as_table_mut()
-        .ok_or_else(|| invalid("configuration must be a table"))?;
-    if root.contains_key("schema_version") {
-        return Ok((value, false));
-    }
-    for key in root.keys() {
-        if key != "backends" && key != "extraction" {
-            return Err(invalid(format!("unknown legacy configuration key: {key}")));
-        }
-    }
-    if let Some(limits) = root.remove("extraction") {
-        let _: crate::ExtractionLimits = limits.clone().try_into().map_err(invalid)?;
-        root.insert("limits".into(), limits);
-    }
-    root.insert("schema_version".into(), 1.into());
-    root.insert("defaults_version".into(), 1.into());
-    Ok((value, true))
 }
 
 fn record(value: &toml::Value, prefix: &str, source: &str, origins: &mut BTreeMap<String, String>) {
@@ -132,19 +79,12 @@ impl ResolvedConfig {
         let mut value = toml::Value::try_from(SmartZipConfig::default()).map_err(invalid)?;
         let mut origins = BTreeMap::new();
         record(&value, "", "defaults-v1", &mut origins);
-        let mut diagnostics = Vec::new();
         let path = path.map(|p| std::path::absolute(p)).transpose()?;
         if let Some(path) = &path {
             let raw = std::fs::read_to_string(path)?;
-            let parsed = raw
+            let mut patch = raw
                 .parse::<toml::Value>()
                 .map_err(|e| invalid(format!("{}: {e}", path.display())))?;
-            let (mut patch, migrated) = migrate_value(parsed)?;
-            if migrated {
-                diagnostics.push(
-                    "legacy-v0 migrated in memory; use config migrate --apply to save".into(),
-                );
-            }
             // Resolve file paths before CLI patches. Bare backend names stay PATH lookups.
             for key in ["state.database", "extraction.output.directory"] {
                 if let Some(p) = value_at(&patch, key).and_then(toml::Value::as_str) {
@@ -202,7 +142,7 @@ impl ResolvedConfig {
             values,
             origins,
             path,
-            diagnostics,
+            diagnostics: Vec::new(),
         })
     }
 

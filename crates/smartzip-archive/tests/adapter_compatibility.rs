@@ -1,18 +1,10 @@
 #![cfg(unix)]
-use smartzip_archive::{
-    ArchiveAdapter, ArchiveExecutor, BackendRouter, ExtractArchiveRequest, ListRequest,
-};
+use smartzip_archive::{ArchiveExecutor, BackendRouter, ListRequest};
 use smartzip_config::{AdapterFamily, BackendConfig, BackendInstallation};
 use smartzip_core::{
     ArchiveFormat, ArchiveOperation, ArchiveRequirements, EncodingMode, TaskExecutionContext,
 };
-use std::{
-    path::PathBuf,
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    },
-};
+use std::{path::PathBuf, sync::Arc};
 
 fn fake_backend() -> (tempfile::TempDir, PathBuf) {
     use std::os::unix::fs::PermissionsExt;
@@ -81,103 +73,17 @@ async fn configured_seven_zip_routes_rar_only_to_installations_with_rar_support(
         .unwrap()
         .contains(&serde_json::json!("Rar")));
     let listing = router
-        .list(ListRequest {
-            archive: legacy_root.path().join("archive.rar"),
-            format: Some(ArchiveFormat::Rar),
-            password: Some(String::new()),
-            encoding: EncodingMode::Auto,
-        })
+        .list_with_context(
+            ListRequest {
+                archive: legacy_root.path().join("archive.rar"),
+                format: Some(ArchiveFormat::Rar),
+                password: Some(String::new()),
+                encoding: EncodingMode::Auto,
+            },
+            Arc::new(TaskExecutionContext::detached()),
+        )
         .await
         .unwrap();
     assert_eq!(listing.format, Some(ArchiveFormat::Rar));
     assert_eq!(listing.entries[0].path, PathBuf::from("payload.txt"));
-}
-
-async fn check_compatibility(backend: &dyn ArchiveAdapter, root: &std::path::Path) {
-    let list = ListRequest {
-        archive: root.join("archive.7z"),
-        format: None,
-        password: Some("test-value".into()),
-        encoding: EncodingMode::Auto,
-    };
-    let a = backend.list(list.clone()).await.unwrap();
-    let log = root.join("backend.log");
-    let first = std::fs::read(&log).unwrap();
-    std::fs::write(&log, "").unwrap();
-    let b = backend
-        .list_with_context(list, Arc::new(TaskExecutionContext::detached()))
-        .await
-        .unwrap();
-    assert_eq!(a, b);
-    assert_eq!(std::fs::read(&log).unwrap(), first);
-    std::fs::write(&log, "").unwrap();
-    let request = ExtractArchiveRequest {
-        archive: root.join("archive.7z"),
-        format: None,
-        output_dir: root.join("out"),
-        password: Some("test-value".into()),
-        encoding: EncodingMode::Auto,
-    };
-    let a = backend.extract(request.clone()).await.unwrap();
-    let first = std::fs::read(&log).unwrap();
-    std::fs::write(&log, "").unwrap();
-    let b = backend
-        .extract_with_context(request, Arc::new(TaskExecutionContext::detached()))
-        .await
-        .unwrap();
-    assert_eq!(a, b);
-    assert_eq!(std::fs::read(&log).unwrap(), first);
-}
-
-#[tokio::test]
-async fn seven_zip_legacy_entries_preserve_commands_results_and_observer_delivery() {
-    let (root, executable) = fake_backend();
-    let delivered = Arc::new(AtomicUsize::new(0));
-    let observed = delivered.clone();
-    let backend =
-        smartzip_archive::sevenzz::SevenZipBackend::new(executable).with_observer(move |_| {
-            observed.fetch_add(1, Ordering::SeqCst);
-        });
-    check_compatibility(&backend, root.path()).await;
-    assert_eq!(delivered.load(Ordering::SeqCst), 2);
-}
-
-#[tokio::test]
-async fn unrar_legacy_entries_preserve_commands_and_results() {
-    let (root, executable) = fake_backend();
-    let backend = smartzip_archive::unrar::UnrarBackend::new(executable);
-    check_compatibility(&backend, root.path()).await;
-}
-
-#[tokio::test]
-async fn probe_preserves_legacy_and_context_diagnostic_differences() {
-    use std::os::unix::fs::PermissionsExt;
-    let (root, executable) = fake_backend();
-    std::fs::write(&executable, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$0.log\"\nprintf 'ERROR: Wrong password\\n' >&2\nexit 2\n").unwrap();
-    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let path = root.path().join("secret.7z");
-    let seven = smartzip_archive::sevenzz::SevenZipBackend::new(executable.clone());
-    assert!(seven.probe(&path).await.unwrap().supported);
-    let log = root.path().join("backend.log");
-    assert!(std::fs::read_to_string(&log)
-        .unwrap()
-        .contains("-bd -bb1 -sccUTF-8"));
-    std::fs::write(&log, "").unwrap();
-    assert!(
-        seven
-            .probe_with_context(&path, Arc::new(TaskExecutionContext::detached()))
-            .await
-            .unwrap()
-            .supported
-    );
-    assert!(!std::fs::read_to_string(&log).unwrap().contains("-bd"));
-    let unrar = smartzip_archive::unrar::UnrarBackend::new(executable);
-    assert!(unrar.probe(&path).await.unwrap().supported);
-    assert!(
-        !unrar
-            .probe_with_context(&path, Arc::new(TaskExecutionContext::detached()))
-            .await
-            .unwrap()
-            .supported
-    );
 }

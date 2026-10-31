@@ -1,5 +1,6 @@
 use smartzip_archive::{ArchiveAdapter, ExtractArchiveRequest, ListRequest, SevenZipBackend};
-use smartzip_core::{ArchiveFormat, EncodingMode};
+use smartzip_core::{ArchiveFormat, EncodingMode, TaskExecutionContext};
+use std::sync::Arc;
 use std::{
     io::{Cursor, Write},
     path::Path,
@@ -48,12 +49,15 @@ async fn legacy_zip_names_and_contents_match_for_plain_and_encrypted_entries() {
         let encoding = EncodingMode::Override("gbk".into());
         let password = encrypted.then(|| "fixture-password".into());
         let listing = backend
-            .list(ListRequest {
-                archive: archive.clone(),
-                format: Some(ArchiveFormat::Zip),
-                password: password.clone(),
-                encoding: encoding.clone(),
-            })
+            .list_with_context(
+                ListRequest {
+                    archive: archive.clone(),
+                    format: Some(ArchiveFormat::Zip),
+                    password: password.clone(),
+                    encoding: encoding.clone(),
+                },
+                Arc::new(TaskExecutionContext::detached()),
+            )
             .await
             .unwrap();
         assert_eq!(listing.entries[0].path, Path::new("测试文件.txt"));
@@ -77,13 +81,16 @@ async fn legacy_zip_names_and_contents_match_for_plain_and_encrypted_entries() {
         assert_eq!(preview, b"verified fixture contents\n");
         let output_dir = root.path().join("output");
         backend
-            .extract(ExtractArchiveRequest {
-                archive,
-                format: Some(ArchiveFormat::Zip),
-                password,
-                encoding,
-                output_dir: output_dir.clone(),
-            })
+            .extract_with_context(
+                ExtractArchiveRequest {
+                    archive,
+                    format: Some(ArchiveFormat::Zip),
+                    password,
+                    encoding,
+                    output_dir: output_dir.clone(),
+                },
+                Arc::new(TaskExecutionContext::detached()),
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -101,13 +108,16 @@ async fn legacy_decoded_traversal_is_rejected_without_creating_output() {
     legacy_zip(&archive, b"../\xb2\xe2\xca\xd4.txt", false);
     let output_dir = root.path().join("output");
     let result = backend
-        .extract(ExtractArchiveRequest {
-            archive,
-            format: Some(ArchiveFormat::Zip),
-            password: None,
-            encoding: EncodingMode::Override("gbk".into()),
-            output_dir,
-        })
+        .extract_with_context(
+            ExtractArchiveRequest {
+                archive,
+                format: Some(ArchiveFormat::Zip),
+                password: None,
+                encoding: EncodingMode::Override("gbk".into()),
+                output_dir,
+            },
+            Arc::new(TaskExecutionContext::detached()),
+        )
         .await;
     assert!(matches!(
         result,

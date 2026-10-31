@@ -21,10 +21,7 @@ pub use backend::{ArchiveAdapter, ArchiveExecutor};
 pub use member::MemberReadRequest;
 pub use native_zip::NativeZipBackend;
 pub use router::{AdapterRegistration, BackendRouter};
-pub use sevenzz::{
-    SevenZipBackend, SevenZipDiagnosticSeverity, SevenZipEvent, SevenZipExitStatus,
-    SevenZipLocator, SevenZipOperation, SevenZipReport, SevenZipResult,
-};
+pub use sevenzz::{SevenZipBackend, SevenZipLocator};
 pub use types::*;
 pub use unrar::{UnrarBackend, UnrarLocator};
 

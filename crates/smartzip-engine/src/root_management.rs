@@ -1,6 +1,6 @@
 //! Live root controls and node snapshots. Durable execution stays in the state recorder.
 use crate::coordinator::Stage;
-use crate::{ExecutionStateRecorder, ExtractTaskIdentity, NodeOutcome, TaskCancellation};
+use crate::{ExecutionControl, ExtractTaskIdentity, NodeOutcome, TaskCancellation};
 use smartzip_core::{AttemptId, DecisionId, NodeId, TaskId};
 use std::{
     collections::HashMap,
@@ -376,13 +376,13 @@ fn node_snapshot(
     }
 }
 pub(crate) struct ManagedRecorder<'a> {
-    pub inner: Option<&'a dyn ExecutionStateRecorder>,
+    pub inner: Option<&'a dyn ExecutionControl>,
     pub management: Arc<RootManagement>,
     pub root: NodeId,
     pub lane: NodeId,
 }
 #[async_trait::async_trait(?Send)]
-impl ExecutionStateRecorder for ManagedRecorder<'_> {
+impl ExecutionControl for ManagedRecorder<'_> {
     fn volume_selected(&self, node_id: &NodeId, members: Vec<PathBuf>) {
         self.management.update(&self.root, |n| {
             if let Some(volumes) = &mut n.volumes {

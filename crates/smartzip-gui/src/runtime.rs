@@ -282,18 +282,14 @@ fn load_policy(request: &JobRequest) -> Result<CompiledRunPolicy, Box<dyn std::e
         resolved.clone()
     } else {
         let paths = smartzip_platform::PlatformPaths::try_new()?;
-        let legacy = smartzip_platform::PlatformPaths::legacy()?;
         let environment = std::env::var_os("SMARTZIP_CONFIG").map(PathBuf::from);
-        let (selected, diagnostics) = smartzip_config::selected_config(
+        let selected = smartzip_config::selected_config(
             None,
             false,
             environment.as_deref(),
             &paths.config_path(),
-            &legacy.config_path(),
         )?;
-        let mut resolved = smartzip_config::ResolvedConfig::load(selected.as_deref())?;
-        resolved.diagnostics.extend(diagnostics);
-        resolved
+        smartzip_config::ResolvedConfig::load(selected.as_deref())?
     };
     let mut patches = Vec::new();
     if let Some(value) = request.settings.recursive {
@@ -371,11 +367,7 @@ fn open_database(
     }
     let path = match &policy.values().state.database {
         Some(path) => path.clone(),
-        None => {
-            smartzip_platform::PlatformPaths::try_new()?
-                .select_database(&smartzip_platform::PlatformPaths::legacy()?)?
-                .0
-        }
+        None => smartzip_platform::PlatformPaths::try_new()?.db_path(),
     };
     let db = if policy.values().state.mode == smartzip_config::StateMode::ReadOnly {
         smartzip_db::SmartZipDb::open_read_only(&path)?
@@ -472,9 +464,7 @@ async fn run_job_inner(
     };
     let candidates = smartzip_passwords::PasswordCandidateRequest {
         manual: request.settings.passwords.clone(),
-        clipboard: None,
         include_empty: true,
-        limit: c.passwords.database_limit,
     };
     let interactive = c.interaction.mode != smartzip_config::InteractionMode::Never;
     let password_prompt = interactive.then_some(&prompts as &dyn InteractivePasswordPrompter);
@@ -548,7 +538,7 @@ async fn run_job_inner(
                     history: None,
                     execution: execution_store
                         .as_deref()
-                        .map(|execution| execution as &dyn smartzip_engine::ExecutionStateRecorder),
+                        .map(|execution| execution as &dyn smartzip_engine::ExecutionControl),
                 },
             );
             let result = current_work.await;
@@ -591,9 +581,8 @@ async fn run_job_inner(
         }
         TaskOperation::Detect => {
             let result = engine
-                .inspect_file_with_listener(
+                .inspect(
                     &backend,
-                    passwords,
                     smartzip_engine::InspectRequest { path, scanner },
                     listener,
                     recorder,

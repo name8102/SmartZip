@@ -66,16 +66,21 @@ async fn extract_records_task_events_and_file_row() {
     let output = TempDir::new().unwrap();
 
     let result = engine
-        .extract_recursive_with_listener_interactive(
+        .extract(
             &backend,
             &service,
             request(vec![archive.clone()], output.path().to_path_buf()),
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some(&recorder),
+            smartzip_engine::ExtractInteraction {
+                password: None,
+                output: None,
+                embedded: None,
+                encoding: None,
+            },
+            smartzip_engine::ExtractObserver {
+                listener: None,
+                history: Some(&recorder),
+                ..Default::default()
+            },
         )
         .await
         .expect("extraction should succeed");
@@ -151,10 +156,7 @@ async fn extract_records_task_events_and_file_row() {
         .find(hash, size)
         .unwrap()
         .expect("known_files should have an entry after a successful extract");
-    assert!(
-        known.last_extract_at.is_none(),
-        "hint cache must not duplicate completion history"
-    );
+    assert!(!known.names_offsets.is_empty());
 }
 
 #[tokio::test]
@@ -171,16 +173,21 @@ async fn successful_password_is_recorded_on_file_row_and_known_files() {
     let output = TempDir::new().unwrap();
 
     let result = engine
-        .extract_recursive_with_listener_interactive(
+        .extract(
             &backend,
             &service,
             request(vec![archive.clone()], output.path().to_path_buf()),
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some(&recorder),
+            smartzip_engine::ExtractInteraction {
+                password: None,
+                output: None,
+                embedded: None,
+                encoding: None,
+            },
+            smartzip_engine::ExtractObserver {
+                listener: None,
+                history: Some(&recorder),
+                ..Default::default()
+            },
         )
         .await
         .expect("extraction should succeed");
@@ -222,12 +229,18 @@ async fn extraction_without_recorder_writes_no_history() {
     let output = TempDir::new().unwrap();
 
     engine
-        .extract_recursive(
+        .extract(
             &backend,
             &service,
             request(vec![archive], output.path().to_path_buf()),
-            None,
-            None,
+            smartzip_engine::ExtractInteraction {
+                password: None,
+                output: None,
+                ..Default::default()
+            },
+            smartzip_engine::ExtractObserver {
+                ..Default::default()
+            },
         )
         .await
         .expect("extraction should succeed");
@@ -250,16 +263,21 @@ async fn history_does_not_skip_a_new_destination() {
 
     let first_output = TempDir::new().unwrap();
     let first = engine
-        .extract_recursive_with_listener_interactive(
+        .extract(
             &backend,
             &service,
             request(vec![archive.clone()], first_output.path().to_path_buf()),
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some(&recorder),
+            smartzip_engine::ExtractInteraction {
+                password: None,
+                output: None,
+                embedded: None,
+                encoding: None,
+            },
+            smartzip_engine::ExtractObserver {
+                listener: None,
+                history: Some(&recorder),
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -267,16 +285,21 @@ async fn history_does_not_skip_a_new_destination() {
 
     let second_output = TempDir::new().unwrap();
     let second = engine
-        .extract_recursive_with_listener_interactive(
+        .extract(
             &backend,
             &service,
             request(vec![archive.clone()], second_output.path().to_path_buf()),
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some(&recorder),
+            smartzip_engine::ExtractInteraction {
+                password: None,
+                output: None,
+                embedded: None,
+                encoding: None,
+            },
+            smartzip_engine::ExtractObserver {
+                listener: None,
+                history: Some(&recorder),
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -292,16 +315,21 @@ async fn history_does_not_skip_a_new_destination() {
     let mut forced_request = request(vec![archive], forced_output.path().to_path_buf());
     forced_request.force = true;
     let forced = engine
-        .extract_recursive_with_listener_interactive(
+        .extract(
             &backend,
             &service,
             forced_request,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some(&recorder),
+            smartzip_engine::ExtractInteraction {
+                password: None,
+                output: None,
+                embedded: None,
+                encoding: None,
+            },
+            smartzip_engine::ExtractObserver {
+                listener: None,
+                history: Some(&recorder),
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -321,16 +349,21 @@ async fn explicit_encoding_is_saved_for_future_known_file_reuse() {
     extract_request.encoding_mode = EncodingMode::Override("utf-8".to_string());
 
     let result = engine
-        .extract_recursive_with_listener_interactive(
+        .extract(
             &backend,
             &service,
             extract_request,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some(&recorder),
+            smartzip_engine::ExtractInteraction {
+                password: None,
+                output: None,
+                embedded: None,
+                encoding: None,
+            },
+            smartzip_engine::ExtractObserver {
+                listener: None,
+                history: Some(&recorder),
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -352,16 +385,21 @@ async fn explicit_encoding_is_saved_for_future_known_file_reuse() {
     let mut reused_request = request(vec![archive], reused_output.path().to_path_buf());
     reused_request.force = true;
     let reused = engine
-        .extract_recursive_with_listener_interactive(
+        .extract(
             &backend,
             &service,
             reused_request,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some(&recorder),
+            smartzip_engine::ExtractInteraction {
+                password: None,
+                output: None,
+                embedded: None,
+                encoding: None,
+            },
+            smartzip_engine::ExtractObserver {
+                listener: None,
+                history: Some(&recorder),
+                ..Default::default()
+            },
         )
         .await
         .unwrap();

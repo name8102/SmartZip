@@ -21,7 +21,6 @@ impl PersistedExtractPlan {
         mut request: crate::ExtractWorkflowRequest,
     ) -> Self {
         request.password_candidates.manual.clear();
-        request.password_candidates.clipboard = None;
         Self { policy, request }
     }
 }
@@ -405,7 +404,7 @@ impl Drop for StateStore {
 }
 
 #[async_trait::async_trait(?Send)]
-impl crate::ExecutionStateRecorder for StateStore {
+impl crate::ExecutionControl for StateStore {
     async fn enqueue_child(
         &self,
         task_id: &TaskId,

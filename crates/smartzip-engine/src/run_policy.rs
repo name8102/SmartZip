@@ -50,7 +50,6 @@ impl CompiledRunPolicy {
         } else {
             0
         };
-        request.password_candidates.limit = c.passwords.database_limit;
         request.layout_policy = match c.extraction.output.layout {
             config::Layout::Conservative => OutputLayoutPolicy::Conservative,
             config::Layout::Smart => OutputLayoutPolicy::Smart,

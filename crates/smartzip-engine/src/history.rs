@@ -212,8 +212,7 @@ pub struct KnownFileUpsert<'a> {
 }
 
 /// A user-confirmed encoding for an exact known file. Unlike an extract
-/// upsert, this overwrites `confirmed_encoding` and does not touch
-/// `last_extract_at`.
+/// upsert, this overwrites `confirmed_encoding` without recording completion.
 #[derive(Debug, Clone)]
 pub struct KnownFileEncodingUpsert<'a> {
     pub sample_hash: &'a str,
@@ -311,7 +310,7 @@ impl<'a> DbTaskHistoryRecorder<'a> {
         FileExtractionRepository::new(self.conn)
     }
 
-    fn legacy_known_store(&self) -> DbKnownFileStore<'a> {
+    fn known_file_store(&self) -> DbKnownFileStore<'a> {
         DbKnownFileStore {
             connection: self.conn,
             writable: self.writable,
@@ -404,13 +403,13 @@ impl<'a> TaskHistoryRecorder for DbTaskHistoryRecorder<'a> {
     }
 
     fn lookup_known_file(&self, hash: &str, size: i64) -> Option<KnownFileHit> {
-        self.legacy_known_store().lookup(hash, size)
+        self.known_file_store().lookup(hash, size)
     }
     fn upsert_known_file_extract(&self, upsert: KnownFileUpsert<'_>) {
-        self.legacy_known_store().remember_extract(upsert);
+        self.known_file_store().remember_extract(upsert);
     }
     fn upsert_known_file_confirmed_encoding(&self, upsert: KnownFileEncodingUpsert<'_>) {
-        self.legacy_known_store().remember_encoding(upsert);
+        self.known_file_store().remember_encoding(upsert);
     }
 
     fn finish(&self, task_id: &TaskId, outcome: TaskOutcome<'_>) {
@@ -705,8 +704,8 @@ impl KnownFileStore for DbKnownFileStore<'_> {
     }
 }
 
-/// Adapts independently selected stores to the legacy workflow API.
-/// New callers select these capabilities separately; no-history does not disable reuse.
+/// Provides independently selected history and known-file stores to workflows.
+/// Disabling history writes does not disable reuse.
 pub struct RunStores<'a> {
     pub history: Option<&'a dyn TaskHistoryRecorder>,
     pub known_files: Option<&'a dyn KnownFileStore>,

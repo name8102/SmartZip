@@ -30,29 +30,6 @@ def main():
     checks = []
     with tempfile.TemporaryDirectory(prefix='smartzip-recovery-') as tmp:
         root = Path(tmp)
-        # Open a real pre-task-system database through the actual CLI entrypoint.
-        old_db = root/'old-v5.db'
-        with sqlite3.connect(old_db) as connection:
-            connection.executescript((ROOT/'scripts/fixtures/state-v5.sql').read_text())
-            connection.executescript("""
-                INSERT INTO passwords(id,value,source) VALUES (1,'synthetic migration fixture','manual');
-                INSERT INTO tasks(id,kind,status,started_at,finished_at) VALUES ('old','extract','completed','2026-09-01','2026-09-01');
-                INSERT INTO file_extractions(task_id,input_path,sample_hash,file_size,status,password_id) VALUES ('old','old.zip','oldhash',123,'extracted',1);
-                INSERT INTO known_files(sample_hash,size,password_id,confirmed_encoding) VALUES ('oldhash',123,1,'gbk');
-            """)
-        migration_config = root/'migration.toml'
-        migration_config.write_text('schema_version = 1\ndefaults_version = 1\n')
-        for _ in range(2):
-            result = subprocess.run([str(binary), '--config', str(migration_config), '--db', str(old_db), 'history', 'tasks', '--json'], capture_output=True, text=True, timeout=30)
-            assert result.returncode == 0, result.stderr
-        with sqlite3.connect(old_db) as connection:
-            assert connection.execute('PRAGMA user_version').fetchone()[0] == 7
-            assert connection.execute('SELECT value FROM passwords WHERE id=1').fetchone()[0] == 'synthetic migration fixture'
-            assert connection.execute('SELECT status,recoverable FROM tasks WHERE id="old"').fetchone() == ('completed',0)
-            assert connection.execute('SELECT status,password_id,node_id FROM file_extractions').fetchall() == [('extracted',1,None)]
-            assert connection.execute('SELECT password_id,confirmed_encoding FROM known_files').fetchall() == [(1,'gbk')]
-            assert connection.execute('PRAGMA integrity_check').fetchone()[0] == 'ok'
-        checks.append('v5 database upgrades through CLI twice: password, history and encoding hints preserved; old tasks not recovered')
         interposer = root / 'commit_fault.so'
         phases = ['extract']
         if sys.platform == 'linux':

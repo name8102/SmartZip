@@ -78,10 +78,6 @@ pub(super) struct TestCommand {
     #[arg(short = 'p', long)]
     pub(super) password: Vec<String>,
 
-    /// Read password from clipboard (platform-dependent placeholder).
-    #[arg(long)]
-    pub(super) use_clipboard: bool,
-
     /// Skip empty password attempt.
     #[arg(long)]
     pub(super) no_empty: bool,

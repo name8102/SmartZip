@@ -2,7 +2,7 @@
 //!
 //! The facade owns caller-injected dependencies and delegates capability work
 //! to the private workflow modules. Public request/result types are re-exported
-//! for API compatibility.
+//! as the workflow interface.
 
 pub mod container;
 pub mod coordinator;
@@ -107,8 +107,6 @@ impl TaskCancellation {
 }
 
 pub use events::TaskEventListener;
-/// Compatibility name for the active execution controller.
-pub use execution::ExecutionControl as ExecutionStateRecorder;
 pub use execution::{
     ArtifactIdentity, CommitIntent, CommitRecord, CommitSuccessFacts, ExecutionControl,
     ExtractRootIdentity, ExtractTaskIdentity, NodeOutcome, StagingArtifact, TaskBudgetSnapshot,
@@ -141,7 +139,7 @@ pub struct ExtractInteraction<'a> {
 pub struct ExtractObserver<'a> {
     pub listener: Option<TaskEventListener>,
     pub history: Option<&'a dyn history::TaskHistoryRecorder>,
-    pub execution: Option<&'a dyn ExecutionStateRecorder>,
+    pub execution: Option<&'a dyn ExecutionControl>,
 }
 
 impl SmartZipEngine {
@@ -220,17 +218,6 @@ impl SmartZipEngine {
         workflow::detect(&self.scanner, request)
     }
 
-    pub async fn inspect_file_with_listener(
-        &self,
-        backend: &dyn ArchiveExecutor,
-        _passwords: &PasswordService<'_>,
-        request: InspectRequest,
-        listener: Option<TaskEventListener>,
-        history: Option<&dyn history::TaskHistoryRecorder>,
-    ) -> smartzip_core::Result<FileAwareDetectResult> {
-        self.inspect(backend, request, listener, history).await
-    }
-
     /// Inspect an archive without constructing a password service.
     pub async fn inspect(
         &self,
@@ -274,107 +261,7 @@ impl SmartZipEngine {
         .await
     }
 
-    pub async fn extract_recursive(
-        &self,
-        backend: &dyn ArchiveExecutor,
-        passwords: &PasswordService<'_>,
-        request: ExtractWorkflowRequest,
-        password_prompter: Option<&dyn InteractivePasswordPrompter>,
-        output_prompter: Option<&dyn InteractiveOutputPrompter>,
-    ) -> smartzip_core::Result<ExtractWorkflowResult> {
-        self.extract_recursive_with_listener_interactive(
-            backend,
-            passwords,
-            request,
-            password_prompter,
-            output_prompter,
-            None,
-            None,
-            None,
-            None,
-        )
-        .await
-    }
-
-    pub async fn extract_recursive_interactive(
-        &self,
-        backend: &dyn ArchiveExecutor,
-        passwords: &PasswordService<'_>,
-        request: ExtractWorkflowRequest,
-        password_prompter: Option<&dyn InteractivePasswordPrompter>,
-        output_prompter: Option<&dyn InteractiveOutputPrompter>,
-        embedded_prompter: Option<&dyn InteractiveEmbeddedPrompter>,
-        encoding_prompter: Option<&dyn InteractiveEncodingPrompter>,
-    ) -> smartzip_core::Result<ExtractWorkflowResult> {
-        self.extract_recursive_with_listener_interactive(
-            backend,
-            passwords,
-            request,
-            password_prompter,
-            output_prompter,
-            embedded_prompter,
-            encoding_prompter,
-            None,
-            None,
-        )
-        .await
-    }
-
-    pub async fn extract_recursive_with_listener(
-        &self,
-        backend: &dyn ArchiveExecutor,
-        passwords: &PasswordService<'_>,
-        request: ExtractWorkflowRequest,
-        password_prompter: Option<&dyn InteractivePasswordPrompter>,
-        output_prompter: Option<&dyn InteractiveOutputPrompter>,
-        listener: Option<TaskEventListener>,
-    ) -> smartzip_core::Result<ExtractWorkflowResult> {
-        self.extract_recursive_with_listener_interactive(
-            backend,
-            passwords,
-            request,
-            password_prompter,
-            output_prompter,
-            None,
-            None,
-            listener,
-            None,
-        )
-        .await
-    }
-
-    pub async fn extract_recursive_with_listener_interactive(
-        &self,
-        backend: &dyn ArchiveExecutor,
-        passwords: &PasswordService<'_>,
-        request: ExtractWorkflowRequest,
-        password_prompter: Option<&dyn InteractivePasswordPrompter>,
-        output_prompter: Option<&dyn InteractiveOutputPrompter>,
-        embedded_prompter: Option<&dyn InteractiveEmbeddedPrompter>,
-        encoding_prompter: Option<&dyn InteractiveEncodingPrompter>,
-        listener: Option<TaskEventListener>,
-        history: Option<&dyn history::TaskHistoryRecorder>,
-    ) -> smartzip_core::Result<ExtractWorkflowResult> {
-        self.extract(
-            backend,
-            passwords,
-            request,
-            ExtractInteraction {
-                password: password_prompter,
-                output: output_prompter,
-                embedded: embedded_prompter,
-                encoding: encoding_prompter,
-            },
-            ExtractObserver {
-                listener,
-                history,
-                execution: None,
-            },
-        )
-        .await
-    }
-
-    /// Canonical extraction entrypoint. Legacy overloads remain source-compatible.
+    /// Execute an extraction with explicit interaction and observation hooks.
     pub async fn extract(
         &self,
         backend: &dyn ArchiveExecutor,
@@ -430,14 +317,14 @@ impl SmartZipEngine {
         let task_id = identity.task_id.clone();
         let output_dir = request.output_dir.clone();
         let events = events::EventSink::new(observer.listener.clone());
-        let legacy_history = observer
+        let passive_history = observer
             .history
             .filter(|_| observer.execution.is_none_or(|e| !e.durable()));
-        if let Some(history) = legacy_history {
+        if let Some(history) = passive_history {
             history.start_extract(&task_id, Some(&output_dir));
         }
         let mut completion = history::CompletionGuard::new(
-            legacy_history,
+            passive_history,
             task_id.clone(),
             events.clone(),
             self.cancellation.clone(),
@@ -478,7 +365,7 @@ impl SmartZipEngine {
             },
         });
         result.events = events.snapshot();
-        if let Some(history) = legacy_history {
+        if let Some(history) = passive_history {
             for event in &result.events {
                 history.record_event(&task_id, event);
             }
@@ -585,7 +472,7 @@ impl SmartZipEngine {
                         history,
                         managed
                             .as_ref()
-                            .map(|m| m as &dyn ExecutionStateRecorder)
+                            .map(|m| m as &dyn ExecutionControl)
                             .or(execution),
                         ExtractTaskIdentity {
                             task_id: task_id.clone(),

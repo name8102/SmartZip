@@ -48,20 +48,41 @@ impl ArchiveAdapter for Adapter {
             supports_charset_override: true,
         }
     }
-    async fn probe(&self, _: &Path) -> Result<ArchiveProbe> {
+    async fn probe_with_context(
+        &self,
+        _: &Path,
+        _context: std::sync::Arc<smartzip_core::TaskExecutionContext>,
+    ) -> Result<ArchiveProbe> {
         unreachable!()
     }
-    async fn list(&self, _: ListRequest) -> Result<ArchiveListing> {
+    async fn list_with_context(
+        &self,
+        _: ListRequest,
+        _context: std::sync::Arc<smartzip_core::TaskExecutionContext>,
+    ) -> Result<ArchiveListing> {
         unreachable!()
     }
-    async fn extract(&self, _: ExtractArchiveRequest) -> Result<ExtractArchiveResult> {
+    async fn extract_with_context(
+        &self,
+        _: ExtractArchiveRequest,
+        _context: std::sync::Arc<smartzip_core::TaskExecutionContext>,
+    ) -> Result<ExtractArchiveResult> {
         unreachable!()
     }
 
-    async fn test(&self, request: TestRequest) -> Result<TestResult> {
+    async fn test_with_context(
+        &self,
+        request: TestRequest,
+        _context: std::sync::Arc<smartzip_core::TaskExecutionContext>,
+    ) -> Result<TestResult> {
         self.calls.lock().unwrap().push(request.archive.clone());
         if matches!(self.behavior, Behavior::Slow) {
-            tokio::time::sleep(Duration::from_secs(30)).await;
+            let cancellation = _context.cancellation_token();
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => return Err(smartzip_core::SmartZipError::Cancelled),
+                _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+            }
         }
         if matches!(self.behavior, Behavior::Change) {
             std::fs::write(&request.archive, b"changed length").unwrap();

@@ -1,4 +1,4 @@
-use crate::{resolve::invalid, ResolvedConfig, SmartZipConfig};
+use crate::{resolve::invalid, SmartZipConfig};
 use std::{
     io::{self, Write},
     path::{Path, PathBuf},
@@ -93,9 +93,6 @@ pub fn edit_config_fields(path: &Path, patches: &[(String, Option<String>)]) -> 
     editable(path)?;
     let original = std::fs::read_to_string(path)?;
     let mut doc = original.parse::<DocumentMut>().map_err(invalid)?;
-    if doc.get("schema_version").is_none() {
-        return Err(invalid("migrate legacy configuration before editing"));
-    }
     let defaults = toml::Value::try_from(SmartZipConfig::default()).map_err(invalid)?;
     let mut seen = std::collections::HashSet::new();
     for (key, value) in patches {
@@ -145,26 +142,4 @@ pub fn edit_config_fields(path: &Path, patches: &[(String, Option<String>)]) -> 
     let config: SmartZipConfig = toml::from_str(&content).map_err(invalid)?;
     config.validate()?;
     write_atomic(path, Some(&original), &content)
-}
-
-pub fn migrate_config(path: &Path, apply: bool) -> io::Result<String> {
-    let original = std::fs::read_to_string(path)?;
-    let mut doc = original.parse::<DocumentMut>().map_err(invalid)?;
-    ResolvedConfig::load(Some(path))?;
-    if doc.get("schema_version").is_some() {
-        return Ok(original);
-    }
-    if let Some(limits) = doc.remove("extraction") {
-        doc.insert("limits", limits);
-    }
-    doc["schema_version"] = toml_edit::value(1);
-    doc["defaults_version"] = toml_edit::value(1);
-    let content = doc.to_string();
-    if apply {
-        editable(path)?;
-        let backup = path.with_extension("toml.v0.bak");
-        write_atomic(&backup, None, &original)?;
-        write_atomic(path, Some(&original), &content)?;
-    }
-    Ok(content)
 }

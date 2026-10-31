@@ -62,42 +62,6 @@ impl PlatformPaths {
         })
     }
 
-    pub fn legacy() -> std::io::Result<Self> {
-        let project = directories::ProjectDirs::from("", "", "SmartZip").ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "unable to determine legacy directories",
-            )
-        })?;
-        Ok(Self {
-            config_dir: project.config_dir().join("smartzip"),
-            data_dir: project.data_dir().join("smartzip"),
-            cache_dir: project.cache_dir().join("smartzip"),
-        })
-    }
-
-    pub fn select_database(&self, legacy: &Self) -> std::io::Result<(PathBuf, Option<String>)> {
-        let path = self.db_path();
-        let old = legacy.db_path();
-        if path != old && old.try_exists()? {
-            if path.try_exists()? {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::AlreadyExists,
-                    format!(
-                        "both {} and {} exist; select with --db",
-                        path.display(),
-                        old.display()
-                    ),
-                ));
-            }
-            return Ok((
-                old.clone(),
-                Some(format!("using legacy database: {}", old.display())),
-            ));
-        }
-        Ok((path, None))
-    }
-
     pub fn ensure_dirs(&self) -> std::io::Result<()> {
         std::fs::create_dir_all(&self.config_dir)?;
         std::fs::create_dir_all(&self.data_dir)?;
@@ -132,29 +96,5 @@ pub fn desktop() -> Desktop {
         Desktop::MacOs
     } else {
         Desktop::Windows
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn database_selection_never_hides_an_existing_legacy_store() {
-        let root = tempfile::tempdir().unwrap();
-        let paths = |name: &str| PlatformPaths {
-            config_dir: root.path().join(name),
-            data_dir: root.path().join(name),
-            cache_dir: root.path().join(name),
-        };
-        let current = paths("current");
-        let old = paths("legacy");
-        std::fs::create_dir_all(&old.data_dir).unwrap();
-        std::fs::write(old.db_path(), b"existing database").unwrap();
-        assert_eq!(current.select_database(&old).unwrap().0, old.db_path());
-        assert!(!current.data_dir.exists());
-        std::fs::create_dir_all(&current.data_dir).unwrap();
-        std::fs::write(current.db_path(), b"another database").unwrap();
-        assert!(current.select_database(&old).is_err());
     }
 }

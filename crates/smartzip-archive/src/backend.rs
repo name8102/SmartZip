@@ -7,20 +7,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 /// Execution seam injected into the engine. Routers implement this trait.
-/// Legacy methods remain required for source compatibility with external executors.
-/// Built-in implementations forward those entries to their context-aware execution;
-/// the defaults here intentionally still support legacy-only implementors.
 #[async_trait]
 pub trait ArchiveExecutor: Send + Sync {
-    /// Reset task-local routing observations before a new top-level workflow.
-    fn begin_task(
-        &self,
-        task_id: TaskId,
-        events: Arc<dyn TaskEventSink>,
-    ) -> Arc<TaskExecutionContext> {
-        Arc::new(TaskExecutionContext::new(task_id, events))
-    }
-
     fn begin_task_with_cancellation(
         &self,
         task_id: TaskId,
@@ -30,31 +18,21 @@ pub trait ArchiveExecutor: Send + Sync {
         Arc::new(TaskExecutionContext::new(task_id, events).with_cancellation(cancellation))
     }
 
-    async fn probe(&self, path: &Path) -> Result<ArchiveProbe>;
     async fn probe_with_context(
         &self,
         path: &Path,
-        _context: Arc<TaskExecutionContext>,
-    ) -> Result<ArchiveProbe> {
-        self.probe(path).await
-    }
-    async fn list(&self, request: ListRequest) -> Result<ArchiveListing>;
+        context: Arc<TaskExecutionContext>,
+    ) -> Result<ArchiveProbe>;
     async fn list_with_context(
         &self,
         request: ListRequest,
-        _context: Arc<TaskExecutionContext>,
-    ) -> Result<ArchiveListing> {
-        self.list(request).await
-    }
-    async fn test(&self, request: TestRequest) -> Result<TestResult>;
+        context: Arc<TaskExecutionContext>,
+    ) -> Result<ArchiveListing>;
     async fn test_with_context(
         &self,
         request: TestRequest,
         context: Arc<TaskExecutionContext>,
-    ) -> Result<TestResult> {
-        let token = context.cancellation_token();
-        tokio::select! { biased; _ = token.cancelled() => Err(smartzip_core::SmartZipError::Cancelled), result = self.test(request) => result }
-    }
+    ) -> Result<TestResult>;
     /// One independent diagnostic pass, outside normal error fallback. None
     /// means no adapter with additional diagnostic value is available.
     async fn diagnose_test_with_context(
@@ -66,29 +44,12 @@ pub trait ArchiveExecutor: Send + Sync {
     ) -> Result<Option<TestResult>> {
         Ok(None)
     }
-    async fn extract(&self, request: ExtractArchiveRequest) -> Result<ExtractArchiveResult>;
-    async fn extract_with_context(
-        &self,
-        request: ExtractArchiveRequest,
-        _context: Arc<TaskExecutionContext>,
-    ) -> Result<ExtractArchiveResult> {
-        self.extract(request).await
-    }
-    async fn extract_with_facts(
-        &self,
-        request: ExtractArchiveRequest,
-        _facts: &ArchiveFacts,
-    ) -> Result<ExtractArchiveResult> {
-        self.extract(request).await
-    }
     async fn extract_with_facts_and_context(
         &self,
         request: ExtractArchiveRequest,
         facts: &ArchiveFacts,
-        _context: Arc<TaskExecutionContext>,
-    ) -> Result<ExtractArchiveResult> {
-        self.extract_with_facts(request, facts).await
-    }
+        context: Arc<TaskExecutionContext>,
+    ) -> Result<ExtractArchiveResult>;
 }
 
 /// Independent native-library or external-program instance used by a router.
@@ -103,41 +64,27 @@ pub trait ArchiveAdapter: Send + Sync {
     fn diagnostic_family(&self) -> Option<&'static str> {
         None
     }
-    async fn probe(&self, path: &Path) -> Result<ArchiveProbe>;
     async fn probe_with_context(
         &self,
         path: &Path,
-        _context: std::sync::Arc<TaskExecutionContext>,
-    ) -> Result<ArchiveProbe> {
-        self.probe(path).await
-    }
-    async fn list(&self, request: ListRequest) -> Result<ArchiveListing>;
+        context: Arc<TaskExecutionContext>,
+    ) -> Result<ArchiveProbe>;
     async fn list_with_context(
         &self,
         request: ListRequest,
-        _context: std::sync::Arc<TaskExecutionContext>,
-    ) -> Result<ArchiveListing> {
-        self.list(request).await
-    }
-    async fn test(&self, request: TestRequest) -> Result<TestResult>;
+        context: Arc<TaskExecutionContext>,
+    ) -> Result<ArchiveListing>;
     async fn test_with_context(
         &self,
         request: TestRequest,
-        context: std::sync::Arc<TaskExecutionContext>,
-    ) -> Result<TestResult> {
-        let token = context.cancellation_token();
-        tokio::select! { biased; _ = token.cancelled() => Err(smartzip_core::SmartZipError::Cancelled), result = self.test(request) => result }
-    }
-    async fn extract(&self, request: ExtractArchiveRequest) -> Result<ExtractArchiveResult>;
-    /// Context-aware extract that can observe cancellation. Default impl
-    /// delegates to `extract` for adapters that do not need cancellation.
+        context: Arc<TaskExecutionContext>,
+    ) -> Result<TestResult>;
+    /// Observe cancellation and stop all output writes before returning.
     async fn extract_with_context(
         &self,
         request: ExtractArchiveRequest,
-        _context: std::sync::Arc<TaskExecutionContext>,
-    ) -> Result<ExtractArchiveResult> {
-        self.extract(request).await
-    }
+        context: Arc<TaskExecutionContext>,
+    ) -> Result<ExtractArchiveResult>;
     /// Concrete capabilities consumed by the router.
     fn capabilities(&self) -> AdapterCapabilities;
 }

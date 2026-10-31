@@ -64,55 +64,6 @@ impl UnrarBackend {
         &self.executable
     }
 
-    // Legacy probe treats password diagnostics as supported; context probe keeps its
-    // existing result.ok interpretation. Both use the same request and result path.
-    async fn probe_impl(
-        &self,
-        path: &Path,
-        context: Option<std::sync::Arc<TaskExecutionContext>>,
-    ) -> Result<ArchiveProbe> {
-        let legacy = context.is_none();
-        let context =
-            context.unwrap_or_else(|| std::sync::Arc::new(TaskExecutionContext::detached()));
-        let result = self
-            .test_with_context(
-                TestRequest {
-                    archive: path.to_path_buf(),
-                    format: Some(ArchiveFormat::Rar),
-                    password: None,
-                    encoding: smartzip_core::EncodingMode::Auto,
-                },
-                context,
-            )
-            .await;
-        let (supported, encrypted) = match result {
-            Ok(result)
-                if legacy
-                    && matches!(
-                        result.diagnostics.failure,
-                        Some(
-                            crate::integrity::TestFailure::PasswordRequired
-                                | crate::integrity::TestFailure::PasswordRejected
-                                | crate::integrity::TestFailure::PasswordIndeterminate
-                        )
-                    ) =>
-            {
-                (true, Some(true))
-            }
-            Ok(result) => (result.ok, result.encrypted),
-            Err(SmartZipError::WrongPassword { .. })
-            | Err(SmartZipError::PasswordRequired { .. }) => (true, Some(true)),
-            Err(SmartZipError::UnsupportedContainer { .. }) => (false, None),
-            Err(error) => return Err(error),
-        };
-        Ok(ArchiveProbe {
-            path: path.to_path_buf(),
-            format: Some(ArchiveFormat::Rar),
-            encrypted,
-            supported,
-        })
-    }
-
     async fn validate_before_extract(
         &self,
         archive: &Path,
@@ -219,24 +170,35 @@ impl ArchiveAdapter for UnrarBackend {
         Some("unrar")
     }
 
-    async fn probe(&self, path: &Path) -> Result<ArchiveProbe> {
-        self.probe_impl(path, None).await
-    }
-
     async fn probe_with_context(
         &self,
         path: &Path,
         context: std::sync::Arc<TaskExecutionContext>,
     ) -> Result<ArchiveProbe> {
-        self.probe_impl(path, Some(context)).await
-    }
-
-    async fn list(&self, request: ListRequest) -> Result<ArchiveListing> {
-        self.list_with_context(
-            request,
-            std::sync::Arc::new(TaskExecutionContext::detached()),
-        )
-        .await
+        let result = self
+            .test_with_context(
+                TestRequest {
+                    archive: path.to_path_buf(),
+                    format: Some(ArchiveFormat::Rar),
+                    password: None,
+                    encoding: smartzip_core::EncodingMode::Auto,
+                },
+                context,
+            )
+            .await;
+        let (supported, encrypted) = match result {
+            Ok(result) => (result.ok, result.encrypted),
+            Err(SmartZipError::WrongPassword { .. })
+            | Err(SmartZipError::PasswordRequired { .. }) => (true, Some(true)),
+            Err(SmartZipError::UnsupportedContainer { .. }) => (false, None),
+            Err(error) => return Err(error),
+        };
+        Ok(ArchiveProbe {
+            path: path.to_path_buf(),
+            format: Some(ArchiveFormat::Rar),
+            encrypted,
+            supported,
+        })
     }
 
     async fn list_with_context(
@@ -271,14 +233,6 @@ impl ArchiveAdapter for UnrarBackend {
             format: Some(ArchiveFormat::Rar),
             entries,
         })
-    }
-
-    async fn test(&self, request: TestRequest) -> Result<TestResult> {
-        self.test_with_context(
-            request,
-            std::sync::Arc::new(TaskExecutionContext::detached()),
-        )
-        .await
     }
 
     async fn test_with_context(
@@ -326,14 +280,6 @@ impl ArchiveAdapter for UnrarBackend {
             truncated,
             request.password.as_deref(),
         ))
-    }
-
-    async fn extract(&self, request: ExtractArchiveRequest) -> Result<ExtractArchiveResult> {
-        self.extract_with_context(
-            request,
-            std::sync::Arc::new(TaskExecutionContext::detached()),
-        )
-        .await
     }
 
     async fn extract_with_context(

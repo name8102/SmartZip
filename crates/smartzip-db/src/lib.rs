@@ -23,8 +23,8 @@ pub enum DbError {
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
-    #[error(transparent)]
-    Migration(#[from] rusqlite_migration::Error),
+    #[error("unsupported database schema version {0}")]
+    UnsupportedSchema(u32),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
 }
@@ -87,7 +87,7 @@ impl SmartZipDb {
             file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         }
         let mut conn = Connection::open(path.as_ref())?;
-        schema::migrate(&mut conn)?;
+        schema::initialize(&mut conn)?;
         Ok(Self {
             conn,
             path: Some(path.as_ref().to_path_buf()),
@@ -97,6 +97,7 @@ impl SmartZipDb {
     pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
         let conn =
             Connection::open_with_flags(path.as_ref(), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        schema::validate(&conn)?;
         Ok(Self {
             conn,
             path: Some(path.as_ref().into()),
@@ -105,7 +106,7 @@ impl SmartZipDb {
 
     pub fn in_memory() -> Result<Self> {
         let mut conn = Connection::open_in_memory()?;
-        schema::migrate(&mut conn)?;
+        schema::initialize(&mut conn)?;
         Ok(Self { conn, path: None })
     }
 

@@ -31,7 +31,6 @@ pub struct LibraryOptions {
 pub struct ConfigSnapshot {
     pub resolved: ResolvedConfig,
     pub edit_path: PathBuf,
-    pub diagnostics: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -56,38 +55,27 @@ pub struct PasswordSummary {
     pub last_failure_at: Option<String>,
 }
 
-fn config_selection(options: &LibraryOptions) -> Result<(Option<PathBuf>, PathBuf, Vec<String>)> {
+fn config_selection(options: &LibraryOptions) -> Result<(Option<PathBuf>, PathBuf)> {
     let environment = std::env::var_os("SMARTZIP_CONFIG").map(PathBuf::from);
     let explicit = options.config_path.as_ref().or(environment.as_ref());
-    let (selected, edit_path, diagnostics) =
-        if let Some(path) = explicit.filter(|_| !options.no_config) {
-            (Some(path.clone()), path.clone(), vec![])
-        } else {
-            let paths = PlatformPaths::try_new().map_err(|e| e.to_string())?;
-            let legacy = PlatformPaths::legacy().map_err(|e| e.to_string())?;
-            let default = paths.config_path();
-            let (selected, diagnostics) = smartzip_config::selected_config(
-                None,
-                options.no_config,
-                None,
-                &default,
-                &legacy.config_path(),
-            )
-            .map_err(|e| e.to_string())?;
-            let edit_path = selected.clone().unwrap_or(default);
-            (selected, edit_path, diagnostics)
-        };
-    Ok((selected, edit_path, diagnostics))
+    if let Some(path) = explicit.filter(|_| !options.no_config) {
+        return Ok((Some(path.clone()), path.clone()));
+    }
+    let default = PlatformPaths::try_new()
+        .map_err(|e| e.to_string())?
+        .config_path();
+    let selected = smartzip_config::selected_config(None, options.no_config, None, &default)
+        .map_err(|e| e.to_string())?;
+    let edit_path = selected.clone().unwrap_or(default);
+    Ok((selected, edit_path))
 }
 
 pub fn load_config(options: &LibraryOptions) -> Result<ConfigSnapshot> {
-    let (selected, edit_path, diagnostics) = config_selection(options)?;
-    let mut resolved = ResolvedConfig::load(selected.as_deref()).map_err(|e| e.to_string())?;
-    resolved.diagnostics.extend(diagnostics.clone());
+    let (selected, edit_path) = config_selection(options)?;
+    let resolved = ResolvedConfig::load(selected.as_deref()).map_err(|e| e.to_string())?;
     Ok(ConfigSnapshot {
         resolved,
         edit_path,
-        diagnostics,
     })
 }
 
@@ -102,13 +90,9 @@ fn database(options: &LibraryOptions, write: bool) -> Result<SmartZipDb> {
     }
     let path = match options.database_path.as_ref().or(state.database.as_ref()) {
         Some(path) => path.clone(),
-        None => {
-            PlatformPaths::try_new()
-                .map_err(|e| e.to_string())?
-                .select_database(&PlatformPaths::legacy().map_err(|e| e.to_string())?)
-                .map_err(|e| e.to_string())?
-                .0
-        }
+        None => PlatformPaths::try_new()
+            .map_err(|e| e.to_string())?
+            .db_path(),
     };
     if write {
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
@@ -277,17 +261,9 @@ pub fn init_config(options: &LibraryOptions, full: bool) -> Result<ConfigSnapsho
     if options.no_config {
         return Err("当前禁用配置文件，请先启用配置".into());
     }
-    let (_, edit_path, _) = config_selection(options)?;
+    let (_, edit_path) = config_selection(options)?;
     smartzip_config::init_config(&edit_path, full).map_err(|e| e.to_string())?;
     load_config(options)
-}
-
-pub fn migrate_config(options: &LibraryOptions, apply: bool) -> Result<String> {
-    if options.no_config {
-        return Err("当前禁用配置文件，请先启用配置".into());
-    }
-    let snapshot = load_config(options)?;
-    smartzip_config::migrate_config(&snapshot.edit_path, apply).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]

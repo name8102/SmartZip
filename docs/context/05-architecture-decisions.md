@@ -6,7 +6,7 @@
 
 engine 负责工作流编排，由 CLI/GUI 注入后端、密码、交互和历史依赖，便于替换策略和测试。
 
-`CompiledRunPolicy` 保持只读快照；`PreparedExtractTask` 在执行前解析一次请求，并按任务自身策略装配密码、历史和已知文件服务。旧解压入口继续保留兼容行为。
+`CompiledRunPolicy` 保持只读快照；`PreparedExtractTask` 在执行前解析一次请求，并按任务自身策略装配密码、历史和已知文件服务。新建和恢复均使用同一准备入口，旧解压重载和兼容别名已删除。
 
 ### ADR-002: Real-time event streaming via mpsc
 

@@ -7,7 +7,6 @@ use smartzip_db::password::{NewPassword, PasswordRecord, PasswordRepository};
 pub enum PasswordSource {
     Empty,
     Manual,
-    Clipboard,
     Recent,
     Database,
 }
@@ -22,33 +21,30 @@ pub struct PasswordCandidate {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PasswordCandidateRequest {
     pub manual: Vec<String>,
-    pub clipboard: Option<String>,
     pub include_empty: bool,
-    pub limit: usize,
 }
 
 impl Default for PasswordCandidateRequest {
     fn default() -> Self {
         Self {
             manual: Vec::new(),
-            clipboard: None,
             include_empty: true,
-            limit: smartzip_config::DEFAULT_PASSWORD_LIMIT,
         }
     }
 }
 
 pub struct PasswordService<'a> {
     repo: Option<PasswordRepository<'a>>,
-    policy: Option<smartzip_config::Passwords>,
+    policy: smartzip_config::Passwords,
 }
 
 impl<'a> PasswordService<'a> {
     pub fn new(repo: PasswordRepository<'a>) -> Self {
-        Self {
-            repo: Some(repo),
-            policy: None,
-        }
+        Self::configured(
+            Some(repo),
+            smartzip_config::Passwords::default(),
+            smartzip_config::StateMode::ReadWrite,
+        )
     }
 
     pub fn configured(
@@ -70,15 +66,15 @@ impl<'a> PasswordService<'a> {
         });
         Self {
             repo: if state == StateMode::Off { None } else { repo },
-            policy: Some(policy),
+            policy,
         }
     }
 
     pub fn remember_batch(&self, batch: &mut Vec<PasswordCandidate>, value: &str, id: Option<i64>) {
-        if self
+        if !self
             .policy
-            .as_ref()
-            .is_some_and(|p| !p.sources.contains(&smartzip_config::PasswordSource::Batch))
+            .sources
+            .contains(&smartzip_config::PasswordSource::Batch)
         {
             return;
         }
@@ -92,10 +88,11 @@ impl<'a> PasswordService<'a> {
     }
 
     pub fn allows_prompt(&self) -> bool {
-        self.policy.as_ref().is_none_or(|p| {
-            p.mode != smartzip_config::PasswordMode::Off
-                && p.sources.contains(&smartzip_config::PasswordSource::Manual)
-        })
+        self.policy.mode != smartzip_config::PasswordMode::Off
+            && self
+                .policy
+                .sources
+                .contains(&smartzip_config::PasswordSource::Manual)
     }
 
     pub fn order_candidates(
@@ -104,9 +101,7 @@ impl<'a> PasswordService<'a> {
         known: Option<&PasswordCandidate>,
         batch: &[PasswordCandidate],
     ) -> Vec<PasswordCandidate> {
-        let Some(policy) = &self.policy else {
-            return legacy_order(base, known, batch);
-        };
+        let policy = &self.policy;
         use smartzip_config::PasswordSource as Source;
         let mut ordered = Vec::new();
         for source in &policy.sources {
@@ -172,8 +167,8 @@ impl<'a> PasswordService<'a> {
             !v.is_empty()
                 && self
                     .policy
-                    .as_ref()
-                    .is_none_or(|p| p.sources.contains(&smartzip_config::PasswordSource::Manual))
+                    .sources
+                    .contains(&smartzip_config::PasswordSource::Manual)
         }) {
             push_unique(
                 &mut candidates,
@@ -185,26 +180,11 @@ impl<'a> PasswordService<'a> {
             );
         }
 
-        if let Some(value) = request
-            .clipboard
-            .map(normalize_password)
-            .filter(|v| !v.is_empty())
-        {
-            push_unique(
-                &mut candidates,
-                PasswordCandidate {
-                    id: None,
-                    value,
-                    source: PasswordSource::Clipboard,
-                },
-            );
-        }
-
         if request.include_empty
             && self
                 .policy
-                .as_ref()
-                .is_none_or(|p| p.sources.contains(&smartzip_config::PasswordSource::Empty))
+                .sources
+                .contains(&smartzip_config::PasswordSource::Empty)
         {
             push_unique(
                 &mut candidates,
@@ -216,21 +196,19 @@ impl<'a> PasswordService<'a> {
             );
         }
 
-        if self.policy.as_ref().is_none_or(|p| {
-            p.sources
-                .contains(&smartzip_config::PasswordSource::Database)
-        }) {
+        if self
+            .policy
+            .sources
+            .contains(&smartzip_config::PasswordSource::Database)
+        {
             if let Some(repo) = &self.repo {
-                for record in repo.ranked_candidates(request.limit)? {
+                for record in repo.ranked_candidates(self.policy.database_limit)? {
                     push_unique(&mut candidates, candidate_from_record(record));
                 }
             }
         }
 
-        if self.policy.is_some() {
-            return Ok(self.order_candidates(&candidates, None, &[]));
-        }
-        Ok(candidates)
+        Ok(self.order_candidates(&candidates, None, &[]))
     }
 
     pub fn record_success(
@@ -238,10 +216,7 @@ impl<'a> PasswordService<'a> {
         candidate: &PasswordCandidate,
     ) -> smartzip_db::Result<Option<i64>> {
         let existing = if candidate.id.is_none()
-            && self
-                .policy
-                .as_ref()
-                .is_some_and(|p| !p.save_success && p.record_statistics)
+            && (!self.policy.save_success && self.policy.record_statistics)
         {
             self.repo
                 .as_ref()
@@ -256,13 +231,13 @@ impl<'a> PasswordService<'a> {
             Some(id) => id,
             None if !candidate.value.is_empty()
                 && self.repo.is_some()
-                && self.policy.as_ref().is_none_or(|p| p.save_success) =>
+                && self.policy.save_success =>
             {
                 self.add_password(&candidate.value, "auto", false)?
             }
             None => return Ok(None),
         };
-        if self.policy.as_ref().is_none_or(|p| p.record_statistics) {
+        if self.policy.record_statistics {
             if let Some(repo) = &self.repo {
                 repo.record_success(id)?;
             }
@@ -271,7 +246,7 @@ impl<'a> PasswordService<'a> {
     }
 
     pub fn record_failure(&self, candidate: &PasswordCandidate) -> smartzip_db::Result<()> {
-        if self.policy.as_ref().is_none_or(|p| p.record_statistics) {
+        if self.policy.record_statistics {
             if let (Some(repo), Some(id)) = (&self.repo, candidate.id) {
                 repo.record_failure(id)?;
             }
@@ -283,10 +258,10 @@ impl<'a> PasswordService<'a> {
     /// unknown or the row is disabled. Used to inject the `known_files`-matched
     /// password at the top of the try order for a specific file.
     pub fn candidate_by_id(&self, id: i64) -> smartzip_db::Result<Option<PasswordCandidate>> {
-        if self
+        if !self
             .policy
-            .as_ref()
-            .is_some_and(|p| !p.sources.contains(&smartzip_config::PasswordSource::Known))
+            .sources
+            .contains(&smartzip_config::PasswordSource::Known)
         {
             return Ok(None);
         }
@@ -299,42 +274,12 @@ impl<'a> PasswordService<'a> {
     }
 }
 
-fn legacy_order(
-    base: &[PasswordCandidate],
-    known: Option<&PasswordCandidate>,
-    batch: &[PasswordCandidate],
-) -> Vec<PasswordCandidate> {
-    let mut ordered = Vec::new();
-    for candidate in base
-        .iter()
-        .filter(|c| matches!(c.source, PasswordSource::Manual | PasswordSource::Clipboard))
-    {
-        push_unique(&mut ordered, candidate.clone());
-    }
-    if let Some(candidate) = known {
-        push_unique(&mut ordered, candidate.clone());
-    }
-    for candidate in batch {
-        push_unique(&mut ordered, candidate.clone());
-    }
-    for candidate in base {
-        push_unique(&mut ordered, candidate.clone());
-    }
-    ordered
-}
-
 fn candidate_from_record(record: PasswordRecord) -> PasswordCandidate {
     PasswordCandidate {
         id: Some(record.id),
         value: record.value,
         source: PasswordSource::Database,
     }
-}
-
-fn normalize_password(value: String) -> String {
-    value
-        .trim_matches(|ch: char| ch.is_whitespace() || ch == '\u{0}')
-        .to_string()
 }
 
 fn push_unique(candidates: &mut Vec<PasswordCandidate>, candidate: PasswordCandidate) {
@@ -350,37 +295,6 @@ fn push_unique(candidates: &mut Vec<PasswordCandidate>, candidate: PasswordCandi
 mod tests {
     use super::*;
     use smartzip_db::{password::PasswordRepository, SmartZipDb};
-
-    #[test]
-    fn candidates_order_explicit_before_empty_and_database_fallback() {
-        let db = SmartZipDb::in_memory().unwrap();
-        let service = PasswordService::new(PasswordRepository::new(db.connection()));
-        service.add_password("数据库密码", "manual", false).unwrap();
-        service.add_password("剪贴板密码", "manual", false).unwrap();
-
-        let candidates = service
-            .ranked_candidates(PasswordCandidateRequest {
-                manual: vec![" 手动密码\n".into()],
-                clipboard: Some("剪贴板密码".into()),
-                include_empty: true,
-                limit: 10,
-            })
-            .unwrap();
-
-        assert_eq!(candidates[0].value, " 手动密码\n");
-        assert_eq!(candidates[0].source, PasswordSource::Manual);
-        assert_eq!(candidates[1].value, "剪贴板密码");
-        assert_eq!(candidates[1].source, PasswordSource::Clipboard);
-        assert_eq!(candidates[2].source, PasswordSource::Empty);
-        assert_eq!(
-            candidates
-                .iter()
-                .filter(|c| c.value == "剪贴板密码")
-                .count(),
-            1
-        );
-        assert!(candidates.iter().any(|c| c.value == "数据库密码"));
-    }
 
     #[test]
     fn success_auto_saves_manual_candidate() {
@@ -406,9 +320,7 @@ mod tests {
         let candidates = service
             .ranked_candidates(PasswordCandidateRequest {
                 manual: vec!["手动密码".into()],
-                clipboard: None,
                 include_empty: true,
-                limit: 10,
             })
             .unwrap();
 
@@ -454,6 +366,38 @@ mod policy_tests {
             })
             .unwrap();
         assert!(service.candidate_by_id(1).unwrap().is_none());
+    }
+
+    #[test]
+    fn configured_database_limit_applies_without_limiting_manual_candidates() {
+        let db = smartzip_db::SmartZipDb::in_memory().unwrap();
+        let service = PasswordService::configured(
+            Some(PasswordRepository::new(db.connection())),
+            Passwords {
+                database_limit: 1,
+                ..Default::default()
+            },
+            StateMode::ReadWrite,
+        );
+        service
+            .add_password("stored-first", "manual", false)
+            .unwrap();
+        service
+            .add_password("stored-second", "manual", false)
+            .unwrap();
+        let candidates = service
+            .ranked_candidates(PasswordCandidateRequest {
+                manual: vec!["explicit-first".into(), "explicit-second".into()],
+                include_empty: false,
+            })
+            .unwrap();
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|c| c.value.as_str())
+                .collect::<Vec<_>>(),
+            ["explicit-first", "explicit-second", "stored-first"]
+        );
     }
 
     #[test]

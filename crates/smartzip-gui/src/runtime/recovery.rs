@@ -24,9 +24,9 @@ pub(super) async fn run(
         .iter()
         .find(|t| t.task_id == id)
         .ok_or("任务已经结束、正在执行，或不再可恢复")?;
-    let (plan, identity) =
-        smartzip_engine::execution_runtime::ExecutionCoordinator::decode_recovery(recovered)?;
-    for input in &plan.request.inputs {
+    let prepared = smartzip_engine::PreparedExtractTask::recover(recovered)?;
+    for root in &prepared.identity().roots {
+        let input = &root.candidate.path;
         if !input.try_exists()? {
             return Err(format!(
                 "恢复所需输入不存在：{}。请还原该输入后重试，或从历史记录重新添加原始归档。",
@@ -35,20 +35,9 @@ pub(super) async fn run(
             .into());
         }
     }
-    let policy = CompiledRunPolicy::compile(smartzip_config::ResolvedConfig {
-        values: plan.policy,
-        origins: Default::default(),
-        path: None,
-        diagnostics: vec![],
-    })?;
+    let policy = prepared.policy();
     let backend = smartzip_archive::BackendRouter::from_config(&policy.values().backends)?;
-    let passwords = smartzip_passwords::PasswordService::configured(
-        Some(smartzip_db::password::PasswordRepository::new(
-            db.connection(),
-        )),
-        policy.values().passwords.clone(),
-        policy.values().state.mode,
-    );
+    let task_id = prepared.identity().task_id.clone();
     let prompts = Prompter {
         mailbox: mailbox.clone(),
         cancellation: cancellation.clone(),
@@ -92,20 +81,18 @@ pub(super) async fn run(
         .collect::<Result<Vec<_>, _>>()?;
     roots.restore_root_history(history);
     // Finish all fallible preflight reads before consuming the claim so they remain retryable.
-    execution.set_paused(&identity.task_id, false).await?;
+    execution.set_paused(&task_id, false).await?;
     let _claim = execution
         .take_recovery(id)
         .ok_or("此恢复任务已被另一操作接管")?;
     let engine = SmartZipEngine::default()
         .with_cancellation_token(cancellation.clone())
-        .with_root_management(roots)
-        .with_run_policy(policy);
-    let result = engine
-        .extract_task(
-            identity.clone(),
+        .with_root_management(roots);
+    let result = prepared
+        .run(
+            engine,
             &backend,
-            &passwords,
-            plan.request,
+            Some(db.connection()),
             smartzip_engine::ExtractInteraction {
                 password: interactive.then_some(&prompts as &dyn InteractivePasswordPrompter),
                 output: Some(&prompts),
@@ -121,7 +108,7 @@ pub(super) async fn run(
         .await;
     match result {
         Ok(result) => {
-            execution.release_task(&identity.task_id);
+            execution.release_task(&task_id);
             let status = serde_json::to_value(result.status)?
                 .as_str()
                 .unwrap_or("failed")
@@ -135,7 +122,7 @@ pub(super) async fn run(
         Err(error) => {
             execution
                 .stop_task(
-                    &identity.task_id,
+                    &task_id,
                     if cancellation.is_cancelled() {
                         "cancelled"
                     } else {

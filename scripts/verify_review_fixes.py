@@ -43,7 +43,7 @@ def main():
         on = ['extraction.reuse.skip_completed=true']
         run(['list', archive, '--password', 'not-a-password', '--json'])
         with sqlite3.connect(db) as connection:
-            assert connection.execute('SELECT COUNT(*) FROM known_files WHERE password_id IS NOT NULL OR last_extract_at IS NOT NULL').fetchone()[0] == 0
+            assert connection.execute('SELECT COUNT(*) FROM known_files WHERE password_id IS NOT NULL').fetchone()[0] == 0
         first = root/'first'
         report = run(['extract', archive, '--output', first, '--json'], on)
         assert report['processed_count'] == 1, report
@@ -62,7 +62,6 @@ def main():
         assert report['skipped_count'] == 1, report
         with sqlite3.connect(db) as connection:
             assert connection.execute('SELECT COUNT(*) FROM tasks').fetchone()[0] == count
-            assert connection.execute('SELECT COUNT(*) FROM known_files WHERE last_extract_at IS NOT NULL').fetchone()[0] == 0
             connection.execute("DELETE FROM tasks WHERE kind = 'extract'")
         report = run(['extract', archive, '--output', root/'after-clear', '--json'], on)
         assert report['processed_count'] == 1, report

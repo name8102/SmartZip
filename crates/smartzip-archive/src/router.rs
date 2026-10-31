@@ -7,7 +7,7 @@ use smartzip_config::{AdapterFamily, BackendConfig, BackendInstallation};
 use smartzip_core::{
     AdapterCapabilities, ArchiveFacts, ArchiveFormat, ArchiveOperation, ArchiveRequirements,
     NegativeCapabilityKey, RejectedAdapter, Result, RouteCandidate, RouteEvent, RoutePlan,
-    SmartZipError, TaskEventSink, TaskExecutionContext, TaskId,
+    SmartZipError, TaskExecutionContext,
 };
 use std::collections::HashSet;
 use std::future::Future;
@@ -235,7 +235,9 @@ impl BackendRouter {
                     candidates.push(RouteCandidate {
                         adapter_id: adapter_id.to_owned(),
                         priority: registration.priority,
-                        notes: vec!["forced for diagnostics; compatibility filters bypassed".into()],
+                        notes: vec![
+                            "forced for diagnostics; compatibility filters bypassed".into(),
+                        ],
                     });
                     continue;
                 }
@@ -441,53 +443,6 @@ impl BackendRouter {
         Err(last_error.unwrap_or_else(|| no_compatible_backend(operation, &plan)))
     }
 
-    async fn extract_with_facts_in_context(
-        &self,
-        request: ExtractArchiveRequest,
-        facts: &ArchiveFacts,
-        context: std::sync::Arc<TaskExecutionContext>,
-    ) -> Result<ExtractArchiveResult> {
-        let container = facts
-            .container
-            .clone()
-            .or_else(|| infer_format(request.format.clone(), &request.archive));
-        let mut requirements = request_requirements(
-            ArchiveOperation::Extract,
-            container.as_ref(),
-            request.password.as_deref(),
-            Some(&request.encoding),
-        );
-        requirements.codecs.extend(facts.codecs.clone());
-        self.extract_isolated_planned(
-            request,
-            container,
-            requirements,
-            std::sync::Arc::clone(&context),
-        )
-        .await
-    }
-
-    async fn extract_isolated(
-        &self,
-        request: ExtractArchiveRequest,
-        context: std::sync::Arc<TaskExecutionContext>,
-    ) -> Result<ExtractArchiveResult> {
-        let container = infer_format(request.format.clone(), &request.archive);
-        let requirements = request_requirements(
-            ArchiveOperation::Extract,
-            container.as_ref(),
-            request.password.as_deref(),
-            Some(&request.encoding),
-        );
-        self.extract_isolated_planned(
-            request,
-            container,
-            requirements,
-            std::sync::Arc::clone(&context),
-        )
-        .await
-    }
-
     async fn extract_isolated_planned(
         &self,
         request: ExtractArchiveRequest,
@@ -588,19 +543,6 @@ impl BackendRouter {
 
 #[async_trait]
 impl ArchiveExecutor for BackendRouter {
-    fn begin_task(
-        &self,
-        task_id: TaskId,
-        events: Arc<dyn TaskEventSink>,
-    ) -> Arc<TaskExecutionContext> {
-        Arc::new(TaskExecutionContext::new(task_id, events))
-    }
-
-    async fn probe(&self, path: &Path) -> Result<ArchiveProbe> {
-        let context = std::sync::Arc::new(TaskExecutionContext::detached());
-        self.probe_with_context(path, context).await
-    }
-
     async fn probe_with_context(
         &self,
         path: &Path,
@@ -634,11 +576,6 @@ impl ArchiveExecutor for BackendRouter {
         .await
     }
 
-    async fn list(&self, request: ListRequest) -> Result<ArchiveListing> {
-        let context = std::sync::Arc::new(TaskExecutionContext::detached());
-        self.list_with_context(request, context).await
-    }
-
     async fn list_with_context(
         &self,
         request: ListRequest,
@@ -663,11 +600,6 @@ impl ArchiveExecutor for BackendRouter {
             },
         )
         .await
-    }
-
-    async fn test(&self, request: TestRequest) -> Result<TestResult> {
-        let context = std::sync::Arc::new(TaskExecutionContext::detached());
-        self.test_with_context(request, context).await
     }
 
     async fn test_with_context(
@@ -782,37 +714,30 @@ impl ArchiveExecutor for BackendRouter {
         }
     }
 
-    async fn extract(&self, request: ExtractArchiveRequest) -> Result<ExtractArchiveResult> {
-        let context = std::sync::Arc::new(TaskExecutionContext::detached());
-        self.extract_with_context(request, context).await
-    }
-
-    async fn extract_with_context(
-        &self,
-        request: ExtractArchiveRequest,
-        context: std::sync::Arc<TaskExecutionContext>,
-    ) -> Result<ExtractArchiveResult> {
-        self.extract_isolated(request, context).await
-    }
-
-    async fn extract_with_facts(
-        &self,
-        request: ExtractArchiveRequest,
-        facts: &ArchiveFacts,
-    ) -> Result<ExtractArchiveResult> {
-        let context = std::sync::Arc::new(TaskExecutionContext::detached());
-        self.extract_with_facts_and_context(request, facts, context)
-            .await
-    }
-
     async fn extract_with_facts_and_context(
         &self,
         request: ExtractArchiveRequest,
         facts: &ArchiveFacts,
         context: std::sync::Arc<TaskExecutionContext>,
     ) -> Result<ExtractArchiveResult> {
-        self.extract_with_facts_in_context(request, facts, context)
-            .await
+        let container = facts
+            .container
+            .clone()
+            .or_else(|| infer_format(request.format.clone(), &request.archive));
+        let mut requirements = request_requirements(
+            ArchiveOperation::Extract,
+            container.as_ref(),
+            request.password.as_deref(),
+            Some(&request.encoding),
+        );
+        requirements.codecs.extend(facts.codecs.clone());
+        self.extract_isolated_planned(
+            request,
+            container,
+            requirements,
+            std::sync::Arc::clone(&context),
+        )
+        .await
     }
 }
 
@@ -1086,7 +1011,7 @@ pub fn format_from_extension(path: impl AsRef<Path>) -> Option<ArchiveFormat> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use smartzip_core::{EncodingMode, TaskEvent, TaskEventKind, TaskEventSink};
+    use smartzip_core::{EncodingMode, TaskEvent, TaskEventKind, TaskEventSink, TaskId};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
@@ -1160,7 +1085,11 @@ mod tests {
             &self.id
         }
 
-        async fn probe(&self, path: &Path) -> Result<ArchiveProbe> {
+        async fn probe_with_context(
+            &self,
+            path: &Path,
+            _context: Arc<TaskExecutionContext>,
+        ) -> Result<ArchiveProbe> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.fail(path)?;
             Ok(ArchiveProbe {
@@ -1171,7 +1100,11 @@ mod tests {
             })
         }
 
-        async fn list(&self, request: ListRequest) -> Result<ArchiveListing> {
+        async fn list_with_context(
+            &self,
+            request: ListRequest,
+            _context: Arc<TaskExecutionContext>,
+        ) -> Result<ArchiveListing> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.fail(&request.archive)?;
             Ok(ArchiveListing {
@@ -1180,7 +1113,11 @@ mod tests {
             })
         }
 
-        async fn test(&self, request: TestRequest) -> Result<TestResult> {
+        async fn test_with_context(
+            &self,
+            request: TestRequest,
+            _context: Arc<TaskExecutionContext>,
+        ) -> Result<TestResult> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.fail(&request.archive)?;
             Ok(TestResult {
@@ -1190,7 +1127,11 @@ mod tests {
             })
         }
 
-        async fn extract(&self, request: ExtractArchiveRequest) -> Result<ExtractArchiveResult> {
+        async fn extract_with_context(
+            &self,
+            request: ExtractArchiveRequest,
+            _context: Arc<TaskExecutionContext>,
+        ) -> Result<ExtractArchiveResult> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             if let Some(content) = self.partial {
                 std::fs::write(request.output_dir.join("partial.txt"), content).unwrap();
@@ -1227,7 +1168,11 @@ mod tests {
         let router = BackendRouter::from_adapters(vec![]);
         let output = tempfile::tempdir().unwrap();
         let error = router
-            .extract(extract_request(output.path().join("out")))
+            .extract_with_facts_and_context(
+                extract_request(output.path().join("out")),
+                &ArchiveFacts::default(),
+                Arc::new(TaskExecutionContext::detached()),
+            )
             .await
             .unwrap_err();
         assert!(matches!(error, SmartZipError::BackendUnavailable { .. }));
@@ -1321,11 +1266,16 @@ mod tests {
         let router =
             BackendRouter::from_adapters(vec![registration(first, 20), registration(second, 10)]);
         let sink = RecordingSink::default();
-        let context = router.begin_task(TaskId::new(), Arc::new(sink.clone()));
+        let context = router.begin_task_with_cancellation(
+            TaskId::new(),
+            Arc::new(sink.clone()),
+            tokio_util::sync::CancellationToken::new(),
+        );
         let temp = tempfile::tempdir().unwrap();
         router
-            .extract_with_context(
+            .extract_with_facts_and_context(
                 extract_request(temp.path().to_path_buf()),
+                &ArchiveFacts::default(),
                 std::sync::Arc::clone(&context),
             )
             .await
@@ -1360,7 +1310,10 @@ mod tests {
                 password: Some("secret".into()),
                 encoding: EncodingMode::Auto,
             };
-            assert!(router.list(request).await.is_err());
+            assert!(router
+                .list_with_context(request, Arc::new(TaskExecutionContext::detached()))
+                .await
+                .is_err());
             assert_eq!(second_calls.load(Ordering::SeqCst), 0);
         }
     }
@@ -1413,14 +1366,22 @@ mod tests {
             registration(first.clone(), 20),
             registration(second.clone(), 10),
         ]);
-        assert!(router.test(request.clone()).await.unwrap().ok);
+        assert!(
+            router
+                .test_with_context(request.clone(), Arc::new(TaskExecutionContext::detached()))
+                .await
+                .unwrap()
+                .ok
+        );
         assert_eq!(second_calls.load(Ordering::SeqCst), 1);
 
         let forced =
             BackendRouter::from_adapters(vec![registration(first, 20), registration(second, 10)])
                 .with_forced_adapter("first");
         assert!(matches!(
-            forced.test(request).await,
+            forced
+                .test_with_context(request, Arc::new(TaskExecutionContext::detached()))
+                .await,
             Err(SmartZipError::BackendProtocolError { .. })
         ));
     }
@@ -1471,7 +1432,11 @@ mod tests {
             .iter()
             .any(|adapter| adapter.adapter_id == "7zz"));
 
-        let reset_context = router.begin_task(TaskId::new(), Arc::new(RecordingSink::default()));
+        let reset_context = router.begin_task_with_cancellation(
+            TaskId::new(),
+            Arc::new(RecordingSink::default()),
+            tokio_util::sync::CancellationToken::new(),
+        );
         let reset_plan = router.plan_with_context(
             ArchiveOperation::Extract,
             Some(&ArchiveFormat::SevenZip),

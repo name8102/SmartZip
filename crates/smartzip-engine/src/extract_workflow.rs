@@ -65,7 +65,7 @@ struct ExecutionNode {
 }
 
 struct StageLeaseGuard<'a> {
-    execution: Option<&'a dyn crate::ExecutionStateRecorder>,
+    execution: Option<&'a dyn crate::ExecutionControl>,
     task_id: TaskId,
     node_id: NodeId,
 }
@@ -104,7 +104,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive(
     encoding_prompter: Option<&dyn InteractiveEncodingPrompter>,
     events: EventSink,
     history: Option<&dyn crate::history::TaskHistoryRecorder>,
-    execution: Option<&dyn crate::ExecutionStateRecorder>,
+    execution: Option<&dyn crate::ExecutionControl>,
     identity: crate::ExtractTaskIdentity,
     state: ExtractTaskState,
 ) -> smartzip_core::Result<ExtractWorkflowResult> {
@@ -145,7 +145,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive(
         archive_recycler
     };
     let task_id = identity.task_id;
-    let legacy_history = if execution.is_none_or(|e| !e.durable()) {
+    let passive_history = if execution.is_none_or(|e| !e.durable()) {
         history
     } else {
         None
@@ -241,7 +241,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive(
         let mut candidate = node.candidate;
         let completion = NodeCompletion {
             execution,
-            history: legacy_history,
+            history: passive_history,
             task_id: &task_id,
             node_id: &node.id,
             generation: node.generation,
@@ -564,7 +564,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive(
                     Ok(f) => f,
                     Err(_) => {
                         record_failure(&mut failed_count, config, &cancellation);
-                        record_skip(legacy_history, &task_id, &candidate, "not_found");
+                        record_skip(passive_history, &task_id, &candidate, "not_found");
                         finish_execution(
                             execution,
                             &task_id,
@@ -1042,7 +1042,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive(
             }
 
             if candidate.detected_format.is_none() {
-                record_skip(legacy_history, &task_id, &candidate, "not_found");
+                record_skip(passive_history, &task_id, &candidate, "not_found");
                 finish_execution_outcome(
                     execution,
                     &task_id,
@@ -1070,7 +1070,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive(
                             kind: format!("{kind:?}"),
                         },
                     });
-                    record_skip(legacy_history, &task_id, &candidate, "business_container");
+                    record_skip(passive_history, &task_id, &candidate, "business_container");
                     finish_execution_outcome(
                         execution,
                         &task_id,
@@ -1126,7 +1126,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive(
                 Err(error) => {
                     record_failure(&mut failed_count, config, &cancellation);
                     events.push(TaskEvent::failed(task_id.clone(), &error));
-                    record_skip(legacy_history, &task_id, &candidate, &error.to_string());
+                    record_skip(passive_history, &task_id, &candidate, &error.to_string());
                     finish_execution_outcome(
                         execution,
                         &task_id,
@@ -1159,7 +1159,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive(
                     .zip(sample_size)
                     .is_some_and(|((h, hash), size)| h.was_extracted(hash, size))
             {
-                record_skip(legacy_history, &task_id, &candidate, "already_extracted");
+                record_skip(passive_history, &task_id, &candidate, "already_extracted");
                 events.push(TaskEvent {
                     task_id: task_id.clone(),
                     kind: TaskEventKind::Decision {
@@ -1960,7 +1960,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive(
                     && !cancellation.stopped_on_error());
             if cancelled_now && !extracted {
                 was_cancelled = true;
-                record_skip(legacy_history, &task_id, &candidate, "cancelled");
+                record_skip(passive_history, &task_id, &candidate, "cancelled");
                 finish_execution_outcome(
                     execution,
                     &task_id,
@@ -2011,7 +2011,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive(
                         };
                         events.push(TaskEvent::failed(task_id.clone(), &error));
                     }
-                    if let Some(recorder) = legacy_history {
+                    if let Some(recorder) = passive_history {
                         recorder.record_file_extraction(
                             &task_id,
                             crate::history::FileExtractionRow {
@@ -2065,7 +2065,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive(
                         _ => "backend_failed",
                     };
                     node_terminal_reason = reason;
-                    if let Some(recorder) = legacy_history {
+                    if let Some(recorder) = passive_history {
                         recorder.record_file_extraction(
                             &task_id,
                             crate::history::FileExtractionRow {
@@ -2086,7 +2086,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive(
                     }
                     let event = TaskEvent::failed(task_id.clone(), &error);
                     events.push(event);
-                } else if let Some(recorder) = legacy_history {
+                } else if let Some(recorder) = passive_history {
                     // No error and not extracted: candidates were tried but none
                     // opened it (e.g. needed a password we never got). Record a
                     // skip with `password_required` rather than a failure.
@@ -2110,7 +2110,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive(
                 }
             }
             if terminal_skip {
-                record_skip(legacy_history, &task_id, &candidate, skip_reason);
+                record_skip(passive_history, &task_id, &candidate, skip_reason);
                 finish_execution_outcome(
                     execution,
                     &task_id,
@@ -2194,7 +2194,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive(
             // File-grain success record: one file_extractions row for this
             // extracted candidate, and a known_files upsert so future runs can
             // reuse its password; dedup queries the history row above.
-            if let Some(recorder) = legacy_history {
+            if let Some(recorder) = passive_history {
                 recorder.record_file_extraction(
                     &task_id,
                     crate::history::FileExtractionRow {
@@ -2482,7 +2482,7 @@ fn retryable_group_error(error: &smartzip_core::SmartZipError) -> bool {
 }
 
 async fn enter_stage(
-    execution: Option<&dyn crate::ExecutionStateRecorder>,
+    execution: Option<&dyn crate::ExecutionControl>,
     task_id: &TaskId,
     node_id: &NodeId,
     generation: u64,
@@ -2591,7 +2591,7 @@ impl NodeCompletion<'_> {
 }
 
 async fn finish_interrupted_node(
-    execution: Option<&dyn crate::ExecutionStateRecorder>,
+    execution: Option<&dyn crate::ExecutionControl>,
     task_id: &TaskId,
     node_id: &NodeId,
     generation: u64,
@@ -2616,7 +2616,7 @@ async fn finish_interrupted_node(
 }
 
 async fn finish_execution(
-    execution: Option<&dyn crate::ExecutionStateRecorder>,
+    execution: Option<&dyn crate::ExecutionControl>,
     task_id: &TaskId,
     node_id: &NodeId,
     generation: u64,
@@ -2636,7 +2636,7 @@ async fn finish_execution(
 }
 
 async fn finish_execution_outcome(
-    execution: Option<&dyn crate::ExecutionStateRecorder>,
+    execution: Option<&dyn crate::ExecutionControl>,
     task_id: &TaskId,
     node_id: &NodeId,
     generation: u64,
@@ -2660,7 +2660,7 @@ async fn finish_execution_outcome(
 }
 
 async fn begin_decision(
-    execution: Option<&dyn crate::ExecutionStateRecorder>,
+    execution: Option<&dyn crate::ExecutionControl>,
     task_id: &TaskId,
     node_id: &NodeId,
     generation: u64,
@@ -2693,7 +2693,7 @@ async fn begin_decision(
 }
 
 async fn finish_decision(
-    execution: Option<&dyn crate::ExecutionStateRecorder>,
+    execution: Option<&dyn crate::ExecutionControl>,
     task_id: &TaskId,
     node_id: &NodeId,
     generation: u64,

@@ -4,7 +4,7 @@ use crate::coordinator::{
     Dispatch, ResourceCapacity, ResourceRequest, Stage, StageRun, TaskCoordinator, TaskPriority,
 };
 use crate::state_store::{NodeSubmission, StateStore, StateStoreError, TaskSubmission};
-use crate::{ExecutionStateRecorder, ExtractRootIdentity, ExtractTaskIdentity, NodeOutcome};
+use crate::{ExecutionControl, ExtractRootIdentity, ExtractTaskIdentity, NodeOutcome};
 use async_trait::async_trait;
 use smartzip_core::{AttemptId, DecisionId, NodeId, TaskId};
 use std::collections::HashMap;
@@ -570,7 +570,7 @@ fn state_error(error: StateStoreError) -> smartzip_core::SmartZipError {
 }
 
 #[async_trait(?Send)]
-impl ExecutionStateRecorder for ExecutionCoordinator {
+impl ExecutionControl for ExecutionCoordinator {
     async fn enqueue_child(
         &self,
         task_id: &TaskId,

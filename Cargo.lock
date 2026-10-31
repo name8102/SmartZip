@@ -5989,16 +5989,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rusqlite_migration"
-version = "2.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "03451d4dc523c0a96d9e412c574670b3f5f184c3988b77a435876be25477bbd3"
-dependencies = [
- "log",
- "rusqlite",
-]
-
-[[package]]
 name = "rust-embed"
 version = "8.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6673,7 +6663,6 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "rusqlite",
- "rusqlite_migration",
  "serde",
  "serde_json",
  "tempfile",

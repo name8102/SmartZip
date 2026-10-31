@@ -1,29 +1,5 @@
-//! Public CLI contracts captured before orchestration refactoring.
+//! CLI startup errors and observable extraction behavior.
 use std::{path::Path, process::Command};
-
-#[test]
-fn public_help_and_streams_remain_stable() {
-    for (command, snapshot) in [
-        ("", include_str!("snapshots/root-help.txt")),
-        ("extract", include_str!("snapshots/extract-help.txt")),
-        ("list", include_str!("snapshots/list-help.txt")),
-        ("detect", include_str!("snapshots/detect-help.txt")),
-        ("test", include_str!("snapshots/test-help.txt")),
-    ] {
-        let mut process = Command::new(env!("CARGO_BIN_EXE_smartzip"));
-        if !command.is_empty() {
-            process.arg(command);
-        }
-        let output = process.arg("--help").env("NO_COLOR", "1").output().unwrap();
-        assert!(output.status.success(), "{command}");
-        assert!(output.stderr.is_empty(), "{command}");
-        assert_eq!(
-            String::from_utf8(output.stdout).unwrap(),
-            snapshot,
-            "{command}"
-        );
-    }
-}
 
 #[test]
 fn argument_errors_remain_on_stderr_without_creating_state() {

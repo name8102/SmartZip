@@ -19,7 +19,6 @@ pub(crate) fn password_source_label(candidate: &PasswordCandidate) -> &'static s
     match candidate.source {
         smartzip_passwords::PasswordSource::Empty => "empty",
         smartzip_passwords::PasswordSource::Manual => "manual",
-        smartzip_passwords::PasswordSource::Clipboard => "clipboard",
         smartzip_passwords::PasswordSource::Recent => "recent",
         smartzip_passwords::PasswordSource::Database => "database",
     }
