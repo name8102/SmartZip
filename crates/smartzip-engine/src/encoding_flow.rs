@@ -20,7 +20,7 @@ pub(crate) fn encoding_mode_label(mode: &EncodingMode) -> String {
 pub(crate) async fn resolve_encoding_mode(
     archive_path: &Path,
     requested: EncodingMode,
-    assessment: Option<&ZipEncodingAssessment>,
+    assessment: Option<&EncodingConfirmationContext>,
     prompter: Option<&dyn InteractiveEncodingPrompter>,
 ) -> smartzip_core::Result<Option<EncodingMode>> {
     if requested != EncodingMode::Auto {
@@ -31,9 +31,9 @@ pub(crate) async fn resolve_encoding_mode(
         return Ok(Some(EncodingMode::Auto));
     };
 
-    if assessment.should_confirm {
+    if !assessment.suspicious_reasons.is_empty() {
         if let Some(prompter) = prompter {
-            match prompter.prompt(archive_path, &assessment.context).await {
+            match prompter.prompt(archive_path, assessment).await {
                 EncodingConfirmationChoice::AcceptDetected => {}
                 EncodingConfirmationChoice::Override(encoding) => {
                     return Ok(Some(EncodingMode::Override(encoding)));
@@ -45,19 +45,10 @@ pub(crate) async fn resolve_encoding_mode(
         }
     }
 
-    Ok(Some(EncodingMode::Override(
-        assessment.detected_raw.selected.clone(),
-    )))
+    Ok(Some(assessment.detected.selected.clone()))
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct ZipEncodingAssessment {
-    pub(crate) detected_raw: smartzip_encoding::EncodingDetectionResult,
-    pub(crate) context: EncodingConfirmationContext,
-    pub(crate) should_confirm: bool,
-}
-
-pub(crate) async fn assess_zip_encoding(archive_path: &Path) -> Option<ZipEncodingAssessment> {
+pub(crate) fn assess_zip_encoding(archive_path: &Path) -> Option<EncodingConfirmationContext> {
     // ZIP raw filename reading is now via the narrowed NativeZip helper, not
     // via the generic ArchiveAdapter/list path. This keeps raw bytes intact
     // for detector and avoids routing through the backend router.
@@ -69,7 +60,7 @@ pub(crate) async fn assess_zip_encoding(archive_path: &Path) -> Option<ZipEncodi
 #[cfg(test)]
 pub(crate) fn build_zip_encoding_assessment(
     listing: ArchiveListing,
-) -> Option<ZipEncodingAssessment> {
+) -> Option<EncodingConfirmationContext> {
     assess_raw_names(
         listing
             .entries
@@ -80,7 +71,7 @@ pub(crate) fn build_zip_encoding_assessment(
 
 fn assess_raw_names<'a>(
     names: impl IntoIterator<Item = &'a [u8]>,
-) -> Option<ZipEncodingAssessment> {
+) -> Option<EncodingConfirmationContext> {
     let raw_entries: Vec<&[u8]> = names.into_iter().filter(|raw| !raw.is_empty()).collect();
     if raw_entries.is_empty() {
         return None;
@@ -106,14 +97,10 @@ fn assess_raw_names<'a>(
         .collect::<Vec<_>>();
     let suspicious_reasons =
         suspicious_encoding_reasons(&detected_raw, &preview_names, ascii_only, &raw_entries);
-    Some(ZipEncodingAssessment {
-        detected_raw,
-        context: EncodingConfirmationContext {
-            detected,
-            preview_names,
-            suspicious_reasons: suspicious_reasons.clone(),
-        },
-        should_confirm: !suspicious_reasons.is_empty(),
+    Some(EncodingConfirmationContext {
+        detected,
+        preview_names,
+        suspicious_reasons,
     })
 }
 

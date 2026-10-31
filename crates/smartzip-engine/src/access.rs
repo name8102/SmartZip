@@ -111,7 +111,7 @@ pub(crate) fn resolve_root_candidate(
     Some(candidate)
 }
 
-pub(crate) async fn prepare_resolved_archive(
+pub(crate) fn prepare_resolved_archive(
     candidate: &ExtractionCandidate,
     volume_input: Option<(PathBuf, crate::volumes::materialize::MaterializedVolumeSet)>,
     staging_root: Option<&Path>,
@@ -168,7 +168,7 @@ pub(crate) async fn prepare_resolved_archive(
         && encoding_mode == EncodingMode::Auto
         && candidate.detected_format == Some(ArchiveFormat::Zip)
     {
-        zip_encoding_assessment = assess_zip_encoding(&archive_path).await;
+        zip_encoding_assessment = assess_zip_encoding(&archive_path);
     }
     Ok(PreparedArchive {
         candidate: candidate.clone(),
@@ -186,8 +186,8 @@ pub(crate) async fn prepare_resolved_archive(
     })
 }
 
-pub(crate) async fn access_archive_with_password<B: ArchiveExecutor>(
-    backend: &B,
+pub(crate) async fn access_archive_with_password(
+    backend: &dyn ArchiveExecutor,
     task_context: std::sync::Arc<TaskExecutionContext>,
     passwords: &PasswordService<'_>,
     resolved: &PreparedArchive,
@@ -206,7 +206,6 @@ pub(crate) async fn access_archive_with_password<B: ArchiveExecutor>(
     let ordered_candidates =
         passwords.order_candidates(password_candidates, known_password.as_ref(), &[]);
     let total_password_attempts = ordered_candidates.len();
-    let mut accepted_password_id = None;
     let mut used_password = None;
     let mut listing = None;
     let mut saw_wrong_password = false;
@@ -242,16 +241,8 @@ pub(crate) async fn access_archive_with_password<B: ArchiveExecutor>(
         .await
         {
             Ok(result) => {
-                accepted_password_id = passwords.record_listing_access(password).ok().flatten();
                 used_password = pw_value.clone();
                 listing = Some(result);
-                if resolved.detect_encoding
-                    && assessment.is_none()
-                    && resolved.encoding_mode == EncodingMode::Auto
-                    && resolved.candidate.detected_format == Some(ArchiveFormat::Zip)
-                {
-                    assessment = assess_zip_encoding(&resolved.archive_path).await;
-                }
                 break;
             }
             Err(error) => {
@@ -313,13 +304,6 @@ pub(crate) async fn access_archive_with_password<B: ArchiveExecutor>(
             Ok(result) => {
                 used_password = Some(password);
                 listing = Some(result);
-                if resolved.detect_encoding
-                    && assessment.is_none()
-                    && resolved.encoding_mode == EncodingMode::Auto
-                    && resolved.candidate.detected_format == Some(ArchiveFormat::Zip)
-                {
-                    assessment = assess_zip_encoding(&resolved.archive_path).await;
-                }
             }
             Err(
                 smartzip_core::SmartZipError::WrongPassword { .. }
@@ -348,6 +332,15 @@ pub(crate) async fn access_archive_with_password<B: ArchiveExecutor>(
                 path: resolved.candidate.path.clone(),
             });
         }
+    }
+
+    if listing.is_some()
+        && resolved.detect_encoding
+        && assessment.is_none()
+        && resolved.encoding_mode == EncodingMode::Auto
+        && resolved.candidate.detected_format == Some(ArchiveFormat::Zip)
+    {
+        assessment = assess_zip_encoding(&resolved.archive_path);
     }
 
     let encoding_mode = resolve_encoding_mode(
@@ -384,9 +377,6 @@ pub(crate) async fn access_archive_with_password<B: ArchiveExecutor>(
     };
 
     Ok(ArchiveAccessOutcome {
-        password_id: accepted_password_id,
-        // Listing alone never proves a content password.
-        has_password: false,
         encoding_mode,
         listing,
     })

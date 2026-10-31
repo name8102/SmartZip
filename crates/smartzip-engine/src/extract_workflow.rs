@@ -22,11 +22,11 @@ use crate::materialize::{
     self, CollisionAction, CommitPolicy, MaterializeRequest, OutputMaterializer,
 };
 use crate::nested::{
-    archive_stem, candidate_key, candidate_output_relative_path, discover_nested_candidates,
+    archive_stem, candidate_key, discover_nested_candidates,
     discover_nested_candidates_from_inventory, output_dir_for_candidate, output_relative_path_for,
     record_skip, recyclable_nested_archive_path, recycle_archive, root_embedded_candidates,
 };
-use crate::password_order::password_source_label;
+use crate::password_order::{load_password_candidates, password_source_label};
 use crate::policy::{
     embedded_policy_from_request, ext_business_container_kind, finding_meets_min_size,
     full_root_scanner_config, should_scan_candidate_for_embedded,
@@ -89,13 +89,13 @@ fn record_failure(
     }
 }
 
-pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecutor>(
+pub(crate) async fn extract_recursive_with_listener_interactive(
     engine_scanner: &EmbeddedScanner,
     run_policy: Option<&crate::CompiledRunPolicy>,
     min_embedded_size_bytes: u64,
     archive_recycler: &ArchiveRecycleHandler,
     cancellation: crate::TaskCancellation,
-    backend: &B,
+    backend: &dyn ArchiveExecutor,
     passwords: &PasswordService<'_>,
     request: ExtractWorkflowRequest,
     password_prompter: Option<&dyn InteractivePasswordPrompter>,
@@ -200,14 +200,8 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
             candidate: root.candidate,
         });
     }
-    // C6: Cache password candidates once before the extraction loop.
-    let password_candidates = passwords
-        .ranked_candidates(request.password_candidates.clone())
-        .map_err(|error| smartzip_core::SmartZipError::BackendFailed {
-            backend: "password-db".into(),
-            exit_code: None,
-            stderr: error.to_string(),
-        })?;
+    let password_candidates =
+        load_password_candidates(passwords, request.password_candidates.clone())?;
     let mut failed_count = 0usize;
     let mut was_cancelled = false;
     let mut volume_resolver = VolumeResolver::new();
@@ -1127,9 +1121,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                 request.encoding_mode.clone(),
                 history,
                 run_policy,
-            )
-            .await
-            {
+            ) {
                 Ok(prepared) => prepared,
                 Err(error) => {
                     record_failure(&mut failed_count, config, &cancellation);
@@ -1248,7 +1240,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
             if let Some(assessment) = zip_encoding_assessment {
                 events.push(TaskEvent {
                     task_id: task_id.clone(),
-                    kind: TaskEventKind::EncodingDetected(assessment.context.detected.clone()),
+                    kind: TaskEventKind::EncodingDetected(assessment.detected.clone()),
                 });
             }
 
@@ -1298,7 +1290,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
             }
             let encoding_decision = if zip_encoding_assessment
                 .as_ref()
-                .is_some_and(|assessment| assessment.should_confirm)
+                .is_some_and(|assessment| !assessment.suspicious_reasons.is_empty())
                 && encoding_prompter.is_some()
             {
                 Some(
@@ -2291,7 +2283,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                 .await?;
                 break 'nodes;
             }
-            let output_relative_path = candidate_output_relative_path(&candidate);
+            let output_relative_path = &candidate.relative_path;
             let mut discovery_policy = embedded_policy.clone();
             if let Some(policy) = run_policy {
                 discovery_policy.mode = policy.embedded_mode(false);
@@ -2311,7 +2303,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                         &actual_output_dir,
                         files,
                         candidate.depth + 1,
-                        &output_relative_path,
+                        output_relative_path,
                         &discovery_policy,
                         nested_embedded_enabled,
                         scan_unrecognized,
@@ -2322,7 +2314,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive<B: ArchiveExecut
                         nested_scanner,
                         &actual_output_dir,
                         candidate.depth + 1,
-                        &output_relative_path,
+                        output_relative_path,
                         &discovery_policy,
                         nested_embedded_enabled,
                         scan_unrecognized,

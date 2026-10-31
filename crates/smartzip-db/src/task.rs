@@ -94,31 +94,20 @@ impl<'a> TaskRepository<'a> {
     ///
     /// Only fields set to `Some` are touched; the rest keep their prior value.
     pub fn finish(&self, id: &str, finish: TaskFinish<'_>) -> Result<()> {
-        let mut sets: Vec<&'static str> = Vec::new();
-        let mut values: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-
-        if let Some(status) = finish.status {
-            sets.push("status = ?");
-            values.push(Box::new(status.as_str().to_string()));
-        }
-        if let Some(finished_at) = finish.finished_at {
-            sets.push("finished_at = ?");
-            values.push(Box::new(finished_at.to_string()));
-        }
-        if let Some(output_path) = finish.output_path {
-            sets.push("output_path = ?");
-            values.push(Box::new(output_path.to_string()));
-        }
-
-        if sets.is_empty() {
+        if finish == TaskFinish::default() {
             return Ok(());
         }
-
-        let sql = format!("UPDATE tasks SET {} WHERE id = ?", sets.join(", "));
-        values.push(Box::new(id.to_string()));
-
-        let params: Vec<&dyn rusqlite::ToSql> = values.iter().map(|b| b.as_ref()).collect();
-        self.conn.execute(&sql, params.as_slice())?;
+        self.conn.execute(
+            "UPDATE tasks SET status = COALESCE(?1, status),
+                finished_at = COALESCE(?2, finished_at),
+                output_path = COALESCE(?3, output_path) WHERE id = ?4",
+            params![
+                finish.status.map(TaskStatus::as_str),
+                finish.finished_at,
+                finish.output_path,
+                id,
+            ],
+        )?;
         Ok(())
     }
 
@@ -217,6 +206,20 @@ mod tests {
         assert_eq!(record.status, "completed");
         assert_eq!(record.finished_at.as_deref(), Some("2026-07-02T00:00:05Z"));
         assert!(record.output_path.is_none());
+
+        repo.finish(
+            "task-2",
+            TaskFinish {
+                output_path: Some("/tmp/out"),
+                ..TaskFinish::default()
+            },
+        )
+        .unwrap();
+        repo.finish("task-2", TaskFinish::default()).unwrap();
+        let record = repo.find_by_id("task-2").unwrap().unwrap();
+        assert_eq!(record.status, "completed");
+        assert_eq!(record.finished_at.as_deref(), Some("2026-07-02T00:00:05Z"));
+        assert_eq!(record.output_path.as_deref(), Some("/tmp/out"));
     }
 
     #[test]

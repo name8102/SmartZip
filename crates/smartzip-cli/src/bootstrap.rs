@@ -226,47 +226,6 @@ pub(super) fn apply_cli_overrides(
     Ok(())
 }
 
-pub(super) fn task_passwords<'a>(
-    db: Option<&'a SmartZipDb>,
-    safety: &SafetyOptions,
-) -> PasswordService<'a> {
-    safety
-        .policy
-        .as_ref()
-        .unwrap()
-        .services(db.map(SmartZipDb::connection))
-        .passwords
-}
-
-pub(super) fn task_stores<'a>(
-    db: Option<&'a SmartZipDb>,
-    safety: &SafetyOptions,
-) -> (
-    Option<smartzip_engine::history::DbTaskHistoryRecorder<'a>>,
-    Option<smartzip_engine::history::DbKnownFileStore<'a>>,
-) {
-    let services = safety
-        .policy
-        .as_ref()
-        .unwrap()
-        .services(db.map(SmartZipDb::connection));
-    (services.history, services.known)
-}
-
-pub(super) fn run_stores<'a>(
-    history: &'a Option<smartzip_engine::history::DbTaskHistoryRecorder<'_>>,
-    known: &'a Option<smartzip_engine::history::DbKnownFileStore<'_>>,
-) -> smartzip_engine::history::RunStores<'a> {
-    smartzip_engine::history::RunStores {
-        history: history
-            .as_ref()
-            .map(|s| s as &dyn smartzip_engine::history::TaskHistoryRecorder),
-        known_files: known
-            .as_ref()
-            .map(|s| s as &dyn smartzip_engine::history::KnownFileStore),
-    }
-}
-
 pub(super) fn build_backend(
     config: &smartzip_config::BackendConfig,
     forced_adapter: Option<&str>,

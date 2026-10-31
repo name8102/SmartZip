@@ -111,10 +111,10 @@ impl PreparedExtractTask {
 
     /// Construct dependencies from this task's snapshot, then execute without
     /// applying configuration a second time. Callers retain backend and UI ownership.
-    pub async fn run<B: ArchiveExecutor>(
+    pub async fn run(
         self,
         engine: SmartZipEngine,
-        backend: &B,
+        backend: &dyn ArchiveExecutor,
         connection: Option<&rusqlite::Connection>,
         interaction: ExtractInteraction<'_>,
         observer: ExtractObserver<'_>,

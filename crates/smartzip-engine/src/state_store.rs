@@ -1140,7 +1140,7 @@ fn recover_published_children(
         &scanner,
         output,
         candidate.depth + 1,
-        &crate::nested::candidate_output_relative_path(&candidate),
+        &candidate.relative_path,
         &policy,
         nested_embedded_enabled,
         aggressive,

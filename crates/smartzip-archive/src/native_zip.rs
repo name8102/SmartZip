@@ -21,31 +21,12 @@ pub struct ZipRawEntry {
 /// Previously this type pretended to be a full `ArchiveAdapter` (probe/list/
 /// test/extract/compress) which polluted routing. It now only reads the
 /// central-directory filename bytes.
-#[derive(Debug, Clone)]
-pub struct NativeZipBackend {
-    id: String,
-}
-
-impl Default for NativeZipBackend {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NativeZipBackend;
 
 impl NativeZipBackend {
     pub fn new() -> Self {
-        Self {
-            id: "native-zip".into(),
-        }
-    }
-
-    pub fn with_id(mut self, id: impl Into<String>) -> Self {
-        self.id = id.into();
-        self
-    }
-
-    pub fn id(&self) -> &str {
-        &self.id
+        Self
     }
 
     fn open_archive_read(path: &Path) -> Result<ZipArchive<File>> {
@@ -59,14 +40,12 @@ impl NativeZipBackend {
     /// Returns the exact filename bytes (`name_raw`) for every entry, plus
     /// `is_dir`. No decoding, no extraction, no materialization.
     pub fn raw_entries(&self, path: &Path) -> Result<Vec<ZipRawEntry>> {
-        let mut archive =
-            Self::open_archive_read(path).map_err(|e| with_backend_identity(e, &self.id))?;
+        let mut archive = Self::open_archive_read(path)?;
         let mut entries = Vec::with_capacity(archive.len());
         for i in 0..archive.len() {
             let entry = archive
                 .by_index_raw(i)
-                .map_err(|source| map_zip_error(source, path))
-                .map_err(|e| with_backend_identity(e, &self.id))?;
+                .map_err(|source| map_zip_error(source, path))?;
             entries.push(ZipRawEntry {
                 raw_name: entry.name_raw().to_vec(),
                 is_dir: entry.is_dir(),
@@ -79,36 +58,8 @@ impl NativeZipBackend {
 
     /// Check whether any entry in the ZIP is encrypted (without decrypting).
     pub fn has_encrypted_entries(&self, path: &Path) -> Result<bool> {
-        let mut archive =
-            Self::open_archive_read(path).map_err(|e| with_backend_identity(e, &self.id))?;
+        let mut archive = Self::open_archive_read(path)?;
         Ok((0..archive.len()).any(|i| archive.by_index_raw(i).ok().is_some_and(|e| e.encrypted())))
-    }
-}
-
-// Keep the old helper for tests that want to verify raw bytes are preserved
-// exactly as stored. This is intentionally *not* exposed as a backend.
-fn with_backend_identity(error: SmartZipError, backend_id: &str) -> SmartZipError {
-    match error {
-        SmartZipError::UnsupportedContainer {
-            path, container, ..
-        } => SmartZipError::UnsupportedContainer {
-            backend: backend_id.to_owned(),
-            path,
-            container,
-        },
-        SmartZipError::UnsupportedCodec { path, codec, .. } => SmartZipError::UnsupportedCodec {
-            backend: backend_id.to_owned(),
-            path,
-            codec,
-        },
-        SmartZipError::BackendFailed {
-            exit_code, stderr, ..
-        } => SmartZipError::BackendFailed {
-            backend: backend_id.to_owned(),
-            exit_code,
-            stderr,
-        },
-        other => other,
     }
 }
 

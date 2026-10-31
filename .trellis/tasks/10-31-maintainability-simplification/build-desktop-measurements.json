@@ -1,0 +1,27 @@
+{
+  "baseline_commit": "40732f9e120841084c03925b218088067cad789a",
+  "cargo": "cargo 1.98.1 (797e8a9bc 2026-08-05)",
+  "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)",
+  "scope": "cargo build -p smartzip-cli -p smartzip-gui --locked, dev; clean engine, CLI and GUI before each measured sample; dependencies warm; identical temporary source path; sccache and incremental disabled",
+  "logical_cpus": 20,
+  "local_cache_control": "clean all 11 workspace packages once before each phase warmup; then clean only measured packages before each sample",
+  "samples": {
+    "before": {
+      "elapsed_seconds": [
+        6.943154784850776,
+        7.18789758416824
+      ],
+      "median_seconds": 7.065526184509508,
+      "binary_bytes": 53417656
+    },
+    "after": {
+      "elapsed_seconds": [
+        7.185234949924052,
+        7.452720528934151
+      ],
+      "median_seconds": 7.318977739429101,
+      "binary_bytes": 53263928
+    }
+  },
+  "median_reduction_percent": -3.587157535064578
+}

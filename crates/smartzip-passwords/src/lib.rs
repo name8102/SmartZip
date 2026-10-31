@@ -233,16 +233,6 @@ impl<'a> PasswordService<'a> {
         Ok(candidates)
     }
 
-    pub fn record_listing_access(
-        &self,
-        candidate: &PasswordCandidate,
-    ) -> smartzip_db::Result<Option<i64>> {
-        // Directory access cannot authenticate file contents, including when
-        // the supplied candidate was already present in the password database.
-        let _ = candidate;
-        Ok(None)
-    }
-
     pub fn record_success(
         &self,
         candidate: &PasswordCandidate,

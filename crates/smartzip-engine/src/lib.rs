@@ -145,9 +145,9 @@ pub struct ExtractObserver<'a> {
 }
 
 impl SmartZipEngine {
-    pub async fn test_archives<B: ArchiveExecutor>(
+    pub async fn test_archives(
         &self,
-        backend: &B,
+        backend: &dyn ArchiveExecutor,
         passwords: &PasswordService<'_>,
         request: TestWorkflowRequest,
         password_prompter: Option<&dyn InteractivePasswordPrompter>,
@@ -220,9 +220,9 @@ impl SmartZipEngine {
         workflow::detect(&self.scanner, request)
     }
 
-    pub async fn inspect_file_with_listener<B: ArchiveExecutor>(
+    pub async fn inspect_file_with_listener(
         &self,
-        backend: &B,
+        backend: &dyn ArchiveExecutor,
         _passwords: &PasswordService<'_>,
         request: InspectRequest,
         listener: Option<TaskEventListener>,
@@ -232,9 +232,9 @@ impl SmartZipEngine {
     }
 
     /// Inspect an archive without constructing a password service.
-    pub async fn inspect<B: ArchiveExecutor>(
+    pub async fn inspect(
         &self,
-        backend: &B,
+        backend: &dyn ArchiveExecutor,
         request: InspectRequest,
         listener: Option<TaskEventListener>,
         history: Option<&dyn history::TaskHistoryRecorder>,
@@ -250,9 +250,9 @@ impl SmartZipEngine {
         .await
     }
 
-    pub async fn list_archive_with_listener_interactive<B: ArchiveExecutor>(
+    pub async fn list_archive_with_listener_interactive(
         &self,
-        backend: &B,
+        backend: &dyn ArchiveExecutor,
         passwords: &PasswordService<'_>,
         request: ListArchiveRequest,
         password_prompter: Option<&dyn InteractivePasswordPrompter>,
@@ -274,9 +274,9 @@ impl SmartZipEngine {
         .await
     }
 
-    pub async fn extract_recursive<B: ArchiveExecutor>(
+    pub async fn extract_recursive(
         &self,
-        backend: &B,
+        backend: &dyn ArchiveExecutor,
         passwords: &PasswordService<'_>,
         request: ExtractWorkflowRequest,
         password_prompter: Option<&dyn InteractivePasswordPrompter>,
@@ -296,9 +296,9 @@ impl SmartZipEngine {
         .await
     }
 
-    pub async fn extract_recursive_interactive<B: ArchiveExecutor>(
+    pub async fn extract_recursive_interactive(
         &self,
-        backend: &B,
+        backend: &dyn ArchiveExecutor,
         passwords: &PasswordService<'_>,
         request: ExtractWorkflowRequest,
         password_prompter: Option<&dyn InteractivePasswordPrompter>,
@@ -320,9 +320,9 @@ impl SmartZipEngine {
         .await
     }
 
-    pub async fn extract_recursive_with_listener<B: ArchiveExecutor>(
+    pub async fn extract_recursive_with_listener(
         &self,
-        backend: &B,
+        backend: &dyn ArchiveExecutor,
         passwords: &PasswordService<'_>,
         request: ExtractWorkflowRequest,
         password_prompter: Option<&dyn InteractivePasswordPrompter>,
@@ -343,9 +343,9 @@ impl SmartZipEngine {
         .await
     }
 
-    pub async fn extract_recursive_with_listener_interactive<B: ArchiveExecutor>(
+    pub async fn extract_recursive_with_listener_interactive(
         &self,
-        backend: &B,
+        backend: &dyn ArchiveExecutor,
         passwords: &PasswordService<'_>,
         request: ExtractWorkflowRequest,
         password_prompter: Option<&dyn InteractivePasswordPrompter>,
@@ -375,9 +375,9 @@ impl SmartZipEngine {
     }
 
     /// Canonical extraction entrypoint. Legacy overloads remain source-compatible.
-    pub async fn extract<B: ArchiveExecutor>(
+    pub async fn extract(
         &self,
-        backend: &B,
+        backend: &dyn ArchiveExecutor,
         passwords: &PasswordService<'_>,
         request: ExtractWorkflowRequest,
         interaction: ExtractInteraction<'_>,
@@ -394,10 +394,10 @@ impl SmartZipEngine {
         .await
     }
 
-    pub async fn extract_task<B: ArchiveExecutor>(
+    pub async fn extract_task(
         &self,
         mut identity: ExtractTaskIdentity,
-        backend: &B,
+        backend: &dyn ArchiveExecutor,
         passwords: &PasswordService<'_>,
         request: ExtractWorkflowRequest,
         interaction: ExtractInteraction<'_>,
@@ -418,10 +418,10 @@ impl SmartZipEngine {
             .await
     }
 
-    pub(crate) async fn extract_resolved<B: ArchiveExecutor>(
+    pub(crate) async fn extract_resolved(
         &self,
         identity: ExtractTaskIdentity,
-        backend: &B,
+        backend: &dyn ArchiveExecutor,
         passwords: &PasswordService<'_>,
         request: ExtractWorkflowRequest,
         interaction: ExtractInteraction<'_>,
@@ -494,10 +494,10 @@ impl SmartZipEngine {
         Ok(result)
     }
 
-    async fn extract_task_inner<B: ArchiveExecutor>(
+    async fn extract_task_inner(
         &self,
         identity: ExtractTaskIdentity,
-        backend: &B,
+        backend: &dyn ArchiveExecutor,
         passwords: &PasswordService<'_>,
         mut request: ExtractWorkflowRequest,
         interaction: ExtractInteraction<'_>,

@@ -47,8 +47,8 @@ pub struct TestWorkflowResult {
     pub exit_code: i32,
 }
 
-pub(crate) async fn run<B: ArchiveExecutor>(
-    backend: &B,
+pub(crate) async fn run(
+    backend: &dyn ArchiveExecutor,
     passwords: &PasswordService<'_>,
     request: TestWorkflowRequest,
     prompter: Option<&dyn InteractivePasswordPrompter>,

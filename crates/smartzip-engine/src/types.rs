@@ -8,7 +8,7 @@ use smartzip_scanner::{EmbeddedArchiveFinding, ScannerConfig};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::encoding_flow::ZipEncodingAssessment;
+use crate::interactive::EncodingConfirmationContext;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DetectRequest {
@@ -81,14 +81,12 @@ pub(crate) struct PreparedArchive {
     pub(crate) encoding_mode: EncodingMode,
     pub(crate) reused_confirmed_encoding: bool,
     pub(crate) detect_encoding: bool,
-    pub(crate) zip_encoding_assessment: Option<ZipEncodingAssessment>,
+    pub(crate) zip_encoding_assessment: Option<EncodingConfirmationContext>,
     pub(crate) recorder_name: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct ArchiveAccessOutcome {
-    pub(crate) password_id: Option<i64>,
-    pub(crate) has_password: bool,
     pub(crate) encoding_mode: EncodingMode,
     pub(crate) listing: ArchiveListing,
 }

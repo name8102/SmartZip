@@ -171,8 +171,7 @@ fn zip_encoding_assessment_skips_confirmation_for_ascii_names() {
     })
     .unwrap();
 
-    assert!(!assessment.should_confirm);
-    assert!(assessment.context.suspicious_reasons.is_empty());
+    assert!(assessment.suspicious_reasons.is_empty());
 }
 
 #[tokio::test]

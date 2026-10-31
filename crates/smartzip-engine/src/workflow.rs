@@ -70,10 +70,10 @@ pub(crate) fn detect(
     })
 }
 
-pub(crate) async fn inspect_file_with_listener<B: ArchiveExecutor>(
+pub(crate) async fn inspect_file_with_listener(
     cancellation: tokio_util::sync::CancellationToken,
     run_policy: Option<&crate::CompiledRunPolicy>,
-    backend: &B,
+    backend: &dyn ArchiveExecutor,
     request: InspectRequest,
     listener: Option<TaskEventListener>,
     history: Option<&dyn crate::history::TaskHistoryRecorder>,
@@ -148,12 +148,11 @@ pub(crate) async fn inspect_file_with_listener<B: ArchiveExecutor>(
             EncodingMode::Auto,
             history,
             run_policy,
-        )
-        .await?;
+        )?;
         if let Some(assessment) = &resolved.zip_encoding_assessment {
             events.push(TaskEvent {
                 task_id: task_id.clone(),
-                kind: TaskEventKind::EncodingDetected(assessment.context.detected.clone()),
+                kind: TaskEventKind::EncodingDetected(assessment.detected.clone()),
             });
         }
         known_password = resolved
@@ -178,8 +177,8 @@ pub(crate) async fn inspect_file_with_listener<B: ArchiveExecutor>(
             encoding = resolved.known_hit.and_then(|hit| hit.confirmed_encoding);
             encoding_confidence = Some(1.0);
         } else if let Some(assessment) = resolved.zip_encoding_assessment {
-            encoding = Some(assessment.detected_raw.selected.clone());
-            encoding_confidence = Some(assessment.detected_raw.confidence);
+            encoding = Some(encoding_mode_label(&assessment.detected.selected));
+            encoding_confidence = Some(assessment.detected.confidence);
         }
         status = if probe.supported {
             "detected"
@@ -253,10 +252,10 @@ pub(crate) async fn inspect_file_with_listener<B: ArchiveExecutor>(
     })
 }
 
-pub(crate) async fn list_archive_with_listener_interactive<B: ArchiveExecutor>(
+pub(crate) async fn list_archive_with_listener_interactive(
     cancellation: tokio_util::sync::CancellationToken,
     run_policy: Option<&crate::CompiledRunPolicy>,
-    backend: &B,
+    backend: &dyn ArchiveExecutor,
     passwords: &PasswordService<'_>,
     request: ListArchiveRequest,
     password_prompter: Option<&dyn InteractivePasswordPrompter>,
@@ -376,12 +375,11 @@ pub(crate) async fn list_archive_with_listener_interactive<B: ArchiveExecutor>(
         request.encoding_mode.clone(),
         history,
         run_policy,
-    )
-    .await?;
+    )?;
     if let Some(assessment) = &resolved.zip_encoding_assessment {
         events.push(TaskEvent {
             task_id: task_id.clone(),
-            kind: TaskEventKind::EncodingDetected(assessment.context.detected.clone()),
+            kind: TaskEventKind::EncodingDetected(assessment.detected.clone()),
         });
     }
     let password_candidates =
@@ -410,8 +408,6 @@ pub(crate) async fn list_archive_with_listener_interactive<B: ArchiveExecutor>(
             crate::history::FileExtractionRow {
                 sample_hash: resolved.sample_hash.as_deref(),
                 file_size: resolved.sample_size,
-                has_password: outcome.has_password,
-                password_id: outcome.password_id,
                 encoding: Some(encoding_mode_label(&outcome.encoding_mode).as_str()),
                 encoding_corrected: resolved.reused_confirmed_encoding
                     || matches!(request.encoding_mode, EncodingMode::Override(_)),
@@ -464,8 +460,9 @@ pub(crate) async fn list_archive_with_listener_interactive<B: ArchiveExecutor>(
         entries: listing.entries,
         encrypted: None,
         encoding: encoding_mode_label(&outcome.encoding_mode),
-        password_id: outcome.password_id,
-        used_password: outcome.has_password,
+        // Listing alone never authenticates a content password.
+        password_id: None,
+        used_password: false,
         embedded_offset: candidate.embedded_offset,
         events: snapshot,
     })

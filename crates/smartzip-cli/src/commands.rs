@@ -21,11 +21,12 @@ pub(super) async fn detect(
         min_confidence: min_confidence.into(),
         ..scanner_config(deep, max_scan_bytes)
     };
+    let policy = safety.policy.as_ref().unwrap();
     let engine = SmartZipEngine::with_scanner_config(config.clone())
         .with_cancellation_token(cancellation.clone())
-        .with_run_policy(safety.policy.as_ref().unwrap().as_ref().clone());
-    let (history_store, known_store) = task_stores(db, safety);
-    let recorder = run_stores(&history_store, &known_store);
+        .with_run_policy(policy.as_ref().clone());
+    let services = policy.services(db.map(SmartZipDb::connection));
+    let recorder = services.stores();
     let result = engine
         .inspect(
             backend,
@@ -34,7 +35,8 @@ pub(super) async fn detect(
                 scanner: config,
             },
             task_listener(json, verbose_routing, safety),
-            (history_store.is_some() || known_store.is_some())
+            services
+                .has_stores()
                 .then_some(&recorder as &dyn smartzip_engine::history::TaskHistoryRecorder),
         )
         .await?;
@@ -88,11 +90,11 @@ pub(super) async fn test_archives(
         ),
     };
 
-    let service = task_passwords(db, safety);
+    let policy = safety.policy.as_ref().unwrap();
     let engine = SmartZipEngine::with_scanner_config(request.scanner.clone())
-        .with_run_policy(safety.policy.as_ref().unwrap().as_ref().clone());
-    let (history_store, known_store) = task_stores(db, safety);
-    let recorder = run_stores(&history_store, &known_store);
+        .with_run_policy(policy.as_ref().clone());
+    let services = policy.services(db.map(SmartZipDb::connection));
+    let recorder = services.stores();
     let prompter = StdinPrompter {
         lock: StdinLock::configured(cancellation.clone(), safety, json),
     };
@@ -121,7 +123,7 @@ pub(super) async fn test_archives(
     let result = engine
         .test_archives(
             backend,
-            &service,
+            &services.passwords,
             request,
             if prompter.lock.interactive {
                 Some(&prompter)
@@ -161,12 +163,12 @@ pub(super) async fn list_archive(
         min_confidence: min_confidence.into(),
         ..scanner_config(deep, max_scan_bytes)
     };
-    let service = task_passwords(db, safety);
+    let policy = safety.policy.as_ref().unwrap();
     let engine = SmartZipEngine::with_scanner_config(config.clone())
         .with_cancellation_token(cancellation.clone())
-        .with_run_policy(safety.policy.as_ref().unwrap().as_ref().clone());
-    let (history_store, known_store) = task_stores(db, safety);
-    let recorder = run_stores(&history_store, &known_store);
+        .with_run_policy(policy.as_ref().clone());
+    let services = policy.services(db.map(SmartZipDb::connection));
+    let recorder = services.stores();
     let stdin_lock = StdinLock::configured(cancellation.clone(), safety, json);
     let password_prompter = StdinPrompter {
         lock: stdin_lock.clone(),
@@ -176,7 +178,7 @@ pub(super) async fn list_archive(
     let result = engine
         .list_archive_with_listener_interactive(
             backend,
-            &service,
+            &services.passwords,
             ListArchiveRequest {
                 path,
                 scanner: config,
@@ -195,7 +197,8 @@ pub(super) async fn list_archive(
             },
             Some(&StdinEncodingPrompter { lock: stdin_lock }),
             task_listener(json, verbose_routing, safety),
-            (history_store.is_some() || known_store.is_some())
+            services
+                .has_stores()
                 .then_some(&recorder as &dyn smartzip_engine::history::TaskHistoryRecorder),
         )
         .await?;

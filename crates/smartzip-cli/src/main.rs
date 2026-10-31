@@ -726,16 +726,16 @@ async fn preview_encodings(
     }
     let candidates = encoding_preview_candidates();
     let mut previews = Vec::new();
-    let service = task_passwords(db, safety);
+    let policy = safety.policy.as_ref().unwrap();
+    let mut services = policy.services(db.map(SmartZipDb::connection));
     let engine = SmartZipEngine::default()
         .with_cancellation_token(cancellation.clone())
-        .with_run_policy(safety.policy.as_ref().unwrap().as_ref().clone());
-    let (_, mut known_store) = task_stores(db, safety);
-    if let Some(store) = &mut known_store {
+        .with_run_policy(policy.as_ref().clone());
+    services.history = None;
+    if let Some(store) = &mut services.known {
         store.writable = false;
     }
-    let history_store = None;
-    let recorder = run_stores(&history_store, &known_store);
+    let recorder = services.stores();
     let control = StdinLock::configured(cancellation.clone(), safety, json);
     let prompt = PreviewPrompter {
         delegate: StdinPrompter {
@@ -756,7 +756,7 @@ async fn preview_encodings(
         let listing = engine
             .list_archive_with_listener_interactive(
                 backend,
-                &service,
+                &services.passwords,
                 ListArchiveRequest {
                     path: path.clone(),
                     scanner: ScannerConfig::default(),
@@ -773,9 +773,9 @@ async fn preview_encodings(
                     .then_some(&prompt as &dyn InteractivePasswordPrompter),
                 None,
                 task_listener(json, verbose_routing, safety),
-                known_store
-                    .as_ref()
-                    .map(|_| &recorder as &dyn smartzip_engine::history::TaskHistoryRecorder),
+                services
+                    .has_stores()
+                    .then_some(&recorder as &dyn smartzip_engine::history::TaskHistoryRecorder),
             )
             .await;
         if listing.is_ok() {

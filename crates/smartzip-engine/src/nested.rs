@@ -83,9 +83,9 @@ pub(crate) fn root_embedded_candidates(
 
 pub(crate) fn output_dir_for_candidate(base: &Path, candidate: &ExtractionCandidate) -> PathBuf {
     match candidate.source {
-        CandidateSource::RootInput => base.join(candidate_output_relative_path(candidate)),
+        CandidateSource::RootInput => base.join(&candidate.relative_path),
         CandidateSource::EmbeddedFinding if candidate.depth == 0 => {
-            base.join(candidate_output_relative_path(candidate))
+            base.join(&candidate.relative_path)
         }
         CandidateSource::ExtractedFile | CandidateSource::EmbeddedFinding => candidate
             .path
@@ -93,10 +93,6 @@ pub(crate) fn output_dir_for_candidate(base: &Path, candidate: &ExtractionCandid
             .unwrap_or(base)
             .join(archive_output_name(&candidate.path)),
     }
-}
-
-pub(crate) fn candidate_output_relative_path(candidate: &ExtractionCandidate) -> PathBuf {
-    candidate.relative_path.clone()
 }
 
 pub(crate) fn recyclable_nested_archive_path(
