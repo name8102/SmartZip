@@ -6,6 +6,7 @@ use std::fs;
 use std::path::Path;
 
 mod file_scan;
+mod lzma;
 mod rar;
 mod windows;
 mod zip;
@@ -98,8 +99,33 @@ impl EmbeddedScanner {
         };
 
         let full_search = matches!(config.mode, ScanMode::Deep);
-        let binwalk = binwalk::Binwalk::configure(None, None, include, None, None, full_search)
+        let mut binwalk = binwalk::Binwalk::configure(None, None, include, None, None, full_search)
             .unwrap_or_else(|_| binwalk::Binwalk::new());
+
+        // Override parsers at registration so all scan entry points use the
+        // same format rules, not just the random-access file parser.
+        for signature in binwalk.pattern_signature_table.values_mut() {
+            match signature.name.as_str() {
+                "zip" => signature.parser = zip::parser,
+                "lzma" => signature.parser = lzma::parser,
+                _ => {}
+            }
+        }
+        if let Some(signature) = binwalk
+            .pattern_signature_table
+            .values()
+            .find(|signature| signature.name == "lzma")
+            .cloned()
+        {
+            for magic in lzma::magic() {
+                if !binwalk.patterns.contains(&magic) {
+                    binwalk
+                        .pattern_signature_table
+                        .insert(binwalk.patterns.len(), signature.clone());
+                    binwalk.patterns.push(magic);
+                }
+            }
+        }
 
         Self { binwalk, config }
     }

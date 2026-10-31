@@ -1,6 +1,77 @@
 //! Associate EOCD records with the current archive, not an entry's inner ZIP.
 
 use aho_corasick::AhoCorasick;
+use binwalk::signatures::common::{
+    SignatureError, SignatureResult, CONFIDENCE_HIGH, CONFIDENCE_MEDIUM,
+};
+
+/// PKWARE APPNOTE 4.4.5, including the deprecated Zstandard ID 20.
+/// Recognizing a container is independent of the selected backend's codecs.
+fn compression_method(method: u16) -> bool {
+    matches!(method, 0..=6 | 8..=10 | 12 | 14 | 16 | 18..=20 | 93..=98)
+}
+
+pub(super) fn local_header_size(data: &[u8]) -> Option<usize> {
+    data.get(..30)?;
+    data.starts_with(b"PK\x03\x04").then_some(())?;
+    Some(30 + u16_at(data, 26)? as usize + u16_at(data, 28)? as usize)
+}
+
+pub(super) fn valid_local_header(data: &[u8]) -> bool {
+    checked_local_header(data).is_some()
+}
+
+fn checked_local_header(data: &[u8]) -> Option<()> {
+    let end = local_header_size(data)?;
+    // Keep reserved flag bits out, but allow bit 14 (alternate streams).
+    let flags = u16_at(data, 6)?;
+    if flags & 0x9780 != 0 {
+        return None;
+    }
+    let method = u16_at(data, 8)?;
+    if method != 99 {
+        return compression_method(method).then_some(());
+    }
+    // Method 99 alone is not sufficient evidence: validate the AES metadata.
+    if flags & 1 == 0 {
+        return None;
+    }
+    let mut extra = data.get(30 + u16_at(data, 26)? as usize..end)?;
+    while !extra.is_empty() {
+        let id = u16_at(extra, 0)?;
+        let size = u16_at(extra, 2)? as usize;
+        let value = extra.get(4..4 + size)?;
+        if id == 0x9901 {
+            return (matches!(u16_at(value, 0)?, 1 | 2)
+                && value.get(2..4)? == b"AE"
+                && matches!(value.get(4)?, 1..=3)
+                && compression_method(u16_at(value, 5)?))
+            .then_some(());
+        }
+        extra = extra.get(4 + size..)?;
+    }
+    None
+}
+
+/// Shared binwalk override for bounded and windowed byte-slice scans.
+pub(super) fn parser(data: &[u8], offset: usize) -> Result<SignatureResult, SignatureError> {
+    let archive = data.get(offset..).ok_or(SignatureError)?;
+    if !valid_local_header(archive) {
+        return Err(SignatureError);
+    }
+    let size = checked_size(archive);
+    Ok(SignatureResult {
+        offset,
+        size: size.unwrap_or(0),
+        confidence: if size.is_some() {
+            CONFIDENCE_HIGH
+        } else {
+            CONFIDENCE_MEDIUM
+        },
+        description: "ZIP archive".into(),
+        ..Default::default()
+    })
+}
 
 pub(super) fn checked_file_size(
     input: &mut crate::file_scan::Input<'_>,
@@ -254,6 +325,21 @@ fn u64_at(data: &[u8], offset: usize) -> Option<u64> {
 mod tests {
     use super::*;
     use std::io::{Cursor, Write};
+
+    #[test]
+    fn defined_compression_methods_and_alternate_stream_flag_are_valid_headers() {
+        let mut header = vec![0; 30];
+        header[..4].copy_from_slice(b"PK\x03\x04");
+        header[7] = 0x40;
+        for method in [0u16, 8, 16, 20, 93, 94, 95, 96, 97, 98] {
+            header[8..10].copy_from_slice(&method.to_le_bytes());
+            assert!(valid_local_header(&header), "method {method}");
+        }
+        for method in [7u16, 11, 13, 15, 17, 99, 65535] {
+            header[8..10].copy_from_slice(&method.to_le_bytes());
+            assert!(!valid_local_header(&header), "method {method}");
+        }
+    }
 
     fn archive(entries: &[(&str, &[u8])]) -> Vec<u8> {
         let mut writer = ::zip::ZipWriter::new(Cursor::new(Vec::new()));

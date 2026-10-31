@@ -98,6 +98,73 @@ fn create_split_encrypted_zip(root: &Path, password: &str) -> PathBuf {
     first_volume
 }
 
+#[tokio::test]
+async fn test_extract_aes_zip_from_video_carrier_with_trailing_data() {
+    use std::io::{Cursor, Write};
+
+    let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    writer
+        .start_file(
+            "文件.txt",
+            zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored)
+                .with_aes_encryption(zip::AesMode::Aes256, "fixture-password"),
+        )
+        .unwrap();
+    writer.write_all(b"encrypted payload").unwrap();
+    let zip = writer.finish().unwrap().into_inner();
+    let mut carrier = b"\x00\x00\x00\x20ftypisom\x00\x00\x02\x00isomiso2avc1mp41".to_vec();
+    carrier.resize(4096, 0);
+    carrier.extend_from_slice(&zip);
+    carrier.extend_from_slice(&[0x42; 14353]);
+    let input = TempDir::new().unwrap();
+    let archive = input.path().join("video.mp4");
+    std::fs::write(&archive, &carrier).unwrap();
+
+    let backend = backend();
+    let db = SmartZipDb::in_memory().unwrap();
+    let service = PasswordService::new(PasswordRepository::new(db.connection()));
+    let output = TempDir::new().unwrap();
+    let result = SmartZipEngine::default()
+        .extract_recursive(
+            &backend,
+            &service,
+            ExtractWorkflowRequest {
+                inputs: vec![archive.clone()],
+                output_dir: output.path().to_path_buf(),
+                recursion_limit: 0,
+                encoding_mode: EncodingMode::Auto,
+                scanner: ScannerConfig::default(),
+                password_candidates: PasswordCandidateRequest {
+                    manual: vec!["fixture-password".into()],
+                    ..Default::default()
+                },
+                layout_policy: Default::default(),
+                single_root_name_policy: Default::default(),
+                embedded_scan_mode: smartzip_core::EmbeddedScanMode::Largest,
+                dominant_min_ratio: 0.70,
+                confirm_large_scan: false,
+                force: false,
+                limits: Default::default(),
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.failed_count, 0, "{result:?}");
+    assert_eq!(result.processed.len(), 1, "{result:?}");
+    assert_eq!(result.processed[0].embedded_offset, Some(4096));
+    assert_eq!(result.processed[0].embedded_size, Some(zip.len() as u64));
+    let extracted = find_file(output.path(), "文件.txt").expect("AES payload should be extracted");
+    assert_eq!(std::fs::read(extracted).unwrap(), b"encrypted payload");
+    assert_eq!(
+        std::fs::read(archive).unwrap(),
+        carrier,
+        "source must remain unchanged"
+    );
+}
+
 // ── Basic extraction (no password) ────────────────────────────────────────
 
 #[rstest]

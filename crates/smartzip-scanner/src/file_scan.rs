@@ -172,7 +172,11 @@ fn parse(
     let mut start = offset;
     let (size, confidence) = match format {
         Zip => {
-            binwalk::structures::zip::parse_zip_header(&prefix).ok()?;
+            let header_size = crate::zip::local_header_size(&prefix)?;
+            let header = input.prefix(offset, header_size)?;
+            if !crate::zip::valid_local_header(&header) {
+                return None;
+            }
             let size = crate::zip::checked_file_size(input, offset);
             (
                 size,
@@ -222,8 +226,8 @@ fn parse(
         Xz | Lzma => {
             if format == Xz {
                 binwalk::structures::xz::parse_xz_header(&prefix).ok()?;
-            } else {
-                binwalk::structures::lzma::parse_lzma_header(&prefix).ok()?;
+            } else if !crate::lzma::valid_header(&prefix) {
+                return None;
             }
             let mut decoder = if format == Xz {
                 xz2::stream::Stream::new_stream_decoder(MAX_HEADER as u64, 0)
@@ -261,10 +265,20 @@ fn parse(
                     _ => {}
                 }
             }
+            // LZMA has no unique magic. Expanded parameter coverage must not
+            // turn failed dry runs into header-only false positives.
+            if format == Lzma && !complete {
+                return None;
+            }
             let size = complete.then(|| decoder.total_in());
             (
                 size,
-                if complete {
+                if complete && format == Lzma {
+                    Confidence::from_binwalk(crate::lzma::confidence(
+                        decoder.total_in(),
+                        decoder.total_out(),
+                    ))
+                } else if complete {
                     Confidence::High
                 } else {
                     Confidence::Medium
