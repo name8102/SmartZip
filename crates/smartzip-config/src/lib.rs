@@ -83,7 +83,7 @@ impl Default for ExtractionLimits {
             max_files: 0,
             max_output_bytes: 0,
             min_free_bytes: 0,
-            max_nested_candidates: 10_000,
+            max_nested_candidates: 0,
         }
     }
 }

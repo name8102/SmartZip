@@ -39,7 +39,7 @@ fn request(inputs: Vec<PathBuf>, output_dir: PathBuf) -> ExtractWorkflowRequest 
     ExtractWorkflowRequest {
         inputs,
         output_dir,
-        recursion_limit: 1,
+        recursion_limit: Some(1),
         encoding_mode: EncodingMode::Auto,
         scanner: ScannerConfig::default(),
         password_candidates: PasswordCandidateRequest::default(),
@@ -47,7 +47,6 @@ fn request(inputs: Vec<PathBuf>, output_dir: PathBuf) -> ExtractWorkflowRequest 
         single_root_name_policy: smartzip_engine::layout::SingleRootNamePolicy::default(),
         embedded_scan_mode: smartzip_core::EmbeddedScanMode::default(),
         dominant_min_ratio: 0.70,
-        confirm_large_scan: false,
         force: false,
         limits: Default::default(),
     }
@@ -148,15 +147,14 @@ async fn extract_records_task_events_and_file_row() {
             root.file_size.unwrap()
         )
         .unwrap());
-    // Completion is recorded only in canonical history; hints do not duplicate it.
-    let known_repo = KnownFileRepository::new(db.connection());
-    let hash = root.sample_hash.as_deref().unwrap();
-    let size = root.file_size.unwrap();
-    let known = known_repo
-        .find(hash, size)
+    // Success without a password or confirmed encoding needs only canonical history.
+    assert!(KnownFileRepository::new(db.connection())
+        .find(
+            root.sample_hash.as_deref().unwrap(),
+            root.file_size.unwrap()
+        )
         .unwrap()
-        .expect("known_files should have an entry after a successful extract");
-    assert!(!known.names_offsets.is_empty());
+        .is_none());
 }
 
 #[tokio::test]

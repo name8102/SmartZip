@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-pub const DEFAULT_MIN_EMBEDDED_FINDING_SIZE: u64 = 10 * 1024 * 1024;
+pub const DEFAULT_MIN_EMBEDDED_FINDING_SIZE: u64 = 0;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EmbeddedScanMode {
@@ -60,8 +60,6 @@ pub struct EmbeddedScanPolicy {
     /// Ignore embedded payloads with a known size below this threshold.
     /// Findings whose size cannot be determined are retained.
     pub min_finding_size_bytes: u64,
-    pub root_full_scan_confirm_threshold: u64,
-    pub max_findings_per_file: usize,
     pub inner_scan_max_bytes: Option<u64>,
 }
 
@@ -71,9 +69,7 @@ impl Default for EmbeddedScanPolicy {
             mode: EmbeddedScanMode::Auto,
             dominant_min_ratio: 0.70,
             min_finding_size_bytes: DEFAULT_MIN_EMBEDDED_FINDING_SIZE,
-            root_full_scan_confirm_threshold: 10 * 1024 * 1024 * 1024,
-            max_findings_per_file: 8,
-            inner_scan_max_bytes: Some(4 * 1024 * 1024 * 1024),
+            inner_scan_max_bytes: None,
         }
     }
 }
@@ -104,13 +100,8 @@ mod tests {
         let policy = EmbeddedScanPolicy::default();
         assert_eq!(policy.mode, EmbeddedScanMode::Auto);
         assert!((policy.dominant_min_ratio - 0.70).abs() < f32::EPSILON);
-        assert_eq!(policy.min_finding_size_bytes, 10 * 1024 * 1024);
-        assert_eq!(
-            policy.root_full_scan_confirm_threshold,
-            10 * 1024 * 1024 * 1024
-        );
-        assert_eq!(policy.max_findings_per_file, 8);
-        assert_eq!(policy.inner_scan_max_bytes, Some(4 * 1024 * 1024 * 1024));
+        assert_eq!(policy.min_finding_size_bytes, 0);
+        assert_eq!(policy.inner_scan_max_bytes, None);
     }
 
     #[test]
@@ -187,12 +178,7 @@ mod tests {
         let roundtrip: EmbeddedScanPolicy = serde_json::from_str(&json).unwrap();
         assert_eq!(roundtrip.mode, EmbeddedScanMode::Auto);
         assert!((roundtrip.dominant_min_ratio - 0.70).abs() < f32::EPSILON);
-        assert_eq!(roundtrip.min_finding_size_bytes, 10 * 1024 * 1024);
-        assert_eq!(
-            roundtrip.root_full_scan_confirm_threshold,
-            10 * 1024 * 1024 * 1024
-        );
-        assert_eq!(roundtrip.max_findings_per_file, 8);
-        assert_eq!(roundtrip.inner_scan_max_bytes, Some(4 * 1024 * 1024 * 1024));
+        assert_eq!(roundtrip.min_finding_size_bytes, 0);
+        assert_eq!(roundtrip.inner_scan_max_bytes, None);
     }
 }

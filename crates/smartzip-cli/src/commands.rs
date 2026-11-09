@@ -227,7 +227,6 @@ pub(super) async fn extract(
         dry_run: _,
         embedded,
         dominant_min_ratio,
-        confirm_large_scan,
         force,
         no_history: _,
     } = request;
@@ -260,7 +259,6 @@ pub(super) async fn extract(
         single_root_name_policy,
         embedded_scan_mode: embedded.into(),
         dominant_min_ratio,
-        confirm_large_scan,
         force,
         limits: policy.values().limits.clone(),
     };

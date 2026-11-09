@@ -1,10 +1,6 @@
 //! LZMA_Alone detection without binwalk's size and parameter heuristics.
 
-use binwalk::signatures::common::{
-    SignatureError, SignatureResult, CONFIDENCE_HIGH, CONFIDENCE_LOW,
-};
-
-const MEMORY_LIMIT: u64 = 64 * 1024 * 1024;
+use binwalk::signatures::common::{CONFIDENCE_HIGH, CONFIDENCE_LOW};
 
 pub(super) fn magic() -> Vec<Vec<u8>> {
     let mut patterns = Vec::new();
@@ -43,43 +39,4 @@ pub(super) fn confidence(consumed: u64, produced: u64) -> u8 {
     } else {
         CONFIDENCE_HIGH
     }
-}
-
-pub(super) fn parser(data: &[u8], offset: usize) -> Result<SignatureResult, SignatureError> {
-    let archive = data.get(offset..).ok_or(SignatureError)?;
-    if !valid_header(archive) {
-        return Err(SignatureError);
-    }
-    let mut decoder =
-        xz2::stream::Stream::new_lzma_decoder(MEMORY_LIMIT).map_err(|_| SignatureError)?;
-    let mut output = [0; 64 * 1024];
-    loop {
-        use xz2::stream::{Action, Status};
-        let input = &archive[decoder.total_in() as usize..];
-        let before = (decoder.total_in(), decoder.total_out());
-        let status = decoder
-            .process(
-                input,
-                &mut output,
-                if input.is_empty() {
-                    Action::Finish
-                } else {
-                    Action::Run
-                },
-            )
-            .map_err(|_| SignatureError)?;
-        if status == Status::StreamEnd {
-            break;
-        }
-        if before == (decoder.total_in(), decoder.total_out()) {
-            return Err(SignatureError);
-        }
-    }
-    Ok(SignatureResult {
-        offset,
-        size: usize::try_from(decoder.total_in()).map_err(|_| SignatureError)?,
-        confidence: confidence(decoder.total_in(), decoder.total_out()),
-        description: "LZMA compressed data; stream checked".into(),
-        ..Default::default()
-    })
 }

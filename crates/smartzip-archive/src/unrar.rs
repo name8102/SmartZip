@@ -175,19 +175,31 @@ impl ArchiveAdapter for UnrarBackend {
         path: &Path,
         context: std::sync::Arc<TaskExecutionContext>,
     ) -> Result<ArchiveProbe> {
-        let result = self
-            .test_with_context(
-                TestRequest {
-                    archive: path.to_path_buf(),
-                    format: Some(ArchiveFormat::Rar),
-                    password: None,
-                    encoding: smartzip_core::EncodingMode::Auto,
-                },
-                context,
+        let args = vec![
+            "lt".into(),
+            "-cfg-".into(),
+            "-c-".into(),
+            "-p-".into(),
+            "--".into(),
+            path.to_string_lossy().into_owned(),
+        ];
+        let output = self
+            .run_with_token(&args, &context.cancellation_token())
+            .await?;
+        let result = if output.status == Some(0) {
+            Ok(output.stdout.lines().any(|line| {
+                line.trim_start()
+                    .strip_prefix("Flags:")
+                    .is_some_and(|flags| flags.split_whitespace().any(|flag| flag == "encrypted"))
+            }))
+        } else {
+            Err(
+                crate::test_output::password_error(&output, "unrar", None, path)
+                    .unwrap_or_else(|| self.map_failure(&output, path)),
             )
-            .await;
+        };
         let (supported, encrypted) = match result {
-            Ok(result) => (result.ok, result.encrypted),
+            Ok(encrypted) => (true, Some(encrypted)),
             Err(SmartZipError::WrongPassword { .. })
             | Err(SmartZipError::PasswordRequired { .. }) => (true, Some(true)),
             Err(SmartZipError::UnsupportedContainer { .. }) => (false, None),
@@ -364,4 +376,34 @@ fn validate_extraction_listing(stdout: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    #[tokio::test]
+    async fn probe_reads_metadata_without_testing_payload() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let executable = root.path().join("unrar");
+        std::fs::write(
+            &executable,
+            r#"#!/bin/sh
+[ "$1" = lt ] || exit 99
+printf 'Name: secret.txt\nFlags: encrypted\n'
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let probe = UnrarBackend::new(executable)
+            .probe_with_context(
+                Path::new("fixture.rar"),
+                Arc::new(TaskExecutionContext::detached()),
+            )
+            .await
+            .unwrap();
+        assert!(probe.supported);
+        assert_eq!(probe.encrypted, Some(true));
+    }
 }

@@ -1,8 +1,5 @@
 //! Command-specific parsed requests. Field order and help are public CLI contracts.
-use super::{
-    ConfidenceArg, DiagnoseArg, EmbeddedModeArg, LayoutPolicyArg, SingleRootNameArg,
-    DEFAULT_RECURSION_LIMIT,
-};
+use super::{ConfidenceArg, DiagnoseArg, EmbeddedModeArg, LayoutPolicyArg, SingleRootNameArg};
 use std::path::PathBuf;
 
 #[derive(Debug, clap::Args)]
@@ -109,8 +106,8 @@ pub(super) struct ExtractCommand {
     pub(super) output: Option<PathBuf>,
 
     /// Maximum nested archive depth.
-    #[arg(long, default_value_t = DEFAULT_RECURSION_LIMIT)]
-    pub(super) recursion_limit: u8,
+    #[arg(long)]
+    pub(super) recursion_limit: Option<usize>,
 
     /// Password to try first. May be repeated.
     #[arg(short = 'p', long)]
@@ -154,10 +151,6 @@ pub(super) struct ExtractCommand {
     /// Minimum ratio for a finding to be considered dominant (0.0-1.0).
     #[arg(long, default_value_t = 0.70)]
     pub(super) dominant_min_ratio: f32,
-
-    /// Auto-confirm large file scans (>10GB).
-    #[arg(long)]
-    pub(super) confirm_large_scan: bool,
 
     /// Do not record this extraction in the task history tables.
     /// Password statistics are still updated.

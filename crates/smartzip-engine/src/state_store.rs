@@ -1111,7 +1111,11 @@ fn recover_published_children(
     let mut candidate: crate::ExtractionCandidate = serde_json::from_str(&parent.input_ref_json)?;
     candidate.relative_path =
         crate::nested::output_relative_path_for(&plan.request.output_dir, output);
-    if candidate.depth >= plan.request.recursion_limit {
+    if plan
+        .request
+        .recursion_limit
+        .is_some_and(|limit| candidate.depth >= limit)
+    {
         return Ok(RecoveredChildren {
             nodes: Vec::new(),
             limit_exceeded: false,
@@ -1150,7 +1154,9 @@ fn recover_published_children(
     for child in discovered {
         let child_id = NodeId::new();
         let input_ref_json = serde_json::to_string(&child)?;
-        if *nested_count >= plan.request.limits.max_nested_candidates {
+        if plan.request.limits.max_nested_candidates != 0
+            && *nested_count >= plan.request.limits.max_nested_candidates
+        {
             if repo.child_exists(&parent.task_id, &parent.node_id, &input_ref_json)? {
                 continue;
             }
@@ -1334,14 +1340,14 @@ mod tests {
     fn extract_plan(input: &Path, output: &Path) -> PersistedExtractPlan {
         let mut policy = smartzip_config::SmartZipConfig::default();
         policy.extraction.recursion.enabled = true;
-        policy.extraction.recursion.max_depth = 3;
+        policy.extraction.recursion.max_depth = Some(3);
         policy.extraction.embedded.nested = smartzip_config::NestedScan::Off;
         PersistedExtractPlan::new(
             policy,
             crate::ExtractWorkflowRequest {
                 inputs: vec![input.to_path_buf()],
                 output_dir: output.to_path_buf(),
-                recursion_limit: 3,
+                recursion_limit: Some(3),
                 scanner: smartzip_scanner::ScannerConfig::default(),
                 encoding_mode: smartzip_core::EncodingMode::Auto,
                 password_candidates: smartzip_passwords::PasswordCandidateRequest::default(),
@@ -1349,7 +1355,6 @@ mod tests {
                 single_root_name_policy: crate::layout::SingleRootNamePolicy::default(),
                 embedded_scan_mode: smartzip_core::EmbeddedScanMode::Auto,
                 dominant_min_ratio: 0.7,
-                confirm_large_scan: false,
                 force: false,
                 limits: smartzip_config::ExtractionLimits::default(),
             },
@@ -1661,6 +1666,7 @@ mod tests {
         std::fs::write(&input, b"input").unwrap();
         std::fs::create_dir_all(&staging).unwrap();
         std::fs::write(staging.join("child.zip"), b"nested").unwrap();
+        std::fs::write(staging.join("second.zip"), b"nested").unwrap();
         let intent = crate::CommitIntent {
             commit_id: "commit-limit".into(),
             staging_path: staging.clone(),
@@ -1679,7 +1685,7 @@ mod tests {
         let mut submission = task_submission(&task_id, &node_id, &input, &output_root);
         let mut plan: PersistedExtractPlan =
             serde_json::from_str(&submission.config_snapshot_json).unwrap();
-        plan.request.limits.max_nested_candidates = 0;
+        plan.request.limits.max_nested_candidates = 1;
         submission.config_snapshot_json = serde_json::to_string(&plan).unwrap();
         {
             let store = StateStore::start(&db_path).unwrap();

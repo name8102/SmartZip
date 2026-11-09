@@ -8,9 +8,6 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-const MAX_VOLUMES: u32 = 4096;
-const MAX_DIRECTORY_ENTRIES: usize = 100_000;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VolumeFamily {
@@ -231,7 +228,7 @@ pub(crate) fn zip_last_disk_hint(path: &Path) -> Option<u32> {
             return None;
         }
         let total = u32::from_le_bytes(bytes.get(locator + 16..locator + 20)?.try_into().ok()?);
-        total.checked_sub(1).filter(|disk| *disk < MAX_VOLUMES)
+        total.checked_sub(1)
     } else {
         Some(u32::from(disk))
     }
@@ -251,22 +248,12 @@ impl VolumeSet {
         let mut issues = Vec::new();
         let mut ambiguous = false;
         if let Some(pattern) = &naming {
-            for (index, entry) in fs::read_dir(parent)?.enumerate() {
-                if index >= MAX_DIRECTORY_ENTRIES {
-                    issues.push("volume discovery directory-entry budget reached".into());
-                    ambiguous = true;
-                    break;
-                }
+            for entry in fs::read_dir(parent)? {
                 let entry = entry?;
                 let Some(other) = entry.file_name().to_str().and_then(parse_name) else {
                     continue;
                 };
                 if other.family == pattern.family && other.stem == pattern.stem {
-                    if other.number != u32::MAX && other.number >= MAX_VOLUMES {
-                        issues.push("volume number exceeds discovery budget".into());
-                        ambiguous = true;
-                        continue;
-                    }
                     found.push((other.number, entry.path()));
                 }
             }
@@ -369,8 +356,9 @@ impl VolumeSet {
                     max = max.max(disk);
                 }
             }
-            for number in pattern.start()..=max.min(MAX_VOLUMES - 1) {
-                if !found.iter().any(|(n, _)| *n == number) {
+            let numbers: std::collections::HashSet<_> = found.iter().map(|(n, _)| *n).collect();
+            for number in pattern.start()..=max {
+                if !numbers.contains(&number) {
                     missing.push(parent.join(pattern.member_name(number)));
                 }
             }
@@ -431,9 +419,6 @@ impl VolumeSet {
             return None;
         }
         let next = naming.number.checked_add(1)?;
-        if next >= MAX_VOLUMES {
-            return None;
-        }
         Some(member.path.parent()?.join(naming.member_name(next)))
     }
 
@@ -552,6 +537,22 @@ impl Seek for VolumeReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn volume_discovery_has_no_fixed_number_budget() {
+        let root = tempfile::tempdir().unwrap();
+        let first = root.path().join("a.part5000.rar");
+        std::fs::write(&first, b"Rar!\x1a\x07\x00").unwrap();
+        let set = VolumeSet::collect(&first).unwrap();
+        assert_eq!(set.members.len(), 1);
+        assert_eq!(set.members[0].number, 5000);
+        assert!(!set.ambiguous);
+        assert_eq!(set.missing.len(), 4999);
+        assert_eq!(
+            set.next_named_member(&set.members[0]).unwrap(),
+            root.path().join("a.part5001.rar")
+        );
+    }
 
     #[test]
     fn arbitrary_member_numerical_order_and_missing_volume() {

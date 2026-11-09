@@ -74,7 +74,7 @@ mode = "off"
 
 | 字段 | 行为 |
 | --- | --- |
-| `extraction.recursion.enabled` / `max_depth` | 默认启用、深度 3；关闭后不遍历产物发现子归档 |
+| `extraction.recursion.enabled` / `max_depth` | 默认启用且不限深度；省略 `max_depth` 表示不限，显式 0 只处理根归档；关闭后不遍历产物发现子归档 |
 | `extraction.embedded.root` | `off/auto/ask/all/largest`；`off` 不运行根内容扫描或切片 |
 | `extraction.embedded.nested` | `off/auto/ask/aggressive/all/largest`；`off` 仍允许普通后缀递归；`auto/ask` 不扫描无归档特征的普通产物，`aggressive/all` 扩大候选范围 |
 | `extraction.volumes.auto_discover` | 关闭解压阶段的兄弟卷枚举、自动准备；显式 `test` 的完整性校验仍有自己的分卷收集与诊断流程 |
@@ -88,7 +88,7 @@ mode = "off"
 | `extraction.cleanup.nested_archives` | `keep/trash/delete`；默认 `trash`，只清理完整成功提交的内层归档 |
 | `passwords.mode` | `auto/manual/off`；`manual` 仅显式密码；`off` 不使用凭据，仍可尝试无密码打开 |
 | `passwords.sources` | 默认依次为 `manual/known/batch/empty/database`；未列出的来源不读取、不补充 |
-| `passwords.database_limit` | 默认 128 |
+| `passwords.database_limit` | 默认 0（不限）；正数限制数据库候选数量 |
 | `passwords.save_success` / `record_statistics` | 独立控制成功密码新增与已有密码的统计更新 |
 | `extraction.reuse.password_hint` / `encoding_hint` | 独立控制已知文件提示 |
 | `interaction.mode` | `auto/always/never`；`never` 不等待输入，需要确认的操作报告 `needs_decision` |
@@ -99,7 +99,7 @@ mode = "off"
 
 关闭递归时内层扫描显示为不生效。统一配置的核心工作流保留根输入；GUI 可另行启用上述成功后回收开关。`trash` 失败保留文件并报告，不降级为永久删除。失败密码尝试的暂存清理、安全检查、取消、预算和提交回滚始终执行。密码仍直接尝试解压到独立暂存目录，不增加每个候选的完整预测试。
 
-资源限制在 `[limits]`：`max_files=0`、`max_output_bytes=0`、`min_free_bytes=0`、`max_nested_candidates=10000`。前两项 0 表示不限，余量 0 表示关闭容量检查；文件中的显式限额仍会生效。扫描搜索窗口不等同于完整解析量或峰值内存限制。
+资源限制在 `[limits]`：`max_files=0`、`max_output_bytes=0`、`min_free_bytes=0`、`max_nested_candidates=0`。文件数、字节数及候选数的 0 表示不限，余量 0 表示关闭容量检查；文件中的显式限额仍会生效。扫描搜索窗口不等同于完整解析量或峰值内存限制。
 
 ## 持久化状态
 

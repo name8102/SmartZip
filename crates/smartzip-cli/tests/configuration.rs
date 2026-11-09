@@ -171,6 +171,8 @@ fn history_and_known_files_are_independent_and_read_only_really_stays_read_only(
             archive.to_str().unwrap(),
             "--output",
             "first",
+            "--encoding",
+            "UTF-8",
             "--json",
             "--non-interactive",
         ],
@@ -265,14 +267,10 @@ fn config_and_environment_select_one_file_and_never_trust_the_working_directory(
     let selected = run(&["config", "get", "extraction.recursion.max_depth"]);
     assert!(selected.status.success());
     assert_eq!(String::from_utf8(selected.stdout).unwrap().trim(), "6");
-    let defaults = run(&[
-        "--no-config",
-        "config",
-        "get",
-        "extraction.recursion.max_depth",
-    ]);
+    let defaults = run(&["--no-config", "config", "show", "--defaults", "--sources"]);
     assert!(defaults.status.success());
-    assert_eq!(String::from_utf8(defaults.stdout).unwrap().trim(), "3");
+    let defaults: Value = serde_json::from_slice(&defaults.stdout).unwrap();
+    assert!(defaults["values"]["extraction"]["recursion"]["max_depth"].is_null());
     let explicit = run(&["--config", "config.toml", "config", "check"]);
     assert!(!explicit.status.success());
 }

@@ -15,12 +15,12 @@
 | **ExtractionCandidate** | 待解压候选条目。包含路径、深度、来源类型、检测格式、内嵌偏移等。 |
 | **CandidateAttempt** | 对单个 `ExtractionCandidate` 的核心处理尝试。负责检测决策、内嵌归档材质化、编码检测、密码尝试、后端解压、输出材质化和结果事件；BFS 队列仍由 `SmartZipEngine` 管理。 |
 | **CandidateSource** | 候选来源枚举：`RootInput`（用户直接输入）、`ExtractedFile`（解压产物中找到的）、`EmbeddedFinding`（扫描器在二进制偏移处发现的）。 |
-| **Root scan** | 用户直接输入的文件应尽可能解压。空搜索窗口后继续扫描直到文件末尾；命中归档头后完整解析其范围，再从归档末尾继续搜索。窗口不限制前缀、归档间隔或已命中归档的长度。过小载荷、业务容器和嵌套扫描大小等效率门槛仅用于嵌套发现。解压资源预算独立生效。 |
-| **Recursive extraction** | BFS 队列驱动的递归解压。有状态批次最多同时推进两个根输入；当前根扫描发现的归档优先于后续根输入，普通嵌套发现仍按 BFS。队列中每个候选经过同一管线：格式检测 → 编码检测 → 有界密码候选直接解压到 `OutputMaterializer` → 输出扫描 → 嵌套候选入队。 |
+| **Root scan** | 用户直接输入的文件应尽可能解压。空搜索窗口后继续扫描直到文件末尾；命中归档头后完整解析其范围，再从归档末尾继续搜索。窗口不限制前缀、归档间隔或已命中归档的长度。默认不设载荷最小值、嵌套扫描字节数或 finding 数量上限；业务容器跳过只用于自动嵌套发现。解压资源预算独立生效。 |
+| **Recursive extraction** | BFS 队列驱动的递归解压。有状态批次最多同时推进两个根输入；当前根扫描发现的归档优先于后续根输入，普通嵌套发现仍按 BFS。队列中每个候选经过同一管线：格式检测 → 编码检测 → 密码候选直接解压到 `OutputMaterializer` → 输出扫描 → 嵌套候选入队。 |
 | **Collapse single output** | 解压产出唯一条目时的优化：将该条目提到父目录，去掉中间层空目录。现在由 `LayoutPlanKind` 的各种 `Commit*` 变体实现，包括内容上移（`CommitSingleDirContentsAsArchiveName`）和直接重命名（`CommitSingleDirAsInnerName`/`CommitSingleFileAsInnerName`）。 |
 | **ArchiveNode** | 动态节点语义由持久 NodeId/generation 和现有文件历史行实现，记录父子、阶段、输入身份与提交事实。节点在父归档解压后增量产生，不预先构造完整 DAG；秘密不进入持久执行快照。 |
 | **VolumeSet** | 分卷归档集合；入口、成员和诊断语义见下方完整性校验。 |
-| **ExtractionLimits** | 不可信归档的资源预算：递归深度、内层候选数、文件数、磁盘安全余量和内嵌 finding 数量。 |
+| **ExtractionLimits** | 用户显式配置的资源预算：递归深度、内层候选数、文件数、磁盘安全余量和内嵌 finding 数量。 |
 | **OutputMaterializer** | 事务式输出策略与 **extraction staging** 的唯一所有者：为 adapter 尝试提供隔离目录、在失败后验证清理、对成功树做布局规划与碰撞处理，再 `CommitCommand` 提交或回滚。失败时默认清理临时目录；开发模式可保留**已选中**成功树用于诊断（失败 adapter 树必须删除）。碰撞在布局规划之后，经 `CollisionResolver` 交互。 |
 | **LayoutPlan** | 智能整理规划结果。包含 `source`（待移动项）、`kind`（整理策略）、`target`（最终目标路径）、`reason`（决策原因）。由 `plan_layout()` 在解压到临时目录后生成。 |
 | **PlanSource** | 待移动项来源：`WholeTempDir`（整个临时目录）、`SingleDir`（单目录）、`SingleDirContents`（单目录内容）、`SingleFile`（单文件）。 |

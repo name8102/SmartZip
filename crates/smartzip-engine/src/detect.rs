@@ -103,12 +103,11 @@ pub fn classify_by_header(
 
 const HEADER_READ_SIZE: usize = 8 * 1024;
 
-pub fn probe_file_header(path: &Path) -> Option<(ArchiveFormat, u64)> {
-    let mut file = File::open(path).ok()?;
-    let mut buf = vec![0u8; HEADER_READ_SIZE];
-    let n = file.read(&mut buf).ok()?;
-    buf.truncate(n);
-    detect_archive_header(&buf)
+pub fn probe_file_header(path: &Path) -> std::io::Result<Option<(ArchiveFormat, u64)>> {
+    let mut file = File::open(path)?;
+    let mut buf = [0u8; HEADER_READ_SIZE];
+    let n = file.read(&mut buf)?;
+    Ok(detect_archive_header(&buf[..n]))
 }
 
 #[cfg(test)]
@@ -312,7 +311,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("zip.dat");
         std::fs::write(&path, b"PK\x03\x04some data here").unwrap();
-        let result = probe_file_header(&path);
+        let result = probe_file_header(&path).unwrap();
         assert_eq!(result, Some((ArchiveFormat::Zip, 0)));
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -323,7 +322,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("unknown.dat");
         std::fs::write(&path, b"hello world this is not an archive").unwrap();
-        assert!(probe_file_header(&path).is_none());
+        assert!(probe_file_header(&path).unwrap().is_none());
         let _ = std::fs::remove_dir_all(dir);
     }
 }

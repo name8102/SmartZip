@@ -116,6 +116,37 @@ fn real_backend_detect_list_test_extract_preserve_source() {
         );
         if operation == TaskOperation::List {
             assert_eq!(outcome.detail["entries"][0]["path"], "hello.txt");
+            let router = outcome
+                .backend_router
+                .expect("listing retains its backend registry");
+            let adapter = events
+                .iter()
+                .rev()
+                .find_map(|event| match &event.kind {
+                    TaskEventKind::Route(smartzip_core::RouteEvent::BackendSelected {
+                        adapter_id,
+                    }) => Some(adapter_id),
+                    _ => None,
+                })
+                .unwrap();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let bytes = runtime
+                .block_on(router.read_member(
+                    adapter,
+                    smartzip_archive::MemberReadRequest {
+                        archive: archive.clone(),
+                        member: "hello.txt".into(),
+                        password: None,
+                        encoding: smartzip_core::EncodingMode::Auto,
+                        max_bytes: 0,
+                    },
+                    CancellationToken::new(),
+                ))
+                .unwrap();
+            assert_eq!(bytes, b"GUI runtime acceptance\n");
         }
         assert!(archive.exists());
     }
@@ -455,7 +486,7 @@ fn explicit_recovery_keeps_identity_and_does_not_run_other_pending_tasks() {
             let request = smartzip_engine::ExtractWorkflowRequest {
                 inputs: vec![archive.clone()],
                 output_dir: output.clone(),
-                recursion_limit: 0,
+                recursion_limit: Some(0),
                 encoding_mode: Default::default(),
                 scanner: Default::default(),
                 password_candidates: Default::default(),
@@ -463,7 +494,6 @@ fn explicit_recovery_keeps_identity_and_does_not_run_other_pending_tasks() {
                 single_root_name_policy: smartzip_engine::layout::SingleRootNamePolicy::Auto,
                 embedded_scan_mode: smartzip_core::EmbeddedScanMode::Auto,
                 dominant_min_ratio: 0.7,
-                confirm_large_scan: false,
                 force: true,
                 limits: cfg.values.limits.clone(),
             };

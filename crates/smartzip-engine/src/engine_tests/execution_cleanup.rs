@@ -17,7 +17,7 @@ fn request(inputs: Vec<PathBuf>, output_dir: PathBuf) -> ExtractWorkflowRequest 
     ExtractWorkflowRequest {
         inputs,
         output_dir,
-        recursion_limit: 0,
+        recursion_limit: Some(0),
         encoding_mode: EncodingMode::Auto,
         scanner: ScannerConfig::default(),
         password_candidates: PasswordCandidateRequest::default(),
@@ -25,7 +25,6 @@ fn request(inputs: Vec<PathBuf>, output_dir: PathBuf) -> ExtractWorkflowRequest 
         single_root_name_policy: Default::default(),
         embedded_scan_mode: EmbeddedScanMode::Ignore,
         dominant_min_ratio: 0.7,
-        confirm_large_scan: false,
         force: false,
         limits: Default::default(),
     }

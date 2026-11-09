@@ -23,8 +23,6 @@ use smartzip_scanner::{Confidence, ScanMode, ScannerConfig};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-const DEFAULT_RECURSION_LIMIT: u8 = smartzip_config::DEFAULT_RECURSION_DEPTH;
-
 #[derive(Debug, Parser)]
 #[command(name = "smartzip", version)]
 #[command(about = "SmartZip cross-platform archive helper")]
@@ -66,7 +64,7 @@ struct Cli {
 
 #[derive(Debug, Clone, clap::Args)]
 struct SafetyOptions {
-    /// Maximum stored password candidates (manual passwords are tried first).
+    /// Maximum stored password candidates (0 = unlimited; manual passwords are tried first).
     #[arg(long, global = true, default_value_t = smartzip_config::DEFAULT_PASSWORD_LIMIT)]
     password_limit: usize,
 
@@ -507,7 +505,7 @@ async fn run(cli: Cli, matches: &clap::ArgMatches) -> Result<(), Box<dyn std::er
                 .any(|a| a["family"] == "7z" && a["version"].is_string());
             let result = serde_json::json!({"schema_version": 1, "version": env!("CARGO_PKG_VERSION"), "database": db_path,
                 "backends": adapters, "warnings": backend.warnings(), "status": if healthy { "completed" } else { "failed" },
-                "exit_code": if healthy { 0 } else { 1 }, "extraction_limits": policy.values().limits, "scan_default_bytes": smartzip_scanner::DEFAULT_SCAN_BYTES,
+                "exit_code": if healthy { 0 } else { 1 }, "extraction_limits": policy.values().limits, "scan_default_bytes": ScannerConfig::default().max_scan_bytes,
                 "scan_hard_limit_bytes": null, "root_scan_strategy": "bounded_metadata_scan_to_eof"});
             if json {
                 println!("{}", serde_json::to_string_pretty(&result)?);

@@ -49,7 +49,9 @@ pub struct Job {
     pub prompt_revision: u64,
     pub dismiss_requested: bool,
     pub persistence_pending: bool,
+    pub request_revision: u64,
     pub task_id: Option<String>,
+    pub backend_router: Option<smartzip_archive::BackendRouter>,
     /// A configured draft stays queued until the user explicitly starts it.
     held: bool,
     /// Explicit start bypasses the global automatic-start pause for this job.
@@ -189,6 +191,7 @@ impl Job {
         };
         self.events.extend(outcome.warnings);
         self.result = Some(outcome.detail);
+        self.backend_router = outcome.backend_router;
         self.prompt = None;
         self.handle = None;
         self.request.settings.passwords.clear();
@@ -264,7 +267,9 @@ impl Queue {
             prompt_revision: 0,
             dismiss_requested: false,
             persistence_pending: false,
+            request_revision: 0,
             task_id: None,
+            backend_router: None,
             held,
             start_requested: false,
             failure_summary: None,
@@ -325,6 +330,7 @@ impl Queue {
         if job.request.operation != TaskOperation::Extract {
             return Err("只有解压任务支持快速配置");
         }
+        let previous_settings = job.request.settings.clone();
         let before = (
             job.request.settings.output.clone(),
             job.request.settings.recursive,
@@ -338,6 +344,9 @@ impl Queue {
         job.quick_overrides.smart_layout |= job.request.settings.smart_layout != before.2;
         job.quick_overrides.delete_source |= job.request.settings.delete_source != before.3;
         job.quick_overrides.auto_encoding |= job.request.settings.auto_encoding != before.4;
+        if job.request.settings != previous_settings {
+            job.request_revision += 1;
+        }
         Ok(())
     }
     pub fn set_task_password(
@@ -353,6 +362,7 @@ impl Queue {
         if job.phase != Phase::Queued {
             return Err("只有排队中的任务可以设置密码");
         }
+        let previous_settings = job.request.settings.clone();
         match value {
             Some(value) => {
                 job.request.settings.passwords = vec![value];
@@ -363,6 +373,9 @@ impl Queue {
                 job.request.settings.temporary_passwords = false;
             }
         }
+        if job.request.settings != previous_settings {
+            job.request_revision += 1;
+        }
         Ok(())
     }
     pub fn apply_global_settings(&mut self, settings: &TaskSettings) {
@@ -370,6 +383,7 @@ impl Queue {
             if job.phase != Phase::Queued || job.request.operation != TaskOperation::Extract {
                 continue;
             }
+            let previous_settings = job.request.settings.clone();
             if !job.quick_overrides.output {
                 job.request.settings.output = settings.output.clone();
             }
@@ -385,6 +399,9 @@ impl Queue {
             if !job.quick_overrides.auto_encoding {
                 job.request.settings.auto_encoding = settings.auto_encoding;
             }
+            if job.request.settings != previous_settings {
+                job.request_revision += 1;
+            }
         }
     }
     pub fn reset_settings(&mut self, id: u64, settings: &TaskSettings) -> Result<(), &'static str> {
@@ -399,12 +416,16 @@ impl Queue {
         if job.request.operation != TaskOperation::Extract {
             return Err("只有解压任务支持快速配置");
         }
+        let previous_settings = job.request.settings.clone();
         job.request.settings.output = settings.output.clone();
         job.request.settings.recursive = settings.recursive;
         job.request.settings.smart_layout = settings.smart_layout;
         job.request.settings.delete_source = settings.delete_source;
         job.request.settings.auto_encoding = settings.auto_encoding;
         job.quick_overrides = QuickOverrides::default();
+        if job.request.settings != previous_settings {
+            job.request_revision += 1;
+        }
         Ok(())
     }
     pub fn has_active(&self) -> bool {
@@ -524,9 +545,8 @@ impl Queue {
     pub fn tick(&mut self) -> bool {
         let mut changed = false;
         for job in &mut self.jobs {
-            if let Some(handle) = &job.handle {
-                let files = handle.roots.snapshot();
-                if job.files != files {
+            if let Some(handle) = &mut job.handle {
+                if let Some(files) = handle.snapshot_if_changed() {
                     job.files = files;
                     changed = true;
                 }
@@ -888,6 +908,7 @@ mod tests {
             status: status.into(),
             detail: serde_json::Value::Null,
             warnings: vec![],
+            backend_router: None,
         }
     }
 

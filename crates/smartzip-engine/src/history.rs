@@ -22,7 +22,7 @@ use smartzip_core::EncodingMode;
 use smartzip_core::{TaskEvent, TaskEventKind, TaskId};
 use smartzip_db::{
     file_extractions::{FileExtractionRepository, NewFileExtraction},
-    known_files::{KnownFileRepository, NameOffset},
+    known_files::KnownFileRepository,
     password::PasswordRepository,
     task::{NewTask, TaskFinish, TaskRepository, TaskStatus},
     task_event::{NewTaskEvent, TaskEventLevel, TaskEventRepository},
@@ -206,19 +206,15 @@ pub struct KnownFileHit {
 pub struct KnownFileUpsert<'a> {
     pub sample_hash: &'a str,
     pub size: i64,
-    pub name: Option<&'a str>,
-    pub offset: Option<i64>,
     pub password_id: Option<i64>,
+    pub confirmed_encoding: Option<&'a str>,
 }
 
-/// A user-confirmed encoding for an exact known file. Unlike an extract
-/// upsert, this overwrites `confirmed_encoding` without recording completion.
+/// A user-confirmed encoding for an exact known file.
 #[derive(Debug, Clone)]
 pub struct KnownFileEncodingUpsert<'a> {
     pub sample_hash: &'a str,
     pub size: i64,
-    pub name: Option<&'a str>,
-    pub offset: Option<i64>,
     pub encoding: &'a str,
 }
 
@@ -671,15 +667,11 @@ impl KnownFileStore for DbKnownFileStore<'_> {
         if !self.writable {
             return;
         }
-        let name_offset = upsert.name.map(|name| NameOffset {
-            name: name.to_string(),
-            offset: upsert.offset,
-        });
-        if let Err(error) = KnownFileRepository::new(self.connection).upsert_password_hint(
+        if let Err(error) = KnownFileRepository::new(self.connection).upsert_hints(
             upsert.sample_hash,
             upsert.size,
-            name_offset,
             upsert.password_id,
+            upsert.confirmed_encoding,
         ) {
             DbTaskHistoryRecorder::warn("known_file upsert", error);
         }
@@ -689,15 +681,11 @@ impl KnownFileStore for DbKnownFileStore<'_> {
         if !self.writable {
             return;
         }
-        let name_offset = upsert.name.map(|name| NameOffset {
-            name: name.to_string(),
-            offset: upsert.offset,
-        });
-        if let Err(error) = KnownFileRepository::new(self.connection).upsert_confirmed_encoding(
+        if let Err(error) = KnownFileRepository::new(self.connection).upsert_hints(
             upsert.sample_hash,
             upsert.size,
-            name_offset,
-            upsert.encoding,
+            None,
+            Some(upsert.encoding),
         ) {
             DbTaskHistoryRecorder::warn("known_file confirmed encoding upsert", error);
         }

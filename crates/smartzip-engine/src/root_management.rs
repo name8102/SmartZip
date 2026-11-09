@@ -17,7 +17,7 @@ pub struct FileTaskSnapshot {
     pub root_id: NodeId,
     pub parent_id: Option<NodeId>,
     pub path: PathBuf,
-    pub depth: u8,
+    pub depth: usize,
     pub state: String,
     pub stage: String,
     pub progress: Option<f32>,
@@ -61,33 +61,34 @@ impl RootManagement {
     fn changed(&self) {
         self.revision.send_modify(|n| *n = n.wrapping_add(1));
     }
+    pub fn revision(&self) -> u64 {
+        *self.revision.borrow()
+    }
     pub fn snapshot(&self) -> Vec<FileTaskSnapshot> {
         let state = self.state.lock().unwrap();
+        let priority = |node: &FileTaskSnapshot| match node.state.as_str() {
+            "waiting_user" => 0,
+            "paused" => 1,
+            _ => 2,
+        };
+        let mut active_roots: HashMap<&NodeId, &FileTaskSnapshot> = HashMap::new();
+        for node in state.nodes.iter().filter(|n| {
+            matches!(
+                n.state.as_str(),
+                "running" | "paused" | "waiting_user" | "waiting_resources"
+            )
+        }) {
+            let active = active_roots.entry(&node.root_id).or_insert(node);
+            if priority(node) < priority(active) {
+                *active = node;
+            }
+        }
         let mut nodes = state.nodes.clone();
         for node in nodes
             .iter_mut()
             .filter(|n| n.parent_id.is_none() && n.root_outcome.is_none())
         {
-            let active = state
-                .nodes
-                .iter()
-                .filter(|n| {
-                    n.root_id == node.root_id
-                        && matches!(
-                            n.state.as_str(),
-                            "running" | "paused" | "waiting_user" | "waiting_resources"
-                        )
-                })
-                .min_by_key(|n| {
-                    if n.state == "waiting_user" {
-                        0
-                    } else if n.state == "paused" {
-                        1
-                    } else {
-                        2
-                    }
-                });
-            if let Some(active) = active {
+            if let Some(active) = active_roots.get(&node.root_id) {
                 let name = active
                     .path
                     .file_name()
@@ -139,6 +140,8 @@ impl RootManagement {
                 .into_iter()
                 .filter(|n| n.parent_id.is_none())
                 .collect();
+            drop(state);
+            self.changed();
         }
     }
     pub(crate) fn register(&self, identity: &ExtractTaskIdentity, cancellation: &TaskCancellation) {
@@ -648,6 +651,50 @@ impl ExecutionControl for ManagedRecorder<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn snapshot_prefers_waiting_user_then_paused_and_keeps_first_equal_priority() {
+        let identity = ExtractTaskIdentity::new(&["a.zip".into(), "b.zip".into()]);
+        let management = RootManagement::default();
+        management.register(&identity, &TaskCancellation::new(CancellationToken::new()));
+        let revision = management.revision();
+        let root = &identity.roots[0];
+        let mut state = management.state.lock().unwrap();
+        for (name, status) in [
+            ("running.zip", "running"),
+            ("paused.zip", "paused"),
+            ("first.zip", "waiting_user"),
+            ("second.zip", "waiting_user"),
+        ] {
+            let id = NodeId::new();
+            let mut child = node_snapshot(
+                &id,
+                &root.root_id,
+                Some(root.node_id.clone()),
+                &crate::ExtractionCandidate::root(name.into()),
+            );
+            child.state = status.into();
+            state.nodes.push(child);
+        }
+        drop(state);
+        management.changed();
+        assert_ne!(management.revision(), revision);
+        let nodes = management.snapshot();
+        assert_eq!(nodes[0].root_activity.as_ref().unwrap().0, "waiting_user");
+        assert!(nodes[0]
+            .root_activity
+            .as_ref()
+            .unwrap()
+            .1
+            .starts_with("first.zip"));
+        assert!(nodes[1].root_activity.is_none());
+        let mut state = management.state.lock().unwrap();
+        state.nodes.retain(|n| n.state != "waiting_user");
+        drop(state);
+        assert_eq!(
+            management.snapshot()[0].root_activity.as_ref().unwrap().0,
+            "paused"
+        );
+    }
     #[test]
     fn recovered_child_keeps_committed_parent_visible_and_partial_outcome() {
         let parent = ExtractTaskIdentity::new(&["parent.zip".into()]);

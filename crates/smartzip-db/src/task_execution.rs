@@ -396,26 +396,18 @@ impl<'a> TaskExecutionRepository<'a> {
                 "UPDATE tasks SET status='running' WHERE id=?1 AND finished_at IS NULL",
                 params![task_id],
             )?;
-            let pending: i64 = tx.query_row(
-                "SELECT COUNT(*) FROM file_extractions WHERE task_id=?1 AND status='pending'",
+            let pending: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM file_extractions WHERE task_id=?1 AND status='pending')",
                 params![task_id],
                 |row| row.get(0),
             )?;
-            if pending == 0 {
-                let failed: i64 = tx.query_row(
-                    "SELECT COUNT(*) FROM file_extractions WHERE task_id=?1 AND status='failed'",
+            if !pending {
+                let (failed, succeeded, cancelled): (i64, i64, i64) = tx.query_row(
+                    "SELECT COALESCE(SUM(status='failed'), 0), \
+                     COALESCE(SUM(status='extracted'), 0), COALESCE(SUM(status='cancelled'), 0) \
+                     FROM file_extractions WHERE task_id=?1",
                     params![task_id],
-                    |row| row.get(0),
-                )?;
-                let succeeded: i64 = tx.query_row(
-                    "SELECT COUNT(*) FROM file_extractions WHERE task_id=?1 AND status='extracted'",
-                    params![task_id],
-                    |row| row.get(0),
-                )?;
-                let cancelled: i64 = tx.query_row(
-                    "SELECT COUNT(*) FROM file_extractions WHERE task_id=?1 AND status='cancelled'",
-                    params![task_id],
-                    |row| row.get(0),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )?;
                 let task_status = if cancelled > 0 {
                     "cancelled"
@@ -728,8 +720,7 @@ fn record_stage_event(
 ) -> Result<()> {
     tx.execute(
         "INSERT INTO task_events(task_id, level, event_type, message, node_id, stage, \
-         attempt_id, sequence) VALUES (?1, 'info', 'stage', ?2, ?3, ?4, ?5, \
-         (SELECT COALESCE(MAX(sequence), 0) + 1 FROM task_events WHERE task_id=?1))",
+         attempt_id) VALUES (?1, 'info', 'stage', ?2, ?3, ?4, ?5)",
         params![task_id, state, node_id, stage, attempt_id],
     )?;
     Ok(())

@@ -19,13 +19,7 @@ pub(crate) struct ArchiveBrowser {
 }
 
 impl ArchiveBrowser {
-    pub(crate) fn new(entries: Vec<ArchiveEntry>) -> Result<Self, String> {
-        for entry in &entries {
-            if entry.is_dir && matches!(entry.path.as_str(), "." | "./") {
-                continue;
-            }
-            validate_member_path(&entry.path)?;
-        }
+    pub(crate) fn new(entries: Vec<ArchiveEntry>) -> Self {
         type Siblings = BTreeMap<(String, bool), Vec<ArchiveChild>>;
         let mut directories: BTreeMap<Vec<String>, Siblings> = BTreeMap::new();
         for entry in entries {
@@ -56,7 +50,7 @@ impl ArchiveBrowser {
                 }
             }
         }
-        Ok(Self {
+        Self {
             directories: directories
                 .into_iter()
                 .map(|(path, grouped)| {
@@ -65,7 +59,7 @@ impl ArchiveBrowser {
                     (path, children)
                 })
                 .collect(),
-        })
+        }
     }
     pub(crate) fn children(&self, directory: &[String]) -> Vec<ArchiveChild> {
         self.directories.get(directory).cloned().unwrap_or_default()
@@ -75,34 +69,14 @@ impl ArchiveBrowser {
     }
 }
 
-fn validate_member_path(path: &str) -> Result<(), String> {
-    if member_parts(path).is_some() {
-        Ok(())
-    } else {
-        Err(format!("unsafe archive member path: {path:?}"))
-    }
-}
+// This is a read-only display hierarchy, not a filesystem path. Keep the original
+// selector on files; member reads and extraction validate paths at their own boundary.
 fn member_parts(path: &str) -> Option<Vec<&str>> {
-    if path.is_empty() || path.contains('\0') || path.contains('\\') {
-        return None;
-    }
-    let mut path = path;
-    while let Some(stripped) = path.strip_prefix("./") {
-        path = stripped;
-    }
-    let path = path.strip_suffix('/').unwrap_or(path);
-    if path.is_empty() || path.starts_with('/') {
-        return None;
-    }
-    let parts: Vec<_> = path.split('/').collect();
-    if parts.first().is_some_and(|part| part.contains(':'))
-        || parts
-            .iter()
-            .any(|part| part.is_empty() || *part == ".." || *part == ".")
-    {
-        return None;
-    }
-    Some(parts)
+    let parts: Vec<_> = path
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect();
+    (!parts.is_empty()).then_some(parts)
 }
 
 #[cfg(test)]
@@ -122,8 +96,7 @@ mod tests {
             entry("nested/file.txt", false),
             entry("nested/deep/image.png", false),
             entry("empty/", true),
-        ])
-        .unwrap();
+        ]);
         let root = browser.children(&[]);
         assert_eq!(
             root.iter()
@@ -137,20 +110,18 @@ mod tests {
         );
     }
     #[test]
-    fn rejects_unsafe_paths_without_normalizing_them() {
+    fn read_only_browser_preserves_unusual_member_selectors() {
         for path in [
             "../secret",
             "/absolute",
             "a/../b",
             "a\\b",
             "a//b",
-            "",
             "C:/archive.txt",
         ] {
-            assert!(
-                ArchiveBrowser::new(vec![entry(path, false)]).is_err(),
-                "{path}"
-            );
+            let browser = ArchiveBrowser::new(vec![entry(path, false)]);
+            let parts = ArchiveBrowser::path_parts(path).unwrap();
+            assert_eq!(browser.children(&parts[..parts.len() - 1])[0].path, path);
         }
     }
     #[test]
@@ -158,8 +129,7 @@ mod tests {
         let browser = ArchiveBrowser::new(vec![
             entry("./", true),
             entry("./folder/file name.txt", false),
-        ])
-        .unwrap();
+        ]);
         assert_eq!(browser.children(&[])[0].name, "folder");
         assert_eq!(
             browser.children(&["folder".into()])[0].path,
@@ -172,8 +142,7 @@ mod tests {
             entry("same", false),
             entry("same", false),
             entry("same/child", false),
-        ])
-        .unwrap();
+        ]);
         assert_eq!(browser.children(&[]).len(), 3);
         assert!(browser.children(&[]).iter().any(|child| child.is_dir));
         assert_eq!(browser.children(&["same".into()])[0].path, "same/child");

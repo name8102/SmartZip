@@ -194,14 +194,12 @@ impl View {
                             .collect()
                     })
                     .unwrap_or_default();
-                crate::archive_browser::ArchiveBrowser::new(entries).map(std::sync::Arc::new)
+                std::sync::Arc::new(crate::archive_browser::ArchiveBrowser::new(entries))
             });
         }
         let query = self.archive_search.read(cx).value().to_lowercase();
         let browser = id.and_then(|id| self.archive_cache.get(&id));
-        let error = browser.and_then(|r| r.as_ref().err()).cloned();
         let mut rows = browser
-            .and_then(|r| r.as_ref().ok())
             .map(|b| b.children(&self.archive_dir))
             .unwrap_or_default();
         rows.retain(|r| query.is_empty() || r.name.to_lowercase().contains(&query));
@@ -222,13 +220,10 @@ impl View {
                 archive: job.request.paths.first()?.clone(),
                 member: PathBuf::new(),
                 backend: job.backend.clone(),
-                config: resolved.values.backends.clone(),
+                router: job.backend_router.clone()?,
                 allow_password: resolved.values.passwords.mode
                     != smartzip_config::PasswordMode::Off,
-                max_bytes: match resolved.values.limits.max_output_bytes {
-                    0 => 8 * 1024 * 1024,
-                    n => n.min(8 * 1024 * 1024) as usize,
-                },
+                max_bytes: 0,
                 encoding: result
                     .get("encoding")
                     .and_then(|v| v.as_str())
@@ -246,7 +241,7 @@ impl View {
             .map(|j| (j.id, j.name()))
             .collect();
         let active = phase.is_some_and(|p| p.active() || p == Phase::Queued);
-        let ready = browser.is_some_and(|result| result.is_ok());
+        let ready = browser.is_some();
         let wide = window.viewport_size().width >= px(1050.);
         let root = div()
             .id("preview-page")
@@ -561,16 +556,6 @@ impl View {
             })
             .when(active, |el| {
                 el.child(Progress::new("listing-progress").loading(true))
-            })
-            .when_some(error, |el, error| {
-                el.child(
-                    div()
-                        .px_3()
-                        .py_2()
-                        .text_base()
-                        .text_color(cx.theme().danger)
-                        .child(error),
-                )
             })
             .child(operation_results)
             .when(ready, |el| el.child(navigation))

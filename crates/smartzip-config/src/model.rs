@@ -4,8 +4,7 @@ use std::path::{Path, PathBuf};
 
 pub const SCHEMA_VERSION: u32 = 1;
 pub const DEFAULTS_VERSION: u32 = 1;
-pub const DEFAULT_RECURSION_DEPTH: u8 = 3;
-pub const DEFAULT_PASSWORD_LIMIT: usize = 128;
+pub const DEFAULT_PASSWORD_LIMIT: usize = 0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -133,13 +132,13 @@ pub enum LogLevel {
 #[serde(default, deny_unknown_fields)]
 pub struct Recursion {
     pub enabled: bool,
-    pub max_depth: u8,
+    pub max_depth: Option<usize>,
 }
 impl Default for Recursion {
     fn default() -> Self {
         Self {
             enabled: true,
-            max_depth: DEFAULT_RECURSION_DEPTH,
+            max_depth: None,
         }
     }
 }

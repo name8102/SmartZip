@@ -426,8 +426,6 @@ pub(crate) async fn list_archive_with_listener_interactive(
                 crate::history::KnownFileEncodingUpsert {
                     sample_hash: hash,
                     size,
-                    name: resolved.recorder_name.as_deref(),
-                    offset: candidate.embedded_offset.map(|o| o as i64),
                     encoding,
                 },
             );

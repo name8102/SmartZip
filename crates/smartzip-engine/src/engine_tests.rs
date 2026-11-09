@@ -96,7 +96,7 @@ fn detects_empty_file_without_findings() {
 }
 
 #[test]
-fn explicit_root_scan_is_full_while_nested_defaults_stay_bounded() {
+fn default_scans_have_no_implicit_byte_or_finding_limit() {
     let nested = ScannerConfig::default();
     let root = full_root_scanner_config(&nested);
 
@@ -104,7 +104,8 @@ fn explicit_root_scan_is_full_while_nested_defaults_stay_bounded() {
     assert_eq!(root.max_scan_bytes, None);
     assert_eq!(root.max_findings, usize::MAX);
     assert_eq!(nested.mode, ScanMode::Fast);
-    assert_eq!(nested.max_scan_bytes, Some(64 * 1024 * 1024));
+    assert_eq!(nested.max_scan_bytes, None);
+    assert_eq!(nested.max_findings, usize::MAX);
 }
 
 #[test]
@@ -118,7 +119,10 @@ fn root_scan_enqueues_every_eligible_finding_with_unique_output() {
         embedded_offset: None,
         embedded_size: None,
     };
-    let policy = smartzip_core::EmbeddedScanPolicy::default();
+    let policy = smartzip_core::EmbeddedScanPolicy {
+        min_finding_size_bytes: 100,
+        ..Default::default()
+    };
     let findings = vec![
         EmbeddedArchiveFinding {
             offset: 100,
@@ -190,7 +194,7 @@ async fn embedded_ask_without_prompter_skips_archive() {
             ExtractWorkflowRequest {
                 inputs: vec![archive],
                 output_dir: output.path().to_path_buf(),
-                recursion_limit: 1,
+                recursion_limit: Some(1),
                 encoding_mode: EncodingMode::Auto,
                 scanner: ScannerConfig::default(),
                 password_candidates: PasswordCandidateRequest {
@@ -201,7 +205,6 @@ async fn embedded_ask_without_prompter_skips_archive() {
                 single_root_name_policy: Default::default(),
                 embedded_scan_mode: smartzip_core::EmbeddedScanMode::Ask,
                 dominant_min_ratio: 0.70,
-                confirm_large_scan: false,
                 force: false,
                 limits: Default::default(),
             },
@@ -354,7 +357,7 @@ async fn recursive_extract_enqueues_nested_archives_and_skips_non_first_volume()
             ExtractWorkflowRequest {
                 inputs: vec![input.clone(), root.join("skip.part2.rar")],
                 output_dir: output.clone(),
-                recursion_limit: 2,
+                recursion_limit: Some(2),
                 encoding_mode: EncodingMode::Auto,
                 scanner: ScannerConfig::default(),
                 password_candidates: PasswordCandidateRequest {
@@ -365,7 +368,6 @@ async fn recursive_extract_enqueues_nested_archives_and_skips_non_first_volume()
                 single_root_name_policy: crate::layout::SingleRootNamePolicy::default(),
                 embedded_scan_mode: smartzip_core::EmbeddedScanMode::default(),
                 dominant_min_ratio: 0.70,
-                confirm_large_scan: false,
                 force: false,
                 limits: Default::default(),
             },
@@ -438,7 +440,7 @@ async fn extract_fails_when_output_target_already_exists() {
             ExtractWorkflowRequest {
                 inputs: vec![input.clone()],
                 output_dir: output,
-                recursion_limit: 1,
+                recursion_limit: Some(1),
                 encoding_mode: EncodingMode::Auto,
                 scanner: ScannerConfig::default(),
                 password_candidates: PasswordCandidateRequest::default(),
@@ -446,7 +448,6 @@ async fn extract_fails_when_output_target_already_exists() {
                 single_root_name_policy: crate::layout::SingleRootNamePolicy::default(),
                 embedded_scan_mode: smartzip_core::EmbeddedScanMode::default(),
                 dominant_min_ratio: 0.70,
-                confirm_large_scan: false,
                 force: false,
                 limits: Default::default(),
             },
@@ -528,7 +529,7 @@ async fn extract_keeps_other_archives_moving_while_prompt_waits() {
             ExtractWorkflowRequest {
                 inputs: vec![conflict.clone(), other.clone()],
                 output_dir: output,
-                recursion_limit: 1,
+                recursion_limit: Some(1),
                 encoding_mode: EncodingMode::Auto,
                 scanner: ScannerConfig::default(),
                 password_candidates: PasswordCandidateRequest::default(),
@@ -536,7 +537,6 @@ async fn extract_keeps_other_archives_moving_while_prompt_waits() {
                 single_root_name_policy: crate::layout::SingleRootNamePolicy::default(),
                 embedded_scan_mode: smartzip_core::EmbeddedScanMode::default(),
                 dominant_min_ratio: 0.70,
-                confirm_large_scan: false,
                 force: false,
                 limits: Default::default(),
             },
@@ -652,7 +652,7 @@ async fn extraction_preserves_encoding_without_full_test_prepass() {
             ExtractWorkflowRequest {
                 inputs: vec![input.clone()],
                 output_dir: output,
-                recursion_limit: 0,
+                recursion_limit: Some(0),
                 encoding_mode: EncodingMode::Override("gbk".into()),
                 scanner: ScannerConfig::default(),
                 password_candidates: PasswordCandidateRequest::default(),
@@ -660,7 +660,6 @@ async fn extraction_preserves_encoding_without_full_test_prepass() {
                 single_root_name_policy: crate::layout::SingleRootNamePolicy::default(),
                 embedded_scan_mode: smartzip_core::EmbeddedScanMode::default(),
                 dominant_min_ratio: 0.70,
-                confirm_large_scan: false,
                 force: false,
                 limits: Default::default(),
             },
@@ -1113,7 +1112,7 @@ async fn stop_on_error_cancels_other_roots_waiting_for_backend_capacity() {
         .resolve_request(ExtractWorkflowRequest {
             inputs: inputs.clone(),
             output_dir: root.path().join("out"),
-            recursion_limit: 0,
+            recursion_limit: Some(0),
             encoding_mode: EncodingMode::Auto,
             scanner: ScannerConfig::default(),
             password_candidates: PasswordCandidateRequest {
@@ -1124,7 +1123,6 @@ async fn stop_on_error_cancels_other_roots_waiting_for_backend_capacity() {
             single_root_name_policy: Default::default(),
             embedded_scan_mode: smartzip_core::EmbeddedScanMode::default(),
             dominant_min_ratio: 0.7,
-            confirm_large_scan: false,
             force: false,
             limits: Default::default(),
         })
@@ -1244,7 +1242,7 @@ async fn stop_on_error_finishes_waiting_nested_node_without_rewriting_its_root()
     let mut config = smartzip_config::SmartZipConfig::default();
     config.extraction.on_error = smartzip_config::OnError::Stop;
     config.extraction.recursion.enabled = true;
-    config.extraction.recursion.max_depth = 1;
+    config.extraction.recursion.max_depth = Some(1);
     config.extraction.embedded.root = smartzip_config::RootScan::Off;
     config.extraction.embedded.nested = smartzip_config::NestedScan::Off;
     let policy = crate::CompiledRunPolicy::compile(smartzip_config::ResolvedConfig {
@@ -1258,7 +1256,7 @@ async fn stop_on_error_finishes_waiting_nested_node_without_rewriting_its_root()
         .resolve_request(ExtractWorkflowRequest {
             inputs: inputs.clone(),
             output_dir: root.path().join("out"),
-            recursion_limit: 1,
+            recursion_limit: Some(1),
             encoding_mode: EncodingMode::Auto,
             scanner: ScannerConfig::default(),
             password_candidates: PasswordCandidateRequest {
@@ -1269,7 +1267,6 @@ async fn stop_on_error_finishes_waiting_nested_node_without_rewriting_its_root()
             single_root_name_policy: Default::default(),
             embedded_scan_mode: smartzip_core::EmbeddedScanMode::default(),
             dominant_min_ratio: 0.7,
-            confirm_large_scan: false,
             force: false,
             limits: Default::default(),
         })
@@ -1363,7 +1360,7 @@ async fn stop_on_error_finishes_a_root_whose_scan_is_running() {
         .resolve_request(ExtractWorkflowRequest {
             inputs: inputs.clone(),
             output_dir: root.path().join("out"),
-            recursion_limit: 0,
+            recursion_limit: Some(0),
             encoding_mode: EncodingMode::Auto,
             scanner: ScannerConfig::default(),
             password_candidates: PasswordCandidateRequest {
@@ -1374,7 +1371,6 @@ async fn stop_on_error_finishes_a_root_whose_scan_is_running() {
             single_root_name_policy: Default::default(),
             embedded_scan_mode: smartzip_core::EmbeddedScanMode::default(),
             dominant_min_ratio: 0.7,
-            confirm_large_scan: false,
             force: false,
             limits: Default::default(),
         })
@@ -1462,7 +1458,7 @@ async fn backend_failures_do_not_record_password_failures() {
             ExtractWorkflowRequest {
                 inputs: vec![input],
                 output_dir: output,
-                recursion_limit: 0,
+                recursion_limit: Some(0),
                 encoding_mode: EncodingMode::Auto,
                 scanner: ScannerConfig::default(),
                 password_candidates: PasswordCandidateRequest {
@@ -1473,7 +1469,6 @@ async fn backend_failures_do_not_record_password_failures() {
                 single_root_name_policy: crate::layout::SingleRootNamePolicy::default(),
                 embedded_scan_mode: smartzip_core::EmbeddedScanMode::default(),
                 dominant_min_ratio: 0.70,
-                confirm_large_scan: false,
                 force: false,
                 limits: Default::default(),
             },
@@ -1734,7 +1729,7 @@ async fn interactive_password_is_reused_for_later_files_in_same_batch() {
             ExtractWorkflowRequest {
                 inputs: vec![first, second],
                 output_dir: root.path().join("out"),
-                recursion_limit: 0,
+                recursion_limit: Some(0),
                 encoding_mode: EncodingMode::Auto,
                 scanner: ScannerConfig::default(),
                 password_candidates: PasswordCandidateRequest {
@@ -1745,7 +1740,6 @@ async fn interactive_password_is_reused_for_later_files_in_same_batch() {
                 single_root_name_policy: Default::default(),
                 embedded_scan_mode: smartzip_core::EmbeddedScanMode::default(),
                 dominant_min_ratio: 0.70,
-                confirm_large_scan: false,
                 force: false,
                 limits: Default::default(),
             },
@@ -1867,7 +1861,7 @@ async fn cancellation_after_publish_keeps_committed_success() {
     let request = ExtractWorkflowRequest {
         inputs: vec![archive],
         output_dir: output,
-        recursion_limit: 0,
+        recursion_limit: Some(0),
         encoding_mode: EncodingMode::Auto,
         scanner: ScannerConfig::default(),
         password_candidates: PasswordCandidateRequest {
@@ -1878,7 +1872,6 @@ async fn cancellation_after_publish_keeps_committed_success() {
         single_root_name_policy: Default::default(),
         embedded_scan_mode: smartzip_core::EmbeddedScanMode::default(),
         dominant_min_ratio: 0.70,
-        confirm_large_scan: false,
         force: false,
         limits: Default::default(),
     };
@@ -1945,7 +1938,7 @@ async fn extract_via_real_seven_zip_with_smart_output() {
             ExtractWorkflowRequest {
                 inputs: vec![archive.clone()],
                 output_dir: output.clone(),
-                recursion_limit: 1,
+                recursion_limit: Some(1),
                 encoding_mode: EncodingMode::Auto,
                 scanner: ScannerConfig::default(),
                 password_candidates: PasswordCandidateRequest::default(),
@@ -1953,7 +1946,6 @@ async fn extract_via_real_seven_zip_with_smart_output() {
                 single_root_name_policy: crate::layout::SingleRootNamePolicy::default(),
                 embedded_scan_mode: smartzip_core::EmbeddedScanMode::default(),
                 dominant_min_ratio: 0.70,
-                confirm_large_scan: false,
                 force: false,
                 limits: Default::default(),
             },
@@ -2021,7 +2013,7 @@ async fn embedded_archive_is_carved_before_extraction_and_recurses() {
             ExtractWorkflowRequest {
                 inputs: vec![disguised.clone()],
                 output_dir: output.clone(),
-                recursion_limit: 2,
+                recursion_limit: Some(2),
                 encoding_mode: EncodingMode::Auto,
                 scanner: ScannerConfig::default(),
                 password_candidates: PasswordCandidateRequest::default(),
@@ -2029,7 +2021,6 @@ async fn embedded_archive_is_carved_before_extraction_and_recurses() {
                 single_root_name_policy: crate::layout::SingleRootNamePolicy::default(),
                 embedded_scan_mode: smartzip_core::EmbeddedScanMode::Aggressive,
                 dominant_min_ratio: 0.70,
-                confirm_large_scan: false,
                 force: false,
                 limits: Default::default(),
             },
@@ -2365,7 +2356,7 @@ async fn configured_cleanup_keep_never_calls_recycler_and_policy_is_a_snapshot()
     let mut resolved = smartzip_config::ResolvedConfig::load(None).unwrap();
     let c = &mut resolved.values;
     c.state.mode = smartzip_config::StateMode::Off;
-    c.extraction.recursion.max_depth = 1;
+    c.extraction.recursion.max_depth = Some(1);
     c.extraction.embedded.root = smartzip_config::RootScan::Off;
     c.extraction.embedded.nested = smartzip_config::NestedScan::Off;
     c.extraction.volumes.auto_discover = false;
@@ -2397,7 +2388,7 @@ async fn configured_cleanup_keep_never_calls_recycler_and_policy_is_a_snapshot()
             ExtractWorkflowRequest {
                 inputs: vec![input.clone()],
                 output_dir: root.path().join("out"),
-                recursion_limit: 0,
+                recursion_limit: Some(0),
                 encoding_mode: EncodingMode::Auto,
                 scanner: ScannerConfig::default(),
                 password_candidates: PasswordCandidateRequest::default(),
@@ -2405,7 +2396,6 @@ async fn configured_cleanup_keep_never_calls_recycler_and_policy_is_a_snapshot()
                 single_root_name_policy: crate::layout::SingleRootNamePolicy::default(),
                 embedded_scan_mode: smartzip_core::EmbeddedScanMode::Auto,
                 dominant_min_ratio: 0.7,
-                confirm_large_scan: false,
                 force: false,
                 limits: Default::default(),
             },
@@ -2644,7 +2634,7 @@ async fn multi_input_starts_extracting_before_scanning_the_entire_batch() {
             ExtractWorkflowRequest {
                 inputs,
                 output_dir: root.path().join("out"),
-                recursion_limit: 0,
+                recursion_limit: Some(0),
                 encoding_mode: EncodingMode::Override("UTF-8".into()),
                 scanner: ScannerConfig::default(),
                 password_candidates: PasswordCandidateRequest {
@@ -2655,7 +2645,6 @@ async fn multi_input_starts_extracting_before_scanning_the_entire_batch() {
                 single_root_name_policy: Default::default(),
                 embedded_scan_mode: Default::default(),
                 dominant_min_ratio: 0.7,
-                confirm_large_scan: false,
                 force: false,
                 limits: Default::default(),
             },
@@ -2727,7 +2716,7 @@ async fn stateless_embedded_inputs_extract_before_scanning_later_carriers() {
             ExtractWorkflowRequest {
                 inputs,
                 output_dir: root.path().join("out"),
-                recursion_limit: 0,
+                recursion_limit: Some(0),
                 encoding_mode: EncodingMode::Override("UTF-8".into()),
                 scanner: ScannerConfig::default(),
                 password_candidates: PasswordCandidateRequest {
@@ -2738,7 +2727,6 @@ async fn stateless_embedded_inputs_extract_before_scanning_later_carriers() {
                 single_root_name_policy: Default::default(),
                 embedded_scan_mode: Default::default(),
                 dominant_min_ratio: 0.7,
-                confirm_large_scan: false,
                 force: false,
                 limits: Default::default(),
             },
@@ -2760,3 +2748,40 @@ async fn stateless_embedded_inputs_extract_before_scanning_later_carriers() {
 }
 
 mod execution_cleanup;
+
+#[tokio::test]
+async fn listing_resolves_auto_encoding_before_the_only_backend_list() {
+    let backend = EmbeddedAwareFakeBackend::default();
+    let db = SmartZipDb::in_memory().unwrap();
+    let passwords = PasswordService::new(PasswordRepository::new(db.connection()));
+    let result = SmartZipEngine::default()
+        .list_archive_with_listener_interactive(
+            &backend,
+            &passwords,
+            ListArchiveRequest {
+                path: fixture_path("enc_utf8.zip"),
+                scanner: ScannerConfig::default(),
+                encoding_mode: EncodingMode::Auto,
+                password_candidates: PasswordCandidateRequest::default(),
+            },
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(backend.list_calls.lock().unwrap().len(), 1);
+    assert_eq!(result.encoding.to_ascii_lowercase(), "utf-8");
+}
+
+#[cfg(unix)]
+#[test]
+fn candidate_keys_preserve_non_utf8_path_identity() {
+    use std::os::unix::ffi::OsStringExt;
+    let first =
+        ExtractionCandidate::root(std::ffi::OsString::from_vec(b"a\xff.zip".to_vec()).into());
+    let second =
+        ExtractionCandidate::root(std::ffi::OsString::from_vec(b"a\xfe.zip".to_vec()).into());
+    assert_ne!(candidate_key(&first), candidate_key(&second));
+}

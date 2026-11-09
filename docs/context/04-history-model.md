@@ -8,7 +8,7 @@
 | **ExecutionControl** | 主动执行控制接口，负责阶段准入、用户决定与持久化提交。与 best-effort 历史观察职责分开。 |
 | **TaskOutcome** | 任务结束时交给 `finish()` 的聚合值。v3 精简为终态（completed/partial/failed/cancelled）+ 输出根路径；`encoding_selected` / `embedded_found` 等明细下沉到 `file_extractions`，不再作为 task 级聚合累积。 |
 | **sample_hash** | 内容采样指纹：`BLAKE3(前 64KB ‖ 后 64KB)` 与 `file_size` 联合判等；文件小于 128KB 时全量哈希。内嵌归档按其范围采样，范围未知时不参与去重。 |
-| **known_files** | `UNIQUE(sample_hash, size)` 复用索引，只保存精确密码记忆、人工确认编码和 name/offset 配对；成功解压事实只在 `file_extractions`。自动猜测不覆盖人工确认编码。 |
+| **known_files** | `UNIQUE(sample_hash, size)` 复用索引，只保存精确密码记忆、人工确认编码；成功解压事实只在 `file_extractions`。自动猜测不覆盖人工确认编码。 |
 
 ### 完整性校验（2026-09-05）
 
@@ -16,7 +16,9 @@
 - **TestArchiveReport**：一组一个报告，分开 integrity、coverage、password_status、confirmed_volumes、suspect_groups、missing/unreadable/unchecked 和带物理范围的依据。局部通过不代表整卷健康，候选组不能求交集得出确认坏卷。
 - **Diagnostic pass**：engine 在失败主测试后发起的独立只读阶段，ArchiveExecutor 至多选择一个不同实现家族的后端；仍尊重强制 `--backend`，普通 corruption fallback 规则保持不变。本地格式校验不经过外部后端路由。
 - `file_extractions.test_report_json` 保存完整报告；`damaged_volumes_json` 只投影 confirmed 路径。test 不更新 known_files，也不用首片 hash 表示整组。
-- DB **v5** 仅重建密码排名索引，完整匹配含 COALESCE 的排序。导入和批量禁用使用单事务；导入保留重复行计数、pin 和重新启用规则，输入/SQL 错误回滚整批。
-- 数据库只维护 v8 的 tasks/file_extractions/task_events、known_files、passwords 与 execution_owner 现行结构，直接建库；执行状态、节点身份、提交对账与累计资源预算使用同一模型。历史迁移链已删除。
+- 密码排名索引完整匹配含 COALESCE 的排序。导入和批量禁用使用单事务；导入保留重复行计数、pin 和重新启用规则，输入/SQL 错误回滚整批。
+- 数据库只维护 v9 的 tasks/file_extractions/task_events、known_files、passwords 与 execution_owner 现行结构，直接建库；执行状态、节点身份、提交对账与累计资源预算使用同一模型。历史迁移链已删除。
 - 解压预算默认不启用运行中检查，只在结束时做一次产出统计。显式限额才启动全树/磁盘检查，在阻塞工作线程运行且每个 monitor 仅一个检查在途；取消或后端结束先等待检查与后端回收，成功后做全新终检并返回累计 Usage。轮询是检查点预算，不是逐字节硬配额。
 - 外部 test 非零退出可返回 `TestResult { ok: false, diagnostics }` 保留证据；调用者必须检查 ok。解压直接尝试隔离输出，不额外进行完整 test 预检；密码/损坏歧义不记密码失败统计。
+
+- `task_events.id` 是唯一事件顺序，不再维护任务内 sequence 或按时间戳重排。`known_files` 只在有密码/确认编码提示时写入，一次 UPSERT 合并两种提示；无提示的成功只记录在 `file_extractions`。

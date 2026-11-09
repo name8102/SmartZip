@@ -15,7 +15,6 @@ mod unix {
         sync::mpsc::Sender,
         time::{Duration, Instant},
     };
-    const MAX_MESSAGE: u64 = 1024 * 1024;
     #[derive(serde::Serialize, serde::Deserialize)]
     struct Message {
         paths: Vec<Vec<u8>>,
@@ -46,13 +45,11 @@ mod unix {
         let mut size = [0; 8];
         stream.read_exact(&mut size)?;
         let length = u64::from_be_bytes(size);
-        if length > MAX_MESSAGE {
-            return Err(io::Error::other("打开请求过大"));
-        }
-        let mut data = vec![0; length as usize];
+        let length = usize::try_from(length).map_err(|_| io::Error::other("打开请求长度无效"))?;
+        let mut data = vec![0; length];
         stream.read_exact(&mut data)?;
         let m: Message = serde_json::from_slice(&data).map_err(io::Error::other)?;
-        if m.paths.len() > 1000 || m.paths.iter().any(|p| p.is_empty() || p.contains(&0)) {
+        if m.paths.iter().any(|p| p.is_empty() || p.contains(&0)) {
             return Err(io::Error::other("打开请求路径无效"));
         }
         Ok(OpenRequest {
@@ -120,9 +117,6 @@ mod unix {
             }
             Err(std::fs::TryLockError::WouldBlock) => {
                 let data = encode(request)?;
-                if data.len() as u64 > MAX_MESSAGE {
-                    return Err(io::Error::other("打开请求过大"));
-                }
                 let deadline = Instant::now() + Duration::from_secs(2);
                 let mut stream = loop {
                     match UnixStream::connect(&socket) {
@@ -148,6 +142,26 @@ mod unix {
     #[cfg(test)]
     mod tests {
         use super::*;
+        #[test]
+        fn large_open_requests_preserve_every_path() {
+            let request = OpenRequest {
+                paths: (0..1001)
+                    .map(|i| PathBuf::from(format!("/tmp/{}/{i}.zip", "a".repeat(512))))
+                    .collect(),
+                intent: OpenIntent::QuickExtract,
+            };
+            let data = encode(&request).unwrap();
+            assert!(data.len() > 1024 * 1024);
+            let (mut sender, mut receiver) = UnixStream::pair().unwrap();
+            let writer = std::thread::spawn(move || {
+                sender
+                    .write_all(&(data.len() as u64).to_be_bytes())
+                    .unwrap();
+                sender.write_all(&data).unwrap();
+            });
+            assert_eq!(receive(&mut receiver).unwrap(), request);
+            writer.join().unwrap();
+        }
         #[test]
         fn existing_instance_receives_literal_paths_and_intent() {
             let tmp = tempfile::tempdir().unwrap();

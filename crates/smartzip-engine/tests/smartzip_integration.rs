@@ -132,7 +132,7 @@ async fn test_extract_aes_zip_from_video_carrier_with_trailing_data() {
             ExtractWorkflowRequest {
                 inputs: vec![archive.clone()],
                 output_dir: output.path().to_path_buf(),
-                recursion_limit: 0,
+                recursion_limit: Some(0),
                 encoding_mode: EncodingMode::Auto,
                 scanner: ScannerConfig::default(),
                 password_candidates: PasswordCandidateRequest {
@@ -143,7 +143,6 @@ async fn test_extract_aes_zip_from_video_carrier_with_trailing_data() {
                 single_root_name_policy: Default::default(),
                 embedded_scan_mode: smartzip_core::EmbeddedScanMode::Largest,
                 dominant_min_ratio: 0.70,
-                confirm_large_scan: false,
                 force: false,
                 limits: Default::default(),
             },
@@ -506,7 +505,7 @@ async fn test_TDD_tar_gz_name_equivalent_to_inner_tar_collision() {
             ExtractWorkflowRequest {
                 inputs: vec![archive.clone()],
                 output_dir: output.path().to_path_buf(),
-                recursion_limit: 2,
+                recursion_limit: Some(2),
                 encoding_mode: EncodingMode::Auto,
                 scanner: ScannerConfig::default(),
                 password_candidates: PasswordCandidateRequest::default(),
@@ -514,7 +513,6 @@ async fn test_TDD_tar_gz_name_equivalent_to_inner_tar_collision() {
                 single_root_name_policy: Default::default(),
                 embedded_scan_mode: smartzip_core::EmbeddedScanMode::default(),
                 dominant_min_ratio: 0.70,
-                confirm_large_scan: false,
                 force: false,
                 limits: Default::default(),
             },
@@ -591,7 +589,7 @@ async fn test_TDD_zip_containing_tar_gz_three_level_collision() {
             ExtractWorkflowRequest {
                 inputs: vec![archive.clone()],
                 output_dir: output.path().to_path_buf(),
-                recursion_limit: 3,
+                recursion_limit: Some(3),
                 encoding_mode: EncodingMode::Auto,
                 scanner: ScannerConfig::default(),
                 password_candidates: PasswordCandidateRequest::default(),
@@ -599,7 +597,6 @@ async fn test_TDD_zip_containing_tar_gz_three_level_collision() {
                 single_root_name_policy: Default::default(),
                 embedded_scan_mode: smartzip_core::EmbeddedScanMode::default(),
                 dominant_min_ratio: 0.70,
-                confirm_large_scan: false,
                 force: false,
                 limits: Default::default(),
             },
@@ -671,7 +668,7 @@ async fn test_TDD_zip_inner_zip_single_file_path_collision() {
             ExtractWorkflowRequest {
                 inputs: vec![archive.clone()],
                 output_dir: output.path().to_path_buf(),
-                recursion_limit: 2,
+                recursion_limit: Some(2),
                 encoding_mode: EncodingMode::Auto,
                 scanner: ScannerConfig::default(),
                 password_candidates: PasswordCandidateRequest::default(),
@@ -679,7 +676,6 @@ async fn test_TDD_zip_inner_zip_single_file_path_collision() {
                 single_root_name_policy: Default::default(),
                 embedded_scan_mode: smartzip_core::EmbeddedScanMode::default(),
                 dominant_min_ratio: 0.70,
-                confirm_large_scan: false,
                 force: false,
                 limits: Default::default(),
             },
@@ -750,7 +746,7 @@ async fn test_TDD_tar_gz_name_equivalent_variant_collision() {
             ExtractWorkflowRequest {
                 inputs: vec![archive.clone()],
                 output_dir: output.path().to_path_buf(),
-                recursion_limit: 2,
+                recursion_limit: Some(2),
                 encoding_mode: EncodingMode::Auto,
                 scanner: ScannerConfig::default(),
                 password_candidates: PasswordCandidateRequest::default(),
@@ -758,7 +754,6 @@ async fn test_TDD_tar_gz_name_equivalent_variant_collision() {
                 single_root_name_policy: Default::default(),
                 embedded_scan_mode: smartzip_core::EmbeddedScanMode::default(),
                 dominant_min_ratio: 0.70,
-                confirm_large_scan: false,
                 force: false,
                 limits: Default::default(),
             },
@@ -823,7 +818,7 @@ async fn test_nested_archive_recycle_failure_warns_and_preserves_success() {
             ExtractWorkflowRequest {
                 inputs: vec![archive],
                 output_dir: output.path().to_path_buf(),
-                recursion_limit: 2,
+                recursion_limit: Some(2),
                 encoding_mode: EncodingMode::Auto,
                 scanner: ScannerConfig::default(),
                 password_candidates: PasswordCandidateRequest::default(),
@@ -831,7 +826,6 @@ async fn test_nested_archive_recycle_failure_warns_and_preserves_success() {
                 single_root_name_policy: Default::default(),
                 embedded_scan_mode: smartzip_core::EmbeddedScanMode::default(),
                 dominant_min_ratio: 0.70,
-                confirm_large_scan: false,
                 force: false,
                 limits: Default::default(),
             },
@@ -880,7 +874,7 @@ async fn test_engine_extract_simple_utf8() {
             ExtractWorkflowRequest {
                 inputs: vec![archive.clone()],
                 output_dir: output.path().to_path_buf(),
-                recursion_limit: 1,
+                recursion_limit: Some(1),
                 encoding_mode: EncodingMode::Auto,
                 scanner: ScannerConfig::default(),
                 password_candidates: PasswordCandidateRequest::default(),
@@ -888,7 +882,6 @@ async fn test_engine_extract_simple_utf8() {
                 single_root_name_policy: smartzip_engine::layout::SingleRootNamePolicy::default(),
                 embedded_scan_mode: smartzip_core::EmbeddedScanMode::default(),
                 dominant_min_ratio: 0.70,
-                confirm_large_scan: false,
                 force: false,
                 limits: Default::default(),
             },
@@ -935,7 +928,7 @@ async fn test_engine_extract_password_archive() {
             ExtractWorkflowRequest {
                 inputs: vec![archive.clone()],
                 output_dir: output.path().to_path_buf(),
-                recursion_limit: 1,
+                recursion_limit: Some(1),
                 encoding_mode: EncodingMode::Auto,
                 scanner: ScannerConfig::default(),
                 password_candidates: PasswordCandidateRequest::default(),
@@ -943,7 +936,6 @@ async fn test_engine_extract_password_archive() {
                 single_root_name_policy: smartzip_engine::layout::SingleRootNamePolicy::default(),
                 embedded_scan_mode: smartzip_core::EmbeddedScanMode::default(),
                 dominant_min_ratio: 0.70,
-                confirm_large_scan: false,
                 force: false,
                 limits: Default::default(),
             },
@@ -995,7 +987,7 @@ async fn test_engine_wrong_manual_password_is_not_saved_to_database() {
             ExtractWorkflowRequest {
                 inputs: vec![archive],
                 output_dir: output.path().to_path_buf(),
-                recursion_limit: 1,
+                recursion_limit: Some(1),
                 encoding_mode: EncodingMode::Auto,
                 scanner: ScannerConfig::default(),
                 password_candidates: PasswordCandidateRequest {
@@ -1006,7 +998,6 @@ async fn test_engine_wrong_manual_password_is_not_saved_to_database() {
                 single_root_name_policy: smartzip_engine::layout::SingleRootNamePolicy::default(),
                 embedded_scan_mode: smartzip_core::EmbeddedScanMode::default(),
                 dominant_min_ratio: 0.70,
-                confirm_large_scan: false,
                 force: false,
                 limits: Default::default(),
             },
@@ -1047,7 +1038,7 @@ async fn test_engine_successful_manual_password_is_saved_to_database() {
             ExtractWorkflowRequest {
                 inputs: vec![archive],
                 output_dir: output.path().to_path_buf(),
-                recursion_limit: 1,
+                recursion_limit: Some(1),
                 encoding_mode: EncodingMode::Auto,
                 scanner: ScannerConfig::default(),
                 password_candidates: PasswordCandidateRequest {
@@ -1058,7 +1049,6 @@ async fn test_engine_successful_manual_password_is_saved_to_database() {
                 single_root_name_policy: smartzip_engine::layout::SingleRootNamePolicy::default(),
                 embedded_scan_mode: smartzip_core::EmbeddedScanMode::default(),
                 dominant_min_ratio: 0.70,
-                confirm_large_scan: false,
                 force: false,
                 limits: Default::default(),
             },
@@ -1130,7 +1120,7 @@ async fn test_engine_interactive_password_reuses_carved_embedded_archive_path() 
             ExtractWorkflowRequest {
                 inputs: vec![archive.clone()],
                 output_dir: output.path().to_path_buf(),
-                recursion_limit: 1,
+                recursion_limit: Some(1),
                 encoding_mode: EncodingMode::Auto,
                 scanner: ScannerConfig::default(),
                 password_candidates: PasswordCandidateRequest {
@@ -1141,7 +1131,6 @@ async fn test_engine_interactive_password_reuses_carved_embedded_archive_path() 
                 single_root_name_policy: smartzip_engine::layout::SingleRootNamePolicy::default(),
                 embedded_scan_mode: smartzip_core::EmbeddedScanMode::default(),
                 dominant_min_ratio: 0.70,
-                confirm_large_scan: false,
                 force: false,
                 limits: Default::default(),
             },
@@ -1207,7 +1196,7 @@ async fn test_router_extracts_split_encrypted_zip_with_manual_password() {
                 ExtractWorkflowRequest {
                     inputs: vec![archive],
                     output_dir: output.path().to_path_buf(),
-                    recursion_limit: 0,
+                    recursion_limit: Some(0),
                     encoding_mode: EncodingMode::Auto,
                     scanner: ScannerConfig::default(),
                     password_candidates: PasswordCandidateRequest {
@@ -1219,7 +1208,6 @@ async fn test_router_extracts_split_encrypted_zip_with_manual_password() {
                     ),
                     embedded_scan_mode: smartzip_core::EmbeddedScanMode::default(),
                     dominant_min_ratio: 0.70,
-                    confirm_large_scan: false,
                     force: false,
                     limits: Default::default(),
                 },
@@ -1270,7 +1258,7 @@ async fn test_router_prompts_for_split_encrypted_zip_password_when_missing() {
             ExtractWorkflowRequest {
                 inputs: vec![archive],
                 output_dir: output.path().to_path_buf(),
-                recursion_limit: 0,
+                recursion_limit: Some(0),
                 encoding_mode: EncodingMode::Auto,
                 scanner: ScannerConfig::default(),
                 password_candidates: PasswordCandidateRequest {
@@ -1281,7 +1269,6 @@ async fn test_router_prompts_for_split_encrypted_zip_password_when_missing() {
                 single_root_name_policy: smartzip_engine::layout::SingleRootNamePolicy::default(),
                 embedded_scan_mode: smartzip_core::EmbeddedScanMode::default(),
                 dominant_min_ratio: 0.70,
-                confirm_large_scan: false,
                 force: false,
                 limits: Default::default(),
             },
@@ -1334,7 +1321,7 @@ async fn test_engine_respects_recursion_limit() {
             ExtractWorkflowRequest {
                 inputs: vec![archive.clone()],
                 output_dir: output.path().to_path_buf(),
-                recursion_limit: 1,
+                recursion_limit: Some(1),
                 encoding_mode: EncodingMode::Auto,
                 scanner: ScannerConfig::default(),
                 password_candidates: PasswordCandidateRequest::default(),
@@ -1342,7 +1329,6 @@ async fn test_engine_respects_recursion_limit() {
                 single_root_name_policy: smartzip_engine::layout::SingleRootNamePolicy::default(),
                 embedded_scan_mode: smartzip_core::EmbeddedScanMode::default(),
                 dominant_min_ratio: 0.70,
-                confirm_large_scan: false,
                 force: false,
                 limits: Default::default(),
             },
@@ -1363,24 +1349,16 @@ async fn test_engine_respects_recursion_limit() {
     );
 
     let workflow_result = result.unwrap();
-    // recursion_limit=1: depth 0 (outer zip) + depth 1 (L2.zip) = 2 processed.
-    // L3.zip at depth 2 is enqueued but skipped.
-    assert!(
-        workflow_result.processed.len() >= 1,
-        "should process at least the outer archive, got {:?}",
-        workflow_result
-            .processed
-            .iter()
-            .map(|c| c.path.display().to_string())
-            .collect::<Vec<_>>()
-    );
-    assert!(
-        workflow_result
-            .skipped
-            .iter()
-            .any(|c| c.path.ends_with("L3.zip")),
-        "L3.zip at depth 2 should be skipped due to recursion limit"
-    );
+    // Stop discovery at the configured depth rather than enqueueing work to skip later.
+    assert_eq!(workflow_result.processed.len(), 2);
+    assert!(workflow_result
+        .processed
+        .iter()
+        .all(|candidate| candidate.depth <= 1));
+    assert!(!workflow_result
+        .enqueued
+        .iter()
+        .any(|candidate| candidate.path.ends_with("L3.zip")));
 }
 
 #[tokio::test]
@@ -1401,7 +1379,7 @@ async fn test_engine_extracts_nested_multi_level_without_path_collision() {
             ExtractWorkflowRequest {
                 inputs: vec![archive.clone()],
                 output_dir: output.path().to_path_buf(),
-                recursion_limit: 3,
+                recursion_limit: Some(3),
                 encoding_mode: EncodingMode::Auto,
                 scanner: ScannerConfig::default(),
                 password_candidates: PasswordCandidateRequest::default(),
@@ -1409,7 +1387,6 @@ async fn test_engine_extracts_nested_multi_level_without_path_collision() {
                 single_root_name_policy: smartzip_engine::layout::SingleRootNamePolicy::default(),
                 embedded_scan_mode: smartzip_core::EmbeddedScanMode::default(),
                 dominant_min_ratio: 0.70,
-                confirm_large_scan: false,
                 force: false,
                 limits: Default::default(),
             },
@@ -1472,7 +1449,7 @@ async fn test_engine_reports_wrong_password_as_failure() {
             ExtractWorkflowRequest {
                 inputs: vec![archive.clone()],
                 output_dir: output.path().to_path_buf(),
-                recursion_limit: 1,
+                recursion_limit: Some(1),
                 encoding_mode: EncodingMode::Auto,
                 scanner: ScannerConfig::default(),
                 password_candidates: PasswordCandidateRequest {
@@ -1483,7 +1460,6 @@ async fn test_engine_reports_wrong_password_as_failure() {
                 single_root_name_policy: smartzip_engine::layout::SingleRootNamePolicy::default(),
                 embedded_scan_mode: smartzip_core::EmbeddedScanMode::default(),
                 dominant_min_ratio: 0.70,
-                confirm_large_scan: false,
                 force: false,
                 limits: Default::default(),
             },
@@ -1530,7 +1506,7 @@ async fn test_engine_preserves_nested_archive_paths() {
             ExtractWorkflowRequest {
                 inputs: vec![archive.clone()],
                 output_dir: output.path().to_path_buf(),
-                recursion_limit: 2,
+                recursion_limit: Some(2),
                 encoding_mode: EncodingMode::Auto,
                 scanner: ScannerConfig::default(),
                 password_candidates: PasswordCandidateRequest::default(),
@@ -1538,7 +1514,6 @@ async fn test_engine_preserves_nested_archive_paths() {
                 single_root_name_policy: smartzip_engine::layout::SingleRootNamePolicy::default(),
                 embedded_scan_mode: smartzip_core::EmbeddedScanMode::default(),
                 dominant_min_ratio: 0.70,
-                confirm_large_scan: false,
                 force: false,
                 limits: Default::default(),
             },
@@ -1767,7 +1742,7 @@ async fn ambiguous_volume_groups_use_first_successful_extraction() {
                 ExtractWorkflowRequest {
                     inputs: vec![seed],
                     output_dir: output.path().to_path_buf(),
-                    recursion_limit: 0,
+                    recursion_limit: Some(0),
                     encoding_mode: EncodingMode::Auto,
                     scanner: ScannerConfig::default(),
                     password_candidates: PasswordCandidateRequest {
@@ -1782,7 +1757,6 @@ async fn ambiguous_volume_groups_use_first_successful_extraction() {
                     single_root_name_policy: Default::default(),
                     embedded_scan_mode: Default::default(),
                     dominant_min_ratio: 0.7,
-                    confirm_large_scan: false,
                     force: false,
                     limits: smartzip_config::ExtractionLimits {
                         max_output_bytes: if limited { 1 } else { 20 * 1024 * 1024 },

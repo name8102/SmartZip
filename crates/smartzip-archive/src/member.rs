@@ -1,7 +1,7 @@
 //! Bounded, exact single-member reads. No filesystem materialization.
 use crate::{
     backend::ArchiveAdapter,
-    sevenzz::{parse_entries, validate_extraction_listing, SevenZipBackend},
+    sevenzz::{parse_entries, SevenZipBackend},
 };
 #[cfg(windows)]
 use process_wrap::tokio::JobObject;
@@ -22,6 +22,7 @@ pub struct MemberReadRequest {
     pub member: PathBuf,
     pub password: Option<String>,
     pub encoding: EncodingMode,
+    /// Maximum returned bytes; zero leaves the read unlimited.
     pub max_bytes: usize,
 }
 
@@ -31,8 +32,7 @@ fn safe_member(member: &Path) -> Result<PathBuf> {
     };
     let raw = member.to_str().ok_or_else(invalid)?;
     // Prevent list-file/selector syntax and ambiguous normalization, even with -spd.
-    if raw.len() > 4096
-        || raw.starts_with('@')
+    if raw.starts_with('@')
         || raw
             .chars()
             .any(|c| c.is_control() || matches!(c, '*' | '?' | '\\'))
@@ -61,7 +61,7 @@ async fn bounded_read(
         if count == 0 {
             return Ok(bytes);
         }
-        if count > limit.saturating_sub(bytes.len()) {
+        if limit != 0 && count > limit.saturating_sub(bytes.len()) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::FileTooLarge,
                 "member read limit exceeded",
@@ -76,7 +76,6 @@ async fn run_bytes(
     args: &[std::ffi::OsString],
     limit: usize,
     token: &CancellationToken,
-    deadline: tokio::time::Instant,
 ) -> Result<Vec<u8>> {
     if token.is_cancelled() {
         return Err(SmartZipError::Cancelled);
@@ -103,7 +102,6 @@ async fn run_bytes(
     // before killing and reaping the complete process group.
     let result = tokio::select! { biased;
         _=token.cancelled()=>Err(SmartZipError::Cancelled),
-        _=tokio::time::sleep_until(deadline)=>Err(SmartZipError::ResourceLimit { detail:"member preview exceeded 30 seconds".into() }),
         result=async {
             let mut sink = tokio::io::sink();
             let (bytes,_,status)=tokio::try_join!(bounded_read(stdout,limit),tokio::io::copy(&mut stderr,&mut sink),child.wait())
@@ -127,13 +125,7 @@ pub(crate) async fn read_member(
     if token.is_cancelled() {
         return Err(SmartZipError::Cancelled);
     }
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
     let member = safe_member(&request.member)?;
-    if request.max_bytes == 0 || request.max_bytes > 32 * 1024 * 1024 {
-        return Err(SmartZipError::ResourceLimit {
-            detail: "member preview limit must be within 1..=32 MiB".into(),
-        });
-    }
     let volumes = crate::volumes::VolumeSet::collect(&request.archive)
         .map_err(|e| SmartZipError::io(Some(request.archive.clone()), e))?;
     if volumes.family != crate::volumes::VolumeFamily::Single || volumes.members.len() != 1 {
@@ -161,15 +153,7 @@ pub(crate) async fn read_member(
     args.extend(common.clone());
     args.push("--".into());
     args.push(archive.as_os_str().into());
-    let listing = run_bytes(
-        executable,
-        adapter.id(),
-        &args,
-        4 * 1024 * 1024,
-        &token,
-        deadline,
-    )
-    .await?;
+    let listing = run_bytes(executable, adapter.id(), &args, 0, &token).await?;
     let listing = match std::str::from_utf8(&listing) {
         Ok(text) => std::borrow::Cow::Borrowed(text),
         Err(_) if matches!(request.encoding, EncodingMode::Override(_)) => {
@@ -183,29 +167,9 @@ pub(crate) async fn read_member(
         }
     };
     let listing = listing.as_ref();
-    validate_extraction_listing(listing)?;
-    // Preview returns one regular member's bytes; extracting links is a separate operation.
-    if listing.lines().any(|line| {
-        line.strip_prefix("Symbolic Link = ")
-            .is_some_and(|value| !value.is_empty())
-            || line
-                .strip_prefix("Hard Link = ")
-                .is_some_and(|value| !value.is_empty())
-            || line
-                .strip_prefix("Attributes = ")
-                .is_some_and(|attributes| {
-                    attributes
-                        .split_whitespace()
-                        .any(|a| a.starts_with('l') && a.len() == 10)
-                })
-    }) {
-        return Err(SmartZipError::UnsafeArchivePath {
-            entry: "member preview contains a link".into(),
-        });
-    }
     let entries = parse_entries(listing);
     if let Some(bytes) =
-        crate::decoded_zip::read_member_if_needed(&request, entries.len(), &token, deadline).await?
+        crate::decoded_zip::read_member_if_needed(&request, entries.len(), &token).await?
     {
         return Ok(bytes);
     }
@@ -219,15 +183,15 @@ pub(crate) async fn read_member(
             detail: "member is absent or ambiguous".into(),
         });
     }
-    if matches[0].is_dir {
+    if matches[0].is_dir || selected_member_is_link(listing, &member) {
         return Err(SmartZipError::UnsupportedFormat {
             path: request.archive,
-            format: Some("directory member".into()),
+            format: Some("directory or link member".into()),
         });
     }
     if matches[0]
         .uncompressed_size
-        .is_some_and(|size| size > request.max_bytes as u64)
+        .is_some_and(|size| request.max_bytes != 0 && size > request.max_bytes as u64)
     {
         return Err(SmartZipError::ResourceLimit {
             detail: format!("member exceeds {} bytes", request.max_bytes),
@@ -245,16 +209,32 @@ pub(crate) async fn read_member(
     args.push("--".into());
     args.push(archive.into_os_string());
     args.push(member.into_os_string());
-    run_bytes(
-        executable,
-        adapter.id(),
-        &args,
-        request.max_bytes,
-        &token,
-        deadline,
-    )
-    .await
+    run_bytes(executable, adapter.id(), &args, request.max_bytes, &token).await
 }
+fn selected_member_is_link(listing: &str, member: &Path) -> bool {
+    let mut selected = false;
+    for line in listing.lines() {
+        if let Some(path) = line.strip_prefix("Path = ") {
+            selected = Path::new(path) == member;
+        } else if selected
+            && (line
+                .strip_prefix("Symbolic Link = ")
+                .is_some_and(|v| !v.is_empty())
+                || line
+                    .strip_prefix("Hard Link = ")
+                    .is_some_and(|v| !v.is_empty())
+                || line.strip_prefix("Attributes = ").is_some_and(|attrs| {
+                    attrs
+                        .split_whitespace()
+                        .any(|a| a.starts_with('l') && a.len() == 10)
+                }))
+        {
+            return true;
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -293,34 +273,62 @@ mod tests {
     }
     #[cfg(unix)]
     #[tokio::test]
-    async fn process_output_overrun_and_deadline_stop_without_waiting_for_child_sleep() {
+    async fn unrelated_links_and_paths_do_not_block_unlimited_member_read() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let executable = root.path().join("backend");
+        let archive = root.path().join("input.zip");
+        std::fs::write(&archive, b"placeholder").unwrap();
+        std::fs::write(
+            &executable,
+            r#"#!/bin/sh
+if [ "$1" = l ]; then
+cat <<'LIST'
+Path = file.txt
+Size = 7
+
+Path = shortcut
+Symbolic Link = /etc/passwd
+
+Path = ../unrelated
+Size = 1
+LIST
+else
+printf payload
+fi
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let bytes = read_member(
+            &SevenZipBackend::new(executable),
+            MemberReadRequest {
+                archive,
+                member: "file.txt".into(),
+                password: None,
+                encoding: EncodingMode::Auto,
+                max_bytes: 0,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(bytes, b"payload");
+        assert_eq!(
+            bounded_read(&b"unlimited"[..], 0).await.unwrap(),
+            b"unlimited"
+        );
+        assert!(safe_member(Path::new(&"a".repeat(5000))).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn process_output_overrun_stops_without_waiting_for_child_sleep() {
         let token = CancellationToken::new();
         let args = vec!["-c".into(), "printf 123456789; sleep 30".into()];
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(3),
-            run_bytes(
-                Path::new("/bin/sh"),
-                "test",
-                &args,
-                4,
-                &token,
-                tokio::time::Instant::now() + std::time::Duration::from_secs(30),
-            ),
-        )
-        .await
-        .unwrap();
-        assert!(matches!(result, Err(SmartZipError::ResourceLimit { .. })));
-        let args = vec!["-c".into(), "sleep 30".into()];
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            run_bytes(
-                Path::new("/bin/sh"),
-                "test",
-                &args,
-                4,
-                &token,
-                tokio::time::Instant::now() + std::time::Duration::from_millis(50),
-            ),
+            run_bytes(Path::new("/bin/sh"), "test", &args, 4, &token),
         )
         .await
         .unwrap();
@@ -338,14 +346,7 @@ mod tests {
         let args = vec!["-c".into(), "sleep 30".into()];
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(3),
-            run_bytes(
-                Path::new("/bin/sh"),
-                "test",
-                &args,
-                4,
-                &token,
-                tokio::time::Instant::now() + std::time::Duration::from_secs(30),
-            ),
+            run_bytes(Path::new("/bin/sh"), "test", &args, 4, &token),
         )
         .await
         .unwrap();
@@ -386,7 +387,7 @@ mod tests {
                 matches!(
                     result,
                     Err(SmartZipError::BackendProtocolError { .. })
-                        | Err(SmartZipError::UnsafeArchivePath { .. })
+                        | Err(SmartZipError::UnsupportedFormat { .. })
                 ),
                 "{result:?}"
             );

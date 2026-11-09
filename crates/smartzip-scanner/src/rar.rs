@@ -5,68 +5,6 @@ pub(crate) fn has_checked_initial_header(data: &[u8]) -> bool {
     checked_initial_header(data).unwrap_or(false)
 }
 
-/// Walk checked blocks and skip their packed data. EOF bytes inside stored or
-/// encrypted file data are not archive boundaries.
-pub(crate) fn checked_size(data: &[u8]) -> Option<usize> {
-    let rar5 = data.starts_with(b"Rar!\x1a\x07\x01\x00");
-    let mut cursor: usize = if rar5 { 8 } else { 7 };
-    loop {
-        let header = data.get(cursor..)?;
-        if rar5 {
-            let crc = u32::from_le_bytes(header.get(..4)?.try_into().ok()?);
-            let mut position = 4;
-            let size = usize::try_from(vint(header, &mut position)?).ok()?;
-            let end = position.checked_add(size)?;
-            let block = header.get(..end)?;
-            if crc32fast::hash(block.get(4..)?) != crc {
-                return None;
-            }
-            let kind = vint(block, &mut position)?;
-            let flags = vint(block, &mut position)?;
-            if flags & 1 != 0 {
-                vint(block, &mut position)?; // Extra area length.
-            }
-            let packed = if flags & 2 != 0 {
-                vint(block, &mut position)?
-            } else {
-                0
-            };
-            cursor = cursor.checked_add(end)?;
-            if kind == 5 {
-                return Some(cursor);
-            }
-            if kind == 4 {
-                return None; // Following headers are encrypted.
-            }
-            cursor = cursor.checked_add(usize::try_from(packed).ok()?)?;
-        } else {
-            let crc = u16::from_le_bytes(header.get(..2)?.try_into().ok()?);
-            let kind = *header.get(2)?;
-            let flags = u16::from_le_bytes(header.get(3..5)?.try_into().ok()?);
-            let size = u16::from_le_bytes(header.get(5..7)?.try_into().ok()?) as usize;
-            if size < 7 || crc32fast::hash(header.get(2..size)?) as u16 != crc {
-                return None;
-            }
-            let mut packed = if flags & 0x8000 != 0 {
-                u32::from_le_bytes(header.get(7..11)?.try_into().ok()?) as u64
-            } else {
-                0
-            };
-            if kind == 0x74 && flags & 0x100 != 0 {
-                packed |= (u32::from_le_bytes(header.get(32..36)?.try_into().ok()?) as u64) << 32;
-            }
-            cursor = cursor.checked_add(size)?;
-            if kind == 0x7b {
-                return Some(cursor);
-            }
-            if kind == 0x73 && flags & 0x80 != 0 {
-                return None;
-            }
-            cursor = cursor.checked_add(usize::try_from(packed).ok()?)?;
-        }
-    }
-}
-
 fn checked_initial_header(data: &[u8]) -> Option<bool> {
     if let Some(header) = data.strip_prefix(b"Rar!\x1a\x07\x01\x00") {
         let expected_crc = u32::from_le_bytes(header.get(..4)?.try_into().ok()?);
@@ -111,7 +49,6 @@ pub(super) fn vint(data: &[u8], position: &mut usize) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
 
     fn block(body: &[u8]) -> Vec<u8> {
         assert!(body.len() < 128);
@@ -138,7 +75,6 @@ mod tests {
             &end,
         ]
         .concat();
-        assert_eq!(checked_size(&archive), Some(archive.len()));
         let carrier = [b"jpeg-prefix".as_slice(), &archive].concat();
         let scanner = crate::EmbeddedScanner::new(crate::ScannerConfig {
             mode: crate::ScanMode::Deep,

@@ -1,16 +1,9 @@
 use crate::{resolve::invalid, SmartZipConfig};
 use std::{
     io::{self, Write},
-    path::{Path, PathBuf},
+    path::Path,
 };
 use toml_edit::{DocumentMut, Item, TableLike};
-
-struct Lock(PathBuf);
-impl Drop for Lock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
 
 fn editable(path: &Path) -> io::Result<std::fs::Metadata> {
     let metadata = std::fs::symlink_metadata(path)?;
@@ -33,17 +26,15 @@ fn write_atomic(path: &Path, original: Option<&str>, contents: &str) -> io::Resu
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
     let lock_path = path.with_extension("toml.lock");
-    let _file = std::fs::OpenOptions::new()
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
         .write(true)
-        .create_new(true)
+        .create(true)
+        .truncate(false)
         .open(&lock_path)?;
-    let _lock = Lock(lock_path);
-    let permissions = if let Some(original) = original {
-        let permissions = editable(path)?.permissions();
-        if std::fs::read_to_string(path)? != original {
-            return Err(invalid("configuration changed while editing; retry"));
-        }
-        Some(permissions)
+    lock.try_lock().map_err(io::Error::from)?;
+    let permissions = if original.is_some() {
+        Some(editable(path)?.permissions())
     } else {
         None
     };
@@ -54,7 +45,6 @@ fn write_atomic(path: &Path, original: Option<&str>, contents: &str) -> io::Resu
     temp.write_all(contents.as_bytes())?;
     temp.as_file().sync_all()?;
     if let Some(original) = original {
-        editable(path)?;
         if std::fs::read_to_string(path)? != original {
             return Err(invalid("configuration changed while editing; retry"));
         }
@@ -90,7 +80,6 @@ pub fn edit_config(path: &Path, key: &str, value: Option<&str>) -> io::Result<()
 /// `None` removes a field so it inherits its default. The file must already exist.
 /// Failed edits leave the file untouched; comments and unrelated fields are preserved.
 pub fn edit_config_fields(path: &Path, patches: &[(String, Option<String>)]) -> io::Result<()> {
-    editable(path)?;
     let original = std::fs::read_to_string(path)?;
     let mut doc = original.parse::<DocumentMut>().map_err(invalid)?;
     let defaults = toml::Value::try_from(SmartZipConfig::default()).map_err(invalid)?;
@@ -106,7 +95,12 @@ pub fn edit_config_fields(path: &Path, patches: &[(String, Option<String>)]) -> 
             ));
         }
         if crate::value_at(&defaults, key).is_none()
-            && !["state.database", "extraction.output.directory"].contains(&key)
+            && ![
+                "state.database",
+                "extraction.output.directory",
+                "extraction.recursion.max_depth",
+            ]
+            .contains(&key)
         {
             return Err(invalid(format!("unknown editable key: {key}")));
         }

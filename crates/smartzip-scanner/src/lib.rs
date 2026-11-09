@@ -8,13 +8,9 @@ use std::path::Path;
 mod file_scan;
 mod lzma;
 mod rar;
-mod windows;
+#[cfg(test)]
+mod scan_tests;
 mod zip;
-
-/// Signature search window. Root parsers can read complete archives beyond it.
-pub const DEFAULT_SCAN_BYTES: u64 = 64 * 1024 * 1024;
-
-pub const DEFAULT_LARGE_SCAN_THRESHOLD: u64 = 10 * 1024 * 1024 * 1024; // 10GB
 
 /// Minimum confidence threshold for scanner findings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -59,8 +55,8 @@ impl Default for ScannerConfig {
     fn default() -> Self {
         Self {
             mode: ScanMode::Fast,
-            max_scan_bytes: Some(DEFAULT_SCAN_BYTES),
-            max_findings: 64,
+            max_scan_bytes: None,
+            max_findings: usize::MAX,
             min_confidence: Confidence::Medium,
             include_formats: default_include_formats(),
         }
@@ -81,6 +77,7 @@ pub struct EmbeddedArchiveFinding {
 pub struct EmbeddedScanner {
     binwalk: binwalk::Binwalk,
     config: ScannerConfig,
+    matcher: aho_corasick::AhoCorasick,
 }
 
 impl EmbeddedScanner {
@@ -102,15 +99,6 @@ impl EmbeddedScanner {
         let mut binwalk = binwalk::Binwalk::configure(None, None, include, None, None, full_search)
             .unwrap_or_else(|_| binwalk::Binwalk::new());
 
-        // Override parsers at registration so all scan entry points use the
-        // same format rules, not just the random-access file parser.
-        for signature in binwalk.pattern_signature_table.values_mut() {
-            match signature.name.as_str() {
-                "zip" => signature.parser = zip::parser,
-                "lzma" => signature.parser = lzma::parser,
-                _ => {}
-            }
-        }
         if let Some(signature) = binwalk
             .pattern_signature_table
             .values()
@@ -127,7 +115,13 @@ impl EmbeddedScanner {
             }
         }
 
-        Self { binwalk, config }
+        let matcher = aho_corasick::AhoCorasick::new(&binwalk.patterns)
+            .expect("built-in archive signatures form a valid matcher");
+        Self {
+            binwalk,
+            config,
+            matcher,
+        }
     }
 
     pub fn config(&self) -> &ScannerConfig {
@@ -140,21 +134,13 @@ impl EmbeddedScanner {
     }
 
     pub fn scan_bytes(&self, data: &[u8]) -> Vec<EmbeddedArchiveFinding> {
-        let scan_len = self.scan_limit().map_or(data.len(), |limit| {
-            usize::try_from(limit).unwrap_or(usize::MAX).min(data.len())
-        });
-        let data = &data[..scan_len];
-        if self.scan_limit().is_none() && self.config.mode == ScanMode::Deep {
-            return self.scan_windows(data, DEFAULT_SCAN_BYTES as usize);
-        }
-        self.binwalk
-            .scan(data)
-            .into_iter()
-            .filter_map(|result| map_signature_result(result, data))
-            .filter(|finding| self.config.include_formats.contains(&finding.format))
-            .filter(|finding| finding.confidence >= self.config.min_confidence)
-            .take(self.config.max_findings)
-            .collect()
+        self.scan_reader(
+            &mut std::io::Cursor::new(data),
+            data.len() as u64,
+            &|| false,
+            file_scan::CHUNK,
+        )
+        .expect("reading an in-memory byte slice cannot fail")
     }
 
     /// Search the requested input extent using bounded reads and metadata walks.
@@ -170,7 +156,9 @@ impl EmbeddedScanner {
         path: impl AsRef<Path>,
         cancelled: &dyn Fn() -> bool,
     ) -> std::io::Result<Vec<EmbeddedArchiveFinding>> {
-        self.scan_file(fs::File::open(path)?, cancelled)
+        let mut file = fs::File::open(path)?;
+        let end = file.metadata()?.len();
+        self.scan_reader(&mut file, end, cancelled, file_scan::CHUNK)
     }
 
     /// Get file size without loading it.
@@ -201,46 +189,6 @@ pub fn default_include_formats() -> Vec<ArchiveFormat> {
         ArchiveFormat::Lz4,
         ArchiveFormat::Lzma,
     ]
-}
-
-fn map_signature_result(
-    result: binwalk::signatures::common::SignatureResult,
-    data: &[u8],
-) -> Option<EmbeddedArchiveFinding> {
-    let format = binwalk_name_to_format(&result.name)?;
-    let mut confidence = Confidence::from_binwalk(result.confidence);
-    let mut size = (result.size > 0).then_some(result.size as u64);
-    let mut description = result.description;
-    if format == ArchiveFormat::Rar {
-        let archive = data.get(result.offset..)?;
-        if !rar::has_checked_initial_header(archive) {
-            return None;
-        }
-        size = rar::checked_size(archive).map(|size| size as u64);
-        confidence = Confidence::Medium;
-        description = match size {
-            Some(size) => {
-                format!("RAR archive; checked block boundaries; total size: {size} bytes")
-            }
-            None => "RAR archive; initial header checksum verified; archive size unknown".into(),
-        };
-    } else if format == ArchiveFormat::Zip {
-        size = zip::checked_size(data.get(result.offset..)?).map(|size| size as u64);
-        if let Some(size) = size {
-            description =
-                format!("ZIP archive; checked central directory; total size: {size} bytes");
-        } else {
-            confidence = Confidence::Medium;
-            description = "ZIP archive; directory boundary unknown".into();
-        }
-    }
-    Some(EmbeddedArchiveFinding {
-        offset: result.offset as u64,
-        size,
-        format,
-        confidence,
-        description,
-    })
 }
 
 fn binwalk_name_to_format(name: &str) -> Option<ArchiveFormat> {
@@ -308,7 +256,7 @@ mod tests {
         assert!(scanner.scan_path(&root).unwrap().is_empty());
         // Unlimited scanning now reaches EOF; keep that case representative
         // without making every unit-test run scan 16 GiB of sparse zeros.
-        file.set_len(DEFAULT_SCAN_BYTES * 2 + 1).unwrap();
+        file.set_len(128 * 1024 * 1024 + 1).unwrap();
         let root_scanner = EmbeddedScanner::new(ScannerConfig {
             mode: ScanMode::Deep,
             max_scan_bytes: None,

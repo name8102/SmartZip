@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use smartzip_db::password::{NewPassword, PasswordRecord, PasswordRepository};
+use std::collections::HashSet;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PasswordSource {
@@ -104,16 +105,17 @@ impl<'a> PasswordService<'a> {
         let policy = &self.policy;
         use smartzip_config::PasswordSource as Source;
         let mut ordered = Vec::new();
+        let mut seen = HashSet::new();
         for source in &policy.sources {
             match source {
                 Source::Known => {
                     if let Some(candidate) = known {
-                        push_unique(&mut ordered, candidate.clone());
+                        push_unique(&mut ordered, &mut seen, candidate);
                     }
                 }
                 Source::Batch => {
                     for candidate in batch {
-                        push_unique(&mut ordered, candidate.clone());
+                        push_unique(&mut ordered, &mut seen, candidate);
                     }
                 }
                 _ => {
@@ -125,7 +127,7 @@ impl<'a> PasswordService<'a> {
                                 | (Source::Database, PasswordSource::Database)
                         )
                     }) {
-                        push_unique(&mut ordered, candidate.clone());
+                        push_unique(&mut ordered, &mut seen, candidate);
                     }
                 }
             }
@@ -170,14 +172,11 @@ impl<'a> PasswordService<'a> {
                     .sources
                     .contains(&smartzip_config::PasswordSource::Manual)
         }) {
-            push_unique(
-                &mut candidates,
-                PasswordCandidate {
-                    id: None,
-                    value,
-                    source: PasswordSource::Manual,
-                },
-            );
+            candidates.push(PasswordCandidate {
+                id: None,
+                value,
+                source: PasswordSource::Manual,
+            });
         }
 
         if request.include_empty
@@ -186,14 +185,11 @@ impl<'a> PasswordService<'a> {
                 .sources
                 .contains(&smartzip_config::PasswordSource::Empty)
         {
-            push_unique(
-                &mut candidates,
-                PasswordCandidate {
-                    id: None,
-                    value: String::new(),
-                    source: PasswordSource::Empty,
-                },
-            );
+            candidates.push(PasswordCandidate {
+                id: None,
+                value: String::new(),
+                source: PasswordSource::Empty,
+            });
         }
 
         if self
@@ -203,7 +199,7 @@ impl<'a> PasswordService<'a> {
         {
             if let Some(repo) = &self.repo {
                 for record in repo.ranked_candidates(self.policy.database_limit)? {
-                    push_unique(&mut candidates, candidate_from_record(record));
+                    candidates.push(candidate_from_record(record));
                 }
             }
         }
@@ -282,12 +278,13 @@ fn candidate_from_record(record: PasswordRecord) -> PasswordCandidate {
     }
 }
 
-fn push_unique(candidates: &mut Vec<PasswordCandidate>, candidate: PasswordCandidate) {
-    if !candidates
-        .iter()
-        .any(|existing| existing.value == candidate.value)
-    {
-        candidates.push(candidate);
+fn push_unique<'a>(
+    candidates: &mut Vec<PasswordCandidate>,
+    seen: &mut HashSet<&'a str>,
+    candidate: &'a PasswordCandidate,
+) {
+    if seen.insert(candidate.value.as_str()) {
+        candidates.push(candidate.clone());
     }
 }
 
@@ -366,6 +363,28 @@ mod policy_tests {
             })
             .unwrap();
         assert!(service.candidate_by_id(1).unwrap().is_none());
+    }
+
+    #[test]
+    fn default_candidates_include_the_whole_database_and_keep_source_precedence() {
+        let db = smartzip_db::SmartZipDb::in_memory().unwrap();
+        let service = PasswordService::new(PasswordRepository::new(db.connection()));
+        let input = (0..256)
+            .map(|i| format!("password-{i}\n"))
+            .collect::<String>();
+        PasswordRepository::new(db.connection())
+            .import_lines(input.as_bytes(), "test")
+            .unwrap();
+        let candidates = service
+            .ranked_candidates(PasswordCandidateRequest {
+                manual: vec!["password-255".into(), "password-255".into()],
+                include_empty: true,
+            })
+            .unwrap();
+        assert_eq!(candidates.len(), 257);
+        assert_eq!(candidates[0].value, "password-255");
+        assert_eq!(candidates[0].source, PasswordSource::Manual);
+        assert!(candidates.iter().any(|c| c.value == "password-254"));
     }
 
     #[test]

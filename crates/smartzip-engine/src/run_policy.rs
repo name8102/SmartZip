@@ -48,7 +48,7 @@ impl CompiledRunPolicy {
         request.recursion_limit = if c.extraction.recursion.enabled {
             c.extraction.recursion.max_depth
         } else {
-            0
+            Some(0)
         };
         request.layout_policy = match c.extraction.output.layout {
             config::Layout::Conservative => OutputLayoutPolicy::Conservative,
@@ -123,7 +123,7 @@ impl CompiledRunPolicy {
             (
                 "nested_discovery",
                 "extraction.recursion.enabled",
-                c.extraction.recursion.enabled && c.extraction.recursion.max_depth > 0,
+                c.extraction.recursion.enabled && c.extraction.recursion.max_depth != Some(0),
             ),
             (
                 "root_scan",
@@ -134,7 +134,7 @@ impl CompiledRunPolicy {
                 "nested_scan",
                 "extraction.embedded.nested",
                 c.extraction.recursion.enabled
-                    && c.extraction.recursion.max_depth > 0
+                    && c.extraction.recursion.max_depth != Some(0)
                     && c.extraction.embedded.nested != config::NestedScan::Off,
             ),
             (

@@ -1,7 +1,7 @@
 use rusqlite::{Connection, TransactionBehavior};
 
 /// The only supported database schema version.
-pub const LATEST_VERSION: u32 = 8;
+pub const LATEST_VERSION: u32 = 9;
 
 const SCHEMA: &str = r#"
 CREATE TABLE passwords (
@@ -28,8 +28,7 @@ CREATE TABLE task_events (
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             node_id TEXT,
             stage TEXT,
-            attempt_id TEXT,
-            sequence INTEGER
+            attempt_id TEXT
         );
 
 CREATE TABLE tasks (
@@ -87,7 +86,6 @@ CREATE TABLE file_extractions (
 CREATE TABLE known_files (
             sample_hash        TEXT NOT NULL,
             size               INTEGER NOT NULL,
-            names_offsets_json TEXT NOT NULL DEFAULT '[]',
             password_id        INTEGER REFERENCES passwords(id) ON DELETE SET NULL,
             confirmed_encoding TEXT,
             PRIMARY KEY (sample_hash, size)
@@ -101,7 +99,7 @@ CREATE TABLE execution_owner (
         );
 
 CREATE INDEX idx_task_events_task
-            ON task_events(task_id, created_at);
+            ON task_events(task_id);
 
 CREATE INDEX idx_tasks_started_at ON tasks(started_at);
 
@@ -126,9 +124,8 @@ CREATE INDEX idx_file_extractions_ready
             ON file_extractions(task_id, execution_state, stage)
             WHERE node_id IS NOT NULL;
 
-CREATE UNIQUE INDEX idx_task_events_sequence
-            ON task_events(task_id, sequence)
-            WHERE sequence IS NOT NULL;
+CREATE INDEX idx_file_extractions_pending
+            ON file_extractions(task_id) WHERE status = 'pending';
 "#;
 
 /// Initialize an empty database atomically, or open an existing current database.
@@ -221,7 +218,7 @@ mod tests {
 
     #[test]
     fn rejects_old_and_unknown_databases_without_modification() {
-        for version in [0, 5, 7, 9] {
+        for version in [0, 5, 7, 8, 10] {
             let mut conn = Connection::open_in_memory().unwrap();
             conn.execute_batch(
                 "CREATE TABLE keep_data(value TEXT); INSERT INTO keep_data VALUES ('preserved');",

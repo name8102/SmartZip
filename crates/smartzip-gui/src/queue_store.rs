@@ -19,21 +19,23 @@ struct Write {
     path: PathBuf,
     snapshot: String,
     position: i64,
-    status: String,
+    status: &'static str,
+    request_revision: u64,
 }
+type Signature = (u64, i64, &'static str);
 impl Write {
-    fn signature(&self) -> String {
-        format!("{}:{}:{}", self.status, self.position, self.snapshot)
+    fn signature(&self) -> Signature {
+        (self.request_revision, self.position, self.status)
     }
 }
 struct Tracked {
     write: Write,
-    sent: String,
-    saved: Option<String>,
+    sent: Option<Signature>,
+    saved: Option<Signature>,
 }
 pub struct QueueStore {
     tx: mpsc::Sender<Write>,
-    rx: mpsc::Receiver<(String, String, Result<(), String>)>,
+    rx: mpsc::Receiver<(String, Signature, Result<(), String>)>,
     tracked: HashMap<String, Tracked>,
     pending: usize,
     pub error: Option<String>,
@@ -67,8 +69,8 @@ impl QueueStore {
     pub fn retry(&mut self) {
         self.error = None;
         for t in self.tracked.values_mut() {
-            if t.saved.as_ref() != Some(&t.sent) {
-                t.sent.clear();
+            if t.saved != t.sent {
+                t.sent = None;
             }
         }
     }
@@ -96,6 +98,22 @@ impl QueueStore {
             if job.phase.active() {
                 continue;
             }
+            let status = match job.phase {
+                Phase::Queued => "queued_gui",
+                Phase::Completed => "completed",
+                Phase::Partial => "partial",
+                Phase::Failed => "failed",
+                _ => "cancelled",
+            };
+            if let Some(t) = self.tracked.get(&id).filter(|t| {
+                t.write.request_revision == job.request_revision
+                    && t.write.position == position as i64
+                    && t.write.status == status
+            }) {
+                job.persistence_pending =
+                    job.phase == Phase::Queued && t.saved.as_ref() != Some(&t.write.signature());
+                continue;
+            }
             let Some(config) = job.request.resolved.as_ref() else {
                 continue;
             };
@@ -108,22 +126,25 @@ impl QueueStore {
                     continue;
                 }
             };
-            let status = match job.phase {
-                Phase::Queued => "queued_gui",
-                Phase::Completed => "completed",
-                Phase::Partial => "partial",
-                Phase::Failed => "failed",
-                _ => "cancelled",
-            };
-            let snapshot = match serde_json::to_string(&Draft {
-                version: 1,
-                request: job.request.clone(),
-            }) {
-                Ok(s) => s,
-                Err(e) => {
-                    self.error = Some(e.to_string());
-                    job.persistence_pending = true;
-                    continue;
+            let snapshot = if job.phase != Phase::Queued {
+                String::new()
+            } else if let Some(t) = self
+                .tracked
+                .get(&id)
+                .filter(|t| t.write.request_revision == job.request_revision)
+            {
+                t.write.snapshot.clone()
+            } else {
+                match serde_json::to_string(&Draft {
+                    version: 1,
+                    request: job.request.clone(),
+                }) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        self.error = Some(e.to_string());
+                        job.persistence_pending = true;
+                        continue;
+                    }
                 }
             };
             let write = Write {
@@ -132,11 +153,12 @@ impl QueueStore {
                 snapshot,
                 position: position as i64,
                 status: status.into(),
+                request_revision: job.request_revision,
             };
             let signature = write.signature();
             let t = self.tracked.entry(id).or_insert_with(|| Tracked {
                 write: write.clone(),
-                sent: String::new(),
+                sent: None,
                 saved: None,
             });
             t.write = write;
@@ -146,12 +168,13 @@ impl QueueStore {
         for (id, t) in &mut self.tracked {
             if !present.contains(id) && t.write.status == "queued_gui" {
                 t.write.status = "cancelled".into();
+                t.write.snapshot.clear();
             }
             let signature = t.write.signature();
-            if t.sent != signature {
+            if t.sent.as_ref() != Some(&signature) {
                 if self.tx.send(t.write.clone()).is_ok() {
                     self.pending += 1;
-                    t.sent = signature;
+                    t.sent = Some(signature);
                 } else {
                     self.error = Some("等待队列保存线程已退出".into());
                 }
@@ -222,6 +245,59 @@ pub fn load(config: &ResolvedConfig) -> Result<Vec<JobRequest>, String> {
 mod tests {
     use super::*;
     #[test]
+    fn unchanged_drafts_reuse_snapshot_and_only_latest_ack_allows_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut resolved = ResolvedConfig::load(None).unwrap();
+        resolved.values.state.database = Some(dir.path().join("state.db"));
+        let mut queue = Queue::default();
+        let id = queue.enqueue_held(JobRequest {
+            operation: TaskOperation::Extract,
+            paths: vec!["archive.zip".into()],
+            settings: Default::default(),
+            resolved: Some(resolved),
+        });
+        let (tx, writes) = mpsc::channel();
+        let (ack, rx) = mpsc::channel();
+        let mut store = QueueStore {
+            tx,
+            rx,
+            tracked: HashMap::new(),
+            pending: 0,
+            error: None,
+        };
+        store.sync(&mut queue);
+        let first = writes.try_recv().unwrap();
+        let snapshot = store.tracked[&first.id].write.snapshot.as_ptr();
+        store.sync(&mut queue);
+        assert!(writes.try_recv().is_err());
+        assert_eq!(store.tracked[&first.id].write.snapshot.as_ptr(), snapshot);
+        queue
+            .update_settings(id, |s| s.recursive = Some(false))
+            .unwrap();
+        store.sync(&mut queue);
+        let updated = writes.try_recv().unwrap();
+        assert_ne!(first.signature(), updated.signature());
+        ack.send((first.id.clone(), first.signature(), Ok(())))
+            .unwrap();
+        store.sync(&mut queue);
+        assert!(queue.jobs[0].persistence_pending);
+        ack.send((updated.id.clone(), updated.signature(), Ok(())))
+            .unwrap();
+        store.sync(&mut queue);
+        assert!(!queue.jobs[0].persistence_pending);
+        queue
+            .update_settings(id, |s| s.recursive = Some(false))
+            .unwrap();
+        store.sync(&mut queue);
+        assert!(writes.try_recv().is_err());
+        queue.cancel(id);
+        store.sync(&mut queue);
+        let cancelled = writes.try_recv().unwrap();
+        assert_eq!(cancelled.status, "cancelled");
+        assert!(cancelled.snapshot.is_empty());
+    }
+
+    #[test]
     fn draft_roundtrip_omits_passwords_and_late_save_preserves_engine_state() {
         let dir = tempfile::tempdir().unwrap();
         let mut resolved = ResolvedConfig::load(None).unwrap();
@@ -247,6 +323,7 @@ mod tests {
             .unwrap(),
             position: 7,
             status: "queued_gui".into(),
+            request_revision: 0,
         };
         assert!(!w.snapshot.contains("never-persist-this"));
         save(&w).unwrap();

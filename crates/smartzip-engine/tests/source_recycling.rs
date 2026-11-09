@@ -134,7 +134,7 @@ fn request(inputs: Vec<PathBuf>, output_dir: PathBuf) -> ExtractWorkflowRequest 
     ExtractWorkflowRequest {
         inputs,
         output_dir,
-        recursion_limit: 0,
+        recursion_limit: Some(0),
         encoding_mode: EncodingMode::Override("UTF-8".into()),
         scanner: Default::default(),
         password_candidates: PasswordCandidateRequest {
@@ -145,7 +145,6 @@ fn request(inputs: Vec<PathBuf>, output_dir: PathBuf) -> ExtractWorkflowRequest 
         single_root_name_policy: Default::default(),
         embedded_scan_mode: Default::default(),
         dominant_min_ratio: 0.7,
-        confirm_large_scan: false,
         force: false,
         limits: Default::default(),
     }

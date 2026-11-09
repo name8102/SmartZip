@@ -98,7 +98,7 @@ pub(crate) fn resolve_root_candidate(
             });
         }
     } else if let Some((format, offset)) = scan_root
-        .then(|| crate::detect::probe_file_header(path))
+        .then(|| crate::detect::probe_file_header(path).ok().flatten())
         .flatten()
     {
         candidate.detected_format = Some(format);
@@ -159,10 +159,6 @@ pub(crate) fn prepare_resolved_archive(
             .as_ref()
             .map(|hit| hit.confirmed_encoding.is_some())
             .unwrap_or(false);
-    let recorder_name = candidate
-        .path
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned());
     let mut zip_encoding_assessment = None;
     if run_policy.is_none_or(|p| p.values().extraction.encoding.mode == "auto")
         && encoding_mode == EncodingMode::Auto
@@ -181,8 +177,6 @@ pub(crate) fn prepare_resolved_archive(
         encoding_mode,
         reused_confirmed_encoding,
         zip_encoding_assessment,
-        detect_encoding: run_policy.is_none_or(|p| p.values().extraction.encoding.mode == "auto"),
-        recorder_name,
     })
 }
 
@@ -210,7 +204,17 @@ pub(crate) async fn access_archive_with_password(
     let mut listing = None;
     let mut saw_wrong_password = false;
     let mut password_prompt_cancelled = false;
-    let mut assessment = resolved.zip_encoding_assessment.clone();
+    let encoding_mode = resolve_encoding_mode(
+        &resolved.archive_path,
+        resolved.encoding_mode.clone(),
+        resolved.zip_encoding_assessment.as_ref(),
+        encoding_prompter,
+    )
+    .await?
+    .ok_or_else(|| smartzip_core::SmartZipError::BackendProtocolError {
+        backend: "user-input".into(),
+        detail: "archive skipped during encoding confirmation".into(),
+    })?;
 
     for (index, password) in ordered_candidates.iter().enumerate() {
         let pw_value = Some(password.value.clone());
@@ -233,7 +237,7 @@ pub(crate) async fn access_archive_with_password(
                     archive: resolved.archive_path.clone(),
                     format: resolved.candidate.detected_format.clone(),
                     password: pw_value.clone(),
-                    encoding: resolved.encoding_mode.clone(),
+                    encoding: encoding_mode.clone(),
                 },
                 std::sync::Arc::clone(&task_context),
             ),
@@ -294,7 +298,7 @@ pub(crate) async fn access_archive_with_password(
                     archive: resolved.archive_path.clone(),
                     format: resolved.candidate.detected_format.clone(),
                     password: Some(password.clone()),
-                    encoding: resolved.encoding_mode.clone(),
+                    encoding: encoding_mode.clone(),
                 },
                 std::sync::Arc::clone(&task_context),
             ),
@@ -334,47 +338,9 @@ pub(crate) async fn access_archive_with_password(
         }
     }
 
-    if listing.is_some()
-        && resolved.detect_encoding
-        && assessment.is_none()
-        && resolved.encoding_mode == EncodingMode::Auto
-        && resolved.candidate.detected_format == Some(ArchiveFormat::Zip)
-    {
-        assessment = assess_zip_encoding(&resolved.archive_path);
-    }
-
-    let encoding_mode = resolve_encoding_mode(
-        &resolved.archive_path,
-        resolved.encoding_mode.clone(),
-        assessment.as_ref(),
-        encoding_prompter,
-    )
-    .await?
-    .ok_or_else(|| smartzip_core::SmartZipError::BackendProtocolError {
-        backend: "user-input".into(),
-        detail: "archive skipped during encoding confirmation".into(),
+    let listing = listing.ok_or_else(|| smartzip_core::SmartZipError::PasswordRequired {
+        path: resolved.candidate.path.clone(),
     })?;
-
-    let listing = match listing {
-        Some(listing) if encoding_mode == resolved.encoding_mode => listing,
-        _ => {
-            backend_call(
-                "archive-backend",
-                "list",
-                &resolved.archive_path,
-                backend.list_with_context(
-                    ListRequest {
-                        archive: resolved.archive_path.clone(),
-                        format: resolved.candidate.detected_format.clone(),
-                        password: used_password.clone(),
-                        encoding: encoding_mode.clone(),
-                    },
-                    std::sync::Arc::clone(&task_context),
-                ),
-            )
-            .await?
-        }
-    };
 
     Ok(ArchiveAccessOutcome {
         encoding_mode,

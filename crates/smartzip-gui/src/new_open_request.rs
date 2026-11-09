@@ -5,9 +5,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const MAX_QUICK_PATHS: usize = 1_000;
-const MAX_QUICK_URL_BYTES: usize = 256 * 1024;
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OpenIntent {
     Preview,
@@ -67,9 +64,6 @@ fn smartzip_request_from_url(url: &url::Url, expected_token: Option<&str>) -> Op
     {
         return None;
     }
-    if url.as_str().len() > MAX_QUICK_URL_BYTES {
-        return None;
-    }
     let query = url.query()?;
     let mut paths = Vec::new();
     let mut token_seen = false;
@@ -94,9 +88,6 @@ fn smartzip_request_from_url(url: &url::Url, expected_token: Option<&str>) -> Op
                 return None;
             }
             paths.push(path);
-            if paths.len() > MAX_QUICK_PATHS {
-                return None;
-            }
         }
     }
     if !paths.is_empty() && token_seen && expected_token.is_some() {
@@ -144,7 +135,7 @@ fn requests_with_token(
 }
 
 pub(crate) fn smartzip_extract_url(paths: &[PathBuf], token: &str) -> Option<String> {
-    if paths.is_empty() || paths.len() > MAX_QUICK_PATHS {
+    if paths.is_empty() {
         return None;
     }
     let mut url = url::Url::parse("smartzip://extract").ok()?;
@@ -160,7 +151,7 @@ pub(crate) fn smartzip_extract_url(paths: &[PathBuf], token: &str) -> Option<Str
         }
     }
     let url: String = url.into();
-    (url.len() <= MAX_QUICK_URL_BYTES).then_some(url)
+    Some(url)
 }
 
 pub(crate) fn forward_finder_quick_extract(paths: &[OsString]) -> Result<(), String> {
@@ -305,6 +296,18 @@ mod tests {
                 paths,
                 intent: OpenIntent::QuickExtract
             })
+        );
+    }
+    #[test]
+    fn smartzip_url_accepts_large_selections_without_application_caps() {
+        let paths: Vec<_> = (0..1001)
+            .map(|i| PathBuf::from(format!("/tmp/{}/archive-{i}.zip", "a".repeat(300))))
+            .collect();
+        let url = smartzip_extract_url(&paths, "test-token").unwrap();
+        assert!(url.len() > 256 * 1024);
+        assert_eq!(
+            request_from_url(&url, Some("test-token")).unwrap().paths,
+            paths
         );
     }
     #[test]

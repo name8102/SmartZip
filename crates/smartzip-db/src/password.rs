@@ -42,13 +42,9 @@ impl<'a> PasswordRepository<'a> {
     }
 
     pub fn upsert(&self, input: NewPassword<'_>) -> Result<i64> {
-        self.conn.execute(
-            UPSERT_PASSWORD,
-            params![input.value, input.source, input.pinned as i64],
-        )?;
         Ok(self.conn.query_row(
-            "SELECT id FROM passwords WHERE value = ?1",
-            params![input.value],
+            &format!("{UPSERT_PASSWORD} RETURNING id"),
+            params![input.value, input.source, input.pinned as i64],
             |row| row.get(0),
         )?)
     }
@@ -122,7 +118,8 @@ impl<'a> PasswordRepository<'a> {
             LIMIT ?1
             "#,
         )?;
-        let rows = stmt.query_map(params![limit as i64], map_password_record)?;
+        let sql_limit = if limit == 0 { -1 } else { limit as i64 };
+        let rows = stmt.query_map(params![sql_limit], map_password_record)?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Into::into)
     }

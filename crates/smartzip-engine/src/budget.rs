@@ -103,7 +103,7 @@ impl TaskBudget {
 
     pub(crate) fn reserve_nested(&self, limit: usize) -> bool {
         let mut state = self.state.lock().unwrap();
-        if state.nested_candidates >= limit {
+        if limit != 0 && state.nested_candidates >= limit {
             return false;
         }
         state.nested_candidates += 1;
@@ -537,6 +537,10 @@ mod tests {
         assert!(budget.reserve_nested(limits.max_nested_candidates));
         assert!(budget.reserve_nested(limits.max_nested_candidates));
         assert!(!budget.reserve_nested(limits.max_nested_candidates));
+        assert!(
+            budget.reserve_nested(0),
+            "zero disables the candidate limit"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

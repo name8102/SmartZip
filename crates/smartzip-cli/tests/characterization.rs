@@ -5,7 +5,7 @@ use std::{path::Path, process::Command};
 fn argument_errors_remain_on_stderr_without_creating_state() {
     let root = tempfile::tempdir().unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_smartzip"))
-        .args(["extract", "archive.zip", "--recursion-limit", "256"])
+        .args(["extract", "archive.zip", "--recursion-limit", "invalid"])
         .current_dir(root.path())
         .env("XDG_DATA_HOME", root.path().join("data"))
         .env("XDG_CONFIG_HOME", root.path().join("config"))

@@ -1,10 +1,5 @@
 //! Associate EOCD records with the current archive, not an entry's inner ZIP.
 
-use aho_corasick::AhoCorasick;
-use binwalk::signatures::common::{
-    SignatureError, SignatureResult, CONFIDENCE_HIGH, CONFIDENCE_MEDIUM,
-};
-
 /// PKWARE APPNOTE 4.4.5, including the deprecated Zstandard ID 20.
 /// Recognizing a container is independent of the selected backend's codecs.
 fn compression_method(method: u16) -> bool {
@@ -53,36 +48,15 @@ fn checked_local_header(data: &[u8]) -> Option<()> {
     None
 }
 
-/// Shared binwalk override for bounded and windowed byte-slice scans.
-pub(super) fn parser(data: &[u8], offset: usize) -> Result<SignatureResult, SignatureError> {
-    let archive = data.get(offset..).ok_or(SignatureError)?;
-    if !valid_local_header(archive) {
-        return Err(SignatureError);
-    }
-    let size = checked_size(archive);
-    Ok(SignatureResult {
-        offset,
-        size: size.unwrap_or(0),
-        confidence: if size.is_some() {
-            CONFIDENCE_HIGH
-        } else {
-            CONFIDENCE_MEDIUM
-        },
-        description: "ZIP archive".into(),
-        ..Default::default()
-    })
-}
-
 pub(super) fn checked_file_size(
     input: &mut crate::file_scan::Input<'_>,
     start: u64,
 ) -> Option<u64> {
-    let end = input.end;
-    input
-        .find(b"PK\x05\x06", start, end, |input, eocd| {
-            check_file_directory(input, start, eocd)
-        })
-        .map(|end| end - start)
+    let offsets = input.zip_eocds();
+    let first = offsets.partition_point(|&offset| offset < start);
+    offsets[first..]
+        .iter()
+        .find_map(|&eocd| check_file_directory(input, start, eocd).map(|end| end - start))
 }
 
 fn check_file_directory(
@@ -183,77 +157,11 @@ fn check_file_directory(
     (references_start && cursor == directory_end).then_some(end)
 }
 
-pub(crate) fn checked_size(data: &[u8]) -> Option<usize> {
-    let matcher = AhoCorasick::new([b"PK\x05\x06"]).ok()?;
-    for eocd in matcher.find_iter(data) {
-        if let Some(end) = check_directory(data, eocd.start()) {
-            return Some(end);
-        }
-    }
-    None
-}
-
-fn check_directory(data: &[u8], eocd: usize) -> Option<usize> {
-    let header = data.get(eocd..eocd.checked_add(22)?)?;
-    if u16_at(header, 4)? != 0 || u16_at(header, 6)? != 0 {
-        return None; // Volume sets have a separate resolver.
-    }
-    let end = eocd.checked_add(22 + u16_at(header, 20)? as usize)?;
-    data.get(..end)?;
-    let count = u16_at(header, 10)? as u64;
-    let size = u32_at(header, 12)? as u64;
-    let offset = u32_at(header, 16)? as u64;
-    let (count, size, offset, directory_end) =
-        if count == u16::MAX as u64 || size == u32::MAX as u64 || offset == u32::MAX as u64 {
-            zip64_directory(data, eocd)?
-        } else {
-            if u16_at(header, 8)? as u64 != count {
-                return None;
-            }
-            (count, size, offset, eocd)
-        };
-    if count == 0 || count > size / 46 {
-        return None;
-    }
-    let directory_start = directory_end.checked_sub(usize::try_from(size).ok()?)?;
-    // Both appended ZIPs (offsets relative to ZIP) and ZIP writers opened after
-    // an existing prefix (offsets include prefix) are common. Normalize from
-    // the actual directory position, allowing a negative adjustment after carve.
-    let adjustment = directory_start as i128 - offset as i128;
-    let mut cursor = directory_start;
-    let mut references_start = false;
-    for _ in 0..count {
-        let entry = data.get(cursor..cursor.checked_add(46)?)?;
-        if !entry.starts_with(b"PK\x01\x02") {
-            return None;
-        }
-        let name_size = u16_at(entry, 28)? as usize;
-        let extra_size = u16_at(entry, 30)? as usize;
-        let comment_size = u16_at(entry, 32)? as usize;
-        let record_end = cursor.checked_add(46 + name_size + extra_size + comment_size)?;
-        if record_end > directory_end {
-            return None;
-        }
-        let name = data.get(cursor + 46..cursor + 46 + name_size)?;
-        let extra = data.get(cursor + 46 + name_size..cursor + 46 + name_size + extra_size)?;
-        let declared = local_offset(entry, extra)?;
-        let local = usize::try_from(declared as i128 + adjustment).ok()?;
-        if local >= directory_start {
-            return None;
-        }
-        let local_header = data.get(local..local.checked_add(30)?)?;
-        if !local_header.starts_with(b"PK\x03\x04")
-            || u16_at(local_header, 26)? as usize != name_size
-            || data.get(local + 30..local + 30 + name_size)? != name
-        {
-            return None;
-        }
-        references_start |= local == 0;
-        cursor = record_end;
-    }
-    // A directory must actually reference the candidate header at offset zero.
-    // archive-offset arithmetic alone can associate an inner ZIP with its parent.
-    (references_start && cursor == directory_end).then_some(end)
+#[cfg(test)]
+fn checked_size(data: &[u8]) -> Option<usize> {
+    let mut reader = std::io::Cursor::new(data);
+    let mut input = crate::file_scan::Input::new(&mut reader, data.len() as u64, &|| false);
+    checked_file_size(&mut input, 0).and_then(|size| usize::try_from(size).ok())
 }
 
 fn local_offset(entry: &[u8], mut extra: &[u8]) -> Option<u64> {
@@ -271,36 +179,6 @@ fn local_offset(entry: &[u8], mut extra: &[u8]) -> Option<u64> {
             return u64_at(value, position);
         }
         extra = extra.get(4 + size..)?;
-    }
-    None
-}
-
-fn zip64_directory(data: &[u8], eocd: usize) -> Option<(u64, u64, u64, usize)> {
-    let locator = eocd.checked_sub(20)?;
-    if data.get(locator..locator + 4)? != b"PK\x06\x07" {
-        return None;
-    }
-    let matcher = AhoCorasick::new([b"PK\x06\x06"]).ok()?;
-    for record in matcher.find_iter(data.get(..locator)?) {
-        let header = data.get(record.start()..locator)?;
-        let Some(size) = u64_at(header, 4).and_then(|size| usize::try_from(size).ok()) else {
-            continue;
-        };
-        if size.checked_add(12) != Some(header.len()) || header.len() < 56 {
-            continue;
-        }
-        if u32_at(header, 16)? != 0
-            || u32_at(header, 20)? != 0
-            || u64_at(header, 24)? != u64_at(header, 32)?
-        {
-            return None;
-        }
-        return Some((
-            u64_at(header, 32)?,
-            u64_at(header, 40)?,
-            u64_at(header, 48)?,
-            record.start(),
-        ));
     }
     None
 }

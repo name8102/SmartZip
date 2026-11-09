@@ -178,7 +178,7 @@ impl ResolvedConfig {
     pub fn explanation(&self) -> BTreeMap<String, String> {
         let mut inactive = BTreeMap::new();
         if !self.values.extraction.recursion.enabled
-            || self.values.extraction.recursion.max_depth == 0
+            || self.values.extraction.recursion.max_depth == Some(0)
         {
             inactive.insert(
                 "extraction.embedded.nested".into(),

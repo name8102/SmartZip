@@ -1,4 +1,4 @@
-//! Bounded, passive member viewing; never writes or executes archive contents.
+//! Passive member viewing; never writes or executes archive contents.
 use gpui::component::{
     button::{Button, ButtonVariants},
     input::{Input, InputState},
@@ -22,7 +22,7 @@ pub struct MemberSource {
     pub archive: PathBuf,
     pub member: PathBuf,
     pub backend: String,
-    pub config: smartzip_config::BackendConfig,
+    pub router: smartzip_archive::BackendRouter,
     pub encoding: smartzip_core::EncodingMode,
     pub unavailable: Option<String>,
     pub allow_password: bool,
@@ -140,10 +140,8 @@ impl MemberPreview {
                     .enable_all()
                     .build()
                     .map_err(|e| e.to_string())?;
-                let backend = smartzip_archive::BackendRouter::from_config(&source.config)
-                    .map_err(|e| e.to_string())?;
                 let bytes = runtime
-                    .block_on(backend.read_member(
+                    .block_on(source.router.read_member(
                         &source.backend,
                         smartzip_archive::MemberReadRequest {
                             archive: source.archive,
@@ -173,16 +171,14 @@ fn decode(bytes: &[u8]) -> Result<Content, String> {
         let (width, height) = image::ImageReader::with_format(Cursor::new(bytes), format)
             .into_dimensions()
             .map_err(|_| "图片头损坏")?;
-        if width == 0 || height == 0 || u64::from(width) * u64::from(height) > 16_000_000 {
-            return Err("图片超过 1600 万像素预览上限".into());
+        if width == 0 || height == 0 {
+            return Err("图片尺寸无效".into());
         }
         let mut reader = image::ImageReader::with_format(Cursor::new(bytes), format);
-        let mut limits = image::Limits::default();
-        limits.max_alloc = Some(96 * 1024 * 1024);
-        reader.limits(limits);
+        reader.no_limits();
         let decoded = reader
             .decode()
-            .map_err(|_| "图片损坏或解码资源超限")?
+            .map_err(|_| "图片解码失败")?
             .thumbnail(2048, 2048);
         let mut png = Cursor::new(Vec::new());
         decoded
@@ -192,9 +188,6 @@ fn decode(bytes: &[u8]) -> Result<Content, String> {
             ImageFormat::Png,
             png.into_inner(),
         ))));
-    }
-    if bytes.len() > 1024 * 1024 {
-        return Err("文本超过 1 MiB 预览上限，可解压后查看".into());
     }
     let text =
         std::str::from_utf8(bytes).map_err(|_| "暂不支持此文件类型或文本编码，可解压后查看")?;
@@ -331,13 +324,16 @@ impl Render for MemberPreview {
 mod tests {
     use super::*;
     #[test]
-    fn passive_text_preserves_markup_and_rejects_binary_and_large_inputs() {
+    fn passive_text_preserves_markup_and_large_inputs_and_rejects_binary() {
         assert!(matches!(
             decode(b"<script>hello</script>"),
             Ok(Content::Text(_))
         ));
         assert!(decode(b"MZ\0binary").is_err());
-        assert!(decode(&vec![b'a'; 1024 * 1024 + 1]).is_err());
+        assert!(matches!(
+            decode(&vec![b'a'; 1024 * 1024 + 1]),
+            Ok(Content::Text(_))
+        ));
     }
     #[test]
     fn small_png_decodes_to_bounded_still_image() {

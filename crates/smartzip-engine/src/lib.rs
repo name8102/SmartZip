@@ -169,7 +169,7 @@ impl SmartZipEngine {
 
     pub fn new(scanner: EmbeddedScanner) -> Self {
         Self {
-            scanner,
+            scanner: Arc::new(scanner),
             run_policy: None,
             cancellation: tokio_util::sync::CancellationToken::new(),
             archive_recycler: Arc::new(smartzip_platform::move_to_trash),

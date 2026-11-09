@@ -60,7 +60,7 @@ pub const SECTIONS: &[Section] = &[
             field!(
                 "extraction.recursion.max_depth",
                 "最大递归深度",
-                "0 表示不继续递归；取值范围为 0–255。",
+                "留空表示不限；0 表示只处理根归档。",
                 Kind::Number
             ),
             field!(
@@ -205,7 +205,7 @@ pub const SECTIONS: &[Section] = &[
             field!(
                 "passwords.database_limit",
                 "密码库候选上限",
-                "从密码库选取的候选数量上限。",
+                "从密码库选取的候选数量上限，0 表示不限。",
                 Kind::Number
             ),
             field!(
@@ -293,7 +293,7 @@ pub const SECTIONS: &[Section] = &[
             field!(
                 "limits.max_nested_candidates",
                 "最大嵌套候选数",
-                "限制嵌套归档扫描产生的候选数量。",
+                "限制嵌套归档扫描产生的候选数量，0 表示不限。",
                 Kind::Number
             ),
         ],
@@ -351,7 +351,11 @@ mod tests {
     fn schema_covers_all_user_configurable_leaves() {
         let resolved = ResolvedConfig::load(None).unwrap();
         let value = toml::Value::try_from(&resolved.values).unwrap();
-        let optional = ["state.database", "extraction.output.directory"];
+        let optional = [
+            "state.database",
+            "extraction.output.directory",
+            "extraction.recursion.max_depth",
+        ];
         let mut keys = HashSet::new();
         for field in SECTIONS.iter().flat_map(|section| section.fields) {
             assert!(keys.insert(field.key), "duplicate field {}", field.key);

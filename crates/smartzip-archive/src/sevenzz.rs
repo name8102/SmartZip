@@ -268,13 +268,15 @@ impl ArchiveAdapter for SevenZipBackend {
         context: Arc<TaskExecutionContext>,
     ) -> Result<ArchiveProbe> {
         let args = vec![
-            "t".into(),
-            "-bsp1".into(),
+            "l".into(),
+            "-slt".into(),
+            "-sccUTF-8".into(),
             "-p".into(),
+            "--".into(),
             path.to_string_lossy().into_owned(),
         ];
         let output = self
-            .run_streaming_with_context(&args, context, false)
+            .run_with_token(&args, &context.cancellation_token())
             .await?;
         let result = if output.status == Some(0) {
             Ok((true, parse_encrypted(&output.stdout, &output.stderr)))
@@ -290,7 +292,7 @@ impl ArchiveAdapter for SevenZipBackend {
         };
         Ok(ArchiveProbe {
             path: path.to_path_buf(),
-            format: None,
+            format: parse_slt_archive_format(&output.stdout),
             encrypted,
             supported,
         })
@@ -402,18 +404,13 @@ impl ArchiveAdapter for SevenZipBackend {
                 request.password.as_deref(),
             ));
         }
-        validate_extraction_listing(&listing.stdout)?;
+        let entries = parse_entries(&listing.stdout);
+        validate_extraction_entries(&entries)?;
         let encrypted = listing
             .stdout
             .lines()
             .any(|line| line.trim_end() == "Encrypted = +");
-        if !crate::decoded_zip::extract_if_needed(
-            &request,
-            parse_entries(&listing.stdout).len(),
-            &token,
-        )
-        .await?
-        {
+        if !crate::decoded_zip::extract_if_needed(&request, entries.len(), &token).await? {
             let mut args = vec!["x".into(), "-y".into(), "-bsp1".into()];
             if let Some(pw) = Self::password_arg(&request.password) {
                 args.push(pw);
@@ -519,8 +516,8 @@ fn extract_unsupported_method(output: &str) -> Option<String> {
     })
 }
 
-pub(crate) fn validate_extraction_listing(stdout: &str) -> Result<()> {
-    for entry in parse_entries(stdout) {
+fn validate_extraction_entries(entries: &[ArchiveEntry]) -> Result<()> {
+    for entry in entries {
         // TAR writers commonly include `.` or `./` for the extraction root.
         // Only a directory made entirely of current-directory components is
         // harmless; empty paths, files named `.`, links, and traversal still fail.
@@ -540,6 +537,11 @@ pub(crate) fn validate_extraction_listing(stdout: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+fn validate_extraction_listing(stdout: &str) -> Result<()> {
+    validate_extraction_entries(&parse_entries(stdout))
 }
 
 pub(crate) fn parse_entries(stdout: &str) -> Vec<ArchiveEntry> {
@@ -691,7 +693,9 @@ fn parse_encrypted(stdout: &str, stderr: &str) -> Option<bool> {
             "-" | "0" | "false" => Some(false),
             _ => None,
         })
-        .last()
+        .fold(None, |encrypted, value| {
+            Some(encrypted.unwrap_or(false) || value)
+        })
 }
 
 fn parse_slt_archive_format(output: &str) -> Option<ArchiveFormat> {
@@ -898,6 +902,10 @@ mod tests {
     fn parses_encryption_evidence_without_fabricating_missing_values() {
         assert_eq!(parse_encrypted("Encrypted = +\n", ""), Some(true));
         assert_eq!(parse_encrypted("Encrypted = -\n", ""), Some(false));
+        assert_eq!(
+            parse_encrypted("Encrypted = +\nEncrypted = -\n", ""),
+            Some(true)
+        );
         assert_eq!(parse_encrypted("", "Encrypted: true\n"), Some(true));
         assert_eq!(parse_encrypted("Encrypted = unknown\n", ""), None);
         assert_eq!(parse_encrypted("Files: 1\n", ""), None);
@@ -1105,6 +1113,27 @@ mod tests {
             SevenZipBackend::encoding_arg(&EncodingMode::Override("Shift_JIS".into())),
             Some("-scs932".into())
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn probe_reads_metadata_without_testing_payload() {
+        let (_root, executable) = fake_executable(
+            r#"
+[ "$1" = l ] || exit 99
+printf 'Path = fixture.7z\nType = 7z\n\nPath = secret.txt\nEncrypted = +\n'
+"#,
+        );
+        let probe = SevenZipBackend::new(executable)
+            .probe_with_context(
+                Path::new("fixture.7z"),
+                Arc::new(TaskExecutionContext::detached()),
+            )
+            .await
+            .unwrap();
+        assert!(probe.supported);
+        assert_eq!(probe.format, Some(ArchiveFormat::SevenZip));
+        assert_eq!(probe.encrypted, Some(true));
     }
 
     #[tokio::test]

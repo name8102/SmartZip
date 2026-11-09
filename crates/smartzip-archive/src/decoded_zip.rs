@@ -30,11 +30,19 @@ fn zip_error(error: zip::result::ZipError, path: &Path) -> SmartZipError {
 }
 
 pub(crate) fn entries(path: &Path, encoding: &str) -> Result<(Vec<ArchiveEntry>, bool)> {
-    let mut headers = File::open(path).map_err(|e| SmartZipError::io(Some(path.into()), e))?;
     let mut archive = zip::ZipArchive::new(
         File::open(path).map_err(|e| SmartZipError::io(Some(path.into()), e))?,
     )
     .map_err(|e| zip_error(e, path))?;
+    decoded_entries(&mut archive, path, encoding)
+}
+
+fn decoded_entries(
+    archive: &mut zip::ZipArchive<File>,
+    path: &Path,
+    encoding: &str,
+) -> Result<(Vec<ArchiveEntry>, bool)> {
+    let mut headers = File::open(path).map_err(|e| SmartZipError::io(Some(path.into()), e))?;
     let mut result = Vec::with_capacity(archive.len());
     let mut legacy = false;
     for index in 0..archive.len() {
@@ -98,10 +106,10 @@ pub(crate) async fn extract_if_needed(
     // Non-ZIP containers and unresolved split ZIPs retain the external path.
     let file = File::open(&request.archive)
         .map_err(|e| SmartZipError::io(Some(request.archive.clone()), e))?;
-    if zip::ZipArchive::new(file).is_err() {
+    let Ok(mut archive) = zip::ZipArchive::new(file) else {
         return Ok(false);
-    }
-    let (entries, legacy) = entries(&request.archive, encoding)?;
+    };
+    let (entries, legacy) = decoded_entries(&mut archive, &request.archive, encoding)?;
     if !legacy {
         return Ok(false);
     }
@@ -114,7 +122,7 @@ pub(crate) async fn extract_if_needed(
     let request = request.clone();
     let token = token.child_token();
     let _cancel_on_drop = token.clone().drop_guard();
-    tokio::task::spawn_blocking(move || extract(request, entries, &token))
+    tokio::task::spawn_blocking(move || extract(request, archive, entries, &token))
         .await
         .map_err(|e| SmartZipError::BackendProtocolError {
             backend: "zip-name-decoder".into(),
@@ -125,14 +133,10 @@ pub(crate) async fn extract_if_needed(
 
 fn extract(
     request: ExtractArchiveRequest,
+    mut archive: zip::ZipArchive<File>,
     entries: Vec<ArchiveEntry>,
     token: &CancellationToken,
 ) -> Result<()> {
-    let mut archive = zip::ZipArchive::new(
-        File::open(&request.archive)
-            .map_err(|e| SmartZipError::io(Some(request.archive.clone()), e))?,
-    )
-    .map_err(|e| zip_error(e, &request.archive))?;
     let mut names = std::collections::HashSet::new();
     let mut safe = Vec::with_capacity(entries.len());
     // Validate every decoded name and file type before creating output.
@@ -273,17 +277,16 @@ pub(crate) async fn read_member_if_needed(
     request: &crate::MemberReadRequest,
     listed_count: usize,
     token: &CancellationToken,
-    deadline: tokio::time::Instant,
 ) -> Result<Option<Vec<u8>>> {
     let EncodingMode::Override(encoding) = &request.encoding else {
         return Ok(None);
     };
     let file = File::open(&request.archive)
         .map_err(|e| SmartZipError::io(Some(request.archive.clone()), e))?;
-    if zip::ZipArchive::new(file).is_err() {
+    let Ok(mut archive) = zip::ZipArchive::new(file) else {
         return Ok(None);
-    }
-    let (entries, legacy) = entries(&request.archive, encoding)?;
+    };
+    let (entries, legacy) = decoded_entries(&mut archive, &request.archive, encoding)?;
     if !legacy {
         return Ok(None);
     }
@@ -308,7 +311,7 @@ pub(crate) async fn read_member_if_needed(
     if entry.is_dir
         || entry
             .uncompressed_size
-            .is_some_and(|s| s > request.max_bytes as u64)
+            .is_some_and(|s| request.max_bytes != 0 && s > request.max_bytes as u64)
     {
         return Err(SmartZipError::ResourceLimit {
             detail: "member is a directory or exceeds preview limit".into(),
@@ -318,26 +321,25 @@ pub(crate) async fn read_member_if_needed(
     let token = token.child_token();
     let _guard = token.clone().drop_guard();
     tokio::task::spawn_blocking(move || {
-        let mut archive = zip::ZipArchive::new(
-            File::open(&request.archive)
-                .map_err(|e| SmartZipError::io(Some(request.archive.clone()), e))?,
-        )
-        .map_err(|e| zip_error(e, &request.archive))?;
         let mut entry = match request.password.as_deref() {
             Some(pw) => archive.by_index_decrypt(index, pw.as_bytes()),
             None => archive.by_index(index),
         }
         .map_err(|e| zip_error(e, &request.archive))?;
+        if entry
+            .unix_mode()
+            .is_some_and(|mode| mode & 0o170000 == 0o120000)
+        {
+            return Err(SmartZipError::UnsupportedFormat {
+                path: request.archive.clone(),
+                format: Some("link member".into()),
+            });
+        }
         let mut bytes = Vec::new();
         let mut buffer = [0; 64 * 1024];
         loop {
             if token.is_cancelled() {
                 return Err(SmartZipError::Cancelled);
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return Err(SmartZipError::ResourceLimit {
-                    detail: "member preview exceeded 30 seconds".into(),
-                });
             }
             let count = entry
                 .read(&mut buffer)
@@ -348,7 +350,7 @@ pub(crate) async fn read_member_if_needed(
             if count == 0 {
                 break;
             }
-            if count > request.max_bytes.saturating_sub(bytes.len()) {
+            if request.max_bytes != 0 && count > request.max_bytes.saturating_sub(bytes.len()) {
                 return Err(SmartZipError::ResourceLimit {
                     detail: "member exceeds preview limit".into(),
                 });
@@ -384,6 +386,7 @@ mod tests {
         let output_dir = root.path().join("output");
         std::fs::create_dir(&output_dir).unwrap();
         let (listed, _) = entries(&archive, "UTF-8").unwrap();
+        let opened = zip::ZipArchive::new(File::open(&archive).unwrap()).unwrap();
         extract(
             ExtractArchiveRequest {
                 archive,
@@ -392,6 +395,7 @@ mod tests {
                 password: None,
                 encoding: EncodingMode::Override("UTF-8".into()),
             },
+            opened,
             listed,
             &CancellationToken::new(),
         )

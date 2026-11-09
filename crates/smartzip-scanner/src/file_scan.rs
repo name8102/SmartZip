@@ -1,37 +1,67 @@
 //! Bounded random-access metadata parsing. Search coverage is independent of RAM.
 use crate::{binwalk_name_to_format, Confidence, EmbeddedArchiveFinding, EmbeddedScanner};
-use std::{
-    fs::File,
-    io::{self, Read, Seek, SeekFrom},
-};
+use std::io::{self, Read, Seek, SeekFrom};
 
-const CHUNK: usize = 1024 * 1024;
+pub(super) const CHUNK: usize = 1024 * 1024;
 const MAX_HEADER: usize = 64 * 1024 * 1024;
 
+pub(super) trait ReadSeek: Read + Seek {}
+impl<T: Read + Seek> ReadSeek for T {}
+
 pub(super) struct Input<'a> {
-    file: File,
+    reader: &'a mut dyn ReadSeek,
     pub end: u64,
     cancelled: &'a dyn Fn() -> bool,
     error: Option<io::Error>,
+    zip_eocds: Option<std::sync::Arc<[u64]>>,
 }
-impl Input<'_> {
+impl<'a> Input<'a> {
+    pub(super) fn new(
+        reader: &'a mut dyn ReadSeek,
+        end: u64,
+        cancelled: &'a dyn Fn() -> bool,
+    ) -> Self {
+        Self {
+            reader,
+            end,
+            cancelled,
+            error: None,
+            zip_eocds: None,
+        }
+    }
+
+    pub(super) fn zip_eocds(&mut self) -> std::sync::Arc<[u64]> {
+        if let Some(offsets) = &self.zip_eocds {
+            return offsets.clone();
+        }
+        // Index signature locations once per input. A truncated ZIP may have
+        // thousands of local headers; none should rescan the remaining carrier.
+        let mut offsets = Vec::new();
+        self.find(b"PK\x05\x06", 0, self.end, |_, position| {
+            offsets.push(position);
+            None
+        });
+        let offsets: std::sync::Arc<[u64]> = offsets.into();
+        self.zip_eocds = Some(offsets.clone());
+        offsets
+    }
+
     pub fn read(&mut self, offset: u64, size: usize) -> Option<Vec<u8>> {
         if (self.cancelled)() {
             self.error = Some(io::Error::new(io::ErrorKind::Interrupted, "scan cancelled"));
             return None;
         }
-        if self.error.is_some() || size > MAX_HEADER || offset.checked_add(size as u64)? > self.end
-        {
+        if self.error.is_some() || offset.checked_add(size as u64)? > self.end {
             return None;
         }
         let mut bytes = vec![0; size];
         let result = (|| {
-            self.file.seek(SeekFrom::Start(offset))?;
+            self.reader.seek(SeekFrom::Start(offset))?;
             for chunk in bytes.chunks_mut(64 * 1024) {
                 if (self.cancelled)() {
                     return Err(io::Error::new(io::ErrorKind::Interrupted, "scan cancelled"));
                 }
-                self.file.read_exact(chunk)?;
+                self.reader.read_exact(chunk)?;
             }
             Ok(())
         })();
@@ -80,23 +110,15 @@ impl Input<'_> {
 }
 
 impl EmbeddedScanner {
-    pub(super) fn scan_file(
+    pub(super) fn scan_reader(
         &self,
-        file: File,
+        reader: &mut dyn ReadSeek,
+        end: u64,
         cancelled: &dyn Fn() -> bool,
+        window_bytes: usize,
     ) -> io::Result<Vec<EmbeddedArchiveFinding>> {
-        let end = file
-            .metadata()?
-            .len()
-            .min(self.scan_limit().unwrap_or(u64::MAX));
-        let mut input = Input {
-            file,
-            end,
-            cancelled,
-            error: None,
-        };
-        let matcher =
-            aho_corasick::AhoCorasick::new(&self.binwalk.patterns).map_err(io::Error::other)?;
+        let end = end.min(self.scan_limit().unwrap_or(u64::MAX));
+        let mut input = Input::new(reader, end, cancelled);
         let overlap = self
             .binwalk
             .patterns
@@ -109,7 +131,7 @@ impl EmbeddedScanner {
         let mut accepted_end = 0;
         let mut findings = Vec::new();
         while cursor < end && findings.len() < self.config.max_findings {
-            let window_end = cursor.saturating_add(CHUNK as u64).min(end);
+            let window_end = cursor.saturating_add(window_bytes as u64).min(end);
             let Some(bytes) = input.read(
                 cursor,
                 (window_end.saturating_add(overlap as u64).min(end) - cursor) as usize,
@@ -117,10 +139,13 @@ impl EmbeddedScanner {
                 break;
             };
             let mut next = window_end;
-            for magic in matcher.find_overlapping_iter(&bytes) {
+            for magic in self.matcher.find_overlapping_iter(&bytes) {
                 let offset = cursor + magic.start() as u64;
                 if offset >= window_end {
                     break;
+                }
+                if offset < accepted_end {
+                    continue;
                 }
                 let signature = &self.binwalk.pattern_signature_table[&magic.pattern().as_usize()];
                 let Some(format) = binwalk_name_to_format(&signature.name) else {
@@ -138,13 +163,15 @@ impl EmbeddedScanner {
                 {
                     continue;
                 }
-                next = finding
+                accepted_end = finding
                     .offset
                     .saturating_add(finding.size.unwrap_or(1))
                     .max(offset + 1);
-                accepted_end = next;
                 findings.push(finding);
-                break;
+                if findings.len() >= self.config.max_findings || accepted_end >= window_end {
+                    next = accepted_end;
+                    break;
+                }
             }
             if input.error.is_some() {
                 break;
@@ -168,7 +195,17 @@ fn parse(
     signature: &binwalk::signatures::common::Signature,
 ) -> Option<EmbeddedArchiveFinding> {
     use smartzip_core::ArchiveFormat::*;
-    let prefix = input.prefix(offset, 64 * 1024)?;
+    let prefix_size = match format {
+        Zip => 30,
+        Bzip2 => 10,
+        Xz => 12,
+        Lzma => 14,
+        Zstd => 18,
+        Lz4 => 19,
+        Rar | Gzip => 64 * 1024,
+        _ => 0,
+    };
+    let prefix = input.prefix(offset, prefix_size)?;
     let mut start = offset;
     let (size, confidence) = match format {
         Zip => {
@@ -230,9 +267,9 @@ fn parse(
                 return None;
             }
             let mut decoder = if format == Xz {
-                xz2::stream::Stream::new_stream_decoder(MAX_HEADER as u64, 0)
+                xz2::stream::Stream::new_stream_decoder(u64::MAX, 0)
             } else {
-                xz2::stream::Stream::new_lzma_decoder(MAX_HEADER as u64)
+                xz2::stream::Stream::new_lzma_decoder(u64::MAX)
             }
             .ok()?;
             let mut reader = Stream::new(input, offset);
@@ -659,5 +696,57 @@ mod tests {
             assert_eq!(findings[0].size, Some(data.len() as u64));
             assert_eq!(findings[1].offset, 30 + data.len() as u64);
         }
+    }
+}
+
+#[cfg(test)]
+mod io_cost_tests {
+    use super::*;
+    use std::{cell::Cell, io::Cursor};
+
+    struct Counted<'a> {
+        bytes: Cursor<&'a [u8]>,
+        reads: Cell<usize>,
+    }
+    impl Read for Counted<'_> {
+        fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+            let read = self.bytes.read(bytes)?;
+            self.reads.set(self.reads.get() + read);
+            Ok(read)
+        }
+    }
+    impl Seek for Counted<'_> {
+        fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+            self.bytes.seek(position)
+        }
+    }
+
+    #[test]
+    fn truncated_zip_headers_share_one_eocd_search() {
+        let mut bytes = vec![0x42; CHUNK * 2];
+        for offset in (0..bytes.len()).step_by(8192) {
+            bytes[offset..offset + 30].fill(0);
+            bytes[offset..offset + 4].copy_from_slice(b"PK\x03\x04");
+        }
+        let mut source = Counted {
+            bytes: Cursor::new(&bytes),
+            reads: Cell::new(0),
+        };
+        let scanner = EmbeddedScanner::new(crate::ScannerConfig {
+            max_findings: usize::MAX,
+            max_scan_bytes: None,
+            include_formats: vec![smartzip_core::ArchiveFormat::Zip],
+            ..Default::default()
+        });
+        let findings = scanner
+            .scan_reader(&mut source, bytes.len() as u64, &|| false, CHUNK)
+            .unwrap();
+        assert_eq!(findings.len(), 256);
+        assert!(findings.iter().all(|finding| finding.size.is_none()));
+        assert!(
+            source.reads.get() < bytes.len() * 4,
+            "{} bytes read",
+            source.reads.get()
+        );
     }
 }

@@ -8,7 +8,7 @@ fn precedence_preserves_false_empty_arrays_and_file_relative_paths() {
     fs::write(&path, "[extraction.recursion]\nenabled=false\n[passwords]\nsources=[]\n[state]\ndatabase='data.db'\n[[backends.installations]]\nid='local'\nfamily='seven-zip-cli'\nexecutable='./bin/7z'\n").unwrap();
     let mut resolved = ResolvedConfig::load(Some(&path)).unwrap();
     assert!(!resolved.values.extraction.recursion.enabled);
-    assert_eq!(resolved.values.extraction.recursion.max_depth, 3);
+    assert_eq!(resolved.values.extraction.recursion.max_depth, None);
     assert!(resolved.values.passwords.sources.is_empty());
     assert_eq!(
         resolved.values.state.database,
@@ -17,10 +17,6 @@ fn precedence_preserves_false_empty_arrays_and_file_relative_paths() {
     assert_eq!(
         resolved.values.backends.installations[0].executable,
         root.path().join("./bin/7z")
-    );
-    assert_eq!(
-        resolved.origins["extraction.recursion.max_depth"],
-        "defaults-v1"
     );
     resolved
         .apply(&[("extraction.recursion.enabled".into(), true.into())])
@@ -55,7 +51,6 @@ fn invalid_files_fail_without_falling_back_or_being_rewritten() {
         "schema_version=1\n[extraction.embedded]\ndominant_min_ratio=nan",
         "[extraction]\nmax_filez=20",
         "[extraction]\nmax_files=20",
-        "schema_version=1\n[extraction.recursion]\nmax_depth=256",
     ] {
         fs::write(&path, text).unwrap();
         assert!(
@@ -115,10 +110,18 @@ fn editing_preserves_comments_and_rejects_conflicts_invalid_values_and_links() {
     );
     assert!(edit_config(&path, "extraction.recursion.enabled", Some("'invalid'")).is_err());
     assert_eq!(fs::read_to_string(&path).unwrap(), modified);
-    fs::write(path.with_extension("toml.lock"), "another writer").unwrap();
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path.with_extension("toml.lock"))
+        .unwrap();
+    lock.try_lock().unwrap();
     assert!(edit_config(&path, "extraction.recursion.enabled", Some("true")).is_err());
     assert_eq!(fs::read_to_string(&path).unwrap(), modified);
-    fs::remove_file(path.with_extension("toml.lock")).unwrap();
+    drop(lock);
+    // A leftover lock file has no ownership after the writer exits.
     edit_config(&path, "extraction.recursion.enabled", None).unwrap();
     assert!(
         ResolvedConfig::load(Some(&path))
@@ -216,7 +219,50 @@ fn failed_batch_edits_preserve_entire_file_and_missing_file_stays_absent() {
         assert!(edit_config_fields(&path, &[valid.clone(), invalid_patch]).is_err());
         assert_eq!(fs::read(&path).unwrap(), original);
     }
-    fs::write(path.with_extension("toml.lock"), "another writer").unwrap();
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path.with_extension("toml.lock"))
+        .unwrap();
+    lock.try_lock().unwrap();
     assert!(edit_config_fields(&path, &[valid]).is_err());
     assert_eq!(fs::read(&path).unwrap(), original);
+}
+
+#[test]
+fn recursion_depth_is_optional_and_accepts_large_explicit_values() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("config.toml");
+    init_config(&path, false).unwrap();
+    assert_eq!(
+        ResolvedConfig::load(Some(&path))
+            .unwrap()
+            .values
+            .extraction
+            .recursion
+            .max_depth,
+        None
+    );
+    edit_config(&path, "extraction.recursion.max_depth", Some("512")).unwrap();
+    assert_eq!(
+        ResolvedConfig::load(Some(&path))
+            .unwrap()
+            .values
+            .extraction
+            .recursion
+            .max_depth,
+        Some(512)
+    );
+    edit_config(&path, "extraction.recursion.max_depth", None).unwrap();
+    assert_eq!(
+        ResolvedConfig::load(Some(&path))
+            .unwrap()
+            .values
+            .extraction
+            .recursion
+            .max_depth,
+        None
+    );
 }

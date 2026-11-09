@@ -80,9 +80,7 @@ pub(crate) struct PreparedArchive {
     pub(crate) known_hit: Option<crate::history::KnownFileHit>,
     pub(crate) encoding_mode: EncodingMode,
     pub(crate) reused_confirmed_encoding: bool,
-    pub(crate) detect_encoding: bool,
     pub(crate) zip_encoding_assessment: Option<EncodingConfirmationContext>,
-    pub(crate) recorder_name: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -95,7 +93,7 @@ pub struct SmartZipEngine {
     pub(crate) root_management: Option<Arc<crate::root_management::RootManagement>>,
     pub(crate) run_policy: Option<Arc<crate::CompiledRunPolicy>>,
     pub(crate) cancellation: tokio_util::sync::CancellationToken,
-    pub(crate) scanner: smartzip_scanner::EmbeddedScanner,
+    pub(crate) scanner: Arc<smartzip_scanner::EmbeddedScanner>,
     pub(crate) archive_recycler: ArchiveRecycleHandler,
     pub(crate) recycle_sources: bool,
     pub(crate) min_embedded_size_bytes: u64,
@@ -107,7 +105,7 @@ pub type ArchiveRecycleHandler = Arc<dyn Fn(PathBuf) -> std::io::Result<()> + Se
 pub struct ExtractWorkflowRequest {
     pub inputs: Vec<PathBuf>,
     pub output_dir: PathBuf,
-    pub recursion_limit: u8,
+    pub recursion_limit: Option<usize>,
     pub encoding_mode: EncodingMode,
     pub scanner: ScannerConfig,
     pub password_candidates: PasswordCandidateRequest,
@@ -115,7 +113,6 @@ pub struct ExtractWorkflowRequest {
     pub single_root_name_policy: crate::layout::SingleRootNamePolicy,
     pub embedded_scan_mode: smartzip_core::EmbeddedScanMode,
     pub dominant_min_ratio: f32,
-    pub confirm_large_scan: bool,
     /// Bypass the `known_files` dedup skip and re-extract even when this file
     /// was already extracted inside the dedup window.
     pub force: bool,
@@ -127,7 +124,7 @@ pub struct ExtractWorkflowRequest {
 pub struct ExtractionCandidate {
     pub path: PathBuf,
     pub relative_path: PathBuf,
-    pub depth: u8,
+    pub depth: usize,
     pub source: CandidateSource,
     pub detected_format: Option<ArchiveFormat>,
     pub embedded_offset: Option<u64>,
@@ -149,7 +146,7 @@ impl ExtractionCandidate {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum CandidateSource {
     RootInput,
     ExtractedFile,

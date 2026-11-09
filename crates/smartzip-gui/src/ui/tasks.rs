@@ -590,7 +590,7 @@ impl View {
             .border_t_1()
             .border_color(cx.theme().border)
             .when(nested, |row| {
-                row.pl(px(40. + 12. * f32::from(file.depth.min(4))))
+                row.pl(px(40. + 12. * file.depth.min(4) as f32))
             })
             .when(selected, |row| row.bg(cx.theme().sidebar_accent))
             .hover(|row| row.bg(cx.theme().sidebar))

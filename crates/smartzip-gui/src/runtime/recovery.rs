@@ -117,6 +117,7 @@ pub(super) async fn run(
                 status,
                 detail: serde_json::to_value(result)?,
                 warnings: vec!["已按原任务配置恢复；临时密码未保存，源归档不会追补回收。".into()],
+                backend_router: None,
             })
         }
         Err(error) => {

@@ -350,7 +350,7 @@ impl Render for ConfigForm {
 
 fn encode_edit(kind: Kind, value: String) -> Option<String> {
     match kind {
-        Kind::Text if value.trim().is_empty() => None,
+        Kind::Text | Kind::Number if value.trim().is_empty() => None,
         Kind::Text | Kind::Choice(_) => Some(toml::Value::String(value).to_string()),
         _ => Some(value),
     }
@@ -363,6 +363,7 @@ mod tests {
     #[test]
     fn edits_preserve_types_and_invalid_input_for_validation() {
         assert_eq!(encode_edit(Kind::Text, "  ".into()), None);
+        assert_eq!(encode_edit(Kind::Number, "  ".into()), None);
         assert_eq!(
             encode_edit(Kind::Number, "not-a-number".into()),
             Some("not-a-number".into())

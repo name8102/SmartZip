@@ -36,12 +36,11 @@ pub(crate) fn archive_stem(path: &Path) -> std::ffi::OsString {
     std::ffi::OsString::from(name_score::archive_display_stem(path))
 }
 
-pub(crate) fn candidate_key(candidate: &ExtractionCandidate) -> String {
-    format!(
-        "{}:{}:{:?}",
-        candidate.path.display(),
+pub(crate) fn candidate_key(candidate: &ExtractionCandidate) -> (PathBuf, u64, CandidateSource) {
+    (
+        candidate.path.clone(),
         candidate.embedded_offset.unwrap_or(0),
-        candidate.source
+        candidate.source.clone(),
     )
 }
 
@@ -254,7 +253,7 @@ struct NestedDiscoveryPolicy<'a> {
 pub(crate) fn discover_nested_candidates(
     scanner: &EmbeddedScanner,
     root: &Path,
-    depth: u8,
+    depth: usize,
     prefix: &Path,
     policy: &smartzip_core::EmbeddedScanPolicy,
     nested_embedded_enabled: bool,
@@ -314,7 +313,7 @@ pub(crate) fn discover_nested_candidates_from_inventory(
     scanner: &EmbeddedScanner,
     root: &Path,
     files: &[crate::budget::InventoryFile],
-    depth: u8,
+    depth: usize,
     prefix: &Path,
     policy: &smartzip_core::EmbeddedScanPolicy,
     nested_embedded_enabled: bool,
@@ -359,7 +358,7 @@ fn classify_nested_file(
     scanner: Option<&EmbeddedScanner>,
     path: &Path,
     relative_path: PathBuf,
-    depth: u8,
+    depth: usize,
     known_size: Option<u64>,
     discovery: &NestedDiscoveryPolicy<'_>,
 ) -> Vec<ExtractionCandidate> {
@@ -381,7 +380,7 @@ fn classify_nested_file(
         && unrecognized_size.is_some_and(|size| size >= policy.min_finding_size_bytes);
     let header_result = (nested_embedded_enabled
         && (detected_format.is_some() || scan_unrecognized_header))
-        .then(|| crate::detect::probe_file_header(&path))
+        .then(|| crate::detect::probe_file_header(&path).ok().flatten())
         .flatten();
     if let Some((fmt, offset)) = header_result {
         if is_business_container(&path) {

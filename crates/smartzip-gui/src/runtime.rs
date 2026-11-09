@@ -25,7 +25,7 @@ pub enum TaskOperation {
     Test,
     Recover,
 }
-#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct TaskSettings {
     pub recovery_task_id: Option<String>,
@@ -83,6 +83,7 @@ pub struct JobOutcome {
     pub status: String,
     pub detail: serde_json::Value,
     pub warnings: Vec<String>,
+    pub backend_router: Option<smartzip_archive::BackendRouter>,
 }
 pub enum JobMessage {
     Event(TaskEvent),
@@ -133,8 +134,19 @@ pub struct JobHandle {
     pub roots: Arc<smartzip_engine::root_management::RootManagement>,
     mailbox: Mailbox,
     cancellation: CancellationToken,
+    root_revision: u64,
 }
 impl JobHandle {
+    pub fn snapshot_if_changed(
+        &mut self,
+    ) -> Option<Vec<smartzip_engine::root_management::FileTaskSnapshot>> {
+        let revision = self.roots.revision();
+        if self.root_revision == revision {
+            return None;
+        }
+        self.root_revision = revision;
+        Some(self.roots.snapshot())
+    }
     pub fn drain(&self) -> Vec<JobMessage> {
         self.mailbox.drain()
     }
@@ -187,6 +199,7 @@ pub fn spawn_job_at(request: JobRequest, queue_position: i64) -> Result<JobHandl
                     status: "cancelled".into(),
                     detail: serde_json::Value::Null,
                     warnings: vec![],
+                    backend_router: None,
                 }),
                 Ok(Err(error)) => JobMessage::Failed(error),
                 Err(_) => JobMessage::Failed("归档工作线程异常终止".into()),
@@ -198,6 +211,7 @@ pub fn spawn_job_at(request: JobRequest, queue_position: i64) -> Result<JobHandl
         roots,
         mailbox,
         cancellation,
+        root_revision: 0,
     })
 }
 
@@ -507,7 +521,6 @@ async fn run_job_inner(
                 single_root_name_policy: smartzip_engine::layout::SingleRootNamePolicy::Auto,
                 embedded_scan_mode: smartzip_core::EmbeddedScanMode::Auto,
                 dominant_min_ratio: c.extraction.embedded.dominant_min_ratio,
-                confirm_large_scan: false,
                 force: request.settings.force,
                 limits: c.limits.clone(),
             };
@@ -652,6 +665,7 @@ async fn run_job_inner(
         status,
         detail,
         warnings,
+        backend_router: (request.operation == TaskOperation::List).then_some(backend),
     })
 }
 
@@ -866,7 +880,7 @@ mod tests {
             smartzip_engine::ExtractWorkflowRequest {
                 inputs: vec![encrypted.clone()],
                 output_dir: temp.path().join("recovered-output"),
-                recursion_limit: 0,
+                recursion_limit: Some(0),
                 encoding_mode: smartzip_core::EncodingMode::Auto,
                 scanner: Default::default(),
                 password_candidates: Default::default(),
@@ -874,7 +888,6 @@ mod tests {
                 single_root_name_policy: Default::default(),
                 embedded_scan_mode: smartzip_core::EmbeddedScanMode::Ignore,
                 dominant_min_ratio: 0.7,
-                confirm_large_scan: false,
                 force: false,
                 limits: Default::default(),
             },

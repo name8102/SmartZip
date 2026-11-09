@@ -35,9 +35,9 @@ async fn ready(path: &Path) {
 }
 
 #[tokio::test]
-async fn process_output_limits_preserve_three_distinct_contracts() {
+async fn protocol_output_is_complete_while_diagnostic_capture_is_bounded() {
     let (_root, path) = executable(
-        "dd if=/dev/zero bs=1048576 count=17 2>/dev/null &\n(dd if=/dev/zero bs=1048576 count=17 2>/dev/null) >&2\nwait",
+        "dd if=/dev/zero bs=1048576 count=17 2>/dev/null; printf '\\nPath = beyond-limit.txt\\nSize = 1\\n' &\n(dd if=/dev/zero bs=1048576 count=17 2>/dev/null) >&2\nwait",
     );
     let backend = SevenZipBackend::new(path.clone());
     let ordinary = tokio::time::timeout(
@@ -46,7 +46,9 @@ async fn process_output_limits_preserve_three_distinct_contracts() {
     )
     .await
     .unwrap();
-    assert!(matches!(ordinary, Err(SmartZipError::ResourceLimit { .. })));
+    let ordinary = ordinary.unwrap();
+    assert_eq!(ordinary.entries.len(), 1);
+    assert_eq!(ordinary.entries[0].path, Path::new("beyond-limit.txt"));
     let streaming = tokio::time::timeout(
         Duration::from_secs(15),
         backend.run_streaming_with_context(&[], Arc::new(TaskExecutionContext::detached()), false),

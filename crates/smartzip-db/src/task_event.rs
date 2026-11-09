@@ -5,7 +5,7 @@
 //! human-readable `message`, and an optional serialized JSON payload for
 //! structured details. Consumers (the CLI `history show` command and the
 //! future GUI history pane) reconstruct a timeline by ordering rows by
-//! `created_at` within a task.
+//! insertion ID within a task.
 
 use crate::Result;
 use rusqlite::{params, Connection};
@@ -85,7 +85,7 @@ impl<'a> TaskEventRepository<'a> {
             SELECT id, task_id, level, event_type, message, data_json, created_at
             FROM task_events
             WHERE task_id = ?1
-            ORDER BY created_at ASC, id ASC
+            ORDER BY id ASC
             "#,
         )?;
         let rows = stmt.query_map(params![task_id], map_event)?;
@@ -128,7 +128,7 @@ mod tests {
         let repo = TaskEventRepository::new(db.connection());
         for (ty, msg, at) in [
             ("Started", "started", "2026-07-02T00:00:01Z"),
-            ("Progress", "extracting", "2026-07-02T00:00:02Z"),
+            ("Progress", "extracting", "2026-07-02 00:00:02"),
             ("Completed", "completed", "2026-07-02T00:00:03Z"),
         ]
         .iter()

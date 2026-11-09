@@ -8,7 +8,6 @@ use smartzip_core::{
 use smartzip_passwords::{PasswordCandidate, PasswordService};
 use smartzip_scanner::{Confidence, EmbeddedArchiveFinding, EmbeddedScanner};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::Read;
 
 use crate::access::prepare_resolved_archive;
 use crate::backend_util::{backend_call, confidence_score};
@@ -40,7 +39,7 @@ use crate::volumes::VolumeResolver;
 /// Shared by concurrent roots; claims never hold a borrow across an await.
 #[derive(Default)]
 pub(crate) struct TaskDedup {
-    seen: HashSet<String>,
+    seen: HashSet<(std::path::PathBuf, u64, CandidateSource)>,
     volumes: HashSet<String>,
     members: HashSet<std::path::PathBuf>,
     // Claim overlapping candidate sets before trial, but consume only winners.
@@ -90,7 +89,7 @@ fn record_failure(
 }
 
 pub(crate) async fn extract_recursive_with_listener_interactive(
-    engine_scanner: &EmbeddedScanner,
+    engine_scanner: &std::sync::Arc<EmbeddedScanner>,
     run_policy: Option<&crate::CompiledRunPolicy>,
     min_embedded_size_bytes: u64,
     archive_recycler: &ArchiveRecycleHandler,
@@ -154,12 +153,12 @@ pub(crate) async fn extract_recursive_with_listener_interactive(
         std::sync::Arc::new(events.clone()),
         cancellation.token().child_token(),
     ));
-    let nested_scanner = if request.scanner == *engine_scanner.config() {
-        None
+    let nested_scanner_shared = if request.scanner == *engine_scanner.config() {
+        engine_scanner.clone()
     } else {
-        Some(EmbeddedScanner::new(request.scanner.clone()))
+        std::sync::Arc::new(EmbeddedScanner::new(request.scanner.clone()))
     };
-    let nested_scanner = nested_scanner.as_ref().unwrap_or(engine_scanner);
+    let nested_scanner = nested_scanner_shared.as_ref();
     let root_scanner = config
         .is_none_or(|c| c.extraction.embedded.root != smartzip_config::RootScan::Off)
         .then(|| EmbeddedScanner::new(full_root_scanner_config(&request.scanner)));
@@ -286,7 +285,10 @@ pub(crate) async fn extract_recursive_with_listener_interactive(
                 .await?;
             continue;
         }
-        if candidate.depth > request.recursion_limit {
+        if request
+            .recursion_limit
+            .is_some_and(|limit| candidate.depth > limit)
+        {
             completion
                 .skip(candidate, "recursion_limit", &mut skipped)
                 .await?;
@@ -557,32 +559,22 @@ pub(crate) async fn extract_recursive_with_listener_interactive(
             {
                 None
             } else {
-                crate::detect::probe_file_header(&candidate.path)
-            };
-            let _has_non_archive_header = {
-                let mut file = match std::fs::File::open(&candidate.path) {
-                    Ok(f) => f,
-                    Err(_) => {
-                        record_failure(&mut failed_count, config, &cancellation);
-                        record_skip(passive_history, &task_id, &candidate, "not_found");
-                        finish_execution(
-                            execution,
-                            &task_id,
-                            &node.id,
-                            node.generation,
-                            "failed",
-                            Some("not_found"),
-                            None,
-                            false,
-                        )
-                        .await?;
-                        skipped.push(candidate);
+                match crate::detect::probe_file_header(&candidate.path) {
+                    Ok(header) => header,
+                    Err(error) => {
+                        completion
+                            .fail(
+                                candidate,
+                                &original_input_path,
+                                "input_unreadable",
+                                error.to_string(),
+                                &mut failed_count,
+                                &mut skipped,
+                            )
+                            .await?;
                         continue 'nodes;
                     }
-                };
-                let mut buf = [0u8; 8192];
-                let n = file.read(&mut buf).unwrap_or(0);
-                crate::detect::detect_non_archive_header(&buf[..n])
+                }
             };
 
             // Root scans enqueue every embedded payload as its own candidate.
@@ -2215,25 +2207,15 @@ pub(crate) async fn extract_recursive_with_listener_interactive(
             }
             if let Some(recorder) = history {
                 if let (Some(hash), Some(size)) = (sample_hash.as_deref(), sample_size) {
-                    let name = &prepared.recorder_name;
                     recorder.upsert_known_file_extract(crate::history::KnownFileUpsert {
                         sample_hash: hash,
                         size,
-                        name: name.as_deref(),
-                        offset: candidate.embedded_offset.map(|o| o as i64),
                         password_id: candidate_password_id,
+                        confirmed_encoding: match &request.encoding_mode {
+                            EncodingMode::Override(encoding) => Some(encoding),
+                            EncodingMode::Auto => None,
+                        },
                     });
-                    if let EncodingMode::Override(encoding) = &request.encoding_mode {
-                        recorder.upsert_known_file_confirmed_encoding(
-                            crate::history::KnownFileEncodingUpsert {
-                                sample_hash: hash,
-                                size,
-                                name: name.as_deref(),
-                                offset: candidate.embedded_offset.map(|o| o as i64),
-                                encoding,
-                            },
-                        );
-                    }
                 }
             }
 
@@ -2289,7 +2271,9 @@ pub(crate) async fn extract_recursive_with_listener_interactive(
                 discovery_policy.mode = policy.embedded_mode(false);
             }
             let nested_candidates = if !was_cancelled
-                && (config.is_none() || candidate.depth < request.recursion_limit)
+                && request
+                    .recursion_limit
+                    .is_none_or(|limit| candidate.depth < limit)
             {
                 let scan_unrecognized = config.is_none_or(|c| {
                     matches!(
@@ -2297,30 +2281,46 @@ pub(crate) async fn extract_recursive_with_listener_interactive(
                         smartzip_config::NestedScan::Aggressive | smartzip_config::NestedScan::All
                     )
                 });
-                if let Some(files) = committed_output_files.borrow().as_deref() {
-                    discover_nested_candidates_from_inventory(
-                        nested_scanner,
-                        &actual_output_dir,
-                        files,
-                        candidate.depth + 1,
-                        output_relative_path,
-                        &discovery_policy,
-                        nested_embedded_enabled,
-                        scan_unrecognized,
-                        cancellation.token(),
+                let scanner = nested_scanner_shared.clone();
+                let root = actual_output_dir.clone();
+                let prefix = output_relative_path.clone();
+                let depth = candidate.depth + 1;
+                let files = committed_output_files.borrow_mut().take();
+                let token = cancellation.token().child_token();
+                let _cancel_on_drop = token.clone().drop_guard();
+                tokio::task::spawn_blocking(move || {
+                    if let Some(files) = files {
+                        discover_nested_candidates_from_inventory(
+                            &scanner,
+                            &root,
+                            &files,
+                            depth,
+                            &prefix,
+                            &discovery_policy,
+                            nested_embedded_enabled,
+                            scan_unrecognized,
+                            &token,
+                        )
+                    } else {
+                        discover_nested_candidates(
+                            &scanner,
+                            &root,
+                            depth,
+                            &prefix,
+                            &discovery_policy,
+                            nested_embedded_enabled,
+                            scan_unrecognized,
+                            &token,
+                        )
+                    }
+                })
+                .await
+                .map_err(|error| {
+                    smartzip_core::SmartZipError::io(
+                        Some(actual_output_dir.clone()),
+                        std::io::Error::other(error),
                     )
-                } else {
-                    discover_nested_candidates(
-                        nested_scanner,
-                        &actual_output_dir,
-                        candidate.depth + 1,
-                        output_relative_path,
-                        &discovery_policy,
-                        nested_embedded_enabled,
-                        scan_unrecognized,
-                        cancellation.token(),
-                    )
-                }
+                })?
             } else {
                 Vec::new()
             };

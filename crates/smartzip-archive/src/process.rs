@@ -20,7 +20,7 @@ type Capture = (Vec<u8>, bool);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Mode {
-    /// Wait for process, then collect pipes; reject truncated output.
+    /// Collect complete protocol output.
     Ordinary,
     /// Same lifecycle, but the backend continues interpreting bounded progress records.
     Streaming,
@@ -54,7 +54,6 @@ enum Failure {
         _kill_error: Option<io::Error>,
         wait_error: Option<io::Error>,
     },
-    OutputLimit,
     MissingPipe(&'static str),
 }
 impl Failure {
@@ -86,9 +85,6 @@ impl Failure {
                 ..
             } if mode != Mode::Diagnostic => SmartZipError::io(Some(executable.into()), source),
             Self::Cancelled { .. } => SmartZipError::Cancelled,
-            Self::OutputLimit => SmartZipError::ResourceLimit {
-                detail: "backend output exceeded 16 MiB; incomplete output was rejected".into(),
-            },
             Self::MissingPipe(pipe) if mode == Mode::Diagnostic => {
                 SmartZipError::BackendProtocolError {
                     backend: id.into(),
@@ -231,13 +227,7 @@ async fn run_child(
         captures
     } else {
         let out = stdout.collect(status.code()).await?;
-        if mode == Mode::Ordinary && out.1 {
-            return Err(Failure::OutputLimit);
-        }
         let err = stderr.collect(status.code()).await?;
-        if mode == Mode::Ordinary && err.1 {
-            return Err(Failure::OutputLimit);
-        }
         (out, err)
     };
     Ok((
@@ -294,9 +284,22 @@ pub(crate) async fn run_bounded(
     token: &CancellationToken,
     mode: Mode,
 ) -> Result<(BackendCommandOutput, bool)> {
-    run(executable, id, args, token, mode, |_, pipe| {
-        bounded_read(pipe)
-    })
+    run(
+        executable,
+        id,
+        args,
+        token,
+        mode,
+        move |_, mut pipe| async move {
+            if mode == Mode::Ordinary {
+                let mut bytes = Vec::new();
+                pipe.read_to_end(&mut bytes).await?;
+                Ok((bytes, false))
+            } else {
+                bounded_read(pipe).await
+            }
+        },
+    )
     .await
 }
 
