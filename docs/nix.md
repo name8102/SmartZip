@@ -1,8 +1,8 @@
-# NixOS 运行与 Nix 开发环境
+# Nix 开发环境与 NixOS 安装
 
-SmartZip 的 flake 提供 Linux x86_64 / aarch64 的 CLI、GUI 和开发 shell。`flake.lock` 固定 Nixpkgs 26.05 的快照及内容哈希；Rust 1.98.1 通过同样锁定的 rust-overlay 提供，工具链下载也有固定哈希。Cargo 依赖仍由 `Cargo.lock` 固定。首次使用需要启用 Nix 的 `nix-command` 和 `flakes` 实验功能。
+SmartZip 的 flake 为 Linux（x86_64 / aarch64）和 macOS（Apple Silicon / Intel）提供开发 shell。CLI 和 GUI 的 Nix 安装包面向 Linux。`flake.lock` 固定 Nixpkgs 26.05 的快照及内容哈希；Rust 1.98.1 通过同样锁定的 rust-overlay 提供，工具链下载也有固定哈希。Cargo 依赖仍由 `Cargo.lock` 固定。首次使用需要启用 Nix 的 `nix-command` 和 `flakes` 实验功能。
 
-## 运行、安装与升级
+## Linux 运行、安装与升级
 
 在仓库目录执行：
 
@@ -49,16 +49,17 @@ cargo run -p smartzip-gui
 python3 -m unittest discover -s scripts -p 'test_*.py'
 ```
 
-开发 shell 提供 Rust/Cargo、rustfmt、Clippy、rust-analyzer、Clang、pkg-config、bindgen 所需 libclang、压缩与 GUI 原生库、7-Zip、Python、just 和常用验证工具。PATH 使用 Nix 工具链，不需要在 NixOS 上通过 rustup 下载通用 Linux 编译器。仓库的 `rust-toolchain.toml` 继续供非 Nix 环境使用。
+开发 shell 提供 Rust/Cargo、rustfmt、Clippy、rust-analyzer、Clang、pkg-config、bindgen 所需 libclang、原生压缩库、7-Zip、Python、just 和常用验证工具。Linux shell 提供 GUI 所需的图形库；macOS shell 使用 Nix 的 Apple SDK 和系统框架，并将 `SMARTZIP_7Z_LIBRARY` 指向固定版本的 `7z.dylib`。开发不需要另装 Homebrew 依赖或通过 rustup 下载工具链。`rust-toolchain.toml` 继续供非 Nix 环境使用。
 
 默认构建目录为 `target/nix`，可通过 `CARGO_TARGET_DIR` 覆盖。`nix develop -c cargo build --locked` 可以直接运行一次命令。仓库附带 `.envrc`；安装 direnv / nix-direnv 并启用 direnv 的 shell hook 后，`direnv allow` 可自动进入环境。
 
 ```sh
 nix fmt flake.nix nix/*.nix
-nix flake check
 ```
 
-flake 的 smoke check 在隔离环境中运行已安装的 CLI，使用真实 7-Zip 完成后端诊断、列出、完整性校验和解压，并比对内容。它不启动原生 GUI；GUI 的拖放、输入法和文件关联仍需桌面验收。Nix 包构建不重复运行全 workspace 测试，需要时使用上面的开发 shell 命令。
+Linux 上的 `nix flake check` 在隔离环境中运行已安装的 CLI，使用真实 7-Zip 完成后端诊断、列出、完整性校验和解压，并比对内容。Nix 包构建不重复运行全 workspace 测试，需要时使用上面的开发 shell 命令。
+
+macOS 可在开发 shell 内运行 `cargo run -p smartzip-cli -- doctor` 检查原生后端，或用 `just install` 构建并安装 `.app` 和 CLI。GUI 的拖放、输入法和文件关联需要桌面验收。
 
 ## 更新固定版本
 

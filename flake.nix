@@ -16,9 +16,13 @@
       rust-overlay,
     }:
     let
-      systems = [
+      linuxSystems = [
         "x86_64-linux"
         "aarch64-linux"
+      ];
+      systems = linuxSystems ++ [
+        "aarch64-darwin"
+        "x86_64-darwin"
       ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
       projectFor =
@@ -69,13 +73,15 @@
           project = projectFor system;
         in
         {
+          sevenzip = project.sevenzip;
+        }
+        // nixpkgs.lib.optionalAttrs (builtins.elem system linuxSystems) {
           default = project.smartzip;
           smartzip = project.smartzip;
-          sevenzip = project.sevenzip;
         }
       );
 
-      apps = forAllSystems (
+      apps = nixpkgs.lib.genAttrs linuxSystems (
         system:
         let
           package = self.packages.${system}.smartzip;
@@ -116,18 +122,19 @@
               zip
               unzip
             ];
-            # GPUI loads graphics libraries at runtime; GPU drivers belong to the host.
-            LD_LIBRARY_PATH = dependencies.libraryPath;
-            SMARTZIP_7Z_LIBRARY = "${sevenzip}/lib/smartzip/7z.so";
+            SMARTZIP_7Z_LIBRARY = "${sevenzip}/lib/smartzip/${sevenzip.libraryName}";
             shellHook = ''
-              export LD_LIBRARY_PATH="/run/opengl-driver/lib:$LD_LIBRARY_PATH"
               export CARGO_TARGET_DIR="''${CARGO_TARGET_DIR:-$PWD/target/nix}"
+            ''
+            + pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
+              # GPUI loads graphics libraries at runtime; GPU drivers belong to the host.
+              export LD_LIBRARY_PATH="/run/opengl-driver/lib:${dependencies.libraryPath}"
             '';
           };
         }
       );
 
-      checks = forAllSystems (
+      checks = nixpkgs.lib.genAttrs linuxSystems (
         system:
         let
           inherit (projectFor system) pkgs smartzip;

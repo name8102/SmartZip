@@ -158,17 +158,17 @@ python3 scripts/package-macos.py --profile release
 
 ## 开发
 
-Linux 可通过 Nix 一次提供 Rust 工具链、C 编译器、原生库、7-Zip、Python 和 just：
+Linux 和 macOS（Apple Silicon / Intel）可通过 Nix 获取 Rust 工具链、C 编译器、原生 7-Zip 库、Python 和 just：
 
 ```bash
 nix develop
-cargo build --locked
+cargo build --workspace --locked
 cargo run -p smartzip-gui
-# 验证 Nix 包的实际后端操作
+# Linux：验证 Nix 包的实际后端操作
 nix flake check
 ```
 
-开发 shell 默认使用 `target/nix`，避免复用其他发行版的编译产物；显式的 `CARGO_TARGET_DIR` 仍优先。使用 direnv 时，安装 direnv 和 nix-direnv、启用 shell hook 后执行 `direnv allow`。NixOS 的持久安装使用上面的 `nix profile add`，开发 shell 内的 GUI 依赖环境不等同于独立安装包。
+开发 shell 默认使用 `target/nix`，显式的 `CARGO_TARGET_DIR` 仍优先。使用 direnv 时，安装 direnv 和 nix-direnv、启用 shell hook 后执行 `direnv allow`。SmartZip 的 Nix 安装包面向 Linux；macOS 可在开发 shell 中使用 `just install` 安装 `.app` 和 CLI。
 
 构建：
 

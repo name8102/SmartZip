@@ -49,7 +49,7 @@ python3 scripts/package_desktop_beta.py target/release/smartzip target/release/s
 python3 scripts/package-macos.py --profile release
 ```
 
-Nix 的 `.#sevenzip` 单独输出 `lib/smartzip/7z.so`，许可证放 `share/licenses/7zip/`，完整源码包放 `share/smartzip/`。`.#smartzip` 包含库和 worker；CLI/GUI wrapper 设置两个绝对路径，不修改 PATH 来寻找 7-Zip CLI。开发 shell 中的 `7zz` 仅用于生成测试 fixture。
+Nix 的 `.#sevenzip` 单独输出 `lib/smartzip/7z.so`（macOS 为 `lib/smartzip/7z.dylib`），许可证放 `share/licenses/7zip/`，完整源码包放 `share/smartzip/`。Linux 的 `.#smartzip` 包含库和 worker；CLI/GUI wrapper 设置两个绝对路径，不修改 PATH 来寻找 7-Zip CLI。开发 shell 中的 `7zz` 仅用于生成测试 fixture。
 
 ## Windows 构建
 
