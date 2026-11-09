@@ -5,7 +5,7 @@ use std::fs;
 fn precedence_preserves_false_empty_arrays_and_file_relative_paths() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("config.toml");
-    fs::write(&path, "[extraction.recursion]\nenabled=false\n[passwords]\nsources=[]\n[state]\ndatabase='data.db'\n[[backends.installations]]\nid='local'\nfamily='seven-zip-cli'\nexecutable='./bin/7z'\n").unwrap();
+    fs::write(&path, "[extraction.recursion]\nenabled=false\n[passwords]\nsources=[]\n[state]\ndatabase='data.db'\n[[backends.installations]]\nid='local'\nfamily='seven-zip-library'\npath='./lib/7z.so'\n").unwrap();
     let mut resolved = ResolvedConfig::load(Some(&path)).unwrap();
     assert!(!resolved.values.extraction.recursion.enabled);
     assert_eq!(resolved.values.extraction.recursion.max_depth, None);
@@ -15,8 +15,8 @@ fn precedence_preserves_false_empty_arrays_and_file_relative_paths() {
         Some(root.path().join("data.db"))
     );
     assert_eq!(
-        resolved.values.backends.installations[0].executable,
-        root.path().join("./bin/7z")
+        resolved.values.backends.installations[0].path,
+        root.path().join("./lib/7z.so")
     );
     resolved
         .apply(&[("extraction.recursion.enabled".into(), true.into())])
@@ -33,6 +33,26 @@ fn precedence_preserves_false_empty_arrays_and_file_relative_paths() {
         ])
         .is_err());
     assert!(resolved.values.state.history);
+}
+
+#[test]
+fn backend_library_bare_relative_path_is_resolved_from_config_directory() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("config.toml");
+    fs::write(
+        &path,
+        "[[backends.installations]]\nid='local'\nfamily='seven-zip-library'\npath='7z.so'\n",
+    )
+    .unwrap();
+    let resolved = ResolvedConfig::load(Some(&path)).unwrap();
+    assert_eq!(
+        resolved.values.backends.installations[0].path,
+        root.path().join("7z.so")
+    );
+    assert_eq!(
+        resolved.values.backends.installations[0].family,
+        AdapterFamily::SevenZipLibrary
+    );
 }
 
 #[test]

@@ -22,8 +22,6 @@ type Capture = (Vec<u8>, bool);
 pub(crate) enum Mode {
     /// Collect complete protocol output.
     Ordinary,
-    /// Same lifecycle, but the backend continues interpreting bounded progress records.
-    Streaming,
     /// Preserve diagnostic locale, pre-start cancellation and concurrent read/wait errors.
     Diagnostic,
 }
@@ -49,7 +47,7 @@ enum Failure {
     Spawn(io::Error),
     Wait(io::Error),
     Read(io::Error),
-    ReaderJoin(JoinError, Option<i32>),
+    ReaderJoin(JoinError),
     Cancelled {
         _kill_error: Option<io::Error>,
         wait_error: Option<io::Error>,
@@ -69,14 +67,7 @@ impl Failure {
                 (mode == Mode::Diagnostic).then(|| executable.into()),
                 source,
             ),
-            Self::ReaderJoin(source, exit_code) if mode == Mode::Streaming => {
-                SmartZipError::BackendFailed {
-                    backend: "7zz".into(),
-                    exit_code,
-                    stderr: source.to_string(),
-                }
-            }
-            Self::ReaderJoin(source, _) => SmartZipError::io(
+            Self::ReaderJoin(source) => SmartZipError::io(
                 (mode == Mode::Diagnostic).then(|| executable.into()),
                 io::Error::other(source),
             ),
@@ -93,7 +84,7 @@ impl Failure {
             }
             Self::MissingPipe(pipe) => SmartZipError::io(
                 Some(executable.into()),
-                io::Error::other(format!("7z child {pipe} pipe was unavailable")),
+                io::Error::other(format!("archive child {pipe} pipe was unavailable")),
             ),
         }
     }
@@ -153,11 +144,11 @@ impl Reader {
     fn spawn(future: impl Future<Output = io::Result<Capture>> + Send + 'static) -> Self {
         Self(Some(tokio::spawn(future)))
     }
-    async fn collect(&mut self, status: Option<i32>) -> std::result::Result<Capture, Failure> {
+    async fn collect(&mut self) -> std::result::Result<Capture, Failure> {
         let result = self.0.as_mut().expect("reader collected once").await;
         self.0.take();
         result
-            .map_err(|error| Failure::ReaderJoin(error, status))?
+            .map_err(|error| Failure::ReaderJoin(error))?
             .map_err(Failure::Read)
     }
     async fn stop(&mut self) {
@@ -206,8 +197,8 @@ async fn run_child(
         if mode == Mode::Diagnostic {
             let (status, out, err) = tokio::try_join!(
                 async { child.wait().await.map_err(Failure::Wait) },
-                stdout.collect(None),
-                stderr.collect(None)
+                stdout.collect(),
+                stderr.collect()
             )?;
             Ok::<_, Failure>((status, Some((out, err))))
         } else {
@@ -226,8 +217,8 @@ async fn run_child(
     let ((stdout, cut_out), (stderr, cut_err)) = if let Some(captures) = captures {
         captures
     } else {
-        let out = stdout.collect(status.code()).await?;
-        let err = stderr.collect(status.code()).await?;
+        let out = stdout.collect().await?;
+        let err = stderr.collect().await?;
         (out, err)
     };
     Ok((
@@ -428,7 +419,7 @@ mod tests {
 
     #[tokio::test]
     async fn kill_and_wait_faults_still_reap_child_and_join_readers() {
-        for mode in [Mode::Ordinary, Mode::Streaming, Mode::Diagnostic] {
+        for mode in [Mode::Ordinary, Mode::Diagnostic] {
             for (fail_kill, fail_wait) in [(true, false), (false, true), (true, true)] {
                 let calls = Arc::new(Mutex::new(Vec::new()));
                 let child = spawn(

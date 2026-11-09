@@ -1,89 +1,163 @@
-use smartzip_core::{Result, SmartZipError};
-use std::fs::File;
-use std::path::Path;
-use zip::ZipArchive;
+//! ZIP central-directory names only; payload decoding belongs to the native library.
+use smartzip_core::{ArchiveInput, Result, SmartZipError};
+use std::{
+    io::{Read, Seek, SeekFrom},
+    path::Path,
+};
 
-/// Raw ZIP entry as stored in central directory, without SmartZip decoding.
-///
-/// This is the only data NativeZip is allowed to expose: the exact byte
-/// sequence of the entry filename as it appears on disk. Encoding detection
-/// must happen in `smartzip-encoding`, not here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ZipRawEntry {
     pub raw_name: Vec<u8>,
+    pub unicode: bool,
+    pub unicode_name: Option<String>,
+    pub encrypted: bool,
     pub is_dir: bool,
     pub compressed_size: u64,
     pub uncompressed_size: u64,
 }
-
-/// Narrow helper for ZIP filename encoding detection.
-///
-/// Previously this type pretended to be a full `ArchiveAdapter` (probe/list/
-/// test/extract/compress) which polluted routing. It now only reads the
-/// central-directory filename bytes.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NativeZipBackend;
-
 impl NativeZipBackend {
     pub fn new() -> Self {
         Self
     }
-
-    fn open_archive_read(path: &Path) -> Result<ZipArchive<File>> {
-        let file = File::open(path)
-            .map_err(|source| SmartZipError::io(Some(path.to_path_buf()), source))?;
-        ZipArchive::new(file).map_err(|source| map_zip_error(source, path))
-    }
-
-    /// Read the raw central-directory entries of a ZIP file.
-    ///
-    /// Returns the exact filename bytes (`name_raw`) for every entry, plus
-    /// `is_dir`. No decoding, no extraction, no materialization.
     pub fn raw_entries(&self, path: &Path) -> Result<Vec<ZipRawEntry>> {
-        let mut archive = Self::open_archive_read(path)?;
-        let mut entries = Vec::with_capacity(archive.len());
-        for i in 0..archive.len() {
-            let entry = archive
-                .by_index_raw(i)
-                .map_err(|source| map_zip_error(source, path))?;
-            entries.push(ZipRawEntry {
-                raw_name: entry.name_raw().to_vec(),
-                is_dir: entry.is_dir(),
-                compressed_size: entry.compressed_size(),
-                uncompressed_size: entry.size(),
-            });
-        }
-        Ok(entries)
+        self.raw_entries_with_input(&ArchiveInput {
+            path: path.into(),
+            offset: 0,
+            length: None,
+            volumes: Default::default(),
+        })
     }
-
-    /// Check whether any entry in the ZIP is encrypted (without decrypting).
     pub fn has_encrypted_entries(&self, path: &Path) -> Result<bool> {
-        let mut archive = Self::open_archive_read(path)?;
-        Ok((0..archive.len()).any(|i| archive.by_index_raw(i).ok().is_some_and(|e| e.encrypted())))
+        Ok(self.raw_entries(path)?.iter().any(|e| e.encrypted))
+    }
+    pub fn raw_entries_with_input(&self, input: &ArchiveInput) -> Result<Vec<ZipRawEntry>> {
+        let parse = || -> std::io::Result<Vec<ZipRawEntry>> {
+            let mut reader = crate::source::InputReader::open(input)?;
+            let size = reader.seek(SeekFrom::End(0))?;
+            let tail_len = size.min(22 + u16::MAX as u64) as usize;
+            reader.seek(SeekFrom::End(-(tail_len as i64)))?;
+            let mut tail = vec![0; tail_len];
+            reader.read_exact(&mut tail)?;
+            let end = (0..tail.len().saturating_sub(21))
+                .rev()
+                .find(|&i| {
+                    tail[i..].starts_with(b"PK\x05\x06")
+                        && i + 22 + u16v(&tail[i + 20..]) as usize == tail.len()
+                })
+                .ok_or_else(|| invalid("ZIP end directory unavailable"))?;
+            let end_pos = size - tail_len as u64 + end as u64;
+            let eocd = &tail[end..];
+            let mut count = u16v(&eocd[10..]) as u64;
+            let mut cd_size = u32v(&eocd[12..]) as u64;
+            let mut cd_offset = u32v(&eocd[16..]) as u64;
+            let mut cd_end = end_pos;
+            if count == u16::MAX as u64
+                || cd_size == u32::MAX as u64
+                || cd_offset == u32::MAX as u64
+            {
+                if end_pos < 20 {
+                    return Err(invalid("ZIP64 locator unavailable"));
+                }
+                reader.seek(SeekFrom::Start(end_pos - 20))?;
+                let mut locator = [0; 20];
+                reader.read_exact(&mut locator)?;
+                if !locator.starts_with(b"PK\x06\x07") {
+                    return Err(invalid("ZIP64 locator unavailable"));
+                }
+                let offset = u64v(&locator[8..]);
+                reader.seek(SeekFrom::Start(offset))?;
+                let mut record = [0; 56];
+                reader.read_exact(&mut record)?;
+                if !record.starts_with(b"PK\x06\x06") {
+                    return Err(invalid("ZIP64 directory unavailable"));
+                }
+                count = u64v(&record[32..]);
+                cd_size = u64v(&record[40..]);
+                cd_offset = u64v(&record[48..]);
+                cd_end = offset;
+            }
+            reader.seek(SeekFrom::Start(cd_offset))?;
+            let mut signature = [0; 4];
+            reader.read_exact(&mut signature)?;
+            if signature != *b"PK\x01\x02" && count != 0 {
+                cd_offset = cd_end
+                    .checked_sub(cd_size)
+                    .ok_or_else(|| invalid("ZIP central-directory bounds"))?;
+            }
+            reader.seek(SeekFrom::Start(cd_offset))?;
+            let mut entries = Vec::new();
+            for _ in 0..count {
+                let mut header = [0; 46];
+                reader.read_exact(&mut header)?;
+                if !header.starts_with(b"PK\x01\x02") {
+                    return Err(invalid("invalid central-directory entry"));
+                }
+                let flags = u16v(&header[8..]);
+                let mut compressed_size = u32v(&header[20..]) as u64;
+                let mut uncompressed_size = u32v(&header[24..]) as u64;
+                let mut raw_name = vec![0; u16v(&header[28..]) as usize];
+                reader.read_exact(&mut raw_name)?;
+                let mut extra = vec![0; u16v(&header[30..]) as usize];
+                reader.read_exact(&mut extra)?;
+                reader.seek(SeekFrom::Current(u16v(&header[32..]) as i64))?;
+                let mut unicode_name = None;
+                let mut rest = extra.as_slice();
+                while rest.len() >= 4 {
+                    let id = u16v(rest);
+                    let len = u16v(&rest[2..]) as usize;
+                    let data = rest
+                        .get(4..4 + len)
+                        .ok_or_else(|| invalid("invalid ZIP extra field"))?;
+                    if id == 0x7075
+                        && data.len() >= 5
+                        && data[0] == 1
+                        && u32v(&data[1..]) == crc32fast::hash(&raw_name)
+                    {
+                        unicode_name = std::str::from_utf8(&data[5..]).ok().map(str::to_owned);
+                    }
+                    if id == 1 {
+                        let mut data = data;
+                        if uncompressed_size == u32::MAX as u64 {
+                            uncompressed_size =
+                                u64v(data.get(..8).ok_or_else(|| invalid("ZIP64 size missing"))?);
+                            data = &data[8..];
+                        }
+                        if compressed_size == u32::MAX as u64 {
+                            compressed_size =
+                                u64v(data.get(..8).ok_or_else(|| invalid("ZIP64 size missing"))?);
+                        }
+                    }
+                    rest = &rest[4 + len..];
+                }
+                entries.push(ZipRawEntry {
+                    is_dir: raw_name.ends_with(b"/")
+                        || (u32v(&header[38..]) >> 16) & 0o170000 == 0o040000,
+                    raw_name,
+                    unicode: flags & 0x800 != 0 || unicode_name.is_some(),
+                    unicode_name,
+                    encrypted: flags & 1 != 0,
+                    compressed_size,
+                    uncompressed_size,
+                });
+            }
+            Ok(entries)
+        };
+        parse().map_err(|e| SmartZipError::io(Some(input.path.clone()), e))
     }
 }
-
-fn map_zip_error(source: zip::result::ZipError, path: &Path) -> SmartZipError {
-    match source {
-        zip::result::ZipError::UnsupportedArchive(feature) => SmartZipError::UnsupportedCodec {
-            backend: "native-zip".into(),
-            path: path.to_path_buf(),
-            codec: Some(feature.to_string()),
-        },
-        zip::result::ZipError::Io(source) => SmartZipError::io(Some(path.to_path_buf()), source),
-        zip::result::ZipError::InvalidArchive(detail) => SmartZipError::CorruptedArchive {
-            path: path.to_path_buf(),
-            detail: detail.to_string(),
-        },
-        zip::result::ZipError::InvalidPassword => SmartZipError::WrongPassword {
-            path: path.to_path_buf(),
-        },
-        other => SmartZipError::BackendFailed {
-            backend: "native-zip".into(),
-            exit_code: None,
-            stderr: other.to_string(),
-        },
-    }
+fn invalid(message: &str) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, message)
+}
+fn u16v(bytes: &[u8]) -> u16 {
+    u16::from_le_bytes(bytes[..2].try_into().unwrap())
+}
+fn u32v(bytes: &[u8]) -> u32 {
+    u32::from_le_bytes(bytes[..4].try_into().unwrap())
+}
+fn u64v(bytes: &[u8]) -> u64 {
+    u64::from_le_bytes(bytes[..8].try_into().unwrap())
 }
 
 // ---------------------------------------------------------------------------
@@ -94,6 +168,7 @@ fn map_zip_error(source: zip::result::ZipError, path: &Path) -> SmartZipError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::File;
     use std::io::Write;
     use std::path::PathBuf;
     use zip::write::SimpleFileOptions;

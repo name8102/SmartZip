@@ -4,16 +4,16 @@
 |------|------------|
 | **ArchiveBackend** | 旧后端抽象名称，历史任务中仍有引用；当前接口见 `ArchiveExecutor` 与 `ArchiveAdapter`。 |
 | **ArchiveExecutor** | 面向 `SmartZipEngine` 的归档执行接口，定义 `probe` / `list` / `test` / `extract`。`BackendRouter` 实现此接口，封装 adapter 发现、能力选择和 fallback。 |
-| **ArchiveAdapter** | 面向 `BackendRouter` 的后端 adapter seam。每个 Rust 原生实现或外部程序实例（包括不同路径或版本的 `7z`、`7zz`）都是独立 adapter，并保留自己的身份和能力，不在进入路由前合并。 |
-| **7-Zip 格式能力** | 注册时读取各安装的 `7z i` / `7zz i` 格式表与 RAR 解码器；缺少 RAR handler 或解码器的构建不参与 RAR 路由。7-Zip 的 `Rar`、`Rar5` 均映射为 `ArchiveFormat::Rar`。 |
+| **ArchiveAdapter** | 面向 `BackendRouter` 的后端 adapter seam。每个官方 7-Zip 原生库或 Unrar 外部程序实例都是独立 adapter，并保留自己的身份和能力，不在进入路由前合并。 |
+| **7-Zip 格式能力** | 注册时通过原生库接口枚举 handler 与 decoder；缺少 RAR handler 或解码器的构建不参与 RAR 路由。7-Zip 的 `Rar`、`Rar5` 均映射为 `ArchiveFormat::Rar`。 |
 | **AdapterCapabilities** | 路由实际消费的 adapter 元数据：支持的 operation、读取容器，以及密码和字符集覆盖能力。运行时 UnsupportedCodec/UnsupportedContainer 仅进入任务级负面缓存，不持久化假设性的 profile 规则。 |
 | **ArchiveFacts** | 路由需要的归档事实：容器和可选 codec 字符串。事实不包含假设性的后端策略。 |
 | **ArchiveRequirements** | 当前调用方的具体路由要求：是否提供密码、是否覆盖文件名字符集，以及已观察的 codec 字符串。 |
 | **RoutePlan** | 针对单个归档和 operation 生成的可解释 adapter 顺序，记录容器、候选、排除原因与 fallback 规则。list/test/extract 分别规划；同一任务复用 facts 和 extract 顺序。 |
-| **NativeBackend** | 原生 adapter。`NativeZipBackend` 负责 ZIP ZipCrypto / AES、原始文件名字节、编码信息和路径安全；它作为需要这些特殊能力的显式路径使用，不是普通 ZIP 密码路径的默认后端。密码候选通过直接解压验证，`test` 仅用于显式完整性检查。复杂格式由 `BackendRouter` 交给其他 adapter。 |
+| **NativeBackend** | `smartzip-sevenzip` 封装官方库的 session、流和回调；`NativeZipBackend` 只读取 ZIP central-directory 原始名称、UTF-8/Unicode extra 与尺寸，不解码载荷、不参与路由。 |
 | **SmartZipEngine** | 解压、检测、浏览和完整性校验的工作流编排器。自身不持有后端、密码服务等依赖——由调用方（CLI/GUI）注入。 |
 | **ExtractionCandidate** | 待解压候选条目。包含路径、深度、来源类型、检测格式、内嵌偏移等。 |
-| **CandidateAttempt** | 对单个 `ExtractionCandidate` 的核心处理尝试。负责检测决策、内嵌归档材质化、编码检测、密码尝试、后端解压、输出材质化和结果事件；BFS 队列仍由 `SmartZipEngine` 管理。 |
+| **CandidateAttempt** | 对单个 `ExtractionCandidate` 的核心处理尝试。负责检测决策、范围来源、编码检测、密码尝试、后端解压、输出材质化和结果事件；BFS 队列仍由 `SmartZipEngine` 管理。 |
 | **CandidateSource** | 候选来源枚举：`RootInput`（用户直接输入）、`ExtractedFile`（解压产物中找到的）、`EmbeddedFinding`（扫描器在二进制偏移处发现的）。 |
 | **Root scan** | 用户直接输入的文件应尽可能解压。空搜索窗口后继续扫描直到文件末尾；命中归档头后完整解析其范围，再从归档末尾继续搜索。窗口不限制前缀、归档间隔或已命中归档的长度。默认不设载荷最小值、嵌套扫描字节数或 finding 数量上限；业务容器跳过只用于自动嵌套发现。解压资源预算独立生效。 |
 | **Recursive extraction** | BFS 队列驱动的递归解压。有状态批次最多同时推进两个根输入；当前根扫描发现的归档优先于后续根输入，普通嵌套发现仍按 BFS。队列中每个候选经过同一管线：格式检测 → 编码检测 → 密码候选直接解压到 `OutputMaterializer` → 输出扫描 → 嵌套候选入队。 |
@@ -32,3 +32,7 @@
 | **MaterializeFailureKind** | 材质化失败类型：`ExtractFailed`（后端解压失败）、`CommitFailed`（提交失败）、`CollisionSkipped`（用户选择跳过碰撞）。 |
 | **Extraction staging** | 单次材质化周期内的隔离写盘能力：为每个 `ArchiveAdapter` 尝试提供独立目录；成功则选中该树交给布局/提交，失败则在进入下一 adapter 前删除并确认不存在。由 `OutputMaterializer` 实现，供 `BackendRouter` 在 extract 路径上使用；engine 与 CLI 不直接操作 staging。实现类型名未冻结。 |
 | **Attempt output** | staging 借出的一次 adapter 写目录句柄：提供路径、成功时交还选中、失败时丢弃并验证清理。不得嵌套在另一层「材质化临时根」之下。实现类型名未冻结。 |
+
+### 原生归档数据流
+
+`ArchiveInput` 描述文件范围和选定卷映射；库直接读取视图，只有 Unrar 才按需物化路径。`EntryRef` 绑定来源快照、库实例与原生索引，编码切换只重建名称视图。原生 worker 一次打开后共享目录、安全规划和批量解码；父进程控制写出、显式预算和 manifest，engine 不再重复扫描原生输出树。完整性报告 schema 2 区分 Native、Process 与 Host 证据。实施和验收见 `.trellis/tasks/11-10-sevenzip-library/implement.md`。

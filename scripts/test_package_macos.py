@@ -14,6 +14,8 @@ class PackageTests(unittest.TestCase):
             root = Path(root)
             binary = root / "source"
             binary.write_bytes(b"test executable")
+            from test_package_native_runtime import fixture_runtime
+            fixture_runtime(root, platform="darwin")
             target = root / "SmartZip.app"
             module.package(binary, target, sign=False)
             with (target / "Contents/Info.plist").open("rb") as file:
@@ -25,6 +27,8 @@ class PackageTests(unittest.TestCase):
             self.assertEqual((target / "Contents/Resources/licenses/NotoSansCJK-OFL.txt").read_bytes(),
                              (module.ROOT / "resources/fonts/OFL.txt").read_bytes())
             executable = target / "Contents/MacOS/smartzip-gui"
+            self.assertTrue((target / "Contents/MacOS/lib/7z.dylib").is_file())
+            self.assertTrue((target / "Contents/MacOS/smartzip-archive-worker").is_file())
             self.assertFalse(executable.is_symlink())
             self.assertEqual(executable.read_bytes(), binary.read_bytes())
             binary.write_bytes(b"new version")
@@ -36,6 +40,8 @@ class PackageTests(unittest.TestCase):
             root = Path(root)
             binary = root / "source"
             binary.write_bytes(b"test")
+            from test_package_native_runtime import fixture_runtime
+            fixture_runtime(root, platform="darwin")
             target = root / "SmartZip.app"
             target.mkdir()
             (target / "user-file").write_text("preserve")

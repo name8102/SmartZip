@@ -42,7 +42,11 @@ def install(source, destination):
     validate(destination)
     if source == destination or source.is_relative_to(destination) or destination.is_relative_to(source):
         raise ValueError('Source and destination must be separate directories')
-    for name in ['bin/smartzip', 'bin/smartzip-gui', 'release.json']:
+    for name in ['bin/smartzip', 'bin/smartzip-gui', 'bin/smartzip-archive-worker',
+                 'bin/lib/7z.so', 'bin/lib/7zip-source.tar.xz',
+                 'bin/lib/licenses/7zip/License.txt', 'bin/lib/licenses/7zip/copying.txt',
+                 'bin/lib/licenses/7zip/unRarLicense.txt', 'bin/lib/licenses/7zip/source.json',
+                 'release.json']:
         if not (source/name).is_file():
             raise ValueError(f'Incomplete package: {name}')
     manifest(source)  # refuse links before copying

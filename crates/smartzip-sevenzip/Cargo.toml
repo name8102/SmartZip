@@ -1,0 +1,10 @@
+[package]
+name = "smartzip-sevenzip"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.95"
+
+[dependencies]
+libloading = "0.9"
+serde = { version = "1", features = ["derive"] }

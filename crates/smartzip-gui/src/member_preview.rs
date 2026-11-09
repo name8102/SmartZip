@@ -24,7 +24,8 @@ pub struct MemberSource {
     pub backend: String,
     pub router: smartzip_archive::BackendRouter,
     pub encoding: smartzip_core::EncodingMode,
-    pub unavailable: Option<String>,
+    pub entry: Option<smartzip_archive::EntryRef>,
+    pub input: Option<smartzip_core::ArchiveInput>,
     pub allow_password: bool,
     pub max_bytes: usize,
 }
@@ -123,11 +124,11 @@ impl MemberPreview {
             cx.notify();
             return;
         }
-        if let Some(reason) = &source.unavailable {
-            self.message = reason.clone();
+        let Some(entry) = source.entry.clone() else {
+            self.message = "此条目缺少归档目录索引，无法预览".into();
             cx.notify();
             return;
-        }
+        };
         self.cancel = CancellationToken::new();
         let token = self.cancel.clone();
         let generation = self.generation;
@@ -145,10 +146,13 @@ impl MemberPreview {
                         &source.backend,
                         smartzip_archive::MemberReadRequest {
                             archive: source.archive,
-                            member: source.member,
+                            entry,
+                            input: source.input,
                             password,
                             encoding: source.encoding,
-                            max_bytes: source.max_bytes,
+                            extent: smartzip_archive::ReadExtent::Complete {
+                                max_bytes: source.max_bytes,
+                            },
                         },
                         token.clone(),
                     ))
@@ -209,7 +213,7 @@ impl Render for MemberPreview {
         let password_retry = self
             .source
             .as_ref()
-            .is_some_and(|source| source.unavailable.is_none() && source.allow_password)
+            .is_some_and(|source| source.entry.is_some() && source.allow_password)
             && !self.busy
             && self.content.is_none();
         let body = div()

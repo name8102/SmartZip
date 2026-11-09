@@ -4,7 +4,6 @@ import argparse
 import json
 import os
 from pathlib import Path
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -17,13 +16,18 @@ def main():
     parser.add_argument('binary', type=Path)
     args = parser.parse_args()
     binary = args.binary.resolve()
-    seven = shutil.which('7z') or shutil.which('7zz')
-    assert seven, 'real 7-Zip required'
+    library_name = '7z.dll' if sys.platform == 'win32' else '7z.dylib' if sys.platform == 'darwin' else '7z.so'
+    candidates = ([Path(os.environ['SMARTZIP_7Z_LIBRARY'])] if os.environ.get('SMARTZIP_7Z_LIBRARY') else
+                  [binary.parent / library_name, binary.parent / 'lib' / library_name,
+                   binary.parent.parent / 'lib/smartzip' / library_name])
+    library = next((path.resolve() for path in candidates if path.is_file()), None)
+    if library is None:
+        raise SystemExit('REQUIRED: native 7-Zip library; set SMARTZIP_7Z_LIBRARY or use a packaged runtime')
     checks, measurements = [], []
     with tempfile.TemporaryDirectory(prefix='smartzip-resource-') as tmp:
         root = Path(tmp)
         config = root/'config.toml'
-        config.write_text('schema_version = 1\ndefaults_version = 1\n[backends]\nauto_discover = false\n[[backends.installations]]\nid = "seven"\nfamily = "seven-zip-cli"\nexecutable = ' + json.dumps(seven) + '\n')
+        config.write_text('schema_version = 1\ndefaults_version = 1\n[backends]\nauto_discover = false\n[[backends.installations]]\nid = "seven"\nfamily = "seven-zip-library"\npath = ' + json.dumps(str(library)) + '\n')
         base = [str(binary), '--config', str(config), '--db', str(root/'state.db')]
         env = dict(os.environ, XDG_CONFIG_HOME=str(root/'config'), XDG_DATA_HOME=str(root/'data'))
 
@@ -92,7 +96,7 @@ def main():
         assert sum(p.stat().st_size for p in output.rglob('*') if p.is_file()) == 2*1024*1024
         assert not list(output.glob('.smartzip-*'))
         checks.append('three roots share a 3 MiB task budget: only one 2 MiB output commits')
-    print(json.dumps({'passed': len(checks), 'checks': checks, 'measurements': measurements, 'scope': 'bounded synthetic cases; RSS samples cover CLI only, not child backends; no throughput claim'}, ensure_ascii=False, indent=2))
+    print(json.dumps({'passed': len(checks), 'checks': checks, 'measurements': measurements, 'scope': 'bounded synthetic cases; RSS samples cover CLI only, not archive workers; no throughput claim'}, ensure_ascii=False, indent=2))
 
 
 if __name__ == '__main__':

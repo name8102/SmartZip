@@ -411,11 +411,9 @@ pub(crate) async fn extract_recursive_with_listener_interactive(
         let mut next_resolution = Some(remaining_groups.pop_front().unwrap_or(resolution));
         let mut group_attempt = 1usize;
         'groupings: loop {
-            // Resolve and materialize volumes once through the shared preparation path.
+            // Resolve volume stream names once through the shared preparation path.
             // Carved findings bypass sibling discovery, including offset-zero payloads.
-            let mut volume_materialized: Option<
-                crate::volumes::materialize::MaterializedVolumeSet,
-            > = None;
+            let mut volume_input: Option<smartzip_core::ArchiveInput> = None;
             let mut volume_archive_path: Option<std::path::PathBuf> = None;
             let mut volume_set_for_candidate: Option<crate::volumes::VolumeSet> = None;
             let preparation = if config.is_some_and(|c| !c.extraction.volumes.auto_discover) {
@@ -449,7 +447,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive(
                     archive_path,
                     set,
                     warnings,
-                    materialized,
+                    input,
                 } => {
                     for warning in warnings {
                         events.push(TaskEvent {
@@ -465,7 +463,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive(
                     candidate = prepared;
                     volume_archive_path = Some(archive_path);
                     volume_set_for_candidate = Some(set);
-                    volume_materialized = Some(materialized);
+                    volume_input = Some(input);
                 }
                 crate::volumes::VolumePreparation::Incomplete {
                     candidate: failed,
@@ -502,26 +500,6 @@ pub(crate) async fn extract_recursive_with_listener_interactive(
                             failed,
                             &original_input_path,
                             "grouping_ambiguous",
-                            error,
-                            &mut failed_count,
-                            &mut skipped,
-                        )
-                        .await?;
-                    continue 'nodes;
-                }
-                crate::volumes::VolumePreparation::MaterializationFailed {
-                    candidate: failed,
-                    error,
-                } => {
-                    let error = format!(
-                        "volume materialization failed for {}: {error}",
-                        failed.path.display()
-                    );
-                    completion
-                        .fail(
-                            failed,
-                            &original_input_path,
-                            "materialize_failed",
                             error,
                             &mut failed_count,
                             &mut skipped,
@@ -1081,7 +1059,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive(
                 }
             }
 
-            // Preparation owns carved/canonical input guards and returns facts only.
+            // Preparation carries physical ranges and logical volumes without copying data.
             if !enter_stage(
                 execution,
                 &task_id,
@@ -1108,8 +1086,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive(
             }
             let prepared = match prepare_resolved_archive(
                 &candidate,
-                volume_archive_path.zip(volume_materialized),
-                Some(&request.output_dir),
+                volume_archive_path.zip(volume_input),
                 request.encoding_mode.clone(),
                 history,
                 run_policy,
@@ -1136,6 +1113,12 @@ pub(crate) async fn extract_recursive_with_listener_interactive(
                     continue 'nodes;
                 }
             };
+            let task_context = std::sync::Arc::new(
+                task_context
+                    .as_ref()
+                    .clone()
+                    .with_archive_input(prepared.input.clone()),
+            );
             let archive_path = &prepared.archive_path;
             let sample_hash = &prepared.sample_hash;
             let sample_size = prepared.sample_size;
@@ -1503,7 +1486,11 @@ pub(crate) async fn extract_recursive_with_listener_interactive(
                             let archive_path = archive_path.clone();
                             let format = candidate.detected_format.clone();
                             let password = pw_value.clone();
-                            let context = task_context.clone();
+                            let context = std::sync::Arc::new(
+                                task_context.as_ref().clone().with_output_budget(
+                                    budget_reservation.output_budget(&request.limits, &temp_output_dir),
+                                ),
+                            );
                             let facts = &archive_facts;
                             let limits = &request.limits;
                             let budget_reservation = &budget_reservation;
@@ -1544,6 +1531,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive(
                                         &archive_path,
                                         backend.extract_with_facts_and_context(
                                             ExtractArchiveRequest {
+                                                selection: None,
                                                 archive: archive_path.clone(),
                                                 format,
                                                 output_dir: temp_output_dir.clone(),

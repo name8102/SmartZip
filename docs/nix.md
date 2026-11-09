@@ -14,7 +14,7 @@ nix build .#smartzip
 ./result/bin/smartzip doctor
 ```
 
-包内提供 `smartzip` 和 `smartzip-gui`，并为两个入口补充 7-Zip 的 PATH。GUI 入口还提供 X11/Wayland、字体、Vulkan/OpenGL 动态库和桌面集成命令；桌面文件声明支持的归档 MIME 类型与快速解压操作，不设置默认文件关联。配置、数据库和任务历史继续使用原来的 XDG 路径。
+包内提供 `smartzip`、`smartzip-gui`、`smartzip-archive-worker` 和官方 7-Zip 26.06 全格式原生库（含 RAR 解码器），两个入口的 wrapper 设置库与 worker 的绝对路径，不依赖 7-Zip CLI。固定源码、许可证与本地重建方式见[原生 7-Zip 说明](native-sevenzip.md)。GUI 入口还提供 X11/Wayland、字体、Vulkan/OpenGL 动态库和桌面集成命令；桌面文件声明支持的归档 MIME 类型与快速解压操作，不设置默认文件关联。配置、数据库和任务历史继续使用原来的 XDG 路径。
 
 安装到当前用户的 Nix profile：
 

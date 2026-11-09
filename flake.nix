@@ -32,6 +32,7 @@
               builtins.elem (nixpkgs.lib.getName pkg) [
                 "7zz"
                 "uasm"
+                "smartzip-sevenzip"
               ];
             overlays = [ rust-overlay.overlays.default ];
           };
@@ -48,13 +49,15 @@
             rustc = rustToolchain;
           };
           dependencies = import ./nix/dependencies.nix { inherit pkgs; };
-          smartzip = pkgs.callPackage ./nix/package.nix { inherit dependencies rustPlatform; };
+          sevenzip = pkgs.callPackage ./nix/sevenzip.nix { };
+          smartzip = pkgs.callPackage ./nix/package.nix { inherit dependencies rustPlatform sevenzip; };
         in
         {
           inherit
             pkgs
             dependencies
             smartzip
+            sevenzip
             rustToolchain
             ;
         };
@@ -68,6 +71,7 @@
         {
           default = project.smartzip;
           smartzip = project.smartzip;
+          sevenzip = project.sevenzip;
         }
       );
 
@@ -91,7 +95,12 @@
       devShells = forAllSystems (
         system:
         let
-          inherit (projectFor system) pkgs dependencies rustToolchain;
+          inherit (projectFor system)
+            pkgs
+            dependencies
+            rustToolchain
+            sevenzip
+            ;
         in
         {
           default = pkgs.mkShell {
@@ -109,6 +118,7 @@
             ];
             # GPUI loads graphics libraries at runtime; GPU drivers belong to the host.
             LD_LIBRARY_PATH = dependencies.libraryPath;
+            SMARTZIP_7Z_LIBRARY = "${sevenzip}/lib/smartzip/7z.so";
             shellHook = ''
               export LD_LIBRARY_PATH="/run/opengl-driver/lib:$LD_LIBRARY_PATH"
               export CARGO_TARGET_DIR="''${CARGO_TARGET_DIR:-$PWD/target/nix}"
@@ -137,9 +147,7 @@
                 export XDG_DATA_HOME="$HOME/data"
                 export XDG_CACHE_HOME="$HOME/cache"
                 mkdir -p "$HOME" "$TMPDIR/input"
-                # RAR headers remain listable even when the decoder is omitted.
-                7zz i > "$TMPDIR/sevenzip-info.txt"
-                grep -Eq 'D.* Rar5$' "$TMPDIR/sevenzip-info.txt"
+                # 7zz only creates the test fixture; SmartZip uses its native library.
                 printf 'SmartZip Nix smoke test\n' > "$TMPDIR/input/payload.txt"
                 7zz a "$TMPDIR/archive.zip" "$TMPDIR/input/payload.txt" > /dev/null
                 smartzip --version

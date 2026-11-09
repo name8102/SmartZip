@@ -22,22 +22,13 @@ pub(crate) async fn run(
 }
 
 /// Only diagnostic lines participate in classification, never displayed names.
-pub(crate) fn diagnostic_text(combined: &str, family: &str) -> String {
+pub(crate) fn diagnostic_text(combined: &str) -> String {
     combined
         .lines()
         .filter_map(|line| {
             let line = line.trim().to_ascii_lowercase();
-            // p7zip uses this exact protocol line when a split payload cannot
-            // be opened. Do not admit arbitrary Open ERROR text or names.
-            if family == "7z" && line == "open error: can not open the file as [7z] archive" {
-                return Some("can not open the file as [7z] archive".into());
-            }
             let message = line.strip_prefix("error: ").unwrap_or(&line);
-            let message = if family == "unrar" {
-                message.rsplit_once(" - ").map_or(message, |(_, tail)| tail)
-            } else {
-                message
-            };
+            let message = message.rsplit_once(" - ").map_or(message, |(_, tail)| tail);
             const PREFIXES: &[&str] = &[
                 "missing volume",
                 "cannot find volume",
@@ -81,14 +72,6 @@ pub(crate) fn diagnostic_text(combined: &str, family: &str) -> String {
             if is_diagnostic(first) {
                 return Some(first.to_owned());
             }
-            // 7z listing failures put the archive path before the diagnostic:
-            // ERROR: path : Can not open encrypted archive. Wrong password?
-            if line.starts_with("error: ") {
-                let last = message.rsplit(" : ").next().unwrap_or(message);
-                if is_diagnostic(last) {
-                    return Some(last.to_owned());
-                }
-            }
             None
         })
         .collect::<Vec<_>>()
@@ -97,19 +80,12 @@ pub(crate) fn diagnostic_text(combined: &str, family: &str) -> String {
 
 pub(crate) fn password_error(
     output: &BackendCommandOutput,
-    family: &str,
     password: Option<&str>,
     path: &Path,
 ) -> Option<SmartZipError> {
-    let failure = report(
-        "credential-attempt",
-        family,
-        output.clone(),
-        false,
-        password,
-    )
-    .diagnostics
-    .failure;
+    let failure = report("credential-attempt", output.clone(), false, password)
+        .diagnostics
+        .failure;
     match failure {
         Some(TestFailure::PasswordRequired) => {
             Some(SmartZipError::PasswordRequired { path: path.into() })
@@ -126,13 +102,12 @@ pub(crate) fn password_error(
 
 pub(crate) fn report(
     id: &str,
-    family: &str,
     mut output: BackendCommandOutput,
     truncated: bool,
     password: Option<&str>,
 ) -> TestResult {
     let combined = format!("{}\n{}", output.stdout, output.stderr);
-    let lower = diagnostic_text(&combined, family);
+    let lower = diagnostic_text(&combined);
     let password_failure = lower.lines().any(|message| {
         [
             "wrong password",
@@ -157,9 +132,7 @@ pub(crate) fn report(
     let encrypted = (ok && password.is_none_or(str::is_empty)).then_some(false);
     let failure = if ok {
         None
-    } else if output.status == Some(255)
-        || family == "unrar" && output.status == Some(10) && lower.contains("break")
-    {
+    } else if output.status == Some(255) || output.status == Some(10) && lower.contains("break") {
         Some(TestFailure::Cancelled)
     } else if lower.contains("missing volume")
         || lower.contains("cannot find volume")
@@ -195,24 +168,10 @@ pub(crate) fn report(
     } else {
         Some(TestFailure::Unknown)
     };
-    let mut damaged_files: Vec<String> = combined
-        .lines()
-        .filter_map(|line| {
-            // Names are untrusted hints. They never establish a volume checksum.
-            [
-                "ERROR: CRC Failed : ",
-                "ERROR: Data Error : ",
-                "ERROR: CRC Failed in encrypted file. Wrong password? : ",
-            ]
-            .iter()
-            .find_map(|prefix| line.strip_prefix(prefix))
-            .map(str::to_owned)
-        })
-        .take(4096)
-        .collect();
+    let mut damaged_files = Vec::<String>::new();
     let mut version: Option<String> = combined
         .lines()
-        .find(|line| line.starts_with("7-Zip ") || line.starts_with("UNRAR "))
+        .find(|line| line.starts_with("UNRAR "))
         .map(|s| s.chars().take(160).collect());
     if let Some(password) = password.filter(|p| !p.is_empty()) {
         output.stdout = output.stdout.replace(password, "[redacted]");
@@ -227,9 +186,8 @@ pub(crate) fn report(
         encrypted,
         diagnostics: BackendTestDiagnostics {
             adapter_id: id.into(),
-            family: family.into(),
+            family: "unrar".into(),
             version,
-            exit_code: output.status,
             failure,
             coverage: if ok {
                 Coverage::Complete
@@ -237,9 +195,12 @@ pub(crate) fn report(
                 Coverage::Partial
             },
             damaged_files,
-            stdout: output.stdout,
-            stderr: output.stderr,
-            output_truncated: truncated,
+            detail: crate::integrity::BackendDiagnosticDetail::Process {
+                exit_code: output.status,
+                stdout: output.stdout,
+                stderr: output.stderr,
+                output_truncated: truncated,
+            },
         },
     }
 }
@@ -249,73 +210,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn archive_and_entry_names_do_not_change_failure_classification() {
-        for name in ["password.zip", "missing volume.zip", "corrupt.zip"] {
-            let result = report(
-                "7z",
-                "7z",
-                BackendCommandOutput {
-                    status: Some(2),
-                    stdout: format!("Testing archive: {name}\nPath = {name}\n"),
-                    stderr: format!("ERROR: CRC Failed : {name}\n"),
-                },
-                false,
-                None,
-            );
-            assert_eq!(result.diagnostics.failure, Some(TestFailure::Corruption));
-            assert_eq!(result.diagnostics.damaged_files, [name]);
-        }
-        let result = report(
-            "7z",
-            "7z",
-            BackendCommandOutput {
-                status: Some(2),
-                stdout: "Testing archive: /tmp/password/archive.jpg\n".into(),
-                stderr: "ERROR: /tmp/password/archive.jpg\nCannot open the file as archive\n"
-                    .into(),
-            },
-            false,
-            None,
-        );
-        assert_eq!(result.diagnostics.failure, Some(TestFailure::Unknown));
-        let io = report(
-            "7z",
-            "7z",
-            BackendCommandOutput {
-                status: Some(2),
-                stdout: String::new(),
-                stderr: "Cannot open /tmp/password/archive.jpg\nPermission denied\n".into(),
-            },
-            false,
-            None,
-        );
-        assert_eq!(io.diagnostics.failure, Some(TestFailure::Io));
-    }
-
-    #[test]
-    fn partial_output_keeps_failure_and_does_not_claim_a_volume() {
-        let result = report(
-            "7z",
-            "7z",
-            BackendCommandOutput {
-                status: Some(2),
-                stdout: "Testing archive: a.7z.001\n".into(),
-                stderr: "ERROR: Data Error : file\n".into(),
-            },
-            false,
-            None,
-        );
-        assert!(!result.ok);
-        assert_eq!(result.diagnostics.failure, Some(TestFailure::Corruption));
-        assert_eq!(result.diagnostics.damaged_files, ["file"]);
-        assert_eq!(result.diagnostics.coverage, Coverage::Partial);
-    }
-
-    #[test]
     fn missing_volume_precedes_cascading_crc_and_password_ambiguity_is_retained() {
         let run = |stderr: &str| {
             report(
-                "unrar",
                 "unrar",
                 BackendCommandOutput {
                     status: Some(3),
@@ -337,26 +234,7 @@ mod tests {
             ambiguous.diagnostics.failure,
             Some(TestFailure::PasswordIndeterminate)
         );
-        assert!(!ambiguous.diagnostics.stderr.contains("secret"));
-    }
-
-    #[test]
-    fn untrusted_names_do_not_prove_password_usage_and_all_output_is_redacted() {
-        let output = |status| BackendCommandOutput {
-            status: Some(status),
-            stdout: "7-Zip secret\nTesting password 7zAES Encrypted = +\n".into(),
-            stderr: "ERROR: CRC Failed : secret\n".into(),
-        };
-        let success = report("7z", "7z", output(0), false, Some("secret"));
-        assert_eq!(success.encrypted, None);
-        let failure = report("7z", "7z", output(2), false, Some("secret"));
-        assert_eq!(
-            failure.diagnostics.version.as_deref(),
-            Some("7-Zip [redacted]")
-        );
-        assert_eq!(failure.diagnostics.damaged_files, ["[redacted]"]);
-        assert!(!failure.diagnostics.stdout.contains("secret"));
-        assert!(!failure.diagnostics.stderr.contains("secret"));
+        assert!(!format!("{:?}", ambiguous.diagnostics.detail).contains("secret"));
     }
 
     #[cfg(target_os = "linux")]

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Required beta acceptance with real 7-Zip and deterministic process faults.
+"""Required beta acceptance with the native 7-Zip library and real archive fixtures.
 No missing-backend skips. All artifacts and databases live in a temporary tree.
 """
 import argparse
@@ -13,7 +13,6 @@ import pty
 import termios
 import shutil
 import signal
-import shlex
 import sqlite3
 import stat
 import subprocess
@@ -32,13 +31,20 @@ def main():
     binary = args.binary.resolve()
     seven = shutil.which("7z") or shutil.which("7zz")
     if not seven:
-        raise SystemExit("REQUIRED: install 7z or 7zz; release tests cannot skip backend coverage")
+        raise SystemExit("REQUIRED: install 7z or 7zz to generate encrypted and split test fixtures")
+    library_name = '7z.dll' if sys.platform == 'win32' else '7z.dylib' if sys.platform == 'darwin' else '7z.so'
+    candidates = ([Path(os.environ['SMARTZIP_7Z_LIBRARY'])] if os.environ.get('SMARTZIP_7Z_LIBRARY') else
+                  [binary.parent / library_name, binary.parent / 'lib' / library_name,
+                   binary.parent.parent / 'lib/smartzip' / library_name])
+    library = next((path.resolve() for path in candidates if path.is_file()), None)
+    if library is None:
+        raise SystemExit('REQUIRED: native 7-Zip library; set SMARTZIP_7Z_LIBRARY or use a packaged runtime')
     checks = []
     with tempfile.TemporaryDirectory(prefix="smartzip-beta-") as workspace:
         root = Path(workspace)
         db = root / "history.db"
         config = root / "backend.toml"
-        config.write_text('[backends]\nauto_discover = false\n[[backends.installations]]\nid = "required-7z"\nfamily = "seven-zip-cli"\nexecutable = ' + json.dumps(seven) + '\n')
+        config.write_text('[backends]\nauto_discover = false\n[[backends.installations]]\nid = "required-7z"\nfamily = "seven-zip-library"\npath = ' + json.dumps(str(library)) + '\n')
         env = dict(os.environ, XDG_DATA_HOME=str(root / "data"), XDG_CONFIG_HOME=str(root / "config"))
         base = [str(binary), "--config", str(config), "--db", str(db)]
 
@@ -192,25 +198,6 @@ def main():
         assert report["processed_count"] == 1 and report["skipped_count"] == 0
         assert next((root / "encrypted-jpg").rglob("payload.bin")).read_bytes() == payload.read_bytes()
         checks.append("encrypted JPG retries remaining passwords after ambiguous encrypted-data error")
-        data_encrypted = root / "data-encrypted.7z"
-        subprocess.run([seven, "a", "-psecret", "-mhe=off", str(data_encrypted), str(payload)], check=True, stdout=subprocess.DEVNULL)
-        trace = root / "password-operations.txt"
-        traced_backend = root / "traced-7z"
-        traced_backend.write_text("#!/bin/sh\nprintf '%s\\n' \"$1\" >> " + shlex.quote(str(trace)) + "\nexec " + shlex.quote(seven) + " \"$@\"\n")
-        traced_backend.chmod(0o700)
-        traced_config = root / "traced.toml"
-        traced_config.write_text('[backends]\nauto_discover = false\n[[backends.installations]]\nid = "trace"\nfamily = "seven-zip-cli"\nexecutable = ' + json.dumps(str(traced_backend)) + '\n')
-        traced_db = root / "traced.db"
-        report = run(["extract", data_encrypted, "-pwrong", "-psecret", "--output", root / "traced-output", "--json"],
-                     command=[str(binary), "--config", str(traced_config), "--db", str(traced_db)], history_db=traced_db)
-        operations = trace.read_text().splitlines()
-        assert "t" not in operations and operations.count("x") == 2, operations
-        assert report["processed_count"] == 1 and report["failed_count"] == 0
-        assert next((root / "traced-output").rglob("payload.bin")).read_bytes() == payload.read_bytes()
-        assert not list((root / "traced-output").glob(".smartzip-*"))
-        with sqlite3.connect(traced_db) as conn:
-            assert conn.execute("SELECT success_count FROM passwords WHERE value='secret'").fetchone()[0] == 1
-        checks.append("password attempts extract directly: two x calls, zero full-test calls, failed staging removed")
         exhausted_db = root / "exhausted.db"
         exhausted_base = [str(binary), "--config", str(config), "--db", str(exhausted_db)]
         report = run(["extract", disguised_protected, "-pwrong", "--no-empty", "--password-limit", "0", "--output", root / "exhausted", "--json"], 1, exhausted_base, exhausted_db)
@@ -318,49 +305,6 @@ def main():
         assert report["files"][0]["integrity"] == "corrupt"
         assert report["files"][0]["password_status"] == "not_needed"
         checks.append("password in archive or entry names cannot change CRC failure classification")
-        # Fault process runs through the actual SevenZipBackend subprocess and
-        # router staging code, so cancellation is deterministic on both targets.
-        fake = root / "slow7z"
-        marker = root / "started"
-        fake.write_text(f'''#!{sys.executable}
-import os, pathlib, sys, time
-if sys.argv[1] == 'i': print('7-Zip 26.03'); sys.exit(0)
-if sys.argv[1] == 't': print('Everything is Ok'); sys.exit(0)
-if sys.argv[1] == 'l': print('Path = file.bin\\nSize = 0'); sys.exit(0)
-output = pathlib.Path(next(x[2:] for x in sys.argv if x.startswith('-o')))
-output.mkdir(parents=True, exist_ok=True)
-pathlib.Path({str(marker)!r}).write_text(str(os.getpid()))
-with (output / 'growing.bin').open('wb', buffering=0) as f:
-    while True: f.write(bytes(4096)); time.sleep(.02)
-''')
-        fake.chmod(0o755)
-        fake_config = root / "fake.toml"
-        fake_config.write_text('[backends]\nauto_discover = false\n[[backends.installations]]\nid = "fault-process"\nfamily = "seven-zip-cli"\nexecutable = ' + json.dumps(str(fake)) + '\n')
-        fake_base = [str(binary), "--config", str(fake_config), "--db", str(db)]
-        report = run(["extract", archive, "--output", root / "dynamic", "--json", "--max-output-bytes", "16384"], 1, fake_base)
-        assert report["status"] == "failed" and not list((root / "dynamic").glob(".smartzip-*"))
-        marker.unlink()
-        process = subprocess.Popen(fake_base + ["extract", str(archive), "--output", str(root / "cancelled"), "--json"],
-                                   stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
-        limit = time.monotonic() + 10
-        while not marker.exists():
-            assert process.poll() is None and time.monotonic() < limit, "backend did not start"
-            time.sleep(.02)
-        child_pid = int(marker.read_text())
-        process.send_signal(signal.SIGINT)
-        out, err = process.communicate(timeout=5)
-        report = json.loads(out)
-        assert process.returncode == 130 and report["status"] == "cancelled", (out, err)
-        assert not list((root / "cancelled").glob(".smartzip-*"))
-        try:
-            os.kill(child_pid, 0)
-        except ProcessLookupError:
-            pass
-        else:
-            raise AssertionError("cancelled backend is still alive")
-        with sqlite3.connect(db) as conn:
-            assert conn.execute("SELECT status FROM tasks WHERE id=?", (report["task_id"],)).fetchone()[0] == "cancelled"
-        checks.append("growing external output: dynamic stop; Ctrl+C reaps child and cleans staging")
         # Unicode truncation exercises a former byte-boundary panic.
         subprocess.run(base + ["password", "add", "中文🙂" * 15], check=True, capture_output=True, env=env)
         listed = subprocess.run(base + ["password", "list"], check=True, capture_output=True, text=True, env=env)

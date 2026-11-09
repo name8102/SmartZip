@@ -37,8 +37,8 @@ impl Installation {
             }),
             path: cx.new(|cx| {
                 InputState::new(window, cx)
-                    .default_value(b.executable.to_string_lossy().to_string())
-                    .placeholder("可执行文件的完整路径")
+                    .default_value(b.path.to_string_lossy().to_string())
+                    .placeholder("动态库或可执行文件的完整路径")
             }),
             version: cx.new(|cx| {
                 InputState::new(window, cx)
@@ -122,10 +122,7 @@ impl ConfigLists {
                 let mut table = toml::map::Map::new();
                 table.insert("id".into(), b.id.read(cx).value().to_string().into());
                 table.insert("family".into(), toml::Value::try_from(&b.family).unwrap());
-                table.insert(
-                    "executable".into(),
-                    b.path.read(cx).value().to_string().into(),
-                );
+                table.insert("path".into(), b.path.read(cx).value().to_string().into());
                 table.insert("enabled".into(), b.enabled.into());
                 let p = b.priority.read(cx).value();
                 table.insert(
@@ -265,11 +262,11 @@ impl Render for ConfigLists {
                     .child(
                         RadioGroup::horizontal(("backend-family", b.identity))
                             .selected_index(Some(usize::from(b.family == AdapterFamily::UnrarCli)))
-                            .children(["7-Zip", "UnRAR"])
+                            .children(["7-Zip 原生库", "UnRAR"])
                             .disabled(self.saving)
                             .on_change(cx.listener(move |this, index: &usize, _, cx| {
                                 this.installations[i].family = if *index == 0 {
-                                    AdapterFamily::SevenZipCli
+                                    AdapterFamily::SevenZipLibrary
                                 } else {
                                     AdapterFamily::UnrarCli
                                 };
@@ -319,8 +316,8 @@ impl Render for ConfigLists {
                             i,
                             BackendInstallation {
                                 id: format!("custom-{i}"),
-                                family: AdapterFamily::SevenZipCli,
-                                executable: Default::default(),
+                                family: AdapterFamily::SevenZipLibrary,
+                                path: Default::default(),
                                 declared_version: None,
                                 enabled: true,
                                 priority: 0,
@@ -385,7 +382,7 @@ impl Render for ConfigLists {
                         .child(format!(
                             "{} · {}",
                             row["family"].as_str().unwrap_or("后端"),
-                            row["executable"].as_str().unwrap_or("内置")
+                            row["path"].as_str().unwrap_or("内置")
                         ))
                         .child(format!(
                             "版本：{}",

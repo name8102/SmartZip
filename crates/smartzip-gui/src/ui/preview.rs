@@ -184,6 +184,12 @@ impl View {
                             .filter_map(|entry| {
                                 Some(crate::archive_browser::ArchiveEntry {
                                     path: entry.get("path")?.as_str()?.into(),
+                                    reference: entry
+                                        .get("native")
+                                        .and_then(|native| native.get("reference"))
+                                        .and_then(|reference| {
+                                            serde_json::from_value(reference.clone()).ok()
+                                        }),
                                     is_dir: entry
                                         .get("is_dir")
                                         .and_then(|v| v.as_bool())
@@ -217,7 +223,7 @@ impl View {
             let result = job.result.as_ref()?;
             let resolved = job.request.resolved.as_ref()?;
             Some(crate::member_preview::MemberSource {
-                archive: job.request.paths.first()?.clone(),
+                archive: PathBuf::from(result.get("path")?.as_str()?),
                 member: PathBuf::new(),
                 backend: job.backend.clone(),
                 router: job.backend_router.clone()?,
@@ -230,7 +236,8 @@ impl View {
                     .filter(|v| !["auto", "backend"].contains(v))
                     .map(|v| smartzip_core::EncodingMode::Override(v.into()))
                     .unwrap_or(smartzip_core::EncodingMode::Auto),
-                unavailable: embedded_preview_notice(result),
+                entry: None,
+                input: Some(serde_json::from_value(result.get("input")?.clone()).ok()?),
             })
         });
         let tabs: Vec<_> = state
@@ -464,6 +471,7 @@ impl View {
                         let path = entry.path.clone();
                         let copy_path = path.clone();
                         let member_source = source.clone();
+                        let reference = entry.reference.clone();
                         let is_dir = entry.is_dir;
                         div().id(("member-row", index)).w_full().h(px(height)).flex().items_center().gap_3().px_3()
                             .hover(|el| el.bg(cx.theme().accent))
@@ -479,6 +487,7 @@ impl View {
                                         this.member_preview.update(cx, |preview, cx| preview.clear(window, cx));
                                     } else if let Some(mut source) = member_source.clone() {
                                         source.member = path.clone().into();
+                                        source.entry = reference.clone();
                                         this.preview_visible = true;
                                         this.member_preview.update(cx, |preview, cx| preview.open(source, window, cx));
                                     }
@@ -582,16 +591,6 @@ impl View {
     }
 }
 
-// A scanner may select an ordinary archive at byte zero. It is still readable
-// through the original file; only nonzero embedded offsets need materialization.
-fn embedded_preview_notice(result: &serde_json::Value) -> Option<String> {
-    result
-        .get("embedded_offset")
-        .and_then(serde_json::Value::as_u64)
-        .filter(|offset| *offset > 0)
-        .map(|_| "内嵌归档内容暂需解压后查看".into())
-}
-
 fn operation_report(operation: TaskOperation, result: Option<&serde_json::Value>) -> Vec<String> {
     let Some(result) = result else {
         return vec![];
@@ -657,13 +656,6 @@ fn operation_report(operation: TaskOperation, result: Option<&serde_json::Value>
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn byte_zero_archive_can_preview_members() {
-        assert!(embedded_preview_notice(&serde_json::json!({"embedded_offset": 0})).is_none());
-        assert!(embedded_preview_notice(&serde_json::json!({"embedded_offset": null})).is_none());
-        assert!(embedded_preview_notice(&serde_json::json!({"embedded_offset": 512})).is_some());
-    }
 
     #[test]
     fn unknown_integrity_does_not_promote_suspect_volumes_to_confirmed_damage() {

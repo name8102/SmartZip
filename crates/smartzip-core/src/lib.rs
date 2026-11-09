@@ -4,6 +4,7 @@ pub mod embedded;
 pub mod error;
 pub mod progress;
 pub mod routing;
+pub mod source;
 pub mod task;
 
 pub use embedded::{
@@ -20,4 +21,5 @@ pub use routing::{
     NegativeCapabilityKey, RejectedAdapter, RouteCandidate, RouteEvent, RoutePlan,
     TaskExecutionContext, TaskRouteContext,
 };
+pub use source::{ArchiveInput, OutputBudget};
 pub use task::{ArchiveFormat, AttemptId, DecisionId, EncodingMode, NodeId, TaskId};

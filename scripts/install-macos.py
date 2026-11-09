@@ -2,7 +2,6 @@
 """Build, package and install SmartZip for the current macOS user."""
 import argparse
 import importlib.util
-import json
 from pathlib import Path
 import plistlib
 import shutil
@@ -53,24 +52,10 @@ def install_bundle(source, destination, verify=True):
 
 
 def build(profile):
-    command = ["cargo", "build", "--locked", "-p", "smartzip-gui", "--message-format=json-render-diagnostics"]
-    if profile == "release":
-        command.append("--release")
-    result = subprocess.run(command, cwd=PACKAGER.ROOT, stdout=subprocess.PIPE, text=True, check=True)
-    # Cargo reports the actual executable, including CARGO_TARGET_DIR and target triples.
-    executable = None
-    for line in result.stdout.splitlines():
-        try:
-            message = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if (message.get("reason") == "compiler-artifact"
-                and message.get("target", {}).get("name") == "smartzip-gui"
-                and message.get("executable")):
-            executable = Path(message["executable"])
-    if executable is None:
-        raise RuntimeError("Cargo 未返回 smartzip-gui 可执行文件")
-    return executable
+    spec = importlib.util.spec_from_file_location('install_desktop', Path(__file__).with_name('install_desktop.py'))
+    installer = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(installer)
+    return installer.build(profile)['smartzip-gui']
 
 
 def main():

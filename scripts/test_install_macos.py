@@ -12,6 +12,8 @@ class InstallTests(unittest.TestCase):
     def fixture(self, root):
         binary = root / "binary"
         binary.write_bytes(b"old app")
+        from test_package_native_runtime import fixture_runtime
+        fixture_runtime(root, platform="darwin")
         source = root / "package/SmartZip.app"
         module.PACKAGER.package(binary, source, sign=False)
         return source

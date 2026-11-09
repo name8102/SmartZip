@@ -15,6 +15,8 @@ class InstallLinuxTests(unittest.TestCase):
         (source/'bin').mkdir(parents=True)
         (source/'bin/smartzip').write_text('old CLI')
         (source/'bin/smartzip-gui').write_text('old GUI')
+        from test_package_native_runtime import fixture_runtime
+        fixture_runtime(source/'bin')
         (source/'release.json').write_text('{}')
         return source, root/'installed'
 

@@ -109,11 +109,14 @@ impl TaskRouteContext {
 
 /// Per-workflow routing context. It keeps route observations and negative
 /// decisions isolated when one router serves concurrent tasks.
+#[derive(Clone)]
 pub struct TaskExecutionContext {
     task_id: TaskId,
     sink: Arc<dyn TaskEventSink>,
     route: Arc<Mutex<TaskRouteContext>>,
     cancellation: tokio_util::sync::CancellationToken,
+    archive_input: Option<crate::ArchiveInput>,
+    output_budget: Option<Arc<dyn crate::OutputBudget>>,
 }
 
 struct DiscardingTaskEventSink;
@@ -133,12 +136,32 @@ impl TaskExecutionContext {
             sink,
             route: Arc::new(Mutex::new(TaskRouteContext::default())),
             cancellation: tokio_util::sync::CancellationToken::new(),
+            archive_input: None,
+            output_budget: None,
         }
     }
 
     pub fn with_cancellation(mut self, cancellation: tokio_util::sync::CancellationToken) -> Self {
         self.cancellation = cancellation;
         self
+    }
+
+    pub fn with_archive_input(mut self, input: crate::ArchiveInput) -> Self {
+        self.archive_input = Some(input);
+        self
+    }
+
+    pub fn archive_input(&self) -> Option<&crate::ArchiveInput> {
+        self.archive_input.as_ref()
+    }
+
+    pub fn with_output_budget(mut self, budget: Arc<dyn crate::OutputBudget>) -> Self {
+        self.output_budget = Some(budget);
+        self
+    }
+
+    pub fn output_budget(&self) -> Option<Arc<dyn crate::OutputBudget>> {
+        self.output_budget.clone()
     }
 
     /// Share this task's negative capability cache while routing a root's events
@@ -153,6 +176,8 @@ impl TaskExecutionContext {
             route: self.route.clone(),
             sink,
             cancellation,
+            archive_input: self.archive_input.clone(),
+            output_budget: self.output_budget.clone(),
         }
     }
 

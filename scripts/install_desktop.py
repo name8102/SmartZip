@@ -10,6 +10,8 @@ import subprocess
 import sys
 import tempfile
 
+from package_native_runtime import copy_runtime
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -21,7 +23,7 @@ def load(name, filename):
 
 
 def build(profile):
-    command = ['cargo', 'build', '--locked', '-p', 'smartzip-cli', '-p', 'smartzip-gui',
+    command = ['cargo', 'build', '--locked', '-p', 'smartzip-cli', '-p', 'smartzip-gui', '-p', 'smartzip-archive',
                '--message-format=json-render-diagnostics']
     if profile == 'release':
         command.append('--release')
@@ -34,10 +36,13 @@ def build(profile):
             continue
         name = message.get('target', {}).get('name')
         if (message.get('reason') == 'compiler-artifact'
-                and name in ('smartzip', 'smartzip-gui') and message.get('executable')):
+                and name in ('smartzip', 'smartzip-gui', 'smartzip-archive-worker') and message.get('executable')):
             binaries[name] = Path(message['executable'])
-    if len(binaries) != 2:
-        raise RuntimeError('Cargo 未返回 CLI 和 GUI 可执行文件')
+    if len(binaries) != 3:
+        raise RuntimeError('Cargo 未返回 CLI、GUI 和 archive worker 可执行文件')
+    if not os.environ.get('SMARTZIP_7Z_LIBRARY'):
+        builder = load('package_sevenzip', 'package_sevenzip.py')
+        builder.build(binaries['smartzip-gui'].parent / 'lib')
     return binaries
 
 
@@ -60,10 +65,11 @@ def install_linux(binaries, destination):
         shutil.copy2(ROOT / 'resources/fonts/OFL.txt', source / 'licenses/NotoSansCJK-OFL.txt')
         for name, binary in binaries.items():
             shutil.copy2(binary, source / 'bin' / name)
+        copy_runtime(binaries['smartzip-gui'], source / 'bin', binaries['smartzip-archive-worker'])
         version = subprocess.check_output([str(binaries['smartzip']), '--version'], text=True).strip()
         (source / 'release.json').write_text(json.dumps({
             'version': version.removeprefix('smartzip '), 'platform': sys.platform,
-            'bundled_backend': False,
+            'bundled_backend': True, 'sevenzip_version': json.loads((source / 'bin/lib/licenses/7zip/source.json').read_text())['version'],
         }, indent=2) + '\n')
         installer.install(source, bundle)
     installer.install(bundle, destination)
@@ -75,6 +81,14 @@ def install_linux(binaries, destination):
                         f'Exec={desktop_exec(destination / "bin/smartzip-gui")}\n'
                         'Terminal=false\nCategories=Utility;Archiving;\n')
     return bundle
+
+
+def install_cli(binaries):
+    cargo_home = Path(os.environ.get('CARGO_HOME', Path.home() / '.cargo')).expanduser()
+    cli_directory = cargo_home / 'bin'
+    cli_directory.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(binaries['smartzip'], cli_directory / 'smartzip')
+    copy_runtime(binaries['smartzip'], cli_directory, binaries['smartzip-archive-worker'])
 
 
 def main(argv=None):
@@ -96,11 +110,7 @@ def main(argv=None):
     else:
         bundle = install_linux(binaries, destination)
     if not args.gui_only:
-        command = ['cargo', 'install', '--path', 'crates/smartzip-cli', '--bin', 'smartzip',
-                   '--locked', '--force']
-        if args.profile == 'debug':
-            command.append('--debug')
-        subprocess.run(command, cwd=ROOT, check=True)
+        install_cli(binaries)
     print(f'GUI 安装位置：{destination}\nGUI 打包产物：{bundle}')
 
 

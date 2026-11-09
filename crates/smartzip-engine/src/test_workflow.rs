@@ -509,7 +509,9 @@ fn executed_result(result: Result<TestResult>) -> TestResult {
                 encrypted: None,
                 diagnostics: BackendTestDiagnostics {
                     failure: Some(failure),
-                    stderr: error.to_string(),
+                    detail: BackendDiagnosticDetail::Host {
+                        message: error.to_string(),
+                    },
                     ..BackendTestDiagnostics::default()
                 },
             }
@@ -523,7 +525,7 @@ fn append_pass(report: &mut TestArchiveReport, result: TestResult, pass_id: u32,
             report.damaged_files.push(file.clone());
         }
     }
-    if result.diagnostics.output_truncated {
+    if result.diagnostics.output_truncated() {
         report
             .stop_reasons
             .push("backend output budget reached; some text diagnostics were discarded".into());

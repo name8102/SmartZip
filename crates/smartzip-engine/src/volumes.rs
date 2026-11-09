@@ -1,7 +1,6 @@
 pub mod alias;
 pub mod directory;
 pub mod fingerprint;
-pub mod materialize;
 pub mod sequence;
 
 use directory::{DirectoryIndexCache, DirectoryVolumeIndex};
@@ -97,8 +96,7 @@ impl VolumeResolution {
     }
 }
 
-/// One canonical volume-preparation result for list and extract callers.
-/// The materialized handle keeps canonical members alive until backend use ends.
+/// Resolved logical volume names for list and extract callers, without filesystem aliases.
 pub enum VolumePreparation {
     Single(crate::types::ExtractionCandidate),
     Resolved {
@@ -106,7 +104,7 @@ pub enum VolumePreparation {
         archive_path: PathBuf,
         set: VolumeSet,
         warnings: Vec<VolumeWarning>,
-        materialized: materialize::MaterializedVolumeSet,
+        input: smartzip_core::ArchiveInput,
     },
     Incomplete {
         candidate: crate::types::ExtractionCandidate,
@@ -116,10 +114,6 @@ pub enum VolumePreparation {
         candidate: crate::types::ExtractionCandidate,
         hypotheses: Vec<VolumeSetHypothesis>,
     },
-    MaterializationFailed {
-        candidate: crate::types::ExtractionCandidate,
-        error: std::io::Error,
-    },
 }
 
 impl VolumePreparation {
@@ -128,7 +122,6 @@ impl VolumePreparation {
             Self::Single(candidate)
             | Self::Incomplete { candidate, .. }
             | Self::GroupingAmbiguous { candidate, .. }
-            | Self::MaterializationFailed { candidate, .. }
             | Self::Resolved { candidate, .. } => candidate,
         }
     }
@@ -340,13 +333,13 @@ impl VolumeResolver {
         VolumeResolution::Single
     }
 
-    /// Resolve and materialize one candidate through the shared integration path.
+    /// Resolve one candidate through the shared integration path.
     pub fn prepare(&mut self, candidate: crate::types::ExtractionCandidate) -> VolumePreparation {
         let resolution = self.resolve(&candidate);
         self.prepare_resolution(candidate, resolution)
     }
 
-    /// Materialize a resolution already produced by this resolver. Root
+    /// Prepare a resolution already produced by this resolver. Root
     /// coalescing uses this to avoid resolving the same explicit volume member
     /// twice before the workflow loop.
     pub fn prepare_resolution(
@@ -378,23 +371,49 @@ fn prepare_resolved(
     set: VolumeSet,
     warnings: Vec<VolumeWarning>,
 ) -> VolumePreparation {
-    match materialize::materialize_volume_set(&set) {
-        Ok(materialized) => {
-            let archive_path = materialized.canonical_entrypoint.clone();
-            candidate.detected_format = Some(set.format.clone());
-            VolumePreparation::Resolved {
-                candidate: candidate.clone(),
-                archive_path,
-                set,
-                warnings,
-                materialized,
-            }
-        }
-        Err(error) => VolumePreparation::MaterializationFailed {
-            candidate: candidate.clone(),
-            error,
-        },
+    let (archive_path, input) = volume_input(&set);
+    candidate.detected_format = Some(set.format.clone());
+    VolumePreparation::Resolved {
+        candidate: candidate.clone(),
+        archive_path,
+        set,
+        warnings,
+        input,
     }
+}
+
+fn volume_input(set: &VolumeSet) -> (PathBuf, smartzip_core::ArchiveInput) {
+    let raw_zip = set.zip_kind == Some(ZipSplitKind::Raw);
+    let total = set.members.len();
+    let mut volumes = std::collections::BTreeMap::new();
+    let mut names = Vec::with_capacity(total);
+    for (index, member) in set.members.iter().enumerate() {
+        let seq = index + 1;
+        let name = match set.format {
+            ArchiveFormat::SevenZip => format!("payload.7z.{seq:03}"),
+            ArchiveFormat::Rar => format!("payload.part{seq:02}.rar"),
+            ArchiveFormat::Zip if raw_zip => format!("payload.zip.{seq:03}"),
+            ArchiveFormat::Zip if seq == total => "payload.zip".into(),
+            ArchiveFormat::Zip => format!("payload.z{seq:02}"),
+            _ => format!("payload.vol{seq:03}"),
+        };
+        volumes.insert(name.clone(), member.path.clone());
+        names.push(name);
+    }
+    let index = if set.format == ArchiveFormat::Zip && !raw_zip {
+        total - 1
+    } else {
+        0
+    };
+    (
+        PathBuf::from(&names[index]),
+        smartzip_core::ArchiveInput {
+            path: set.members[index].path.clone(),
+            offset: 0,
+            length: None,
+            volumes,
+        },
+    )
 }
 
 enum HypothesisOutcome {
@@ -1702,7 +1721,7 @@ mod tests {
     }
 
     #[test]
-    fn prepared_volume_keeps_candidate_identity() {
+    fn native_prepared_volume_keeps_candidate_identity_without_aliases() {
         let dir = TempDir::new().unwrap();
         let p1 = dir.path().join("inner.part01.rar");
         let p2 = dir.path().join("inner.part02.rar");
@@ -1715,11 +1734,15 @@ mod tests {
             VolumePreparation::Resolved {
                 candidate,
                 archive_path,
+                input,
                 ..
             } => {
                 assert_eq!(candidate.path, p1);
-                assert_ne!(archive_path, candidate.path);
-                assert!(archive_path.exists());
+                assert_eq!(archive_path, PathBuf::from("payload.part01.rar"));
+                assert_eq!(input.path, p1);
+                assert_eq!(input.volumes["payload.part01.rar"], p1);
+                assert_eq!(input.volumes["payload.part02.rar"], p2);
+                assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
             }
             other => panic!("expected resolved volume, got {:?}", other.candidate()),
         }
@@ -2127,54 +2150,6 @@ mod tests {
             }
             other => panic!("clipping should still resolve, got {:?}", other),
         }
-    }
-    #[test]
-    fn materialize_creates_canonical_files() {
-        let dir = TempDir::new().unwrap();
-        let p1 = dir.path().join("src01.rar");
-        let p2 = dir.path().join("src02.rar");
-        create_fake_rar(&p1);
-        create_fake_rar(&p2);
-        let set = VolumeSet {
-            format: ArchiveFormat::Rar,
-            entrypoint: p1.clone(),
-            members: vec![
-                VolumeMember {
-                    path: p1.clone(),
-                    filename_ordinal: Some(1),
-                    logical_index: Some(1),
-                },
-                VolumeMember {
-                    path: p2.clone(),
-                    filename_ordinal: Some(2),
-                    logical_index: Some(2),
-                },
-            ],
-            expected_volume_count: Some(2),
-            expected_logical_size: None,
-            zip_kind: None,
-        };
-        let mat = crate::volumes::materialize::materialize_volume_set(&set).unwrap();
-        assert!(mat.canonical_entrypoint.exists());
-        assert_eq!(mat.canonical_members.len(), 2);
-        // Check that canonical files exist and have same size as original
-        for (orig, canon) in set.members.iter().zip(mat.canonical_members.iter()) {
-            assert!(canon.exists());
-            assert_eq!(
-                fs::metadata(&orig.path).unwrap().len(),
-                fs::metadata(canon).unwrap().len()
-            );
-        }
-        // Drop should clean up
-        let staging = mat.staging_dir.clone();
-        drop(mat);
-        // TempDir should be deleted on drop, but we used tempdir_in which may still exist until drop? Our MaterializedVolumeSet holds TempDir, so after drop it should be gone.
-        assert!(
-            !staging.exists()
-                || fs::read_dir(&staging)
-                    .map(|mut d| d.next().is_none())
-                    .unwrap_or(true)
-        );
     }
     #[test]
     fn foreign_prefix_with_raw_seed_resolves_zip() {

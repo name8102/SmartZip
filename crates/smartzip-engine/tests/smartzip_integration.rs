@@ -188,6 +188,7 @@ async fn test_extract_archive_no_password(#[case] fixture_name: &str) {
     backend
         .extract_with_facts_and_context(
             ExtractArchiveRequest {
+                selection: None,
                 archive: archive.clone(),
                 format: None,
                 output_dir: output.path().to_path_buf(),
@@ -233,6 +234,7 @@ async fn test_extract_with_unicode_password(
     let result = backend
         .extract_with_facts_and_context(
             ExtractArchiveRequest {
+                selection: None,
                 archive: archive.clone(),
                 format: None,
                 output_dir: output.path().to_path_buf(),
@@ -274,6 +276,7 @@ async fn test_extract_7z_unicode_password(
     let result = backend
         .extract_with_facts_and_context(
             ExtractArchiveRequest {
+                selection: None,
                 archive: archive.clone(),
                 format: None,
                 output_dir: output.path().to_path_buf(),
@@ -317,6 +320,7 @@ async fn test_extract_wrong_password_fails(
     let result = backend
         .extract_with_facts_and_context(
             ExtractArchiveRequest {
+                selection: None,
                 archive: archive.clone(),
                 format: None,
                 output_dir: output.path().to_path_buf(),
@@ -1099,7 +1103,7 @@ impl InteractiveEmbeddedPrompter for ExtractEmbeddedPrompter {
 }
 
 #[tokio::test]
-async fn test_engine_interactive_password_reuses_carved_embedded_archive_path() {
+async fn test_engine_interactive_password_reuses_embedded_archive_stream() {
     let archive = fixture_path("video_7z_pass.mp4");
     assert!(archive.exists(), "fixture missing: video_7z_pass.mp4");
 
@@ -1808,7 +1812,7 @@ async fn ambiguous_volume_groups_use_first_successful_extraction() {
             assert!(result.processed.is_empty());
             assert_eq!(std::fs::read_dir(output.path()).unwrap().count(), 0);
         }
-        // Canonical input copies and failed output staging are both gone.
+        // Source volumes remain unchanged and failed output staging is removed.
         assert_eq!(std::fs::read_dir(&volumes).unwrap().count(), 3);
     }
 }

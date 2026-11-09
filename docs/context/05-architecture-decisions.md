@@ -14,7 +14,7 @@ engine 负责工作流编排，由 CLI/GUI 注入后端、密码、交互和历�
 
 ### ADR-003: Capability-aware mixed backend routing
 
-executor 隔离 engine 与 adapter 细节；router 按 operation、容器、密码和字符集能力选择候选，保留不同外部程序的身份与可解释的路由依据。显式配置优先，运行时不支持信息只进入任务级负面缓存。
+executor 隔离 engine 与 adapter 细节；router 按 operation、容器、密码和字符集能力选择候选，保留不同原生库/外部程序的身份与可解释的路由依据。显式配置优先，运行时不支持信息只进入任务级负面缓存。
 
 普通 route 仅对 UnsupportedContainer、UnsupportedCodec、BackendUnavailable 和 BackendProtocolError 允许 fallback；密码、损坏、安全、资源、权限、磁盘和取消错误终止当前 route。独立只读诊断见完整性校验部分。
 
@@ -47,3 +47,7 @@ executor 隔离 engine 与 adapter 细节；router 按 operation、容器、密�
 `OutputMaterializer` 统一管理隔离输出：每次 adapter 尝试使用独立目录；失败后删除并确认不存在，才允许下一次尝试。清理失败终止当前候选，避免污染后续尝试。
 
 成功树交给布局、碰撞处理和提交；这些阶段的失败不再触发后端 fallback。密码重试开启新的材质化周期，避免双层临时目录与清理职责分散。
+
+### ADR-010: Native sessions with parent-owned output
+
+7-Zip 使用官方固定版本原生库，不再解析 CLI 文本。短生命周期 worker 保持可终止的解码边界；私有管道传递请求、目录、字节和结构化结果，密码不进入 argv。父进程持有受控输出 writer，按实际写入准入预算；逐流关闭并累积 manifest，保留 OutputMaterializer 提交/清理职责。内嵌和字节分卷直接使用范围/拼接流，不预先 carve 或建立别名树。

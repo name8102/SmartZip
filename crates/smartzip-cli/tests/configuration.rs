@@ -54,7 +54,7 @@ impl Workspace {
 #[test]
 fn disabled_backend_is_neither_probed_nor_started() {
     use std::os::unix::fs::PermissionsExt;
-    let w = Workspace::new("schema_version=1\n[state]\nmode='off'\n[extraction.recursion]\nenabled=false\n[backends]\nauto_discover=false\n[[backends.installations]]\nid='disabled'\nfamily='seven-zip-cli'\nexecutable='./backend'\ndeclared_version='24.09'\nenabled=false\n");
+    let w = Workspace::new("schema_version=1\n[state]\nmode='off'\n[extraction.recursion]\nenabled=false\n[backends]\nauto_discover=false\n[[backends.installations]]\nid='disabled'\nfamily='seven-zip-library'\npath='./backend'\ndeclared_version='24.09'\nenabled=false\n");
     fs::write(
         w.path("backend"),
         "#!/bin/sh\ntouch backend-started\nexit 1\n",
@@ -80,7 +80,7 @@ fn disabled_backend_is_neither_probed_nor_started() {
 
 #[test]
 fn explain_and_config_commands_have_no_archive_backend_or_state_side_effects() {
-    let w = Workspace::new("schema_version=1\n[extraction.recursion]\nenabled=false\nmax_depth=7\n[state]\ndatabase='state/db.sqlite'\n[backends]\nauto_discover=false\n[[backends.installations]]\nid='never-run'\nfamily='seven-zip-cli'\nexecutable='./nonexistent-executable'\n");
+    let w = Workspace::new("schema_version=1\n[extraction.recursion]\nenabled=false\nmax_depth=7\n[state]\ndatabase='state/db.sqlite'\n[backends]\nauto_discover=false\n[[backends.installations]]\nid='never-run'\nfamily='seven-zip-library'\npath='./nonexistent-executable'\n");
     let report = w.json(&["extract", "nonexistent-archive.zip", "--explain"], 0);
     assert_eq!(
         report["configuration"]["values"]["extraction"]["recursion"]["enabled"],

@@ -3,12 +3,14 @@ use std::collections::BTreeMap;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ArchiveEntry {
     pub(crate) path: String,
+    pub(crate) reference: Option<smartzip_archive::EntryRef>,
     pub(crate) is_dir: bool,
     pub(crate) size: Option<u64>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ArchiveChild {
     pub(crate) path: String,
+    pub(crate) reference: Option<smartzip_archive::EntryRef>,
     pub(crate) name: String,
     pub(crate) is_dir: bool,
     pub(crate) size: Option<u64>,
@@ -43,6 +45,11 @@ impl ArchiveBrowser {
                 if !is_dir || siblings.is_empty() {
                     siblings.push(ArchiveChild {
                         path,
+                        reference: if is_dir {
+                            None
+                        } else {
+                            entry.reference.clone()
+                        },
                         name,
                         is_dir,
                         size: if is_dir { None } else { entry.size },
@@ -70,7 +77,7 @@ impl ArchiveBrowser {
 }
 
 // This is a read-only display hierarchy, not a filesystem path. Keep the original
-// selector on files; member reads and extraction validate paths at their own boundary.
+// display path on files; reads use the catalog reference rather than this label.
 fn member_parts(path: &str) -> Option<Vec<&str>> {
     let parts: Vec<_> = path
         .split('/')
@@ -85,6 +92,7 @@ mod tests {
     fn entry(path: &str, is_dir: bool) -> ArchiveEntry {
         ArchiveEntry {
             path: path.into(),
+            reference: None,
             is_dir,
             size: Some(7),
         }
@@ -110,7 +118,7 @@ mod tests {
         );
     }
     #[test]
-    fn read_only_browser_preserves_unusual_member_selectors() {
+    fn read_only_browser_preserves_unusual_display_paths() {
         for path in [
             "../secret",
             "/absolute",
@@ -135,6 +143,21 @@ mod tests {
             browser.children(&["folder".into()])[0].path,
             "./folder/file name.txt"
         );
+    }
+    #[test]
+    fn duplicate_names_keep_distinct_catalog_indices() {
+        let mut first = entry("same", false);
+        first.reference = Some(smartzip_archive::EntryRef {
+            catalog_id: "catalog".into(),
+            index: 1,
+        });
+        let mut second = first.clone();
+        second.reference.as_mut().unwrap().index = 4;
+        let browser = ArchiveBrowser::new(vec![first, second]);
+        let children = browser.children(&[]);
+        assert_eq!(children.len(), 2);
+        assert_eq!(children[0].reference.as_ref().unwrap().index, 1);
+        assert_eq!(children[1].reference.as_ref().unwrap().index, 4);
     }
     #[test]
     fn merges_directory_and_preserves_duplicate_files() {

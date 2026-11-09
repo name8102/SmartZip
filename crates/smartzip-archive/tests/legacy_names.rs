@@ -30,9 +30,8 @@ fn legacy_zip(path: &Path, name: &[u8], encrypted: bool) {
 }
 
 fn backend() -> Option<SevenZipBackend> {
-    which::which("7zz")
-        .or_else(|_| which::which("7z"))
-        .ok()
+    smartzip_archive::SevenZipLocator::default()
+        .locate()
         .map(SevenZipBackend::new)
 }
 
@@ -69,10 +68,16 @@ async fn legacy_zip_names_and_contents_match_for_plain_and_encrypted_entries() {
                 backend.id(),
                 smartzip_archive::MemberReadRequest {
                     archive: archive.clone(),
-                    member: "测试文件.txt".into(),
+                    entry: listing.entries[0]
+                        .native
+                        .as_ref()
+                        .unwrap()
+                        .reference
+                        .clone(),
+                    input: None,
                     password: password.clone(),
                     encoding: encoding.clone(),
-                    max_bytes: 1024,
+                    extent: smartzip_archive::ReadExtent::Complete { max_bytes: 1024 },
                 },
                 tokio_util::sync::CancellationToken::new(),
             )
@@ -83,6 +88,7 @@ async fn legacy_zip_names_and_contents_match_for_plain_and_encrypted_entries() {
         backend
             .extract_with_context(
                 ExtractArchiveRequest {
+                    selection: None,
                     archive,
                     format: Some(ArchiveFormat::Zip),
                     password,
@@ -110,6 +116,7 @@ async fn legacy_decoded_traversal_is_rejected_without_creating_output() {
     let result = backend
         .extract_with_context(
             ExtractArchiveRequest {
+                selection: None,
                 archive,
                 format: Some(ArchiveFormat::Zip),
                 password: None,

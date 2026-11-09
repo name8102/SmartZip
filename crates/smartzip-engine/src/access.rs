@@ -12,7 +12,7 @@ use crate::backend_util::backend_call;
 use crate::encoding_flow::{assess_zip_encoding, resolve_encoding_mode};
 use crate::events::EventSink;
 use crate::interactive::{InteractiveEncodingPrompter, InteractivePasswordPrompter};
-use crate::nested::{archive_output_name, materialize_archive_input};
+use crate::nested::{archive_input, archive_output_name};
 use crate::password_order::password_source_label;
 use crate::policy::full_root_scanner_config;
 use crate::types::{ArchiveAccessOutcome, CandidateSource, ExtractionCandidate, PreparedArchive};
@@ -113,18 +113,13 @@ pub(crate) fn resolve_root_candidate(
 
 pub(crate) fn prepare_resolved_archive(
     candidate: &ExtractionCandidate,
-    volume_input: Option<(PathBuf, crate::volumes::materialize::MaterializedVolumeSet)>,
-    staging_root: Option<&Path>,
+    volume_input: Option<(PathBuf, smartzip_core::ArchiveInput)>,
     requested_encoding: EncodingMode,
     history: Option<&dyn crate::history::TaskHistoryRecorder>,
     run_policy: Option<&crate::CompiledRunPolicy>,
 ) -> smartzip_core::Result<PreparedArchive> {
-    let (archive_path, archive_temp, volume_keep) = if let Some((path, guard)) = volume_input {
-        (path, None, Some(guard))
-    } else {
-        let archive_input = materialize_archive_input(candidate, staging_root)?;
-        (archive_input.path, archive_input._temp, None)
-    };
+    let (archive_path, input) =
+        volume_input.unwrap_or_else(|| (candidate.path.clone(), archive_input(candidate)));
     let (sample_hash, sample_size) = if history.is_none() {
         (None, None)
     } else {
@@ -136,7 +131,7 @@ pub(crate) fn prepare_resolved_archive(
             )
             .map(|(h, s)| (Some(h), Some(s as i64)))
             .unwrap_or((None, None)),
-            _ => smartzip_db::sample_hash::sample_hash(&archive_path)
+            _ => smartzip_db::sample_hash::sample_hash(&input.path)
                 .map(|(h, s)| (Some(h), Some(s as i64)))
                 .unwrap_or((None, None)),
         }
@@ -164,13 +159,12 @@ pub(crate) fn prepare_resolved_archive(
         && encoding_mode == EncodingMode::Auto
         && candidate.detected_format == Some(ArchiveFormat::Zip)
     {
-        zip_encoding_assessment = assess_zip_encoding(&archive_path);
+        zip_encoding_assessment = assess_zip_encoding(&input);
     }
     Ok(PreparedArchive {
         candidate: candidate.clone(),
         archive_path,
-        _archive_temp: archive_temp,
-        _volume_keep: volume_keep,
+        input,
         sample_hash,
         sample_size,
         known_hit,
@@ -191,6 +185,12 @@ pub(crate) async fn access_archive_with_password(
     events: &EventSink,
     task_id: &TaskId,
 ) -> smartzip_core::Result<ArchiveAccessOutcome> {
+    let task_context = std::sync::Arc::new(
+        task_context
+            .as_ref()
+            .clone()
+            .with_archive_input(resolved.input.clone()),
+    );
     let password_prompter = password_prompter.filter(|_| passwords.allows_prompt());
     let known_password = resolved
         .known_hit
@@ -203,6 +203,7 @@ pub(crate) async fn access_archive_with_password(
     let mut used_password = None;
     let mut listing = None;
     let mut saw_wrong_password = false;
+    let mut saw_indeterminate_password = false;
     let mut password_prompt_cancelled = false;
     let encoding_mode = resolve_encoding_mode(
         &resolved.archive_path,
@@ -253,6 +254,11 @@ pub(crate) async fn access_archive_with_password(
                 if matches!(&error, smartzip_core::SmartZipError::WrongPassword { .. }) {
                     saw_wrong_password = true;
                     let _ = passwords.record_failure(password);
+                } else if matches!(
+                    &error,
+                    smartzip_core::SmartZipError::PasswordIndeterminate { .. }
+                ) {
+                    saw_indeterminate_password = true;
                 } else if matches!(
                     &error,
                     smartzip_core::SmartZipError::PasswordRequired { .. }
@@ -321,6 +327,17 @@ pub(crate) async fn access_archive_with_password(
                     },
                 });
             }
+            Err(smartzip_core::SmartZipError::PasswordIndeterminate { .. }) => {
+                saw_indeterminate_password = true;
+                events.push(TaskEvent {
+                    task_id: task_id.clone(),
+                    kind: TaskEventKind::Warning {
+                        message:
+                            "Password or encrypted data could not be verified; try again or skip"
+                                .into(),
+                    },
+                });
+            }
             Err(error) => return Err(error),
         }
     }
@@ -331,6 +348,11 @@ pub(crate) async fn access_archive_with_password(
         });
     }
     if used_password.is_none() {
+        if saw_indeterminate_password {
+            return Err(smartzip_core::SmartZipError::PasswordIndeterminate {
+                path: resolved.candidate.path.clone(),
+            });
+        }
         if saw_wrong_password {
             return Err(smartzip_core::SmartZipError::WrongPassword {
                 path: resolved.candidate.path.clone(),

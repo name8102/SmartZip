@@ -28,7 +28,7 @@ SmartZip 是一个用 Rust 重写的跨平台压缩包辅助工具，目标是�
 
 NixOS 使用仓库的 Nix 包，包含 CLI、GUI、运行库、7-Zip 后端和应用菜单入口：
 
-后端使用带 RAR 解码器的 `_7zz-rar`（包含 unRAR 许可代码）；默认的 `_7zz` 可列出 RAR 内容，但缺少解压所需的解码器。
+后端使用官方 7-Zip 26.06 全格式动态库（包含 RAR 解码器），归档操作在独立 worker 中执行，运行时无需安装 `7z` / `7zz`。构建、加载路径和许可证见[原生 7-Zip 说明](docs/native-sevenzip.md)。
 
 ```bash
 nix run . -- --help
@@ -38,7 +38,7 @@ nix profile add .#smartzip
 
 开发时执行 `nix develop`，再使用 Cargo、Python 或 `just`。Nix 依赖由 `flake.lock` 固定；迁移旧安装、桌面入口和升级方式见 [Nix 指南](docs/nix.md)。
 
-构建、打包并安装当前平台的 CLI 和 GUI（默认 release，需要 Python 3.11+）：
+构建、打包并安装当前平台的 CLI 和 GUI（默认 release，需要 Python 3.12+、GNU make 和 C/C++ 编译器）：
 
 ```bash
 just install
@@ -47,13 +47,15 @@ smartzip --help
 smartzip doctor
 ```
 
-CLI 安装到 Cargo 的用户级 bin 目录。Linux GUI 安装到 `~/.local/opt/SmartZip` 并加入应用菜单；macOS GUI 安装到 `~/Applications/SmartZip.app`。`just install release /自定义/GUI路径` 可指定 GUI 位置。构建使用当前平台工具链，打包产物位于 Cargo 实际输出目录下的 `bundle/`，兼容自定义 `CARGO_TARGET_DIR`。
+安装器构建并一起分发 CLI、GUI、归档 worker、固定版本 7-Zip 原生库、许可证与源码包；首次构建库会下载并校验固定源码。CLI 和归档运行库安装到 Cargo 的用户级 bin 目录。Linux GUI 安装到 `~/.local/opt/SmartZip` 并加入应用菜单；macOS GUI 安装到 `~/Applications/SmartZip.app`。`just install release /自定义/GUI路径` 可指定 GUI 位置。构建使用当前平台工具链，打包产物位于 Cargo 实际输出目录下的 `bundle/`，兼容自定义 `CARGO_TARGET_DIR`。
 
 查看帮助：
 
 ```bash
 cargo run -p smartzip-cli -- --help
 ```
+
+运行归档命令前，先执行 `cargo build -p smartzip-archive` 构建 worker；非 Nix 环境还需[准备原生库](docs/native-sevenzip.md)。
 
 常用命令示例：
 
@@ -124,7 +126,8 @@ macOS 会校验签名并替换同标识的旧应用，Linux 会更新已管理�
 macOS 仅打包、不安装：
 
 ```bash
-cargo build -p smartzip-gui --release
+cargo build -p smartzip-gui -p smartzip-archive --release
+python3 scripts/package_sevenzip.py --output target/release/lib
 python3 scripts/package-macos.py --profile release
 ```
 

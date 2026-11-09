@@ -10,6 +10,7 @@ import shutil
 import signal
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import time
 import zipfile
@@ -19,17 +20,24 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('binary', type=Path)
     args = parser.parse_args()
-    binary = str(args.binary.resolve())
+    binary = args.binary.resolve()
     seven = shutil.which('7z') or shutil.which('7zz')
-    assert seven, 'real 7-Zip required'
+    assert seven, '7z or 7zz required to generate encrypted test fixtures'
+    library_name = '7z.dll' if sys.platform == 'win32' else '7z.dylib' if sys.platform == 'darwin' else '7z.so'
+    candidates = ([Path(os.environ['SMARTZIP_7Z_LIBRARY'])] if os.environ.get('SMARTZIP_7Z_LIBRARY') else
+                  [binary.parent / library_name, binary.parent / 'lib' / library_name,
+                   binary.parent.parent / 'lib/smartzip' / library_name])
+    library = next((path.resolve() for path in candidates if path.is_file()), None)
+    if library is None:
+        raise SystemExit('REQUIRED: native 7-Zip library; set SMARTZIP_7Z_LIBRARY or use a packaged runtime')
     checks = []
     with tempfile.TemporaryDirectory(prefix='smartzip-review-fixes-') as tmp:
         root = Path(tmp)
         config = root / 'config.toml'
-        config.write_text('schema_version = 1\ndefaults_version = 1\n[backends]\nauto_discover = false\n[[backends.installations]]\nid = "seven"\nfamily = "seven-zip-cli"\nexecutable = ' + json.dumps(seven) + '\n')
+        config.write_text('schema_version = 1\ndefaults_version = 1\n[backends]\nauto_discover = false\n[[backends.installations]]\nid = "seven"\nfamily = "seven-zip-library"\npath = ' + json.dumps(str(library)) + '\n')
         db = root / 'state.db'
         env = dict(os.environ, XDG_DATA_HOME=str(root/'data'), XDG_CONFIG_HOME=str(root/'config'))
-        base = [binary, '--config', str(config), '--db', str(db)]
+        base = [str(binary), '--config', str(config), '--db', str(db)]
 
         def run(arguments, settings=(), expected=0):
             command = base + [x for setting in settings for x in ['--set', setting]] + list(map(str, arguments))

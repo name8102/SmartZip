@@ -80,13 +80,10 @@ impl UnrarBackend {
         ];
         let output = self.run_with_token(&args, token).await?;
         if output.status != Some(0) {
-            return Err(crate::test_output::password_error(
-                &output,
-                "unrar",
-                password.as_deref(),
-                archive,
-            )
-            .unwrap_or_else(|| self.map_failure(&output, archive)));
+            return Err(
+                crate::test_output::password_error(&output, password.as_deref(), archive)
+                    .unwrap_or_else(|| self.map_failure(&output, archive)),
+            );
         }
         validate_extraction_listing(&output.stdout)?;
         let encrypted = output.stdout.lines().any(|line| {
@@ -122,7 +119,7 @@ impl UnrarBackend {
 
     fn map_failure(&self, output: &BackendCommandOutput, path: &Path) -> SmartZipError {
         let combined = format!("{}\n{}", output.stdout, output.stderr);
-        let lower = crate::test_output::diagnostic_text(&combined, "unrar");
+        let lower = crate::test_output::diagnostic_text(&combined);
         if lower.contains("wrong password") || lower.contains("incorrect password") {
             SmartZipError::WrongPassword {
                 path: path.to_path_buf(),
@@ -175,6 +172,8 @@ impl ArchiveAdapter for UnrarBackend {
         path: &Path,
         context: std::sync::Arc<TaskExecutionContext>,
     ) -> Result<ArchiveProbe> {
+        let _input = crate::source::MaterializedInput::new(path, context.archive_input())?;
+        let path = _input.path.as_path();
         let args = vec![
             "lt".into(),
             "-cfg-".into(),
@@ -193,10 +192,8 @@ impl ArchiveAdapter for UnrarBackend {
                     .is_some_and(|flags| flags.split_whitespace().any(|flag| flag == "encrypted"))
             }))
         } else {
-            Err(
-                crate::test_output::password_error(&output, "unrar", None, path)
-                    .unwrap_or_else(|| self.map_failure(&output, path)),
-            )
+            Err(crate::test_output::password_error(&output, None, path)
+                .unwrap_or_else(|| self.map_failure(&output, path)))
         };
         let (supported, encrypted) = match result {
             Ok(encrypted) => (true, Some(encrypted)),
@@ -215,9 +212,12 @@ impl ArchiveAdapter for UnrarBackend {
 
     async fn list_with_context(
         &self,
-        request: ListRequest,
+        mut request: ListRequest,
         context: std::sync::Arc<TaskExecutionContext>,
     ) -> Result<ArchiveListing> {
+        let _input =
+            crate::source::MaterializedInput::new(&request.archive, context.archive_input())?;
+        request.archive = _input.path.clone();
         let token = context.cancellation_token();
         let args = vec![
             "lb".to_string(),
@@ -234,6 +234,7 @@ impl ArchiveAdapter for UnrarBackend {
             .lines()
             .filter(|line| !line.trim().is_empty())
             .map(|line| ArchiveEntry {
+                native: None,
                 path: PathBuf::from(line),
                 raw_name: Vec::new(),
                 compressed_size: None,
@@ -249,9 +250,12 @@ impl ArchiveAdapter for UnrarBackend {
 
     async fn test_with_context(
         &self,
-        request: TestRequest,
+        mut request: TestRequest,
         context: std::sync::Arc<TaskExecutionContext>,
     ) -> Result<TestResult> {
+        let _input =
+            crate::source::MaterializedInput::new(&request.archive, context.archive_input())?;
+        request.archive = _input.path.clone();
         if request
             .format
             .as_ref()
@@ -287,7 +291,6 @@ impl ArchiveAdapter for UnrarBackend {
         }
         Ok(crate::test_output::report(
             &self.id,
-            "unrar",
             output,
             truncated,
             request.password.as_deref(),
@@ -296,9 +299,22 @@ impl ArchiveAdapter for UnrarBackend {
 
     async fn extract_with_context(
         &self,
-        request: ExtractArchiveRequest,
+        mut request: ExtractArchiveRequest,
         context: std::sync::Arc<TaskExecutionContext>,
     ) -> Result<ExtractArchiveResult> {
+        if request.selection.is_some() {
+            return Err(SmartZipError::UnsupportedContainer {
+                backend: self.id.clone(),
+                path: request.archive,
+                container: Some("indexed extraction requires native 7-Zip".into()),
+            });
+        }
+        if let Some(b) = context.output_budget() {
+            b.set_native_admission(false);
+        }
+        let _input =
+            crate::source::MaterializedInput::new(&request.archive, context.archive_input())?;
+        request.archive = _input.path.clone();
         let encrypted = self
             .validate_before_extract(
                 &request.archive,
@@ -324,13 +340,13 @@ impl ArchiveAdapter for UnrarBackend {
         if output.status != Some(0) {
             return Err(crate::test_output::password_error(
                 &output,
-                "unrar",
                 request.password.as_deref(),
                 &request.archive,
             )
             .unwrap_or_else(|| self.map_failure(&output, &request.archive)));
         }
         Ok(ExtractArchiveResult {
+            manifest: None,
             output_dir: request.output_dir,
             encrypted,
         })

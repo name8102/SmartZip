@@ -3,11 +3,13 @@
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import platform
 import shutil
 import statistics
 import subprocess
+import sys
 import tempfile
 import time
 import zipfile
@@ -19,16 +21,24 @@ parser.add_argument('--output', type=Path, required=True)
 parser.add_argument('--samples', type=int, default=7)
 args = parser.parse_args()
 binaries = {'baseline': args.baseline.resolve(), 'optimized': args.optimized.resolve()}
-seven = shutil.which('7z') or shutil.which('7zz')
-assert seven, 'real 7-Zip is required'
 results = {'platform': platform.platform(), 'files': 3000, 'samples': args.samples,
-           'scope': 'synthetic ZIP with 3000 128-byte files; warm filesystem; CLI startup, test-before-extract, layout and nested scan included; fixture and DB initialization excluded',
+           'scope': 'synthetic ZIP with 3000 128-byte files; warm filesystem; CLI and native-worker startup, extraction, layout and nested scan included; fixture and DB initialization excluded',
            'binaries': {k: {'path': str(v), 'sha256': hashlib.sha256(v.read_bytes()).hexdigest()} for k, v in binaries.items()},
            'timings_seconds': {k: {'raw': []} for k in binaries}}
 with tempfile.TemporaryDirectory(prefix='smartzip-extract-bench-') as workspace:
     root = Path(workspace)
-    config = root / 'config.toml'
-    config.write_text('[backends]\nauto_discover = false\n[[backends.installations]]\nid = "benchmark-7z"\nfamily = "seven-zip-cli"\nexecutable = ' + json.dumps(seven) + '\n')
+    configs = {}
+    for variant, binary in binaries.items():
+        library_name = '7z.dll' if sys.platform == 'win32' else '7z.dylib' if sys.platform == 'darwin' else '7z.so'
+        candidates = ([Path(os.environ['SMARTZIP_7Z_LIBRARY'])] if os.environ.get('SMARTZIP_7Z_LIBRARY') else
+                      [binary.parent / library_name, binary.parent / 'lib' / library_name,
+                       binary.parent.parent / 'lib/smartzip' / library_name])
+        library = next((path.resolve() for path in candidates if path.is_file()), None)
+        if library is None:
+            raise SystemExit('REQUIRED: native 7-Zip library; set SMARTZIP_7Z_LIBRARY or use a packaged runtime')
+        config = root / f'{variant}-config.toml'
+        config.write_text('[backends]\nauto_discover = false\n[[backends.installations]]\nid = "benchmark-7z"\nfamily = "seven-zip-library"\npath = ' + json.dumps(str(library)) + '\n')
+        configs[variant] = config
     archive = root / 'small-files.zip'
     payload = b'x' * 128
     with zipfile.ZipFile(archive, 'w', zipfile.ZIP_DEFLATED) as z:
@@ -38,7 +48,7 @@ with tempfile.TemporaryDirectory(prefix='smartzip-extract-bench-') as workspace:
         # Alternate order to reduce drift correlated with the executable.
         for variant in (list(binaries) if sample % 2 == 0 else list(reversed(binaries))):
             db = root / f'{variant}-{sample}.db'
-            base = [str(binaries[variant]), '--config', str(config), '--db', str(db)]
+            base = [str(binaries[variant]), '--config', str(configs[variant]), '--db', str(db)]
             subprocess.run(base + ['password', 'list', '--json'], capture_output=True, check=True)
             dest = root / f'{variant}-{sample}'
             started = time.perf_counter()

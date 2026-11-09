@@ -141,14 +141,8 @@ pub(crate) async fn inspect_file_with_listener(
         reason = Some("business_container".to_string());
         detected_format = Some(ArchiveFormat::Zip);
     } else if let Some(candidate) = candidate {
-        let resolved = prepare_resolved_archive(
-            &candidate,
-            None,
-            None,
-            EncodingMode::Auto,
-            history,
-            run_policy,
-        )?;
+        let resolved =
+            prepare_resolved_archive(&candidate, None, EncodingMode::Auto, history, run_policy)?;
         if let Some(assessment) = &resolved.zip_encoding_assessment {
             events.push(TaskEvent {
                 task_id: task_id.clone(),
@@ -165,7 +159,15 @@ pub(crate) async fn inspect_file_with_listener(
             .as_ref()
             .and_then(|hit| hit.confirmed_encoding.clone());
         let probe = backend
-            .probe_with_context(&resolved.archive_path, std::sync::Arc::clone(&task_context))
+            .probe_with_context(
+                &resolved.archive_path,
+                std::sync::Arc::new(
+                    task_context
+                        .as_ref()
+                        .clone()
+                        .with_archive_input(resolved.input.clone()),
+                ),
+            )
             .await
             .map_err(|error| map_detect_error(error, &request.path))?;
         encrypted = probe.encrypted;
@@ -332,7 +334,7 @@ pub(crate) async fn list_archive_with_listener_interactive(
             candidate,
             archive_path,
             warnings,
-            materialized,
+            input,
             ..
         } => {
             for warning in warnings {
@@ -343,7 +345,7 @@ pub(crate) async fn list_archive_with_listener_interactive(
                     },
                 });
             }
-            (candidate, Some((archive_path, materialized)))
+            (candidate, Some((archive_path, input)))
         }
         crate::volumes::VolumePreparation::Incomplete { candidate, problem } => {
             return Err(smartzip_core::SmartZipError::CorruptedArchive {
@@ -360,18 +362,11 @@ pub(crate) async fn list_archive_with_listener_interactive(
                 detail: format!("grouping ambiguous: {} hypotheses", hypotheses.len()),
             });
         }
-        crate::volumes::VolumePreparation::MaterializationFailed { candidate, error } => {
-            return Err(smartzip_core::SmartZipError::CorruptedArchive {
-                path: candidate.path,
-                detail: format!("volume materialization failed: {error}"),
-            });
-        }
     };
 
     let resolved = prepare_resolved_archive(
         &candidate,
         volume_input,
-        None,
         request.encoding_mode.clone(),
         history,
         run_policy,
@@ -401,7 +396,7 @@ pub(crate) async fn list_archive_with_listener_interactive(
 
     if let Some(recorder) = history {
         // History follows the logical candidate/request identity, never the
-        // temporary canonical staging path used by the backend.
+        // logical volume names passed to the backend.
         let history_input_path = &request.path;
         recorder.record_file_extraction(
             &task_id,
@@ -452,6 +447,7 @@ pub(crate) async fn list_archive_with_listener_interactive(
 
     completion.complete();
     Ok(ListArchiveResult {
+        input: resolved.input.clone(),
         task_id,
         path: request.path,
         detected_format: candidate.detected_format,

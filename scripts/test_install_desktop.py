@@ -13,12 +13,15 @@ spec.loader.exec_module(installer)
 class InstallDesktopTests(unittest.TestCase):
     def test_build_uses_cargo_artifacts_in_custom_target_directory(self):
         binaries = {'smartzip': '/custom target/native/debug/smartzip',
-                    'smartzip-gui': '/custom target/native/debug/smartzip-gui'}
+                    'smartzip-gui': '/custom target/native/debug/smartzip-gui',
+                    'smartzip-archive-worker': '/custom target/native/debug/smartzip-archive-worker'}
         output = '\n'.join(json.dumps({'reason': 'compiler-artifact', 'target': {'name': name},
                                        'executable': path}) for name, path in binaries.items())
-        with patch.object(installer.subprocess, 'run', return_value=Mock(stdout=output)) as run:
+        with patch.object(installer, 'load'), \
+                patch.object(installer.subprocess, 'run', return_value=Mock(stdout=output)) as run:
             self.assertEqual(installer.build('debug'), {k: Path(v) for k, v in binaries.items()})
             self.assertNotIn('--release', run.call_args.args[0])
+            self.assertIn('smartzip-archive', run.call_args.args[0])
 
     def test_native_platform_selection_and_cli_install(self):
         binaries = {'smartzip': Path('/build/smartzip'), 'smartzip-gui': Path('/build/smartzip-gui')}
@@ -27,7 +30,7 @@ class InstallDesktopTests(unittest.TestCase):
                     patch.object(installer, 'build', return_value=binaries), \
                     patch.object(installer, 'install_linux') as linux, \
                     patch.object(installer, 'load') as load, \
-                    patch.object(installer.subprocess, 'run') as run:
+                    patch.object(installer, 'install_cli') as cli:
                 installer.main(['--profile', 'debug', '--destination', '/custom/SmartZip.app'])
                 if platform == 'linux':
                     linux.assert_called_once_with(binaries, Path('/custom/SmartZip.app'))
@@ -35,22 +38,23 @@ class InstallDesktopTests(unittest.TestCase):
                 else:
                     load.return_value.install_bundle.assert_called_once()
                     linux.assert_not_called()
-                self.assertIn('--debug', run.call_args.args[0])
-                self.assertIn('crates/smartzip-cli', run.call_args.args[0])
+                cli.assert_called_once_with(binaries)
 
     def test_gui_only_does_not_install_cli(self):
         with patch.object(installer.sys, 'platform', 'linux'), \
                 patch.object(installer, 'build'), patch.object(installer, 'install_linux'), \
-                patch.object(installer.subprocess, 'run') as run:
+                patch.object(installer, 'install_cli') as cli:
             installer.main(['--gui-only'])
-            run.assert_not_called()
+            cli.assert_not_called()
 
     def test_linux_package_update_and_launcher(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            binaries = {name: root / name for name in ('smartzip', 'smartzip-gui')}
+            binaries = {name: root / name for name in ('smartzip', 'smartzip-gui', 'smartzip-archive-worker')}
             for binary in binaries.values():
                 binary.write_text('binary')
+            from test_package_native_runtime import fixture_runtime
+            fixture_runtime(root)
             destination = root / 'User Apps/SmartZip'
             with patch.dict(installer.os.environ, {'XDG_DATA_HOME': str(root / 'data')}), \
                     patch.object(installer.subprocess, 'check_output', return_value='smartzip 0.1.0\n'):

@@ -65,13 +65,48 @@ pub struct BackendTestDiagnostics {
     pub adapter_id: String,
     pub family: String,
     pub version: Option<String>,
-    pub exit_code: Option<i32>,
     pub failure: Option<TestFailure>,
     pub coverage: Coverage,
     pub damaged_files: Vec<String>,
-    pub stdout: String,
-    pub stderr: String,
-    pub output_truncated: bool,
+    pub detail: BackendDiagnosticDetail,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BackendDiagnosticDetail {
+    Host {
+        message: String,
+    },
+    Native {
+        report: smartzip_sevenzip::RunReport,
+    },
+    Process {
+        exit_code: Option<i32>,
+        stdout: String,
+        stderr: String,
+        output_truncated: bool,
+    },
+}
+impl Default for BackendDiagnosticDetail {
+    fn default() -> Self {
+        Self::Process {
+            exit_code: None,
+            stdout: String::new(),
+            stderr: String::new(),
+            output_truncated: false,
+        }
+    }
+}
+impl BackendTestDiagnostics {
+    pub fn output_truncated(&self) -> bool {
+        matches!(
+            self.detail,
+            BackendDiagnosticDetail::Process {
+                output_truncated: true,
+                ..
+            }
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -192,7 +227,7 @@ pub struct TestArchiveReport {
 impl TestArchiveReport {
     pub fn new(volumes: VolumeSet, input: PathBuf) -> Self {
         Self {
-            schema_version: 1,
+            schema_version: 2,
             input_paths: vec![input],
             entrypoint: volumes.entrypoint.clone(),
             missing_volumes: volumes.missing.clone(),

@@ -11,6 +11,8 @@ import sys
 import tempfile
 import tomllib
 
+from package_native_runtime import copy_runtime, runtime_files
+
 ROOT = Path(__file__).resolve().parents[1]
 BUNDLE_ID = "org.smartzip.SmartZip"
 
@@ -45,7 +47,7 @@ def info_plist():
     }
 
 
-def package(binary, output, sign=True):
+def package(binary, output, sign=True, worker=None, library=None):
     binary, output = Path(binary), Path(output)
     if not binary.is_file():
         raise ValueError(f"Build the GUI first: missing {binary}")
@@ -59,6 +61,7 @@ def package(binary, output, sign=True):
             raise ValueError("Refusing to replace an unknown bundle") from error
         if old.get("CFBundleIdentifier") != BUNDLE_ID:
             raise ValueError("Refusing to replace a different application's bundle")
+    runtime_files(binary, worker, library, platform='darwin')
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".smartzip-package-", dir=output.parent) as temporary:
         staging = Path(temporary) / "SmartZip.app"
@@ -66,13 +69,15 @@ def package(binary, output, sign=True):
         executable.parent.mkdir(parents=True)
         shutil.copy2(binary, executable)
         executable.chmod(0o755)
+        copy_runtime(binary, executable.parent, worker, library, platform='darwin')
         licenses = staging / "Contents/Resources/licenses"
         licenses.mkdir(parents=True)
         shutil.copy2(ROOT / "resources/fonts/OFL.txt", licenses / "NotoSansCJK-OFL.txt")
         with (staging / "Contents/Info.plist").open("wb") as target:
             plistlib.dump(info_plist(), target)
         if sign and sys.platform == "darwin":
-            subprocess.run(["/usr/bin/codesign", "--force", "--sign", "-", str(staging)], check=True)
+            for artifact in (executable.parent / "lib/7z.dylib", executable.parent / "smartzip-archive-worker", staging):
+                subprocess.run(["/usr/bin/codesign", "--force", "--sign", "-", str(artifact)], check=True)
             subprocess.run(["/usr/bin/codesign", "--verify", "--strict", str(staging)], check=True)
         backup = Path(temporary) / "previous.app"
         if output.exists():
@@ -91,7 +96,9 @@ if __name__ == "__main__":
     parser.add_argument("--profile", choices=["debug", "release"], default="release")
     parser.add_argument("--binary", type=Path)
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--worker", type=Path)
+    parser.add_argument("--library", type=Path)
     args = parser.parse_args()
     binary = args.binary or ROOT / "target" / args.profile / "smartzip-gui"
     output = args.output or ROOT / "target" / args.profile / "bundle" / "SmartZip.app"
-    print(package(binary, output))
+    print(package(binary, output, worker=args.worker, library=args.library))

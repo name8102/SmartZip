@@ -58,6 +58,7 @@ pub struct FileAwareDetectResult {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ListArchiveResult {
+    pub input: smartzip_core::ArchiveInput,
     pub task_id: TaskId,
     pub path: PathBuf,
     pub detected_format: Option<ArchiveFormat>,
@@ -73,8 +74,7 @@ pub struct ListArchiveResult {
 pub(crate) struct PreparedArchive {
     pub(crate) candidate: ExtractionCandidate,
     pub(crate) archive_path: PathBuf,
-    pub(crate) _archive_temp: Option<tempfile::NamedTempFile>,
-    pub(crate) _volume_keep: Option<crate::volumes::materialize::MaterializedVolumeSet>,
+    pub(crate) input: smartzip_core::ArchiveInput,
     pub(crate) sample_hash: Option<String>,
     pub(crate) sample_size: Option<i64>,
     pub(crate) known_hit: Option<crate::history::KnownFileHit>,

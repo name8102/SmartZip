@@ -2,8 +2,6 @@
 
 use smartzip_core::{ArchiveFormat, TaskId};
 use smartzip_scanner::{EmbeddedArchiveFinding, EmbeddedScanner};
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use crate::name_score;
@@ -125,43 +123,24 @@ pub(crate) async fn recycle_archive(
         .map_err(std::io::Error::other)?
 }
 
-pub(crate) struct ArchiveInput {
-    pub(crate) path: PathBuf,
-    pub(crate) _temp: Option<tempfile::NamedTempFile>,
-}
-
-pub(crate) fn materialize_archive_input(
-    candidate: &ExtractionCandidate,
-    staging_root: Option<&Path>,
-) -> smartzip_core::Result<ArchiveInput> {
-    if let Some(offset) = candidate
-        .embedded_offset
-        .filter(|offset| *offset > 0 || candidate.source == CandidateSource::EmbeddedFinding)
-    {
-        let temp = carve_embedded_archive(
-            &candidate.path,
-            offset,
-            candidate.embedded_size,
-            candidate.detected_format.as_ref(),
-            staging_root,
-        )
-        .map_err(
-            |source| smartzip_core::SmartZipError::EmbeddedArchiveCarveFailed {
-                path: candidate.path.clone(),
-                offset,
-                detail: source.to_string(),
-            },
-        )?;
-        let path = temp.path().to_path_buf();
-        Ok(ArchiveInput {
-            path,
-            _temp: Some(temp),
-        })
-    } else {
-        Ok(ArchiveInput {
-            path: candidate.path.clone(),
-            _temp: None,
-        })
+pub(crate) fn archive_input(candidate: &ExtractionCandidate) -> smartzip_core::ArchiveInput {
+    let offset = candidate.embedded_offset.unwrap_or(0);
+    let length = candidate.embedded_size.or_else(|| {
+        (candidate.detected_format == Some(ArchiveFormat::Zip)
+            && (offset > 0 || candidate.source == CandidateSource::EmbeddedFinding))
+            .then(|| {
+                crate::embedded_zip::detect_zip_end(&candidate.path, offset)
+                    .ok()
+                    .flatten()
+            })
+            .flatten()
+            .map(|end| end - offset)
+    });
+    smartzip_core::ArchiveInput {
+        path: candidate.path.clone(),
+        offset,
+        length,
+        volumes: Default::default(),
     }
 }
 
@@ -175,71 +154,6 @@ pub(crate) fn output_relative_path_for(base: &Path, output_dir: &Path) -> PathBu
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("archive"))
         })
-}
-
-pub(crate) fn carve_embedded_archive(
-    source: &Path,
-    offset: u64,
-    size: Option<u64>,
-    format: Option<&ArchiveFormat>,
-    staging_root: Option<&Path>,
-) -> std::io::Result<tempfile::NamedTempFile> {
-    let file_len = std::fs::metadata(source)?.len();
-
-    if offset >= file_len {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("carve offset {} exceeds file size {}", offset, file_len),
-        ));
-    }
-
-    let effective_end = match size {
-        Some(s) => {
-            if s == 0 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "carve size cannot be zero",
-                ));
-            }
-            offset.saturating_add(s).min(file_len)
-        }
-        None => {
-            if format == Some(&ArchiveFormat::Zip) {
-                if let Ok(Some(zip_end)) = crate::embedded_zip::detect_zip_end(source, offset) {
-                    zip_end
-                } else {
-                    file_len
-                }
-            } else {
-                file_len
-            }
-        }
-    };
-
-    if effective_end <= offset {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "carve range is empty",
-        ));
-    }
-
-    let mut input = File::open(source)?;
-    input.seek(SeekFrom::Start(offset))?;
-
-    let mut output = match staging_root {
-        Some(root) => {
-            std::fs::create_dir_all(root)?;
-            tempfile::Builder::new()
-                .prefix(".smartzip-carve-")
-                .tempfile_in(root)?
-        }
-        None => tempfile::NamedTempFile::new()?,
-    };
-    let bytes_to_copy = effective_end - offset;
-    std::io::copy(&mut input.take(bytes_to_copy), &mut output)?;
-    output.flush()?;
-
-    Ok(output)
 }
 
 #[derive(Clone, Copy)]
@@ -508,25 +422,21 @@ pub fn format_from_extension(path: impl AsRef<std::path::Path>) -> Option<Archiv
 }
 
 #[cfg(test)]
-mod target_staging_tests {
+mod input_tests {
     use super::*;
 
     #[test]
-    fn embedded_input_is_carved_on_target_and_removed_after_use() {
+    fn native_embedded_input_carries_a_range_without_creating_staging_files() {
         let source = tempfile::tempdir().unwrap();
-        let target = tempfile::tempdir().unwrap();
         let path = source.path().join("carrier.bin");
         std::fs::write(&path, b"prefixPAYLOADsuffix").unwrap();
         let mut candidate = ExtractionCandidate::root(path.clone());
         candidate.embedded_offset = Some(6);
         candidate.embedded_size = Some(7);
-        let input = materialize_archive_input(&candidate, Some(target.path())).unwrap();
-        assert_eq!(input.path.parent(), Some(target.path()));
-        assert_eq!(std::fs::read(&input.path).unwrap(), b"PAYLOAD");
+        let input = archive_input(&candidate);
+        assert_eq!(input.path, path);
+        assert_eq!((input.offset, input.length), (6, Some(7)));
+        assert!(input.volumes.is_empty());
         assert_eq!(std::fs::read_dir(source.path()).unwrap().count(), 1);
-        let staging = input.path.clone();
-        drop(input);
-        assert!(!staging.exists());
-        assert_eq!(std::fs::read(path).unwrap(), b"prefixPAYLOADsuffix");
     }
 }

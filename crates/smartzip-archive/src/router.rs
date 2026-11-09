@@ -1,5 +1,5 @@
 use crate::backend::{ArchiveAdapter, ArchiveExecutor};
-use crate::sevenzz::{SevenZipBackend, SevenZipLocator};
+use crate::sevenzip::{SevenZipBackend, SevenZipLocator};
 use crate::types::*;
 use crate::unrar::{UnrarBackend, UnrarLocator};
 use async_trait::async_trait;
@@ -62,12 +62,12 @@ pub struct BackendRouter {
 
 impl BackendRouter {
     /// Read one validated member through the configured 7-Zip adapter.
-    pub async fn read_member(
+    pub async fn read_member_result(
         &self,
         adapter_id: &str,
         request: crate::member::MemberReadRequest,
         token: CancellationToken,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<crate::MemberReadResult> {
         let registration =
             self.registration(adapter_id)
                 .ok_or_else(|| SmartZipError::BackendUnavailable {
@@ -80,17 +80,29 @@ impl BackendRouter {
                 container: Some("single-member-read requires 7-Zip".into()),
             });
         }
-        crate::member::read_member(registration.adapter.as_ref(), request, token).await
+        registration
+            .adapter
+            .read_member_with_context(request, token)
+            .await
+    }
+    pub async fn read_member(
+        &self,
+        adapter_id: &str,
+        request: crate::MemberReadRequest,
+        token: CancellationToken,
+    ) -> Result<Vec<u8>> {
+        self.read_member_result(adapter_id, request, token)
+            .await
+            .map(|r| r.bytes)
     }
     pub fn diagnostics(&self) -> Vec<serde_json::Value> {
         self.adapters.iter().map(|registration| {
-            let adapter = &registration.adapter;
-            let family = adapter.diagnostic_family().unwrap_or("unknown");
-            let version = adapter.executable_path().map(|path| identify_version(path, if family == "unrar" { "unrar-cli" } else { "seven-zip-cli" }));
-            serde_json::json!({"id": adapter.id(), "family": family, "executable": adapter.executable_path(),
-                "version": version.as_ref().and_then(|v| v.as_ref().ok()),
-                "error": version.as_ref().and_then(|v| v.as_ref().err()).map(ToString::to_string),
-                "capabilities": registration.capabilities})
+            let adapter=&registration.adapter;
+            let native=adapter.runtime_diagnostics();
+            let process_version=adapter.executable_path().map(|path|identify_version(path));
+            let version=process_version.as_ref().and_then(|v|v.as_ref().ok()).map(String::as_str).or_else(||native.pointer("/runtime/version").and_then(|v|v.as_str()));
+            let error=process_version.as_ref().and_then(|v|v.as_ref().err()).map(ToString::to_string).or_else(||native.get("error").and_then(|e|e.as_str()).map(str::to_owned));
+            serde_json::json!({"id":adapter.id(),"family":adapter.diagnostic_family(),"executable":adapter.executable_path(),"library":native.get("library"),"version":version,"error":error,"runtime":native.get("runtime"),"capabilities":registration.capabilities})
         }).collect()
     }
 
@@ -116,13 +128,13 @@ impl BackendRouter {
         let explicit_paths: HashSet<PathBuf> = config
             .installations
             .iter()
-            .map(|entry| resolve_executable(&entry.executable))
+            .map(|entry| resolve_executable(&entry.path))
             .collect();
         let mut registered_paths = HashSet::new();
         let mut warnings = Vec::new();
 
         for installation in config.installations.iter().filter(|entry| entry.enabled) {
-            let executable = resolve_executable(&installation.executable);
+            let executable = resolve_executable(&installation.path);
             if !registered_paths.insert(executable.clone()) {
                 warnings.push(format!(
                     "backend {} duplicates an earlier configured executable and was ignored",
@@ -130,12 +142,32 @@ impl BackendRouter {
                 ));
                 continue;
             }
-            check_declared_version(installation, &mut warnings);
+            if installation.family == AdapterFamily::UnrarCli {
+                check_declared_version(installation, &mut warnings);
+            }
             let registration = match &installation.family {
-                AdapterFamily::SevenZipCli => AdapterRegistration::from_adapter(
-                    SevenZipBackend::new(executable).with_id(installation.id.clone()),
-                    installation.priority,
-                ),
+                AdapterFamily::SevenZipLibrary => {
+                    let adapter = SevenZipBackend::new(executable).with_id(installation.id.clone());
+                    match adapter.runtime_info() {
+                        Err(error) => warnings.push(format!(
+                            "native library unavailable for {}: {error}",
+                            installation.id
+                        )),
+                        Ok(info) => {
+                            if installation
+                                .declared_version
+                                .as_deref()
+                                .is_some_and(|v| v != info.version)
+                            {
+                                warnings.push(format!(
+                                    "backend {} declares another version; library is {}",
+                                    installation.id, info.version
+                                ));
+                            }
+                        }
+                    }
+                    AdapterRegistration::from_adapter(adapter, installation.priority)
+                }
                 AdapterFamily::UnrarCli => AdapterRegistration::new(
                     UnrarBackend::new(executable).with_id(installation.id.clone()),
                     unrar_capabilities(),
@@ -149,7 +181,6 @@ impl BackendRouter {
                 if !explicit_paths.contains(&resolve_executable(&executable)) {
                     adapters.push(discovered_registration(
                         UnrarBackend::new(executable.clone()),
-                        "unrar-cli",
                         &executable,
                         20,
                         &mut warnings,
@@ -158,19 +189,17 @@ impl BackendRouter {
             }
             for executable in SevenZipLocator::default().locate_all() {
                 if !explicit_paths.contains(&resolve_executable(&executable)) {
-                    adapters.push(discovered_registration(
-                        SevenZipBackend::new(executable.clone()),
-                        "sevenzip-cli",
-                        &executable,
-                        10,
-                        &mut warnings,
-                    ));
+                    let adapter = SevenZipBackend::new(executable);
+                    if let Err(error) = adapter.runtime_info() {
+                        warnings.push(format!("native library unavailable: {error}"));
+                    }
+                    adapters.push(AdapterRegistration::from_adapter(adapter, 10));
                 }
             }
         }
         if adapters.is_empty() {
             warnings.push(if config.auto_discover {
-                "No archive backends were discovered or enabled. Install 7-Zip (7zz/7z), or configure its executable path in backends.installations. Explicitly disabled installations are excluded from discovery."
+                "No archive backends were discovered or enabled. Install the bundled 7-Zip native library, or configure its library path in backends.installations. Explicitly disabled installations are excluded from discovery."
             } else {
                 "No archive backends are enabled and backends.auto_discover is false. Enable automatic discovery or configure an enabled installation in backends.installations."
             }.into());
@@ -513,6 +542,9 @@ impl BackendRouter {
                     // already stopped and no longer writing to output_dir.
                     // Clear and verify before any retry.
                     clear_attempt_output(&request.output_dir)?;
+                    if let Some(budget) = context.output_budget() {
+                        budget.reset_attempt_usage()?;
+                    }
                     self.emit(
                         context.as_ref(),
                         RouteEvent::BackendAttemptCleaned {
@@ -743,12 +775,11 @@ impl ArchiveExecutor for BackendRouter {
 
 fn discovered_registration<A: ArchiveAdapter + 'static>(
     adapter: A,
-    family_key: &str,
     executable: &Path,
     priority: i32,
     warnings: &mut Vec<String>,
 ) -> AdapterRegistration {
-    if let Err(error) = identify_version(executable, family_key) {
+    if let Err(error) = identify_version(executable) {
         warnings.push(format!(
             "auto-discovered backend {} version command failed ({error})",
             executable.display()
@@ -795,8 +826,8 @@ pub(crate) fn unrar_capabilities() -> AdapterCapabilities {
     }
 }
 
-fn identify_version(executable: &Path, family_key: &str) -> std::io::Result<String> {
-    let argument = if family_key == "unrar-cli" { "-v" } else { "i" };
+fn identify_version(executable: &Path) -> std::io::Result<String> {
+    let argument = "-v";
     let output = std::process::Command::new(executable)
         .arg(argument)
         .output()?;
@@ -836,8 +867,8 @@ fn check_declared_version(installation: &BackendInstallation, warnings: &mut Vec
     let Some(declared) = installation.declared_version.as_deref() else {
         return;
     };
-    let output = std::process::Command::new(&installation.executable)
-        .arg("i")
+    let output = std::process::Command::new(&installation.path)
+        .arg("-v")
         .output();
     match output {
         Ok(output) if output.status.success() => {
@@ -912,7 +943,7 @@ fn error_class(error: &SmartZipError) -> &'static str {
 
 fn no_compatible_backend(operation: ArchiveOperation, plan: &RoutePlan) -> SmartZipError {
     let explanation = if plan.rejected.is_empty() {
-        "No archive backend is registered. Install 7-Zip (7zz/7z), enable backends.auto_discover, or set an enabled executable path in backends.installations."
+        "No archive backend is registered. Install the bundled 7-Zip native library, enable backends.auto_discover, or set an enabled library path in backends.installations."
     } else {
         "Registered archive backends do not meet this operation's requirements. Check the rejection reasons below and configure a compatible backend."
     };
@@ -1139,6 +1170,7 @@ mod tests {
             self.fail(&request.archive)?;
             std::fs::write(request.output_dir.join("success.txt"), &self.id).unwrap();
             Ok(ExtractArchiveResult {
+                manifest: None,
                 output_dir: request.output_dir,
                 encrypted: None,
             })
@@ -1155,6 +1187,7 @@ mod tests {
 
     fn extract_request(output_dir: PathBuf) -> ExtractArchiveRequest {
         ExtractArchiveRequest {
+            selection: None,
             archive: PathBuf::from("fixture.7z"),
             format: Some(ArchiveFormat::SevenZip),
             output_dir,
@@ -1453,13 +1486,13 @@ mod tests {
     }
 
     #[test]
-    fn configured_adapter_survives_version_command_failure() {
+    fn configured_unloadable_library_reports_error_without_guessing_capabilities() {
         let config = BackendConfig {
             auto_discover: false,
             installations: vec![BackendInstallation {
                 id: "configured-7z".into(),
-                family: AdapterFamily::SevenZipCli,
-                executable: PathBuf::from("/definitely/missing/7z"),
+                family: AdapterFamily::SevenZipLibrary,
+                path: PathBuf::from("/definitely/missing/7z"),
                 declared_version: Some("24.09".into()),
                 enabled: true,
                 priority: 50,
@@ -1470,7 +1503,7 @@ mod tests {
         assert!(router
             .warnings()
             .iter()
-            .any(|warning| warning.contains("configured adapter remains active")));
+            .any(|warning| warning.contains("native library unavailable")));
     }
 
     #[test]
@@ -1481,16 +1514,16 @@ mod tests {
             installations: vec![
                 BackendInstallation {
                     id: "first-7z".into(),
-                    family: AdapterFamily::SevenZipCli,
-                    executable: duplicate_path.clone(),
+                    family: AdapterFamily::SevenZipLibrary,
+                    path: duplicate_path.clone(),
                     declared_version: None,
                     enabled: true,
                     priority: 0,
                 },
                 BackendInstallation {
                     id: "duplicate-7z".into(),
-                    family: AdapterFamily::SevenZipCli,
-                    executable: duplicate_path,
+                    family: AdapterFamily::SevenZipLibrary,
+                    path: duplicate_path,
                     declared_version: None,
                     enabled: true,
                     priority: 0,

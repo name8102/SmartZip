@@ -134,17 +134,25 @@ fn real_backend_detect_list_test_extract_preserve_source() {
                 .build()
                 .unwrap();
             let bytes = runtime
-                .block_on(router.read_member(
-                    adapter,
-                    smartzip_archive::MemberReadRequest {
-                        archive: archive.clone(),
-                        member: "hello.txt".into(),
-                        password: None,
-                        encoding: smartzip_core::EncodingMode::Auto,
-                        max_bytes: 0,
-                    },
-                    CancellationToken::new(),
-                ))
+                .block_on(
+                    router.read_member(
+                        adapter,
+                        smartzip_archive::MemberReadRequest {
+                            archive: archive.clone(),
+                            entry: serde_json::from_value(
+                                outcome.detail["entries"][0]["native"]["reference"].clone(),
+                            )
+                            .unwrap(),
+                            input: Some(
+                                serde_json::from_value(outcome.detail["input"].clone()).unwrap(),
+                            ),
+                            password: None,
+                            encoding: smartzip_core::EncodingMode::Auto,
+                            extent: smartzip_archive::ReadExtent::Complete { max_bytes: 0 },
+                        },
+                        CancellationToken::new(),
+                    ),
+                )
                 .unwrap();
             assert_eq!(bytes, b"GUI runtime acceptance\n");
         }

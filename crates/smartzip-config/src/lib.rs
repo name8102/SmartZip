@@ -6,7 +6,7 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum AdapterFamily {
-    SevenZipCli,
+    SevenZipLibrary,
     UnrarCli,
 }
 
@@ -15,7 +15,7 @@ pub enum AdapterFamily {
 pub struct BackendInstallation {
     pub id: String,
     pub family: AdapterFamily,
-    pub executable: PathBuf,
+    pub path: PathBuf,
     #[serde(default)]
     pub declared_version: Option<String>,
     #[serde(default = "enabled_by_default")]
@@ -50,10 +50,10 @@ impl BackendConfig {
     pub fn validate(&self) -> std::result::Result<(), String> {
         let mut ids = std::collections::HashSet::new();
         for installation in &self.installations {
-            if installation.executable.as_os_str().is_empty()
-                || installation.executable.to_string_lossy().contains('\0')
+            if installation.path.as_os_str().is_empty()
+                || installation.path.to_string_lossy().contains('\0')
             {
-                return Err("backend executable must be a nonempty valid path".into());
+                return Err("backend path must be a nonempty valid path".into());
             }
             if installation.id.trim().is_empty() {
                 return Err("backend installation ID cannot be empty".into());

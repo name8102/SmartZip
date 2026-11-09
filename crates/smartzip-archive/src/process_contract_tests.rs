@@ -1,9 +1,7 @@
 //! Fault cases captured against the original runners before centralization.
-use crate::{ArchiveAdapter, ListRequest, SevenZipBackend};
-use smartzip_core::{EncodingMode, SmartZipError, TaskExecutionContext};
+use smartzip_core::SmartZipError;
 use std::{
     path::{Path, PathBuf},
-    sync::Arc,
     time::Duration,
 };
 use tokio_util::sync::CancellationToken;
@@ -16,14 +14,6 @@ fn executable(body: &str) -> (tempfile::TempDir, PathBuf) {
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
     (root, path)
 }
-fn list() -> ListRequest {
-    ListRequest {
-        archive: "fixture.7z".into(),
-        format: None,
-        password: None,
-        encoding: EncodingMode::Auto,
-    }
-}
 async fn ready(path: &Path) {
     tokio::time::timeout(Duration::from_secs(5), async {
         while !path.exists() {
@@ -32,121 +22,6 @@ async fn ready(path: &Path) {
     })
     .await
     .expect("child did not become ready");
-}
-
-#[tokio::test]
-async fn protocol_output_is_complete_while_diagnostic_capture_is_bounded() {
-    let (_root, path) = executable(
-        "dd if=/dev/zero bs=1048576 count=17 2>/dev/null; printf '\\nPath = beyond-limit.txt\\nSize = 1\\n' &\n(dd if=/dev/zero bs=1048576 count=17 2>/dev/null) >&2\nwait",
-    );
-    let backend = SevenZipBackend::new(path.clone());
-    let ordinary = tokio::time::timeout(
-        Duration::from_secs(15),
-        backend.list_with_context(list(), Arc::new(TaskExecutionContext::detached())),
-    )
-    .await
-    .unwrap();
-    let ordinary = ordinary.unwrap();
-    assert_eq!(ordinary.entries.len(), 1);
-    assert_eq!(ordinary.entries[0].path, Path::new("beyond-limit.txt"));
-    let streaming = tokio::time::timeout(
-        Duration::from_secs(15),
-        backend.run_streaming_with_context(&[], Arc::new(TaskExecutionContext::detached()), false),
-    )
-    .await
-    .unwrap()
-    .unwrap();
-    assert_eq!(streaming.status, Some(0));
-    assert_eq!(streaming.stdout.len(), crate::process::MAX_OUTPUT);
-    assert_eq!(streaming.stderr.len(), crate::process::MAX_OUTPUT);
-    let (diagnostic, truncated) = tokio::time::timeout(
-        Duration::from_secs(15),
-        crate::test_output::run(&path, "fault-test", &[], &CancellationToken::new()),
-    )
-    .await
-    .unwrap()
-    .unwrap();
-    assert!(truncated);
-    assert_eq!(diagnostic.status, Some(0));
-    assert_eq!(diagnostic.stdout.len(), crate::process::MAX_OUTPUT);
-    assert_eq!(diagnostic.stderr.len(), crate::process::MAX_OUTPUT);
-}
-
-#[tokio::test]
-async fn process_start_errors_preserve_backend_identity_and_io_path() {
-    let root = tempfile::tempdir().unwrap();
-    let missing = root.path().join("missing");
-    let error = SevenZipBackend::new(missing.clone())
-        .with_id("selected")
-        .list_with_context(list(), Arc::new(TaskExecutionContext::detached()))
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(error, SmartZipError::BackendUnavailable { backend } if backend == "selected")
-    );
-    let error = crate::test_output::run(&missing, "selected", &[], &CancellationToken::new())
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(error, SmartZipError::BackendUnavailable { backend } if backend == "selected")
-    );
-    let expected_path = root.path().canonicalize().unwrap();
-    let error = SevenZipBackend::new(root.path().to_path_buf())
-        .list_with_context(list(), Arc::new(TaskExecutionContext::detached()))
-        .await
-        .unwrap_err();
-    assert!(matches!(error, SmartZipError::Io { path: Some(path), .. } if path == expected_path));
-}
-
-#[tokio::test]
-async fn process_cancellation_before_start_and_after_pipe_eof_remains_bounded() {
-    let (_root, path) = executable("exec 1>&- 2>&-\nprintf ready > \"$0.ready\"\nsleep 30");
-    let token = CancellationToken::new();
-    token.cancel();
-    assert!(matches!(
-        crate::test_output::run(&path, "fault-test", &[], &token).await,
-        Err(SmartZipError::Cancelled)
-    ));
-    assert!(!path.with_extension("ready").exists());
-    for mode in 0..3 {
-        let marker = path.with_extension("ready");
-        let _ = std::fs::remove_file(&marker);
-        let token = CancellationToken::new();
-        let child_token = token.clone();
-        let executable = path.clone();
-        let pending = tokio::spawn(async move {
-            let backend = SevenZipBackend::new(executable.clone());
-            match mode {
-                0 => backend
-                    .list_with_context(
-                        list(),
-                        Arc::new(TaskExecutionContext::detached().with_cancellation(child_token)),
-                    )
-                    .await
-                    .map(|_| ()),
-                1 => backend
-                    .run_streaming_with_context(
-                        &[],
-                        Arc::new(TaskExecutionContext::detached().with_cancellation(child_token)),
-                        false,
-                    )
-                    .await
-                    .map(|_| ()),
-                _ => crate::test_output::run(&executable, "fault-test", &[], &child_token)
-                    .await
-                    .map(|_| ()),
-            }
-        });
-        ready(&marker).await;
-        token.cancel();
-        assert!(matches!(
-            tokio::time::timeout(Duration::from_secs(5), pending)
-                .await
-                .unwrap()
-                .unwrap(),
-            Err(SmartZipError::Cancelled)
-        ));
-    }
 }
 
 #[cfg(target_os = "linux")]

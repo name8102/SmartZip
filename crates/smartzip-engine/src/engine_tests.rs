@@ -166,6 +166,7 @@ fn zip_encoding_assessment_skips_confirmation_for_ascii_names() {
     let assessment = build_zip_encoding_assessment(ArchiveListing {
         format: Some(ArchiveFormat::Zip),
         entries: vec![smartzip_archive::ArchiveEntry {
+            native: None,
             path: PathBuf::from("docs/readme.txt"),
             raw_name: b"docs/readme.txt".to_vec(),
             compressed_size: None,
@@ -625,6 +626,7 @@ impl ArchiveExecutor for EncodingAwareBackend {
             smartzip_core::SmartZipError::io(Some(request.output_dir.clone()), source)
         })?;
         Ok(ExtractArchiveResult {
+            manifest: None,
             output_dir: request.output_dir,
             encrypted: None,
         })
@@ -799,6 +801,7 @@ impl ArchiveExecutor for FailFirstExtractBackend {
         std::fs::write(request.output_dir.join("unexpected"), b"unexpected")
             .map_err(|error| smartzip_core::SmartZipError::io(None, error))?;
         Ok(ExtractArchiveResult {
+            manifest: None,
             output_dir: request.output_dir,
             encrypted: Some(false),
         })
@@ -865,6 +868,7 @@ impl ArchiveExecutor for NestedThenFailBackend {
                 std::fs::write(request.output_dir.join("nested.zip"), b"nested")
                     .map_err(|error| smartzip_core::SmartZipError::io(None, error))?;
                 Ok(ExtractArchiveResult {
+                    manifest: None,
                     output_dir: request.output_dir,
                     encrypted: Some(false),
                 })
@@ -885,6 +889,7 @@ impl ArchiveExecutor for NestedThenFailBackend {
                 std::fs::write(request.output_dir.join("unexpected"), b"unexpected")
                     .map_err(|error| smartzip_core::SmartZipError::io(None, error))?;
                 Ok(ExtractArchiveResult {
+                    manifest: None,
                     output_dir: request.output_dir,
                     encrypted: Some(false),
                 })
@@ -1682,6 +1687,7 @@ impl ArchiveExecutor for BatchPasswordBackend {
             smartzip_core::SmartZipError::io(Some(request.output_dir.clone()), source)
         })?;
         Ok(ExtractArchiveResult {
+            manifest: None,
             output_dir: request.output_dir,
             encrypted: Some(true),
         })
@@ -1838,6 +1844,7 @@ impl ArchiveExecutor for FakeBackend {
             })?;
         }
         Ok(ExtractArchiveResult {
+            manifest: None,
             output_dir: request.output_dir,
             encrypted: Some(true),
         })
@@ -1979,7 +1986,7 @@ async fn extract_via_real_seven_zip_with_smart_output() {
 }
 
 #[tokio::test]
-async fn embedded_archive_is_carved_before_extraction_and_recurses() {
+async fn native_embedded_archive_stream_preserves_source_and_recurses() {
     let root = std::env::temp_dir().join(format!("smartzip-embedded-{}", std::process::id()));
     let archive = root.join("payload.zip");
     let disguised = root.join("photo.jpg");
@@ -1988,14 +1995,15 @@ async fn embedded_archive_is_carved_before_extraction_and_recurses() {
 
     let payload = root.join("payload.txt");
     std::fs::write(&payload, b"payload").unwrap();
-    let status = std::process::Command::new("7z")
-        .arg("a")
-        .arg(&archive)
-        .arg(&payload)
-        .current_dir(&root)
-        .status()
-        .unwrap();
-    assert!(status.success(), "7z must be available in PATH");
+    {
+        use std::io::Write;
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(&archive).unwrap());
+        writer
+            .start_file("payload.txt", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(b"payload").unwrap();
+        writer.finish().unwrap();
+    }
 
     let mut composite = Vec::from(&b"JPEG-HEADER"[..]);
     composite.extend_from_slice(&std::fs::read(&archive).unwrap());
@@ -2042,8 +2050,8 @@ async fn embedded_archive_is_carved_before_extraction_and_recurses() {
         2,
         "expected root archive and nested archive calls"
     );
-    assert_ne!(calls[0].0, disguised.display().to_string());
-    assert!(calls[0].1, "carved archive should start with zip magic");
+    assert_eq!(calls[0].0, disguised.display().to_string());
+    assert!(calls[0].1, "archive range should start with zip magic");
     assert!(calls[1].0.ends_with("nested.zip"));
     assert!(result
         .enqueued
@@ -2054,21 +2062,22 @@ async fn embedded_archive_is_carved_before_extraction_and_recurses() {
 }
 
 #[tokio::test]
-async fn list_embedded_archive_is_carved_before_backend() {
+async fn native_embedded_archive_listing_preserves_source_range() {
     let root = std::env::temp_dir().join(format!("smartzip-list-embedded-{}", std::process::id()));
     let archive = root.join("payload.zip");
     let carrier = root.join("photo.jpg");
     std::fs::create_dir_all(&root).unwrap();
     let payload = root.join("payload.txt");
     std::fs::write(&payload, b"payload").unwrap();
-    let status = std::process::Command::new("7z")
-        .arg("a")
-        .arg(&archive)
-        .arg(&payload)
-        .current_dir(&root)
-        .status()
-        .unwrap();
-    assert!(status.success(), "7z must be available in PATH");
+    {
+        use std::io::Write;
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(&archive).unwrap());
+        writer
+            .start_file("payload.txt", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(b"payload").unwrap();
+        writer.finish().unwrap();
+    }
 
     let mut composite = Vec::from(&b"JPEG-HEADER"[..]);
     composite.extend_from_slice(&std::fs::read(&archive).unwrap());
@@ -2100,9 +2109,9 @@ async fn list_embedded_archive_is_carved_before_backend() {
     assert!(!calls.is_empty());
     assert!(
         calls.iter().all(
-            |(path, starts_with_zip)| path != &carrier.display().to_string() && *starts_with_zip
+            |(path, starts_with_zip)| path == &carrier.display().to_string() && *starts_with_zip
         ),
-        "list backend should receive only carved archives: {calls:?}"
+        "list backend should receive the original carrier with its archive range: {calls:?}"
     );
     let _ = std::fs::remove_dir_all(root);
 }
@@ -2131,10 +2140,17 @@ impl ArchiveExecutor for EmbeddedAwareFakeBackend {
     async fn list_with_context(
         &self,
         request: ListRequest,
-        _context: std::sync::Arc<smartzip_core::TaskExecutionContext>,
+        context: std::sync::Arc<smartzip_core::TaskExecutionContext>,
     ) -> smartzip_core::Result<ArchiveListing> {
-        let starts_with_zip = std::fs::read(&request.archive)
-            .map(|bytes| bytes.starts_with(b"PK"))
+        let input = context
+            .archive_input()
+            .expect("engine supplies source range");
+        let starts_with_zip = std::fs::read(&input.path)
+            .map(|bytes| {
+                bytes
+                    .get(input.offset as usize..)
+                    .is_some_and(|bytes| bytes.starts_with(b"PK"))
+            })
             .unwrap_or(false);
         self.list_calls
             .lock()
@@ -2162,10 +2178,17 @@ impl ArchiveExecutor for EmbeddedAwareFakeBackend {
         &self,
         request: ExtractArchiveRequest,
         _facts: &smartzip_core::ArchiveFacts,
-        _context: std::sync::Arc<smartzip_core::TaskExecutionContext>,
+        context: std::sync::Arc<smartzip_core::TaskExecutionContext>,
     ) -> smartzip_core::Result<ExtractArchiveResult> {
-        let starts_with_zip = std::fs::read(&request.archive)
-            .map(|bytes| bytes.starts_with(b"PK"))
+        let input = context
+            .archive_input()
+            .expect("engine supplies source range");
+        let starts_with_zip = std::fs::read(&input.path)
+            .map(|bytes| {
+                bytes
+                    .get(input.offset as usize..)
+                    .is_some_and(|bytes| bytes.starts_with(b"PK"))
+            })
             .unwrap_or(false);
         self.calls
             .lock()
@@ -2183,6 +2206,7 @@ impl ArchiveExecutor for EmbeddedAwareFakeBackend {
             })?;
         }
         Ok(ExtractArchiveResult {
+            manifest: None,
             output_dir: request.output_dir,
             encrypted: None,
         })
@@ -2214,6 +2238,7 @@ impl ArchiveExecutor for PasswordListingBackend {
         _context: std::sync::Arc<smartzip_core::TaskExecutionContext>,
     ) -> smartzip_core::Result<ArchiveListing> {
         let accepted = request.password.as_deref() == Some("correct");
+        let indeterminate = request.password.as_deref() == Some("uncertain");
         let path = request.archive.clone();
         self.requests.lock().unwrap().push(request);
         if accepted {
@@ -2221,6 +2246,8 @@ impl ArchiveExecutor for PasswordListingBackend {
                 format: Some(ArchiveFormat::Zip),
                 entries: Vec::new(),
             })
+        } else if indeterminate {
+            Err(SmartZipError::PasswordIndeterminate { path })
         } else {
             Err(SmartZipError::WrongPassword { path })
         }
@@ -2241,6 +2268,55 @@ impl ArchiveExecutor for PasswordListingBackend {
     ) -> smartzip_core::Result<ExtractArchiveResult> {
         panic!("listing must not extract")
     }
+}
+
+#[rstest]
+#[case(true)]
+#[case(false)]
+#[tokio::test]
+async fn native_listing_retries_indeterminate_password_without_making_exhaustion_definitive(
+    #[case] succeeds: bool,
+) {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("encrypted.zip");
+    std::fs::write(&path, b"listing backend fixture").unwrap();
+    let backend = PasswordListingBackend {
+        requests: Mutex::new(Vec::new()),
+    };
+    let db = SmartZipDb::in_memory().unwrap();
+    let passwords = PasswordService::new(PasswordRepository::new(db.connection()));
+    let result = SmartZipEngine::default()
+        .list_archive_with_listener_interactive(
+            &backend,
+            &passwords,
+            ListArchiveRequest {
+                path,
+                scanner: ScannerConfig::default(),
+                encoding_mode: EncodingMode::Override("UTF-8".into()),
+                password_candidates: PasswordCandidateRequest {
+                    manual: vec![
+                        "uncertain".into(),
+                        if succeeds { "correct" } else { "wrong" }.into(),
+                    ],
+                    include_empty: false,
+                    ..Default::default()
+                },
+            },
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+    if succeeds {
+        result.unwrap();
+    } else {
+        assert!(matches!(
+            result,
+            Err(SmartZipError::PasswordIndeterminate { .. })
+        ));
+    }
+    assert_eq!(backend.requests.lock().unwrap().len(), 2);
 }
 
 struct ListingPasswordPrompt(Mutex<Option<&'static str>>);

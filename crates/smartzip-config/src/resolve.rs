@@ -108,15 +108,13 @@ impl ResolvedConfig {
                 .and_then(toml::Value::as_array_mut)
             {
                 for item in items {
-                    if let Some(executable) = item.get_mut("executable") {
-                        if let Some(p) = executable.as_str() {
+                    if let Some(backend_path) = item.get_mut("path") {
+                        if let Some(p) = backend_path.as_str() {
                             if p.is_empty() {
-                                return Err(invalid(
-                                    "backends.installations.executable cannot be empty",
-                                ));
+                                return Err(invalid("backends.installations.path cannot be empty"));
                             }
-                            if Path::new(p).is_relative() && (p.contains('/') || p.contains('\\')) {
-                                *executable = path
+                            if Path::new(p).is_relative() {
+                                *backend_path = path
                                     .parent()
                                     .unwrap()
                                     .join(p)

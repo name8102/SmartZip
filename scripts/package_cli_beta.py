@@ -8,6 +8,8 @@ import tarfile
 import tempfile
 import shutil
 
+from package_native_runtime import copy_runtime
+
 binary, target, destination = Path(sys.argv[1]).resolve(), sys.argv[2], Path(sys.argv[3])
 version = subprocess.check_output([str(binary), '--version'], text=True).strip().split()[-1]
 name = f'smartzip-{version}-{target}'
@@ -17,7 +19,8 @@ with tempfile.TemporaryDirectory() as work:
     root = Path(work) / name
     root.mkdir()
     shutil.copy2(binary, root / 'smartzip')
-    for source in ['README.md', 'LICENSE', 'CHANGELOG.md', 'docs/cli-beta.md']:
+    copy_runtime(binary, root)
+    for source in ['README.md', 'LICENSE', 'CHANGELOG.md', 'docs/cli-beta.md', 'docs/native-sevenzip.md']:
         shutil.copy2(source, root / Path(source).name)
     with tarfile.open(archive, 'w:gz') as output:
         output.add(root, arcname=name)

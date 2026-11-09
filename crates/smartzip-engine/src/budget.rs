@@ -1,8 +1,8 @@
-//! Optional limits for the managed extraction tree. Polling bounds resource use
-//! at checkpoints, not to the last byte a subprocess can write between checks.
-use smartzip_core::{Result, SmartZipError, TaskExecutionContext};
+//! Task-wide write admission for native output, with tree monitoring for external backends.
+use smartzip_core::{OutputBudget, Result, SmartZipError, TaskExecutionContext};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub use smartzip_config::ExtractionLimits;
@@ -98,6 +98,7 @@ impl TaskBudget {
             budget: self.clone(),
             id,
             committed: false,
+            native_admission: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -120,36 +121,37 @@ pub(crate) struct TaskBudgetReservation {
     budget: Arc<TaskBudget>,
     id: u64,
     committed: bool,
+    native_admission: Arc<AtomicBool>,
 }
 
 impl TaskBudgetReservation {
+    pub(crate) fn output_budget(
+        &self,
+        limits: &ExtractionLimits,
+        path: &Path,
+    ) -> Arc<dyn OutputBudget> {
+        Arc::new(AttemptOutputBudget {
+            budget: self.budget.clone(),
+            id: self.id,
+            limits: limits.clone(),
+            path: path.to_path_buf(),
+            native_admission: self.native_admission.clone(),
+        })
+    }
+
     fn update(&self, usage: Usage, limits: &ExtractionLimits) -> Result<()> {
         let mut state = self.budget.state.lock().unwrap();
-        let other = state
-            .in_flight
-            .iter()
-            .filter(|(id, _)| **id != self.id)
-            .fold(state.committed, |total, (_, usage)| Usage {
-                files: total.files.saturating_add(usage.files),
-                bytes: total.bytes.saturating_add(usage.bytes),
-            });
-        let total = Usage {
-            files: other.files.saturating_add(usage.files),
-            bytes: other.bytes.saturating_add(usage.bytes),
-        };
-        if limits.max_files != 0 && total.files > limits.max_files {
-            return Err(exceeded(format!(
-                "output entry limit {} exceeded",
-                limits.max_files
-            )));
-        }
-        if limits.max_output_bytes != 0 && total.bytes > limits.max_output_bytes {
-            return Err(exceeded(format!(
-                "output byte limit {} exceeded",
-                limits.max_output_bytes
-            )));
-        }
+        check_total(&state, self.id, usage, limits)?;
         state.in_flight.insert(self.id, usage);
+        Ok(())
+    }
+
+    fn update_monitored(&self, usage: Usage, limits: &ExtractionLimits) -> Result<()> {
+        let mut state = self.budget.state.lock().unwrap();
+        if !self.native_admission.load(Ordering::Acquire) {
+            check_total(&state, self.id, usage, limits)?;
+            state.in_flight.insert(self.id, usage);
+        }
         Ok(())
     }
 
@@ -164,6 +166,87 @@ impl TaskBudgetReservation {
         self.committed = true;
         usage
     }
+}
+
+struct AttemptOutputBudget {
+    budget: Arc<TaskBudget>,
+    id: u64,
+    limits: ExtractionLimits,
+    path: PathBuf,
+    native_admission: Arc<AtomicBool>,
+}
+
+impl OutputBudget for AttemptOutputBudget {
+    fn reserve(&self, files: u64, bytes: u64) -> Result<()> {
+        check_free_space(&self.path, &self.limits)?;
+        let mut state = self.budget.state.lock().unwrap();
+        let usage = state
+            .in_flight
+            .get(&self.id)
+            .copied()
+            .ok_or_else(|| SmartZipError::Cancelled)?;
+        let usage = Usage {
+            files: usage.files.saturating_add(files),
+            bytes: usage.bytes.saturating_add(bytes),
+        };
+        check_total(&state, self.id, usage, &self.limits)?;
+        state.in_flight.insert(self.id, usage);
+        Ok(())
+    }
+
+    fn set_native_admission(&self, enabled: bool) {
+        let _state = self.budget.state.lock().unwrap();
+        self.native_admission.store(enabled, Ordering::Release);
+    }
+
+    fn reset_attempt_usage(&self) -> Result<()> {
+        let mut state = self.budget.state.lock().unwrap();
+        let usage = state
+            .in_flight
+            .get_mut(&self.id)
+            .ok_or(SmartZipError::Cancelled)?;
+        *usage = Usage::default();
+        self.native_admission.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    fn requires_admission(&self) -> bool {
+        self.set_native_admission(true);
+        self.limits.max_files != 0
+            || self.limits.max_output_bytes != 0
+            || self.limits.min_free_bytes != 0
+    }
+}
+
+fn check_total(
+    state: &TaskBudgetState,
+    id: u64,
+    usage: Usage,
+    limits: &ExtractionLimits,
+) -> Result<()> {
+    let other = state
+        .in_flight
+        .iter()
+        .filter(|(other_id, _)| **other_id != id)
+        .fold(state.committed, |total, (_, usage)| Usage {
+            files: total.files.saturating_add(usage.files),
+            bytes: total.bytes.saturating_add(usage.bytes),
+        });
+    if limits.max_files != 0 && other.files.saturating_add(usage.files) > limits.max_files {
+        return Err(exceeded(format!(
+            "output entry limit {} exceeded",
+            limits.max_files
+        )));
+    }
+    if limits.max_output_bytes != 0
+        && other.bytes.saturating_add(usage.bytes) > limits.max_output_bytes
+    {
+        return Err(exceeded(format!(
+            "output byte limit {} exceeded",
+            limits.max_output_bytes
+        )));
+    }
+    Ok(())
 }
 
 impl Drop for TaskBudgetReservation {
@@ -336,7 +419,8 @@ pub(crate) async fn monitor<T>(
         ..Default::default()
     }));
     let reservation = budget.reserve_attempt();
-    let (value, inventory) = monitor_task(path, limits, &reservation, context, operation).await?;
+    let (value, inventory) =
+        monitor_output(path, limits, &reservation, context, operation, |_| None).await?;
     let usage = inventory.usage;
     Ok((
         value,
@@ -347,12 +431,26 @@ pub(crate) async fn monitor<T>(
     ))
 }
 
-pub(crate) async fn monitor_task<T>(
+pub(crate) async fn monitor_task(
+    path: &Path,
+    limits: &ExtractionLimits,
+    reservation: &TaskBudgetReservation,
+    context: Arc<TaskExecutionContext>,
+    operation: impl std::future::Future<Output = Result<smartzip_archive::ExtractArchiveResult>>,
+) -> Result<(smartzip_archive::ExtractArchiveResult, OutputInventory)> {
+    monitor_output(path, limits, reservation, context, operation, |value| {
+        value.manifest.as_ref()
+    })
+    .await
+}
+
+async fn monitor_output<T>(
     path: &Path,
     limits: &ExtractionLimits,
     reservation: &TaskBudgetReservation,
     context: Arc<TaskExecutionContext>,
     operation: impl std::future::Future<Output = Result<T>>,
+    manifest: impl Fn(&T) -> Option<&smartzip_archive::OutputManifest>,
 ) -> Result<(T, OutputInventory)> {
     use std::time::Duration;
     use tokio::time::{Instant, MissedTickBehavior};
@@ -364,15 +462,14 @@ pub(crate) async fn monitor_task<T>(
             return Err(SmartZipError::Cancelled);
         }
         // One final inventory for history/recovery; no polling of the live tree.
-        let inventory = scan_result(scan(path, limits, Usage::default(), true, true).await)?;
+        let inventory = final_inventory(path, limits, manifest(&value)).await?;
         reservation.update(inventory.usage, limits)?;
         if context.is_cancelled() {
             return Err(SmartZipError::Cancelled);
         }
         return Ok((value, inventory));
     }
-    let initial = scan_result(scan(path, limits, Usage::default(), tree_limits, false).await)?;
-    reservation.update(initial.usage, limits)?;
+    scan_result(scan(path, limits, Usage::default(), false, false).await)?;
     let mut operation = std::pin::pin!(operation);
     let period = Duration::from_secs(1);
     let mut interval = tokio::time::interval_at(Instant::now() + period, period);
@@ -383,7 +480,7 @@ pub(crate) async fn monitor_task<T>(
             result = &mut operation => break result?,
             _ = interval.tick() => {
                 let started = Instant::now();
-                let full = tree_limits && started >= next_tree;
+                let full = tree_limits && !reservation.native_admission.load(Ordering::Acquire) && started >= next_tree;
                 let mut pending = scan(path, limits, Usage::default(), full, false);
                 let result = tokio::select! {
                     result = &mut operation => {
@@ -391,7 +488,7 @@ pub(crate) async fn monitor_task<T>(
                         let value = result?;
                         let inventory = checked?;
                         if full {
-                            reservation.update(inventory.usage, limits)?;
+                            reservation.update_monitored(inventory.usage, limits)?;
                         }
                         break value;
                     }
@@ -399,7 +496,7 @@ pub(crate) async fn monitor_task<T>(
                 };
                 let checked = result.and_then(|inventory| {
                     if full {
-                        reservation.update(inventory.usage, limits)
+                        reservation.update_monitored(inventory.usage, limits)
                     } else {
                         Ok(())
                     }
@@ -419,7 +516,7 @@ pub(crate) async fn monitor_task<T>(
     if context.is_cancelled() {
         return Err(SmartZipError::Cancelled);
     }
-    let inventory = scan_result(scan(path, limits, Usage::default(), true, true).await)?;
+    let inventory = final_inventory(path, limits, manifest(&value)).await?;
     reservation.update(inventory.usage, limits)?;
     if context.is_cancelled() {
         return Err(SmartZipError::Cancelled);
@@ -427,9 +524,93 @@ pub(crate) async fn monitor_task<T>(
     Ok((value, inventory))
 }
 
+async fn final_inventory(
+    path: &Path,
+    limits: &ExtractionLimits,
+    manifest: Option<&smartzip_archive::OutputManifest>,
+) -> Result<OutputInventory> {
+    if let Some(manifest) = manifest {
+        if limits.min_free_bytes != 0 {
+            scan_result(scan(path, limits, Usage::default(), false, false).await)?;
+        }
+        return Ok(OutputInventory {
+            root: path.to_path_buf(),
+            usage: Usage {
+                files: manifest.entries,
+                bytes: manifest.bytes,
+            },
+            files: manifest
+                .files
+                .iter()
+                .map(|file| InventoryFile {
+                    relative_path: file.relative_path.clone(),
+                    size: file.size,
+                })
+                .collect(),
+        });
+    }
+    scan_result(scan(path, limits, Usage::default(), true, true).await)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_write_admission_shares_attempt_usage_and_releases_on_drop() {
+        let budget = Arc::new(TaskBudget::default());
+        let limits = ExtractionLimits {
+            max_files: 2,
+            max_output_bytes: 9,
+            min_free_bytes: 0,
+            ..Default::default()
+        };
+        let first = budget.reserve_attempt();
+        let second = budget.reserve_attempt();
+        let first_output = first.output_budget(&limits, Path::new("/unused"));
+        let second_output = second.output_budget(&limits, Path::new("/unused"));
+        assert!(first_output.requires_admission());
+        first_output.reserve(1, 5).unwrap();
+        first_output.reserve(0, 2).unwrap();
+        assert!(second_output.reserve(1, 3).is_err());
+        second_output.reserve(1, 2).unwrap();
+        assert!(first_output.reserve(1, 0).is_err());
+        drop(first);
+        second_output.reserve(1, 7).unwrap();
+        assert!(first_output.reserve(0, 1).is_err());
+    }
+
+    #[tokio::test]
+    async fn native_manifest_provides_inventory_without_scanning_output_tree() {
+        let budget = Arc::new(TaskBudget::default());
+        let reservation = budget.reserve_attempt();
+        let path = Path::new("/missing-native-output-root");
+        let limits = ExtractionLimits::default();
+        let (_, inventory) = monitor_task(
+            path,
+            &limits,
+            &reservation,
+            Arc::new(TaskExecutionContext::detached()),
+            async {
+                Ok(smartzip_archive::ExtractArchiveResult {
+                    output_dir: path.to_path_buf(),
+                    encrypted: Some(false),
+                    manifest: Some(smartzip_archive::OutputManifest {
+                        entries: 2,
+                        bytes: 7,
+                        files: vec![smartzip_archive::OutputFile {
+                            relative_path: PathBuf::from("dir/file"),
+                            size: 7,
+                        }],
+                    }),
+                })
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(inventory.usage, Usage { files: 2, bytes: 7 });
+        assert_eq!(inventory.files[0].relative_path, PathBuf::from("dir/file"));
+    }
 
     #[test]
     fn disabled_disk_limit_does_not_inspect_the_filesystem() {

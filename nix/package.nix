@@ -4,7 +4,7 @@
   dependencies,
   makeWrapper,
   makeDesktopItem,
-  _7zz-rar,
+  sevenzip,
   xdg-utils,
   desktop-file-utils,
 }:
@@ -48,6 +48,8 @@ rustPlatform.buildRustPackage {
     "smartzip-cli"
     "-p"
     "smartzip-gui"
+    "-p"
+    "smartzip-archive"
   ];
   strictDeps = true;
   nativeBuildInputs = dependencies.nativeBuildInputs ++ [ makeWrapper ];
@@ -56,18 +58,25 @@ rustPlatform.buildRustPackage {
   # Workspace tests remain available through `nix develop -c cargo test --workspace --locked`.
   doCheck = false;
   postInstall = ''
+    mkdir -p "$out/share/licenses"
+    install -Dm755 ${sevenzip}/lib/smartzip/7z.so "$out/lib/smartzip/7z.so"
+    cp -r ${sevenzip}/share/licenses/7zip "$out/share/licenses/7zip"
+    mkdir -p "$out/share/smartzip"
+    cp ${sevenzip}/share/smartzip/7zip-source.tar.xz "$out/share/smartzip/"
     install -Dm644 ${../resources/fonts/OFL.txt} "$out/share/licenses/smartzip/NotoSansCJK-OFL.txt"
     install -Dm644 ${desktop}/share/applications/*.desktop \
       "$out/share/applications/org.smartzip.SmartZip.desktop"
   '';
   postFixup = ''
     wrapProgram "$out/bin/smartzip" \
-      --suffix PATH : ${lib.makeBinPath [ _7zz-rar ]}
+      --set SMARTZIP_7Z_LIBRARY "$out/lib/smartzip/7z.so" \
+      --set SMARTZIP_ARCHIVE_WORKER "$out/bin/smartzip-archive-worker"
     wrapProgram "$out/bin/smartzip-gui" \
+      --set SMARTZIP_7Z_LIBRARY "$out/lib/smartzip/7z.so" \
+      --set SMARTZIP_ARCHIVE_WORKER "$out/bin/smartzip-archive-worker" \
       --set SMARTZIP_GUI_LAUNCHER "$out/bin/smartzip-gui" \
       --suffix PATH : ${
         lib.makeBinPath [
-          _7zz-rar
           xdg-utils
           desktop-file-utils
         ]

@@ -56,6 +56,20 @@ pub trait ArchiveExecutor: Send + Sync {
 #[async_trait]
 pub trait ArchiveAdapter: Send + Sync {
     fn id(&self) -> &str;
+    fn runtime_diagnostics(&self) -> serde_json::Value {
+        serde_json::Value::Null
+    }
+    async fn read_member_with_context(
+        &self,
+        request: crate::MemberReadRequest,
+        _token: tokio_util::sync::CancellationToken,
+    ) -> Result<crate::MemberReadResult> {
+        Err(smartzip_core::SmartZipError::UnsupportedContainer {
+            backend: self.id().into(),
+            path: request.archive,
+            container: Some("indexed member reads".into()),
+        })
+    }
     fn executable_path(&self) -> Option<&Path> {
         None
     }

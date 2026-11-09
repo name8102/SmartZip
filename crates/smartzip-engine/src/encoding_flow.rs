@@ -48,12 +48,14 @@ pub(crate) async fn resolve_encoding_mode(
     Ok(Some(assessment.detected.selected.clone()))
 }
 
-pub(crate) fn assess_zip_encoding(archive_path: &Path) -> Option<EncodingConfirmationContext> {
+pub(crate) fn assess_zip_encoding(
+    input: &smartzip_core::ArchiveInput,
+) -> Option<EncodingConfirmationContext> {
     // ZIP raw filename reading is now via the narrowed NativeZip helper, not
     // via the generic ArchiveAdapter/list path. This keeps raw bytes intact
     // for detector and avoids routing through the backend router.
     let reader = NativeZipBackend::new();
-    let entries = reader.raw_entries(archive_path).ok()?;
+    let entries = reader.raw_entries_with_input(input).ok()?;
     assess_raw_names(entries.iter().map(|entry| entry.raw_name.as_slice()))
 }
 

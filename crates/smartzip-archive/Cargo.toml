@@ -6,7 +6,14 @@ license.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 
+[[bin]]
+name = "smartzip-archive-worker"
+path = "src/bin/worker.rs"
+
 [dependencies]
+tempfile.workspace = true
+smartzip-sevenzip.workspace = true
+blake3.workspace = true
 libc.workspace = true
 async-trait.workspace = true
 process-wrap.workspace = true
@@ -20,8 +27,7 @@ smartzip-encoding.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 which.workspace = true
-zip.workspace = true
 crc32fast.workspace = true
 
 [dev-dependencies]
-tempfile.workspace = true
+zip.workspace = true

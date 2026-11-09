@@ -95,7 +95,7 @@ mode = "off"
 | `logging.level` | `off/error/warn/info/debug`，控制任务事件输出；命令结果与启动错误仍会显示 |
 | `backends.auto_discover` / 安装项 `enabled` | 沿用后端结构；禁用的安装项不探测、不启动 |
 
-后端自动发现优先使用进程的 `PATH`。macOS 还检查 Homebrew、MacPorts 和 Nix 的常见安装目录，支持从 Finder 启动时不带终端 PATH 的应用。自定义安装位置可通过 `backends.installations` 的 `executable` 指定绝对路径；关闭自动发现或显式禁用安装项仍然生效。若路由的 `candidates`、`rejected` 都为空，表示没有注册后端，并非压缩包损坏的证据；`smartzip doctor --json` 可检查实际发现的后端及配置提示。
+7-Zip 使用 `seven-zip-library` 原生库后端，自动发现按 `SMARTZIP_7Z_LIBRARY`、应用旁 `lib/7z.so`（macOS 为 `7z.dylib`，Windows 为 `7z.dll`）、`../lib/smartzip/7z.so` 的顺序加载。归档 worker 使用 `SMARTZIP_ARCHIVE_WORKER` 或应用旁的 `smartzip-archive-worker`；Nix wrapper 设置两个绝对路径。自定义安装项使用 `family = "seven-zip-library"` 和 `path = "./lib/7z.so"`，相对路径按配置文件所在目录解析，不搜索 7z/7zz 命令。UnRAR 安装项仍使用 `unrar-cli` 和 `path` 指定可执行文件；自动发现沿用 PATH。关闭 `backends.auto_discover` 或显式禁用安装项仍然生效。`smartzip doctor --json` 可检查实际发现的后端及配置提示。完整分发布局见[原生 7-Zip 说明](native-sevenzip.md)。
 
 关闭递归时内层扫描显示为不生效。统一配置的核心工作流保留根输入；GUI 可另行启用上述成功后回收开关。`trash` 失败保留文件并报告，不降级为永久删除。失败密码尝试的暂存清理、安全检查、取消、预算和提交回滚始终执行。密码仍直接尝试解压到独立暂存目录，不增加每个候选的完整预测试。
 
