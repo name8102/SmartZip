@@ -3,7 +3,7 @@ use crate::{member::ReadExtent, types::*};
 use smartzip_core::{Result, SmartZipError};
 use smartzip_sevenzip::Entry;
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     io::{self, Write},
     path::{Path, PathBuf},
     sync::Arc,
@@ -20,19 +20,60 @@ pub(super) enum Target {
         extent: ReadExtent,
     },
 }
+impl Target {
+    pub(super) fn check_catalog(&self, id: &str) -> Result<()> {
+        let refs = match self {
+            Self::Read { entry, .. } => std::slice::from_ref(entry),
+            Self::Extract { selection, .. } => selection.as_deref().unwrap_or_default(),
+            Self::None => &[],
+        };
+        if refs.iter().any(|entry| entry.catalog_id != id) {
+            return Err(SmartZipError::BackendProtocolError {
+                backend: "native-plan".into(),
+                detail: "member catalog is stale; list the source again".into(),
+            });
+        }
+        Ok(())
+    }
+}
+
 pub(super) struct ControlledOutput {
     target: Target,
     budget: Option<Arc<dyn smartzip_core::OutputBudget>>,
-    paths: BTreeMap<u32, PathBuf>,
-    metadata: BTreeMap<u32, (Option<u32>, Option<u64>)>,
-    handles: BTreeMap<u32, std::fs::File>,
-    sizes: BTreeMap<u32, u64>,
-    directories: BTreeSet<PathBuf>,
-    links: BTreeMap<u32, (PathBuf, bool, Vec<u8>, Option<String>)>,
-    pub(super) selection: Option<Vec<u32>>,
+    files: BTreeMap<u32, PlannedFile>,
+    directories: BTreeMap<PathBuf, Metadata>,
     pub(super) memory: Vec<u8>,
     manifest: OutputManifest,
 }
+
+#[derive(Default)]
+struct Metadata {
+    mode: Option<u32>,
+    modified: Option<u64>,
+}
+struct PlannedFile {
+    path: PathBuf,
+    metadata: Metadata,
+    kind: FileKind,
+}
+enum FileKind {
+    Regular {
+        handle: Option<std::fs::File>,
+        size: Option<u64>,
+    },
+    Link {
+        hard: bool,
+        bytes: Vec<u8>,
+        target: Option<String>,
+    },
+}
+
+fn is_link(entry: &Entry) -> bool {
+    entry.link.is_some()
+        || entry.hard_link.is_some()
+        || entry.unix_mode.is_some_and(|m| m & 0o170000 == 0o120000)
+}
+
 impl ControlledOutput {
     pub(super) fn new(
         target: Target,
@@ -41,186 +82,130 @@ impl ControlledOutput {
         Self {
             target,
             budget,
-            paths: Default::default(),
-            metadata: Default::default(),
-            handles: Default::default(),
-            sizes: Default::default(),
-            directories: Default::default(),
-            links: Default::default(),
-            selection: None,
+            files: BTreeMap::new(),
+            directories: BTreeMap::new(),
             memory: vec![],
-            manifest: Default::default(),
+            manifest: OutputManifest::default(),
         }
     }
+
+    pub(super) fn is_extract(&self) -> bool {
+        matches!(self.target, Target::Extract { .. })
+    }
+
     pub(super) fn prepare(
         &mut self,
-        id: &str,
-        entries: &[ArchiveEntry],
-        native: &[Entry],
+        entries: &[Entry],
+        name: impl Fn(&Entry) -> Result<String>,
     ) -> Result<()> {
-        let check = |r: &EntryRef| {
-            if r.catalog_id != id || !native.iter().any(|e| e.index == r.index) {
-                Err(SmartZipError::BackendProtocolError {
-                    backend: "native-plan".into(),
-                    detail: "member catalog is stale; list the source again".into(),
-                })
-            } else {
-                Ok(())
-            }
-        };
-        match &self.target {
-            Target::None => {}
-            Target::Read { entry, .. } => {
-                check(entry)?;
-                let found = native.iter().find(|e| e.index == entry.index).unwrap();
-                if found.is_dir
-                    || found.link.is_some()
-                    || found.hard_link.is_some()
-                    || found.unix_mode.is_some_and(|m| m & 0o170000 == 0o120000)
-                {
+        let root = match &self.target {
+            Target::None => return Ok(()),
+            Target::Read { .. } => {
+                if entries.iter().any(|entry| entry.is_dir || is_link(entry)) {
                     return Err(SmartZipError::UnsupportedFormat {
                         path: PathBuf::new(),
                         format: Some("directory or link preview".into()),
                     });
                 }
-                self.selection = Some(vec![entry.index]);
+                return Ok(());
             }
-            Target::Extract { root, selection } => {
-                if let Some(refs) = selection {
-                    for r in refs {
-                        check(r)?;
-                    }
-                    self.selection = Some(refs.iter().map(|r| r.index).collect());
+            Target::Extract { root, .. } => root,
+        };
+
+        // Reserve directory names before assigning filenames. Links are not created
+        // until all ordinary files are complete and are never used as parents.
+        let mut dirs = BTreeSet::new();
+        for entry in entries {
+            let name = name(entry)?;
+            let path = crate::safety::safe_entry_path(name.as_bytes())
+                .ok_or_else(|| SmartZipError::UnsafeArchivePath { entry: name })?;
+            if entry
+                .unix_mode
+                .is_some_and(|m| !matches!(m & 0o170000, 0 | 0o040000 | 0o100000 | 0o120000))
+            {
+                return Err(SmartZipError::UnsafeArchivePath {
+                    entry: path.display().to_string(),
+                });
+            }
+            for dir in path.ancestors().skip(usize::from(!entry.is_dir)) {
+                if dir.as_os_str().is_empty() || !dirs.insert(dir.to_path_buf()) {
+                    break;
                 }
-                let mut used = BTreeSet::new();
-                let mut directories = BTreeSet::new();
-                for (entry, raw) in entries.iter().zip(native) {
-                    if self
-                        .selection
-                        .as_ref()
-                        .is_some_and(|s| !s.contains(&raw.index))
-                    {
-                        continue;
+            }
+            let metadata = Metadata {
+                mode: entry.unix_mode,
+                modified: entry.modified,
+            };
+            if entry.is_dir {
+                self.directories.insert(path, metadata);
+            } else {
+                let kind = if is_link(entry) {
+                    FileKind::Link {
+                        hard: entry.hard_link.is_some(),
+                        bytes: Vec::new(),
+                        target: entry.hard_link.clone().or_else(|| entry.link.clone()),
                     }
-                    let name = entry.path.to_string_lossy();
-                    let mut path =
-                        crate::safety::safe_entry_path(name.as_bytes()).ok_or_else(|| {
-                            SmartZipError::UnsafeArchivePath {
-                                entry: name.into_owned(),
-                            }
-                        })?;
-                    if raw.unix_mode.is_some_and(|m| {
-                        !matches!(m & 0o170000, 0 | 0o040000 | 0o100000 | 0o120000)
-                    }) {
+                } else {
+                    FileKind::Regular {
+                        handle: None,
+                        size: None,
+                    }
+                };
+                self.files.insert(
+                    entry.index,
+                    PlannedFile {
+                        path,
+                        metadata,
+                        kind,
+                    },
+                );
+            }
+        }
+        let mut used: HashMap<PathBuf, usize> = dirs.iter().map(|dir| (dir.clone(), 2)).collect();
+        for file in self.files.values_mut() {
+            if let Some(mut suffix) = used.get(&file.path).copied() {
+                let candidate = loop {
+                    let candidate = duplicate_path(&file.path, suffix);
+                    suffix += 1;
+                    if !used.contains_key(&candidate) {
+                        break candidate;
+                    }
+                };
+                *used.get_mut(&file.path).unwrap() = suffix;
+                file.path = candidate;
+            }
+            used.insert(file.path.clone(), 2);
+        }
+
+        std::fs::create_dir_all(root).map_err(|e| SmartZipError::io(Some(root.clone()), e))?;
+        for path in dirs {
+            admit(&self.budget, 1, 0)?;
+            let directory = root.join(&path);
+            match std::fs::create_dir(&directory) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    if !std::fs::symlink_metadata(&directory)
+                        .map_err(|e| SmartZipError::io(Some(directory.clone()), e))?
+                        .is_dir()
+                    {
                         return Err(SmartZipError::UnsafeArchivePath {
                             entry: path.display().to_string(),
                         });
                     }
-                    if !raw.is_dir {
-                        let base = path.clone();
-                        let mut n = 2;
-                        while used.contains(&path) {
-                            path = duplicate_path(&base, n);
-                            n += 1;
-                        }
-                    }
-                    used.insert(path.clone());
-                    if raw.is_dir {
-                        self.directories.insert(path.clone());
-                        directories.insert(path.clone());
-                    } else if let Some(parent) = path.parent() {
-                        if !parent.as_os_str().is_empty() {
-                            directories.insert(parent.to_path_buf());
-                        }
-                    }
-                    self.paths.insert(raw.index, path.clone());
-                    self.metadata
-                        .insert(raw.index, (raw.unix_mode, raw.modified));
-                    if raw.link.is_some()
-                        || raw.hard_link.is_some()
-                        || raw.unix_mode.is_some_and(|m| m & 0o170000 == 0o120000)
-                    {
-                        self.links.insert(
-                            raw.index,
-                            (
-                                path,
-                                raw.hard_link.is_some(),
-                                Vec::new(),
-                                raw.hard_link.clone().or(raw.link.clone()),
-                            ),
-                        );
-                    }
                 }
-                // Ancestor lookup is linear in path depth, not quadratic in archive size.
-                let non_directories: BTreeSet<_> = self
-                    .paths
-                    .iter()
-                    .filter(|(_, p)| !self.directories.contains(*p))
-                    .map(|(_, p)| p.clone())
-                    .collect();
-                for path in self.paths.values() {
-                    if path
-                        .ancestors()
-                        .skip(1)
-                        .any(|parent| non_directories.contains(parent))
-                    {
-                        return Err(SmartZipError::UnsafeArchivePath {
-                            entry: path.display().to_string(),
-                        });
-                    }
-                }
-                let mut all_dirs = BTreeSet::new();
-                for path in directories {
-                    for parent in path.ancestors() {
-                        if !parent.as_os_str().is_empty() {
-                            all_dirs.insert(parent.to_path_buf());
-                        }
-                    }
-                }
-                std::fs::create_dir_all(root)
-                    .map_err(|e| SmartZipError::io(Some(root.clone()), e))?;
-                for path in all_dirs {
-                    self.admit(1, 0)?;
-                    let directory = root.join(&path);
-                    match std::fs::create_dir(&directory) {
-                        Ok(()) => {}
-                        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                            let metadata = std::fs::symlink_metadata(&directory)
-                                .map_err(|e| SmartZipError::io(Some(directory.clone()), e))?;
-                            if !metadata.is_dir() || metadata.file_type().is_symlink() {
-                                return Err(SmartZipError::UnsafeArchivePath {
-                                    entry: path.display().to_string(),
-                                });
-                            }
-                        }
-                        Err(error) => return Err(SmartZipError::io(Some(directory), error)),
-                    }
-                    self.manifest.entries += 1;
-                }
+                Err(error) => return Err(SmartZipError::io(Some(directory), error)),
             }
+            self.manifest.entries += 1;
         }
         Ok(())
     }
-    fn admit(&self, files: u64, bytes: u64) -> Result<()> {
-        if let Some(b) = &self.budget {
-            b.reserve(files, bytes)?;
-        }
-        Ok(())
-    }
+
     pub(super) fn write(&mut self, index: u32, bytes: &[u8]) -> Result<bool> {
         match &self.target {
-            Target::None => {
-                return Err(SmartZipError::BackendProtocolError {
-                    backend: "native".into(),
-                    detail: "unexpected payload in inspect/test".into(),
-                })
-            }
+            Target::None => return Err(protocol("unexpected payload in inspect/test")),
             Target::Read { entry, extent } => {
                 if index != entry.index {
-                    return Err(SmartZipError::BackendProtocolError {
-                        backend: "native".into(),
-                        detail: "unexpected member stream".into(),
-                    });
+                    return Err(protocol("unexpected member stream"));
                 }
                 match *extent {
                     ReadExtent::Prefix { bytes: limit } => {
@@ -241,170 +226,196 @@ impl ControlledOutput {
                 }
             }
             Target::Extract { root, .. } => {
-                let path = self
-                    .paths
-                    .get(&index)
-                    .ok_or_else(|| SmartZipError::BackendProtocolError {
-                        backend: "native".into(),
-                        detail: format!("unselected output index {index}"),
-                    })?
-                    .clone();
-                if self.links.contains_key(&index) {
-                    self.links
-                        .get_mut(&index)
-                        .unwrap()
-                        .2
-                        .extend_from_slice(bytes);
-                    return Ok(false);
-                }
-                if !self.handles.contains_key(&index) {
-                    self.admit(1, 0)?;
-                    let file = std::fs::OpenOptions::new()
-                        .write(true)
-                        .create_new(true)
-                        .open(root.join(&path))
-                        .map_err(|e| SmartZipError::io(Some(root.join(&path)), e))?;
-                    self.handles.insert(index, file);
-                    self.manifest.entries += 1;
-                }
-                self.admit(0, bytes.len() as u64)?;
-                self.handles
+                let file = self
+                    .files
                     .get_mut(&index)
-                    .unwrap()
-                    .write_all(bytes)
-                    .map_err(|e| SmartZipError::io(Some(root.join(&path)), e))?;
-                self.manifest.bytes += bytes.len() as u64;
-                *self.sizes.entry(index).or_default() += bytes.len() as u64;
+                    .ok_or_else(|| protocol(format!("unselected output index {index}")))?;
+                match &mut file.kind {
+                    FileKind::Link { bytes: target, .. } => target.extend_from_slice(bytes),
+                    FileKind::Regular { handle, size } => {
+                        if handle.is_none() {
+                            if size.is_some() {
+                                return Err(protocol(format!(
+                                    "member stream {index} already closed"
+                                )));
+                            }
+                            admit(&self.budget, 1, bytes.len() as u64)?;
+                            *handle = Some(create_file(root, &file.path)?);
+                            *size = Some(0);
+                            self.manifest.entries += 1;
+                        } else {
+                            admit(&self.budget, 0, bytes.len() as u64)?;
+                        }
+                        handle
+                            .as_mut()
+                            .unwrap()
+                            .write_all(bytes)
+                            .map_err(|e| SmartZipError::io(Some(root.join(&file.path)), e))?;
+                        self.manifest.bytes += bytes.len() as u64;
+                        *size.as_mut().unwrap() += bytes.len() as u64;
+                    }
+                }
             }
         }
         Ok(false)
     }
+
     pub(super) fn close(&mut self, index: u32) -> Result<()> {
-        if let Some(mut file) = self.handles.remove(&index) {
-            file.flush().map_err(|e| SmartZipError::io(None, e))?;
+        let Target::Extract { root, .. } = &self.target else {
+            return Ok(());
+        };
+        if let Some(file) = self.files.get_mut(&index) {
+            if let FileKind::Regular { handle, .. } = &mut file.kind {
+                if let Some(handle) = handle.take() {
+                    apply_metadata(&handle, &file.metadata)
+                        .map_err(|e| SmartZipError::io(Some(root.join(&file.path)), e))?;
+                }
+            }
         }
         Ok(())
     }
+
     pub(super) fn finish(&mut self) -> Result<Option<OutputManifest>> {
         let Target::Extract { root, .. } = &self.target else {
             return Ok(None);
         };
-        // Native GetStream may write no bytes for an empty file; materialize it here.
-        for (index, path) in &self.paths {
-            if self.links.contains_key(index) || self.directories.contains(path) {
+        let mut links = Vec::new();
+        for file in std::mem::take(&mut self.files).into_values() {
+            let FileKind::Regular { handle, size } = file.kind else {
+                links.push(file);
                 continue;
-            }
-            if !self.sizes.contains_key(index) {
-                self.admit(1, 0)?;
-                let file = std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(root.join(path))
-                    .map_err(|e| SmartZipError::io(Some(root.join(path)), e))?;
-                drop(file);
+            };
+            // A successful native item can have no payload (empty file).
+            let handle = if size.is_none() {
+                admit(&self.budget, 1, 0)?;
                 self.manifest.entries += 1;
+                Some(create_file(root, &file.path)?)
+            } else {
+                handle
+            };
+            if let Some(handle) = handle {
+                apply_metadata(&handle, &file.metadata)
+                    .map_err(|e| SmartZipError::io(Some(root.join(&file.path)), e))?;
             }
-            let size = self.sizes.get(index).copied().unwrap_or(0);
             self.manifest.files.push(OutputFile {
-                relative_path: path.clone(),
-                size,
+                relative_path: file.path,
+                size: size.unwrap_or(0),
             });
         }
-        self.handles.clear();
-        for (path, hard, bytes, metadata_target) in self.links.values() {
-            let target = if bytes.is_empty() {
-                metadata_target.as_deref().unwrap_or("").as_bytes()
-            } else {
-                bytes.as_slice()
+        // Hard link sources can only be regular files and previously created
+        // hard links; there are no archive-controlled symlinks on disk yet.
+        links.sort_by_key(|file| matches!(file.kind, FileKind::Link { hard: false, .. }));
+        for file in links {
+            let FileKind::Link {
+                hard,
+                bytes,
+                target,
+            } = file.kind
+            else {
+                unreachable!()
             };
-            self.admit(1, 0)?;
-            let target =
-                std::str::from_utf8(target).map_err(|_| SmartZipError::UnsafeArchivePath {
-                    entry: path.display().to_string(),
-                })?;
-            let resolved = link_target(path, target, *hard).ok_or_else(|| {
-                SmartZipError::UnsafeArchivePath {
-                    entry: path.display().to_string(),
-                }
-            })?;
-            if *hard {
-                std::fs::hard_link(root.join(resolved), root.join(path))
-                    .map_err(|e| SmartZipError::io(Some(root.join(path)), e))?;
-                let size = std::fs::metadata(root.join(path))
-                    .map_err(|e| SmartZipError::io(Some(root.join(path)), e))?
+            let path = file.path;
+            let target = if bytes.is_empty() {
+                target.as_deref().unwrap_or("").as_bytes()
+            } else {
+                &bytes
+            };
+            let unsafe_path = || SmartZipError::UnsafeArchivePath {
+                entry: path.display().to_string(),
+            };
+            let target = std::str::from_utf8(target).map_err(|_| unsafe_path())?;
+            let resolved = link_target(&path, target, hard).ok_or_else(unsafe_path)?;
+            let destination = root.join(&path);
+            admit(&self.budget, 1, 0)?;
+            if hard {
+                let source = root.join(resolved);
+                let size = std::fs::metadata(&source)
+                    .map_err(|e| SmartZipError::io(Some(source.clone()), e))?
                     .len();
+                std::fs::hard_link(source, &destination)
+                    .map_err(|e| SmartZipError::io(Some(destination), e))?;
                 self.manifest.files.push(OutputFile {
-                    relative_path: path.clone(),
+                    relative_path: path,
                     size,
                 });
             } else {
+                let target = relative_link_target(&path, &resolved);
                 #[cfg(unix)]
-                std::os::unix::fs::symlink(target, root.join(path))
-                    .map_err(|e| SmartZipError::io(Some(root.join(path)), e))?;
+                let result = std::os::unix::fs::symlink(target, &destination);
                 #[cfg(windows)]
-                std::os::windows::fs::symlink_file(target, root.join(path))
-                    .map_err(|e| SmartZipError::io(Some(root.join(path)), e))?;
+                let result = std::os::windows::fs::symlink_file(target, &destination);
+                result.map_err(|e| SmartZipError::io(Some(destination), e))?;
             }
             self.manifest.entries += 1;
         }
-        // Apply directory metadata last, so a read-only directory never blocks children.
-        let mut metadata: Vec<_> = self
-            .paths
-            .iter()
-            .filter(|(index, _)| !self.links.contains_key(index))
-            .collect();
-        metadata.sort_by_key(|(_, path)| std::cmp::Reverse(path.components().count()));
-        for (index, path) in metadata {
+
+        // Reverse path order puts children before parents. Delay restrictive modes
+        // until everything inside the directory has been written.
+        #[cfg(unix)]
+        for (path, metadata) in self.directories.iter().rev() {
+            if metadata.modified.is_none() && metadata.mode.is_none() {
+                continue;
+            }
             let destination = root.join(path);
-            let (mode, modified) = self.metadata[index];
-            if let Some(ticks) = modified {
-                let nanos = (ticks as i128 - 116444736000000000i128) * 100;
-                let duration = std::time::Duration::new(
-                    (nanos.unsigned_abs() / 1_000_000_000) as u64,
-                    (nanos.unsigned_abs() % 1_000_000_000) as u32,
-                );
-                let time = if nanos >= 0 {
-                    std::time::UNIX_EPOCH.checked_add(duration)
-                } else {
-                    std::time::UNIX_EPOCH.checked_sub(duration)
-                };
-                if let Some(time) = time {
-                    let file = if self.directories.contains(path) {
-                        #[cfg(unix)]
-                        {
-                            Some(std::fs::File::open(&destination))
-                        }
-                        #[cfg(not(unix))]
-                        {
-                            None
-                        }
-                    } else {
-                        Some(std::fs::OpenOptions::new().write(true).open(&destination))
-                    };
-                    if let Some(file) = file {
-                        file.and_then(|file| {
-                            file.set_times(std::fs::FileTimes::new().set_modified(time))
-                        })
-                        .map_err(|e| SmartZipError::io(Some(destination.clone()), e))?;
-                    }
-                }
-            }
-            #[cfg(unix)]
-            if let Some(mode) = mode {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(
-                    &destination,
-                    std::fs::Permissions::from_mode(mode & 0o777),
-                )
-                .map_err(|e| SmartZipError::io(Some(destination.clone()), e))?;
-            }
-            #[cfg(not(unix))]
-            let _ = mode;
+            std::fs::File::open(&destination)
+                .and_then(|directory| apply_metadata(&directory, metadata))
+                .map_err(|e| SmartZipError::io(Some(destination), e))?;
         }
         Ok(Some(std::mem::take(&mut self.manifest)))
     }
 }
-fn duplicate_path(path: &Path, n: u32) -> PathBuf {
+
+fn protocol(detail: impl Into<String>) -> SmartZipError {
+    SmartZipError::BackendProtocolError {
+        backend: "native".into(),
+        detail: detail.into(),
+    }
+}
+
+fn admit(
+    budget: &Option<Arc<dyn smartzip_core::OutputBudget>>,
+    files: u64,
+    bytes: u64,
+) -> Result<()> {
+    budget
+        .as_ref()
+        .map_or(Ok(()), |budget| budget.reserve(files, bytes))
+}
+
+fn create_file(root: &Path, path: &Path) -> Result<std::fs::File> {
+    let destination = root.join(path);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&destination)
+        .map_err(|e| SmartZipError::io(Some(destination), e))
+}
+
+fn apply_metadata(file: &std::fs::File, metadata: &Metadata) -> io::Result<()> {
+    if let Some(ticks) = metadata.modified {
+        let nanos = (ticks as i128 - 116444736000000000i128) * 100;
+        let duration = std::time::Duration::new(
+            (nanos.unsigned_abs() / 1_000_000_000) as u64,
+            (nanos.unsigned_abs() % 1_000_000_000) as u32,
+        );
+        let time = if nanos >= 0 {
+            std::time::UNIX_EPOCH.checked_add(duration)
+        } else {
+            std::time::UNIX_EPOCH.checked_sub(duration)
+        };
+        if let Some(time) = time {
+            file.set_times(std::fs::FileTimes::new().set_modified(time))?;
+        }
+    }
+    #[cfg(unix)]
+    if let Some(mode) = metadata.mode {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(mode & 0o777))?;
+    }
+    Ok(())
+}
+
+fn duplicate_path(path: &Path, n: usize) -> PathBuf {
     let stem = path.file_stem().unwrap_or_default().to_string_lossy();
     let ext = path
         .extension()
@@ -413,11 +424,8 @@ fn duplicate_path(path: &Path, n: u32) -> PathBuf {
     path.with_file_name(format!("{stem} ({n}){ext}"))
 }
 fn link_target(path: &Path, target: &str, hard: bool) -> Option<PathBuf> {
-    if target.starts_with('/')
-        || target.starts_with('\\')
-        || target.contains('\0')
-        || target.as_bytes().get(1) == Some(&b':')
-    {
+    let target = crate::safety::archive_separators(target);
+    if target.is_empty() || target.starts_with('/') || target.contains('\0') {
         return None;
     }
     let mut resolved = if hard {
@@ -425,16 +433,41 @@ fn link_target(path: &Path, target: &str, hard: bool) -> Option<PathBuf> {
     } else {
         path.parent()?.into()
     };
-    for part in target.replace('\\', "/").split('/') {
+    let mut first = true;
+    for part in target.split('/') {
         match part {
-            "" | "." => {}
+            "" | "." => continue,
             ".." => {
                 if !resolved.pop() {
                     return None;
                 }
             }
-            s => resolved.push(s),
+            part if crate::safety::safe_component(part, first) => {
+                resolved.push(part);
+                first = false;
+            }
+            _ => return None,
         }
     }
     Some(resolved)
+}
+
+// Emit only leading parent components. Keeping interior ".." would let a
+// symlink in the target path change the effective meaning of those components.
+fn relative_link_target(link: &Path, resolved: &Path) -> PathBuf {
+    let parent = link.parent().unwrap();
+    let shared = parent
+        .components()
+        .zip(resolved.components())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let mut target = PathBuf::new();
+    for _ in parent.components().skip(shared) {
+        target.push("..");
+    }
+    target.extend(resolved.components().skip(shared));
+    if target.as_os_str().is_empty() {
+        target.push(".");
+    }
+    target
 }

@@ -2,7 +2,8 @@
 use serde::{Deserialize, Serialize};
 use smartzip_sevenzip::{Control, Entry, Error, Library, OpenOptions, OutputFactory, RunReport};
 use std::{
-    io::{self, Read, Write},
+    collections::HashSet,
+    io::{self, BufWriter, Read, Write},
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -98,22 +99,57 @@ pub(crate) struct Request {
 }
 #[derive(Serialize, Deserialize)]
 pub(crate) enum Operation {
-    Inspect,
+    Probe,
+    List,
     Verify,
     Decode { indices: Option<Vec<u32>> },
 }
 #[derive(Serialize, Deserialize)]
 pub(crate) enum Event {
-    Catalog { format: String, entries: Vec<Entry> },
-    Progress { completed: u64, total: Option<u64> },
-    Report(RunReport),
+    Probe {
+        format: String,
+        encrypted: Option<bool>,
+    },
+    Catalog {
+        format: String,
+        item_count: u32,
+        entries: Vec<Entry>,
+    },
+    Progress {
+        completed: u64,
+        total: Option<u64>,
+    },
+    Report {
+        report: RunReport,
+        verification: Option<Verification>,
+    },
     Error(Error),
 }
-pub(crate) enum Frame {
+#[derive(Serialize, Deserialize)]
+pub(crate) struct Verification {
+    pub format: String,
+    pub item_count: u32,
+    pub encrypted: Option<bool>,
+    pub complete: bool,
+    pub failures: Vec<Entry>,
+}
+
+pub(crate) fn successful_indices(report: &RunReport) -> Option<HashSet<u32>> {
+    (report.hresult == 0
+        && report.flags.errors.unwrap_or(0) == 0
+        && report.stream_errors.is_empty()
+        && report.extra_results.iter().all(|item| item.result == 0)
+        && report.items.iter().all(|item| item.result == 0))
+    .then(|| report.items.iter().map(|item| item.index).collect())
+}
+
+pub(crate) enum Frame<'a> {
     Event(Event),
-    Data { index: u32, bytes: Vec<u8> },
+    Data { index: u32, bytes: &'a [u8] },
     End(u32),
 }
+
+pub(crate) const DATA_CHUNK: usize = 64 * 1024;
 
 pub(crate) fn write_json(writer: &mut impl Write, value: &impl Serialize) -> io::Result<()> {
     let data = serde_json::to_vec(value).map_err(io::Error::other)?;
@@ -122,7 +158,7 @@ pub(crate) fn write_json(writer: &mut impl Write, value: &impl Serialize) -> io:
     writer.flush()
 }
 struct Pipe {
-    output: Mutex<io::Stdout>,
+    output: Mutex<BufWriter<io::Stdout>>,
     failed: AtomicBool,
     last_progress: Mutex<Option<std::time::Instant>>,
 }
@@ -140,22 +176,20 @@ impl Pipe {
             .output
             .lock()
             .map_err(|_| io::Error::other("protocol lock poisoned"))?;
-        out.write_all(&[1])?;
-        out.write_all(&index.to_le_bytes())?;
-        out.write_all(&(bytes.len() as u32).to_le_bytes())?;
-        out.write_all(bytes)?;
-        out.flush()
+        let mut header = [1; 9];
+        header[1..5].copy_from_slice(&index.to_le_bytes());
+        header[5..].copy_from_slice(&(bytes.len() as u32).to_le_bytes());
+        out.write_all(&header)?;
+        out.write_all(bytes)
     }
-}
-impl Pipe {
     fn end(&self, index: u32) -> io::Result<()> {
         let mut out = self
             .output
             .lock()
             .map_err(|_| io::Error::other("protocol lock poisoned"))?;
-        out.write_all(&[2])?;
-        out.write_all(&index.to_le_bytes())?;
-        out.flush()
+        let mut frame = [2; 5];
+        frame[1..].copy_from_slice(&index.to_le_bytes());
+        out.write_all(&frame)
     }
 }
 impl Control for Pipe {
@@ -204,7 +238,7 @@ impl Drop for Stream {
 }
 impl Write for Stream {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        for chunk in bytes.chunks(64 * 1024) {
+        for chunk in bytes.chunks(DATA_CHUNK) {
             self.pipe.data(self.index, chunk)?;
         }
         Ok(bytes.len())
@@ -223,7 +257,7 @@ pub fn run() -> io::Result<()> {
     input.read_exact(&mut data)?;
     let request: Request = serde_json::from_slice(&data).map_err(io::Error::other)?;
     let pipe = Arc::new(Pipe {
-        output: Mutex::new(io::stdout()),
+        output: Mutex::new(BufWriter::with_capacity(2 * DATA_CHUNK, io::stdout())),
         failed: AtomicBool::new(false),
         last_progress: Mutex::new(None),
     });
@@ -248,43 +282,93 @@ pub fn run() -> io::Result<()> {
             },
             pipe.clone(),
         )?;
-        let mut entries = session.entries()?;
-        for entry in &mut entries {
-            if entry.name.is_empty() {
-                entry.name = std::path::Path::new(&session_default_name)
-                    .file_stem()
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or(std::ffi::OsStr::new("data"))
-                    .to_string_lossy()
-                    .into_owned();
-            }
-        }
-        pipe.event(&Event::Catalog {
-            format: session.format().to_owned(),
-            entries,
-        })
-        .map_err(|e| Error {
+        let protocol_error = |e: io::Error| Error {
             message: e.to_string(),
             hresult: None,
             password_requested: false,
             flags: Default::default(),
             stream_errors: vec![],
-        })?;
+        };
+        let list = matches!(&request.operation, Operation::List);
         let (indices, test) = match request.operation {
-            Operation::Inspect => return Ok(None),
+            Operation::Probe => {
+                pipe.event(&Event::Probe {
+                    format: session.format().to_owned(),
+                    encrypted: session.encrypted()?,
+                })
+                .map_err(protocol_error)?;
+                return Ok(None);
+            }
             Operation::Verify => (None, true),
+            Operation::List => (None, false),
             Operation::Decode { indices } => (indices, false),
         };
+        let name_entries = |entries: &mut [Entry]| {
+            for entry in entries {
+                if entry.name.is_empty() {
+                    entry.name = std::path::Path::new(&session_default_name)
+                        .file_stem()
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or(std::ffi::OsStr::new("data"))
+                        .to_string_lossy()
+                        .into_owned();
+                }
+            }
+        };
+        if !test {
+            let mut entries = match &indices {
+                Some(indices) => session.entries_at(indices)?,
+                None => session.entries()?,
+            };
+            name_entries(&mut entries);
+            pipe.event(&Event::Catalog {
+                format: session.format().to_owned(),
+                item_count: session.item_count()?,
+                entries,
+            })
+            .map_err(protocol_error)?;
+            if list {
+                return Ok(None);
+            }
+        }
         let report = session.run(
             indices.as_deref(),
             test,
             Arc::new(Factory(pipe.clone())),
             pipe.clone(),
         )?;
-        Ok(Some(report))
+        let verification = if test {
+            let complete = match successful_indices(&report) {
+                Some(indices) => !session.missing_file_results(&indices)?,
+                None => false,
+            };
+            let mut failed: Vec<_> = report
+                .items
+                .iter()
+                .filter(|i| i.result != 0)
+                .map(|i| i.index)
+                .collect();
+            failed.sort_unstable();
+            failed.dedup();
+            let mut failures = session.entries_at(&failed)?;
+            name_entries(&mut failures);
+            Some(Verification {
+                format: session.format().to_owned(),
+                item_count: session.item_count()?,
+                complete,
+                encrypted: session.encrypted()?,
+                failures,
+            })
+        } else {
+            None
+        };
+        Ok(Some(Event::Report {
+            report,
+            verification,
+        }))
     })();
     match result {
-        Ok(Some(report)) => pipe.event(&Event::Report(report)),
+        Ok(Some(event)) => pipe.event(&event),
         Ok(None) => Ok(()),
         Err(error) => pipe.event(&Event::Error(error)),
     }

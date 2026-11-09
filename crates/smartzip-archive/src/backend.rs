@@ -39,11 +39,11 @@ pub trait ArchiveExecutor: Send + Sync {
         &self,
         _request: TestRequest,
         _previous: &crate::integrity::BackendTestDiagnostics,
-        _multivolume: bool,
         _context: Arc<TaskExecutionContext>,
     ) -> Result<Option<TestResult>> {
         Ok(None)
     }
+    /// Extract into caller-owned staging; the caller cleans it on terminal failure.
     async fn extract_with_facts_and_context(
         &self,
         request: ExtractArchiveRequest,

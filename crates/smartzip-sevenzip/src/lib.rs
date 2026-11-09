@@ -582,7 +582,7 @@ impl Session {
             warnings: get(72)?,
         })
     }
-    pub fn entries(&mut self) -> Result<Vec<Entry>, Error> {
+    pub fn item_count(&self) -> Result<u32, Error> {
         let mut count = 0;
         let hr =
             unsafe { (self.archive.table::<ArchiveVtable>().count)(self.archive.0, &mut count) };
@@ -593,29 +593,68 @@ impl Session {
                 self.flags().unwrap_or_default(),
             ));
         }
-        let mut entries = Vec::new();
-        for index in 0..count {
-            entries.push(Entry {
-                index,
-                name: self
-                    .property(index, 3)?
-                    .text()
-                    .or(self.property(index, 4)?.text())
-                    .unwrap_or_default(),
-                is_dir: self.property(index, 6)?.boolean().unwrap_or(false),
-                size: self.property(index, 7)?.number(),
-                packed_size: self.property(index, 8)?.number(),
-                encrypted: self.property(index, 15)?.boolean(),
-                link: self.property(index, 54)?.text(),
-                hard_link: self.property(index, 90)?.text(),
-                unix_mode: self.property(index, 53)?.number().map(|n| n as u32),
-                modified: self.property(index, 12)?.filetime(),
-                method: self.property(index, 22)?.text(),
-                crc: self.property(index, 19)?.number().map(|n| n as u32),
-                block: self.property(index, 27)?.number(),
-            });
+        Ok(count)
+    }
+    pub fn encrypted(&self) -> Result<Option<bool>, Error> {
+        let mut encrypted = None;
+        for index in 0..self.item_count()? {
+            match self.property(index, 15)?.boolean() {
+                Some(true) => return Ok(Some(true)),
+                Some(false) => encrypted = Some(false),
+                None => {}
+            }
         }
-        Ok(entries)
+        Ok(encrypted)
+    }
+    pub fn entries(&self) -> Result<Vec<Entry>, Error> {
+        (0..self.item_count()?)
+            .map(|index| self.entry(index))
+            .collect()
+    }
+    pub fn entries_at(&self, indices: &[u32]) -> Result<Vec<Entry>, Error> {
+        let count = self.item_count()?;
+        indices
+            .iter()
+            .map(|&index| {
+                if index >= count {
+                    return Err(Error::message("Archive index out of range"));
+                }
+                self.entry(index)
+            })
+            .collect()
+    }
+    pub fn missing_file_results(
+        &self,
+        successful: &std::collections::HashSet<u32>,
+    ) -> Result<bool, Error> {
+        for index in 0..self.item_count()? {
+            if !successful.contains(&index) && !self.property(index, 6)?.boolean().unwrap_or(false)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+    fn entry(&self, index: u32) -> Result<Entry, Error> {
+        let name = match self.property(index, 3)?.text() {
+            Some(name) => name,
+            None => self.property(index, 4)?.text().unwrap_or_default(),
+        };
+        Ok(Entry {
+            index,
+            name,
+            is_dir: self.property(index, 6)?.boolean().unwrap_or(false),
+            size: self.property(index, 7)?.number(),
+            packed_size: self.property(index, 8)?.number(),
+            encrypted: self.property(index, 15)?.boolean(),
+            link: self.property(index, 54)?.text(),
+            hard_link: self.property(index, 90)?.text(),
+            unix_mode: self.property(index, 53)?.number().map(|n| n as u32),
+            modified: self.property(index, 12)?.filetime(),
+            method: self.property(index, 22)?.text(),
+            crc: self.property(index, 19)?.number().map(|n| n as u32),
+            block: self.property(index, 27)?.number(),
+        })
     }
     pub fn run(
         &mut self,

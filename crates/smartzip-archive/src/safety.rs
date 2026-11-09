@@ -1,55 +1,43 @@
-use std::path::{Component, PathBuf};
+use std::{borrow::Cow, path::PathBuf};
 
-/// Reject Windows drive-letter paths and UNC/network paths in a
-/// platform-independent way. Operates on the **normalized** string
-/// (backslashes already converted to forward slashes).
-///
-/// Cases rejected:
-/// - `C:\foo`, `C:/foo`, `C:foo` — any `letter:` prefix
-/// - `\\server\share` → `//server/share` after normalization
-/// - Bare `//` (double slash without scheme, e.g. `//etc/passwd`)
-fn has_windows_prefix(s: &str) -> bool {
-    let b = s.as_bytes();
-    // UNC / double-slash: //server/share (already normalized from \\)
-    if b.len() >= 2 && b[0] == b'/' && b[1] == b'/' {
-        return true;
-    }
-    // Drive letter: C: — covers C:\foo, C:/foo, and C:foo (drive-relative)
-    if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
-        return true;
-    }
-    false
-}
-
-/// Validate and sanitize a ZIP entry name into a safe relative path.
-///
-/// Rejects:
-/// - Absolute paths (`/foo`)
-/// - Parent directory traversal (`../foo`)
-/// - Windows drive paths (`C:\foo`, `C:/foo`, `C:foo`) — all forms
-/// - UNC / double-slash paths (`\\server\share`, `//etc/passwd`)
-/// - NUL bytes
-/// - Empty paths
+/// Normalize archive separators and reject paths that can escape the output
+/// directory when joined. Validate each component before pushing it.
 pub fn safe_entry_path(raw_name: &[u8]) -> Option<PathBuf> {
     if raw_name.contains(&0) {
         return None;
     }
     let name = String::from_utf8_lossy(raw_name);
-    let normalized = name.replace('\\', "/");
-
-    if has_windows_prefix(&normalized) {
+    let normalized = archive_separators(&name);
+    if normalized.starts_with('/') {
         return None;
     }
-
     let mut path = PathBuf::new();
-    for component in std::path::Path::new(&normalized).components() {
-        match component {
-            Component::Normal(part) => path.push(part),
-            Component::CurDir => {}
-            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+    for part in normalized.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => return None,
+            part if !safe_component(part, path.as_os_str().is_empty()) => return None,
+            part => path.push(part),
         }
     }
     (!path.as_os_str().is_empty()).then_some(path)
+}
+
+pub(crate) fn archive_separators(name: &str) -> Cow<'_, str> {
+    if name.contains('\\') {
+        Cow::Owned(name.replace('\\', "/"))
+    } else {
+        Cow::Borrowed(name)
+    }
+}
+
+pub(crate) fn safe_component(part: &str, first: bool) -> bool {
+    // On Windows a colon also addresses an alternate data stream.
+    if cfg!(windows) && part.contains(':') {
+        return false;
+    }
+    let bytes = part.as_bytes();
+    !(first && bytes.get(1) == Some(&b':') && bytes[0].is_ascii_alphabetic())
 }
 
 #[cfg(test)]
@@ -106,6 +94,7 @@ mod tests {
     fn rejects_windows_drive_relative() {
         assert_eq!(safe_entry_path(b"C:evil.txt"), None);
         assert_eq!(safe_entry_path(b"Z:folder/file.txt"), None);
+        assert_eq!(safe_entry_path(b"./Z:folder/file.txt"), None);
     }
 
     #[test]

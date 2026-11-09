@@ -67,6 +67,8 @@ pub struct EncodingConfirmationContext {
     pub detected: smartzip_core::EncodingDetectionResult,
     pub preview_names: Vec<String>,
     pub suspicious_reasons: Vec<String>,
+    #[serde(skip)]
+    pub(crate) native_names: bool,
 }
 
 #[async_trait]

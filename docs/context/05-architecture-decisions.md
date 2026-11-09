@@ -44,10 +44,12 @@ executor 隔离 engine 与 adapter 细节；router 按 operation、容器、密�
 
 ### ADR-009: Single extraction staging owner
 
-`OutputMaterializer` 统一管理隔离输出：每次 adapter 尝试使用独立目录；失败后删除并确认不存在，才允许下一次尝试。清理失败终止当前候选，避免污染后续尝试。
+`OutputMaterializer` 管理每次提取尝试的隔离目录和终止时的清理。只有 router 要在同一尝试内切换 adapter 时，才先清空目录、确认无残留并重置尝试额度。终止失败由材质化层一次移除目录，不再逐项清理后重复删除。
 
 成功树交给布局、碰撞处理和提交；这些阶段的失败不再触发后端 fallback。密码重试开启新的材质化周期，避免双层临时目录与清理职责分散。
 
 ### ADR-010: Native sessions with parent-owned output
 
 7-Zip 使用官方固定版本原生库，不再解析 CLI 文本。短生命周期 worker 保持可终止的解码边界；私有管道传递请求、目录、字节和结构化结果，密码不进入 argv。父进程持有受控输出 writer，按实际写入准入预算；逐流关闭并累积 manifest，保留 OutputMaterializer 提交/清理职责。内嵌和字节分卷直接使用范围/拼接流，不预先 carve 或建立别名树。
+
+探测只返回格式和加密信息，完整性校验只返回原生结果和失败成员，按索引读取只传所选条目。ZIP 名称读取器只提供编码判断与覆盖所需的数据；成员身份与名称视图分离。提取产出清单转移给预算、提交和嵌套发现，GUI 浏览目录保留类型化结果，诊断 JSON 在导出时生成。

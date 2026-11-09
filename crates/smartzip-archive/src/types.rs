@@ -24,8 +24,6 @@ pub struct ArchiveEntry {
     pub native: Option<NativeEntry>,
     pub path: PathBuf,
     #[serde(default)]
-    pub raw_name: Vec<u8>,
-    #[serde(default)]
     pub compressed_size: Option<u64>,
     #[serde(default)]
     pub uncompressed_size: Option<u64>,

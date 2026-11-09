@@ -12,11 +12,7 @@ pub(crate) struct Usage {
     pub bytes: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct InventoryFile {
-    pub relative_path: PathBuf,
-    pub size: u64,
-}
+pub(crate) use smartzip_archive::OutputFile as InventoryFile;
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct OutputInventory {
@@ -27,14 +23,14 @@ pub(crate) struct OutputInventory {
 
 impl OutputInventory {
     pub(crate) fn published_files(
-        &self,
+        self,
         plan: &crate::layout::LayoutPlan,
     ) -> Option<Vec<InventoryFile>> {
         use crate::layout::{LayoutPlanKind, PlanSource};
 
         let source = match (&plan.kind, &plan.source) {
             (LayoutPlanKind::PreserveBothSingleDir | LayoutPlanKind::PreserveBothSingleFile, _)
-            | (_, PlanSource::WholeTempDir) => return Some(self.files.clone()),
+            | (_, PlanSource::WholeTempDir) => return Some(self.files),
             (
                 _,
                 PlanSource::SingleDir(path)
@@ -45,17 +41,11 @@ impl OutputInventory {
 
         Some(
             self.files
-                .iter()
-                .filter_map(|file| {
-                    let relative_path = if file.relative_path == source {
-                        PathBuf::new()
-                    } else {
-                        file.relative_path.strip_prefix(source).ok()?.to_path_buf()
-                    };
-                    Some(InventoryFile {
-                        relative_path,
-                        size: file.size,
-                    })
+                .into_iter()
+                .filter_map(|mut file| {
+                    file.relative_path =
+                        file.relative_path.strip_prefix(source).ok()?.to_path_buf();
+                    Some(file)
                 })
                 .collect(),
         )
@@ -293,13 +283,23 @@ fn inspect_inventory(
         if entry.depth() == 0 && entry.file_type().is_dir() {
             continue;
         }
-        let metadata = match std::fs::symlink_metadata(entry.path()) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(SmartZipError::io(Some(entry.path().into()), error)),
-        };
-        usage.files = usage.files.saturating_add(1);
-        if metadata.is_file() {
+        if entry.file_type().is_file() && (collect_files || limits.max_output_bytes != 0) {
+            let metadata = match entry.metadata() {
+                Ok(metadata) => metadata,
+                Err(error)
+                    if error
+                        .io_error()
+                        .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+                {
+                    continue
+                }
+                Err(error) => {
+                    return Err(SmartZipError::io(
+                        Some(entry.path().into()),
+                        std::io::Error::other(error),
+                    ))
+                }
+            };
             usage.bytes = usage.bytes.saturating_add(metadata.len());
             if collect_files {
                 files.push(InventoryFile {
@@ -312,6 +312,7 @@ fn inspect_inventory(
                 });
             }
         }
+        usage.files = usage.files.saturating_add(1);
         if limits.max_files != 0 && usage.files > limits.max_files {
             return Err(exceeded(format!(
                 "output entry limit {} exceeded",
@@ -335,7 +336,7 @@ fn inspect_inventory(
 
 #[cfg(test)]
 pub(crate) fn inspect(path: &Path, limits: &ExtractionLimits, previous: Usage) -> Result<Usage> {
-    inspect_inventory(path, limits, previous, false).map(|inventory| inventory.usage)
+    inspect_inventory(path, limits, previous, true).map(|inventory| inventory.usage)
 }
 
 fn check_free_space(path: &Path, limits: &ExtractionLimits) -> Result<()> {
@@ -439,7 +440,7 @@ pub(crate) async fn monitor_task(
     operation: impl std::future::Future<Output = Result<smartzip_archive::ExtractArchiveResult>>,
 ) -> Result<(smartzip_archive::ExtractArchiveResult, OutputInventory)> {
     monitor_output(path, limits, reservation, context, operation, |value| {
-        value.manifest.as_ref()
+        value.manifest.take()
     })
     .await
 }
@@ -450,65 +451,61 @@ async fn monitor_output<T>(
     reservation: &TaskBudgetReservation,
     context: Arc<TaskExecutionContext>,
     operation: impl std::future::Future<Output = Result<T>>,
-    manifest: impl Fn(&T) -> Option<&smartzip_archive::OutputManifest>,
+    take_manifest: impl Fn(&mut T) -> Option<smartzip_archive::OutputManifest>,
 ) -> Result<(T, OutputInventory)> {
     use std::time::Duration;
     use tokio::time::{Instant, MissedTickBehavior};
 
     let tree_limits = limits.max_files != 0 || limits.max_output_bytes != 0;
-    if !tree_limits && limits.min_free_bytes == 0 {
-        let value = operation.await?;
-        if context.is_cancelled() {
-            return Err(SmartZipError::Cancelled);
-        }
-        // One final inventory for history/recovery; no polling of the live tree.
-        let inventory = final_inventory(path, limits, manifest(&value)).await?;
-        reservation.update(inventory.usage, limits)?;
-        if context.is_cancelled() {
-            return Err(SmartZipError::Cancelled);
-        }
-        return Ok((value, inventory));
+    if limits.min_free_bytes != 0 {
+        scan_result(scan(path, limits, Usage::default(), false, false).await)?;
     }
-    scan_result(scan(path, limits, Usage::default(), false, false).await)?;
-    let mut operation = std::pin::pin!(operation);
-    let period = Duration::from_secs(1);
-    let mut interval = tokio::time::interval_at(Instant::now() + period, period);
-    interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    let mut next_tree = Instant::now() + period;
-    let value = loop {
-        tokio::select! {
-            result = &mut operation => break result?,
-            _ = interval.tick() => {
-                let started = Instant::now();
-                let full = tree_limits && !reservation.native_admission.load(Ordering::Acquire) && started >= next_tree;
-                let mut pending = scan(path, limits, Usage::default(), full, false);
-                let result = tokio::select! {
-                    result = &mut operation => {
-                        let checked = scan_result(pending.await);
-                        let value = result?;
-                        let inventory = checked?;
-                        if full {
-                            reservation.update_monitored(inventory.usage, limits)?;
+    let mut value = if !tree_limits && limits.min_free_bytes == 0 {
+        operation.await?
+    } else {
+        let mut operation = std::pin::pin!(operation);
+        let period = Duration::from_secs(1);
+        let mut interval = tokio::time::interval_at(Instant::now() + period, period);
+        interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut next_tree = Instant::now() + period;
+        loop {
+            tokio::select! {
+                result = &mut operation => break result?,
+                _ = interval.tick() => {
+                    let started = Instant::now();
+                    let full = tree_limits && !reservation.native_admission.load(Ordering::Acquire) && started >= next_tree;
+                    if !full && limits.min_free_bytes == 0 {
+                        continue;
+                    }
+                    let mut pending = scan(path, limits, Usage::default(), full, false);
+                    let result = tokio::select! {
+                        result = &mut operation => {
+                            let checked = scan_result(pending.await);
+                            let value = result?;
+                            let inventory = checked?;
+                            if full {
+                                reservation.update_monitored(inventory.usage, limits)?;
+                            }
+                            break value;
                         }
-                        break value;
+                        result = &mut pending => scan_result(result),
+                    };
+                    let checked = result.and_then(|inventory| {
+                        if full {
+                            reservation.update_monitored(inventory.usage, limits)
+                        } else {
+                            Ok(())
+                        }
+                    });
+                    if let Err(error) = checked {
+                            context.cancel();
+                            let _ = operation.await;
+                            return Err(error);
                     }
-                    result = &mut pending => scan_result(result),
-                };
-                let checked = result.and_then(|inventory| {
                     if full {
-                        reservation.update_monitored(inventory.usage, limits)
-                    } else {
-                        Ok(())
+                        let delay = (started.elapsed() * 4).max(period);
+                        next_tree = Instant::now() + delay;
                     }
-                });
-                if let Err(error) = checked {
-                        context.cancel();
-                        let _ = operation.await;
-                        return Err(error);
-                }
-                if full {
-                    let delay = (started.elapsed() * 4).max(period);
-                    next_tree = Instant::now() + delay;
                 }
             }
         }
@@ -516,7 +513,7 @@ async fn monitor_output<T>(
     if context.is_cancelled() {
         return Err(SmartZipError::Cancelled);
     }
-    let inventory = final_inventory(path, limits, manifest(&value)).await?;
+    let inventory = final_inventory(path, limits, take_manifest(&mut value)).await?;
     reservation.update(inventory.usage, limits)?;
     if context.is_cancelled() {
         return Err(SmartZipError::Cancelled);
@@ -527,7 +524,7 @@ async fn monitor_output<T>(
 async fn final_inventory(
     path: &Path,
     limits: &ExtractionLimits,
-    manifest: Option<&smartzip_archive::OutputManifest>,
+    manifest: Option<smartzip_archive::OutputManifest>,
 ) -> Result<OutputInventory> {
     if let Some(manifest) = manifest {
         if limits.min_free_bytes != 0 {
@@ -539,14 +536,7 @@ async fn final_inventory(
                 files: manifest.entries,
                 bytes: manifest.bytes,
             },
-            files: manifest
-                .files
-                .iter()
-                .map(|file| InventoryFile {
-                    relative_path: file.relative_path.clone(),
-                    size: file.size,
-                })
-                .collect(),
+            files: manifest.files,
         });
     }
     scan_result(scan(path, limits, Usage::default(), true, true).await)

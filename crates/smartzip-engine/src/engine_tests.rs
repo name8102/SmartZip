@@ -1,6 +1,5 @@
 //! Unit tests moved out of lib.rs.
 
-use crate::encoding_flow::*;
 use crate::interactive::*;
 use crate::nested::*;
 use crate::policy::*;
@@ -159,24 +158,6 @@ fn root_scan_enqueues_every_eligible_finding_with_unique_output() {
     assert!(candidates
         .iter()
         .all(|candidate| candidate.source == CandidateSource::EmbeddedFinding));
-}
-
-#[test]
-fn zip_encoding_assessment_skips_confirmation_for_ascii_names() {
-    let assessment = build_zip_encoding_assessment(ArchiveListing {
-        format: Some(ArchiveFormat::Zip),
-        entries: vec![smartzip_archive::ArchiveEntry {
-            native: None,
-            path: PathBuf::from("docs/readme.txt"),
-            raw_name: b"docs/readme.txt".to_vec(),
-            compressed_size: None,
-            uncompressed_size: None,
-            is_dir: false,
-        }],
-    })
-    .unwrap();
-
-    assert!(assessment.suspicious_reasons.is_empty());
 }
 
 #[tokio::test]

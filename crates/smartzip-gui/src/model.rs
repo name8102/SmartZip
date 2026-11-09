@@ -1,7 +1,7 @@
 //! Window-independent queue. A dropped batch remains one engine workflow.
 use crate::runtime::{
-    spawn_job_at, InteractionRequest, JobHandle, JobMessage, JobOutcome, JobRequest, TaskOperation,
-    TaskSettings,
+    spawn_job_at, InteractionRequest, JobDetail, JobHandle, JobMessage, JobOutcome, JobRequest,
+    TaskOperation, TaskSettings,
 };
 use smartzip_core::{RouteEvent, TaskEvent, TaskEventKind};
 use std::path::PathBuf;
@@ -44,14 +44,13 @@ pub struct Job {
     pub stage: String,
     pub events: Vec<String>,
     pub outputs: Vec<PathBuf>,
-    pub result: Option<serde_json::Value>,
+    pub result: JobDetail,
     pub prompt: Option<InteractionRequest>,
     pub prompt_revision: u64,
     pub dismiss_requested: bool,
     pub persistence_pending: bool,
     pub request_revision: u64,
     pub task_id: Option<String>,
-    pub backend_router: Option<smartzip_archive::BackendRouter>,
     /// A configured draft stays queued until the user explicitly starts it.
     held: bool,
     /// Explicit start bypasses the global automatic-start pause for this job.
@@ -190,8 +189,7 @@ impl Job {
             }
         };
         self.events.extend(outcome.warnings);
-        self.result = Some(outcome.detail);
-        self.backend_router = outcome.backend_router;
+        self.result = outcome.detail;
         self.prompt = None;
         self.handle = None;
         self.request.settings.passwords.clear();
@@ -262,14 +260,13 @@ impl Queue {
             stage: "等待启动".into(),
             events: vec![],
             outputs: vec![],
-            result: None,
+            result: JobDetail::None,
             prompt: None,
             prompt_revision: 0,
             dismiss_requested: false,
             persistence_pending: false,
             request_revision: 0,
             task_id: None,
-            backend_router: None,
             held,
             start_requested: false,
             failure_summary: None,
@@ -906,9 +903,8 @@ mod tests {
     fn outcome(status: &str) -> JobOutcome {
         JobOutcome {
             status: status.into(),
-            detail: serde_json::Value::Null,
+            detail: JobDetail::None,
             warnings: vec![],
-            backend_router: None,
         }
     }
 

@@ -1,4 +1,5 @@
 use super::*;
+use crate::runtime::JobDetail;
 use gpui::component::{
     h_resizable,
     menu::{DropdownMenu, PopupMenuItem},
@@ -61,7 +62,7 @@ impl View {
                     operation,
                     job.phase,
                     job.stage.clone(),
-                    operation_report(operation, job.result.as_ref()),
+                    job.result.report(),
                 ))
             })
             .collect();
@@ -166,78 +167,45 @@ impl View {
             .unwrap_or_default();
         let phase = selected.map(|j| j.phase);
         let stage = selected.map(|j| j.stage.clone()).unwrap_or_default();
-        let count = selected
-            .and_then(|j| j.result.as_ref())
-            .and_then(|r| r.get("entries"))
-            .and_then(|v| v.as_array())
-            .map_or(0, Vec::len);
-        if let Some(job) = selected.filter(|j| j.result.is_some()) {
-            self.archive_cache.entry(job.id).or_insert_with(|| {
-                let entries = job
-                    .result
-                    .as_ref()
-                    .and_then(|r| r.get("entries"))
-                    .and_then(|v| v.as_array())
-                    .map(|entries| {
-                        entries
-                            .iter()
-                            .filter_map(|entry| {
-                                Some(crate::archive_browser::ArchiveEntry {
-                                    path: entry.get("path")?.as_str()?.into(),
-                                    reference: entry
-                                        .get("native")
-                                        .and_then(|native| native.get("reference"))
-                                        .and_then(|reference| {
-                                            serde_json::from_value(reference.clone()).ok()
-                                        }),
-                                    is_dir: entry
-                                        .get("is_dir")
-                                        .and_then(|v| v.as_bool())
-                                        .unwrap_or(false),
-                                    size: entry.get("uncompressed_size").and_then(|v| v.as_u64()),
-                                })
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                std::sync::Arc::new(crate::archive_browser::ArchiveBrowser::new(entries))
-            });
-        }
+        let archive = selected.and_then(|job| match &job.result {
+            JobDetail::Archive(archive) => Some(archive),
+            _ => None,
+        });
+        let count = archive.map_or(0, |archive| archive.count);
         let query = self.archive_search.read(cx).value().to_lowercase();
-        let browser = id.and_then(|id| self.archive_cache.get(&id));
-        let mut rows = browser
-            .map(|b| b.children(&self.archive_dir))
+        let rows = archive
+            .map(|archive| archive.browser.children(&self.archive_dir))
             .unwrap_or_default();
-        rows.retain(|r| query.is_empty() || r.name.to_lowercase().contains(&query));
-        if self.archive_sort_size {
-            rows.sort_by_key(|r| {
-                (
-                    !r.is_dir,
-                    std::cmp::Reverse(r.size.unwrap_or(0)),
-                    r.name.clone(),
-                )
-            });
-        }
+        let visible = (!query.is_empty() || self.archive_sort_size).then(|| {
+            let mut visible: Vec<_> = rows
+                .iter()
+                .enumerate()
+                .filter_map(|(index, row)| {
+                    (query.is_empty() || row.name.to_lowercase().contains(&query)).then_some(index)
+                })
+                .collect();
+            if self.archive_sort_size {
+                visible.sort_by(|&a, &b| {
+                    let key = |row: &crate::archive_browser::ArchiveChild| {
+                        (!row.is_dir, std::cmp::Reverse(row.size.unwrap_or(0)))
+                    };
+                    key(&rows[a])
+                        .cmp(&key(&rows[b]))
+                        .then_with(|| rows[a].name.cmp(&rows[b].name))
+                });
+            }
+            visible
+        });
+        let row_count = visible.as_ref().map_or(rows.len(), Vec::len);
         let height = state.preferences.density.row_height().max(40.);
         let source = selected.and_then(|job| {
-            let result = job.result.as_ref()?;
             let resolved = job.request.resolved.as_ref()?;
             Some(crate::member_preview::MemberSource {
-                archive: PathBuf::from(result.get("path")?.as_str()?),
+                archive: archive?.clone(),
                 member: PathBuf::new(),
-                backend: job.backend.clone(),
-                router: job.backend_router.clone()?,
                 allow_password: resolved.values.passwords.mode
                     != smartzip_config::PasswordMode::Off,
-                max_bytes: 0,
-                encoding: result
-                    .get("encoding")
-                    .and_then(|v| v.as_str())
-                    .filter(|v| !["auto", "backend"].contains(v))
-                    .map(|v| smartzip_core::EncodingMode::Override(v.into()))
-                    .unwrap_or(smartzip_core::EncodingMode::Auto),
                 entry: None,
-                input: Some(serde_json::from_value(result.get("input")?.clone()).ok()?),
             })
         });
         let tabs: Vec<_> = state
@@ -248,7 +216,7 @@ impl View {
             .map(|j| (j.id, j.name()))
             .collect();
         let active = phase.is_some_and(|p| p.active() || p == Phase::Queued);
-        let ready = browser.is_some();
+        let ready = archive.is_some();
         let wide = window.viewport_size().width >= px(1050.);
         let root = div()
             .id("preview-page")
@@ -309,7 +277,6 @@ impl View {
                             .tooltip("关闭归档")
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 cx.stop_propagation();
-                                this.archive_cache.remove(&tab);
                                 this.archive_positions.remove(&tab);
                                 this.shared.update(cx, |state, cx| {
                                     state.previews.close(tab);
@@ -455,9 +422,8 @@ impl View {
                         cx.notify();
                     })),
             );
-        let row_count = rows.len();
         let mut files = div().size_full().min_h_0().flex().flex_col();
-        if ready && !rows.is_empty() {
+        if ready && row_count != 0 {
             files = files
                 .child(div().flex().items_center().px_3().py_2().gap_3().text_sm()
                     .text_color(cx.theme().muted_foreground)
@@ -465,9 +431,9 @@ impl View {
                     .child(div().flex_1().child("名称"))
                     .child(div().w(px(90.)).child("大小"))
                     .child(div().w(px(34.))))
-                .child(gpui::uniform_list("archive-entries", rows.len(), cx.processor(move |_, range: std::ops::Range<usize>, _, cx| {
+                .child(gpui::uniform_list("archive-entries", row_count, cx.processor(move |_, range: std::ops::Range<usize>, _, cx| {
                     range.map(|index| {
-                        let entry = &rows[index];
+                        let entry = &rows[visible.as_ref().map_or(index, |visible| visible[index])];
                         let path = entry.path.clone();
                         let copy_path = path.clone();
                         let member_source = source.clone();
@@ -588,102 +554,5 @@ impl View {
                     }),
             )
             .into_any_element()
-    }
-}
-
-fn operation_report(operation: TaskOperation, result: Option<&serde_json::Value>) -> Vec<String> {
-    let Some(result) = result else {
-        return vec![];
-    };
-    if operation == TaskOperation::Detect {
-        let Some(count) = result.get("embedded_count").and_then(|v| v.as_u64()) else {
-            return vec![];
-        };
-        let mut lines = vec![format!("检测到 {} 个内嵌归档候选", count)];
-        if let Some(reason) = result.get("reason").and_then(|v| v.as_str()) {
-            lines.push(reason.into());
-        }
-        return lines;
-    }
-    let mut lines = vec![];
-    for file in result
-        .get("files")
-        .and_then(|v| v.as_array())
-        .into_iter()
-        .flatten()
-    {
-        let integrity = match file.get("integrity").and_then(|v| v.as_str()) {
-            Some("intact") => "完好",
-            Some("corrupt") => "确认损坏",
-            Some("incomplete") => "缺少分卷",
-            _ => "尚不能确定",
-        };
-        let coverage = match file.get("coverage").and_then(|v| v.as_str()) {
-            Some("complete") => "完整",
-            Some("partial") => "部分",
-            _ => "未检查",
-        };
-        lines.push(format!("完整性：{integrity} · 检查范围：{coverage}"));
-        for (field, label) in [
-            ("confirmed_volumes", "确认损坏的卷"),
-            ("suspect_groups", "疑似损坏的分卷组"),
-            ("missing_volumes", "缺失卷"),
-            ("unreadable_volumes", "无法读取的卷"),
-            ("unchecked_volumes", "未检查的卷"),
-        ] {
-            let count = file
-                .get(field)
-                .and_then(|v| v.as_array())
-                .map_or(0, Vec::len);
-            if count > 0 {
-                lines.push(format!("{label}：{count}"));
-            }
-        }
-        for reason in file
-            .get("stop_reasons")
-            .and_then(|v| v.as_array())
-            .into_iter()
-            .flatten()
-            .filter_map(|v| v.as_str())
-            .take(3)
-        {
-            lines.push(reason.into());
-        }
-    }
-    lines
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn unknown_integrity_does_not_promote_suspect_volumes_to_confirmed_damage() {
-        let result = serde_json::json!({"files": [{"integrity":"unknown", "coverage":"partial", "suspect_groups":[{"members":["a.001","a.002"]}], "unchecked_volumes":["a.002"]}]});
-        let report = operation_report(TaskOperation::Test, Some(&result));
-        assert_eq!(
-            report,
-            vec![
-                "完整性：尚不能确定 · 检查范围：部分",
-                "疑似损坏的分卷组：1",
-                "未检查的卷：1"
-            ]
-        );
-    }
-
-    #[test]
-    fn failed_detection_does_not_claim_zero_embedded_archives() {
-        assert!(operation_report(
-            TaskOperation::Detect,
-            Some(&serde_json::json!({"error":"unreadable"}))
-        )
-        .is_empty());
-        assert_eq!(
-            operation_report(
-                TaskOperation::Detect,
-                Some(&serde_json::json!({"embedded_count":0}))
-            ),
-            vec!["检测到 0 个内嵌归档候选"]
-        );
     }
 }

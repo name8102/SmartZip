@@ -140,20 +140,17 @@ pub(crate) fn prepare_resolved_archive(
         (Some(recorder), Some(hash), Some(size)) => recorder.lookup_known_file(hash, size),
         _ => None,
     };
-    let encoding_mode = match (
-        &requested_encoding,
+    let confirmed_encoding = if requested_encoding == EncodingMode::Auto
+        && run_policy.is_none_or(|policy| policy.values().extraction.encoding.mode != "backend")
+    {
         known_hit
             .as_ref()
-            .and_then(|hit| hit.confirmed_encoding.clone()),
-    ) {
-        (EncodingMode::Auto, Some(enc)) => EncodingMode::Override(enc),
-        _ => requested_encoding.clone(),
+            .and_then(|hit| hit.confirmed_encoding.clone())
+    } else {
+        None
     };
-    let reused_confirmed_encoding = requested_encoding == EncodingMode::Auto
-        && known_hit
-            .as_ref()
-            .map(|hit| hit.confirmed_encoding.is_some())
-            .unwrap_or(false);
+    let reused_confirmed_encoding = confirmed_encoding.is_some();
+    let encoding_mode = confirmed_encoding.map_or(requested_encoding, EncodingMode::Override);
     let mut zip_encoding_assessment = None;
     if run_policy.is_none_or(|p| p.values().extraction.encoding.mode == "auto")
         && encoding_mode == EncodingMode::Auto

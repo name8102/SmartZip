@@ -1,4 +1,55 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
+
+#[derive(Debug)]
+pub(crate) struct ArchiveView {
+    pub(crate) input: smartzip_core::ArchiveInput,
+    pub(crate) path: std::path::PathBuf,
+    pub(crate) adapter: String,
+    pub(crate) router: smartzip_archive::BackendRouter,
+    pub(crate) browser: ArchiveBrowser,
+    pub(crate) count: usize,
+}
+
+impl ArchiveView {
+    pub(crate) fn new(
+        result: smartzip_engine::ListArchiveResult,
+        router: smartzip_archive::BackendRouter,
+    ) -> Self {
+        use smartzip_core::{RouteEvent, TaskEventKind};
+        let adapter = result
+            .events
+            .into_iter()
+            .rev()
+            .find_map(|event| match event.kind {
+                TaskEventKind::Route(RouteEvent::BackendSelected { adapter_id }) => {
+                    Some(adapter_id)
+                }
+                _ => None,
+            })
+            .unwrap_or_default();
+        let count = result.entries.len();
+        let browser = ArchiveBrowser::new(result.entries.into_iter().map(|entry| {
+            ArchiveEntry {
+                path: entry
+                    .path
+                    .into_os_string()
+                    .into_string()
+                    .unwrap_or_else(|path| path.to_string_lossy().into_owned()),
+                reference: entry.native.map(|native| native.reference),
+                is_dir: entry.is_dir,
+                size: entry.uncompressed_size,
+            }
+        }));
+        Self {
+            input: result.input,
+            path: result.path,
+            adapter,
+            router,
+            browser,
+            count,
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ArchiveEntry {
@@ -17,11 +68,11 @@ pub(crate) struct ArchiveChild {
 }
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ArchiveBrowser {
-    directories: BTreeMap<Vec<String>, Vec<ArchiveChild>>,
+    directories: BTreeMap<Vec<String>, Arc<[ArchiveChild]>>,
 }
 
 impl ArchiveBrowser {
-    pub(crate) fn new(entries: Vec<ArchiveEntry>) -> Self {
+    pub(crate) fn new(entries: impl IntoIterator<Item = ArchiveEntry>) -> Self {
         type Siblings = BTreeMap<(String, bool), Vec<ArchiveChild>>;
         let mut directories: BTreeMap<Vec<String>, Siblings> = BTreeMap::new();
         for entry in entries {
@@ -62,13 +113,13 @@ impl ArchiveBrowser {
                 .into_iter()
                 .map(|(path, grouped)| {
                     let mut children: Vec<_> = grouped.into_values().flatten().collect();
-                    children.sort_by_key(|child| (!child.is_dir, child.name.to_lowercase()));
-                    (path, children)
+                    children.sort_by_cached_key(|child| (!child.is_dir, child.name.to_lowercase()));
+                    (path, children.into())
                 })
                 .collect(),
         }
     }
-    pub(crate) fn children(&self, directory: &[String]) -> Vec<ArchiveChild> {
+    pub(crate) fn children(&self, directory: &[String]) -> Arc<[ArchiveChild]> {
         self.directories.get(directory).cloned().unwrap_or_default()
     }
     pub(crate) fn path_parts(path: &str) -> Option<Vec<String>> {

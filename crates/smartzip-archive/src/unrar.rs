@@ -236,7 +236,6 @@ impl ArchiveAdapter for UnrarBackend {
             .map(|line| ArchiveEntry {
                 native: None,
                 path: PathBuf::from(line),
-                raw_name: Vec::new(),
                 compressed_size: None,
                 uncompressed_size: None,
                 is_dir: line.ends_with('/') || line.ends_with('\\'),

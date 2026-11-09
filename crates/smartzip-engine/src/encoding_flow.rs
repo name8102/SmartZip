@@ -1,8 +1,5 @@
 //! Encoding mode resolve, zip assessment, mojibake heuristics.
 
-use smartzip_archive::native_zip::NativeZipBackend;
-#[cfg(test)]
-use smartzip_archive::ArchiveListing;
 use smartzip_core::EncodingMode;
 use std::path::Path;
 
@@ -15,6 +12,18 @@ pub(crate) fn encoding_mode_label(mode: &EncodingMode) -> String {
         EncodingMode::Auto => "auto".to_string(),
         EncodingMode::Override(name) => name.clone(),
     }
+}
+
+pub(crate) fn applied_encoding_label(
+    mode: &EncodingMode,
+    assessment: Option<&EncodingConfirmationContext>,
+) -> String {
+    if *mode == EncodingMode::Auto {
+        if let Some(assessment) = assessment.filter(|a| a.native_names) {
+            return encoding_mode_label(&assessment.detected.selected);
+        }
+    }
+    encoding_mode_label(mode)
 }
 
 pub(crate) async fn resolve_encoding_mode(
@@ -45,64 +54,71 @@ pub(crate) async fn resolve_encoding_mode(
         }
     }
 
-    Ok(Some(assessment.detected.selected.clone()))
+    Ok(Some(if assessment.native_names {
+        EncodingMode::Auto
+    } else {
+        assessment.detected.selected.clone()
+    }))
 }
 
 pub(crate) fn assess_zip_encoding(
     input: &smartzip_core::ArchiveInput,
 ) -> Option<EncodingConfirmationContext> {
-    // ZIP raw filename reading is now via the narrowed NativeZip helper, not
-    // via the generic ArchiveAdapter/list path. This keeps raw bytes intact
-    // for detector and avoids routing through the backend router.
-    let reader = NativeZipBackend::new();
-    let entries = reader.raw_entries_with_input(input).ok()?;
-    assess_raw_names(entries.iter().map(|entry| entry.raw_name.as_slice()))
+    assess_zip_names(&smartzip_archive::zip_names::read(input).ok()?)
 }
 
-#[cfg(test)]
-pub(crate) fn build_zip_encoding_assessment(
-    listing: ArchiveListing,
+pub fn assess_zip_names(
+    entries: &[smartzip_archive::zip_names::ZipName],
 ) -> Option<EncodingConfirmationContext> {
-    assess_raw_names(
-        listing
-            .entries
-            .iter()
-            .map(|entry| entry.raw_name.as_slice()),
-    )
-}
-
-fn assess_raw_names<'a>(
-    names: impl IntoIterator<Item = &'a [u8]>,
-) -> Option<EncodingConfirmationContext> {
-    let raw_entries: Vec<&[u8]> = names.into_iter().filter(|raw| !raw.is_empty()).collect();
-    if raw_entries.is_empty() {
+    if entries.is_empty() {
         return None;
     }
-
-    let ascii_only = raw_entries.iter().all(|raw| raw.is_ascii());
-    let capacity = raw_entries.iter().map(|raw| raw.len()).sum::<usize>() + raw_entries.len() - 1;
-    let mut raw_names = Vec::with_capacity(capacity);
-    for (idx, raw) in raw_entries.iter().enumerate() {
-        if idx > 0 {
-            raw_names.push(b'/');
-        }
-        raw_names.extend_from_slice(raw);
+    // Do not feed names whose encoding is already known into the legacy
+    // detector: a large Unicode subset can otherwise dominate its decision.
+    let unresolved: Vec<_> = entries
+        .iter()
+        .filter(|name| name.native_name().is_none())
+        .collect();
+    if unresolved.is_empty() {
+        let selected = EncodingMode::Override("UTF-8".into());
+        return Some(EncodingConfirmationContext {
+            detected: smartzip_core::EncodingDetectionResult {
+                selected,
+                confidence: 1.0,
+                candidates: vec![smartzip_core::EncodingCandidate {
+                    name: "UTF-8".into(),
+                    confidence: 1.0,
+                }],
+            },
+            preview_names: Vec::new(),
+            suspicious_reasons: Vec::new(),
+            native_names: true,
+        });
     }
 
+    let capacity = unresolved
+        .iter()
+        .map(|entry| entry.raw_name.len() + 1)
+        .sum();
+    let mut raw_names = Vec::with_capacity(capacity);
+    for name in &unresolved {
+        raw_names.extend_from_slice(&name.raw_name);
+        raw_names.push(b'/');
+    }
     let mut detector = smartzip_encoding::ArchiveEncodingDetector::new();
     let detected_raw = detector.detect(&raw_names);
     let detected = to_core_encoding_detection(&detected_raw);
-    let preview_names = raw_entries
+    let preview_names = unresolved
         .iter()
         .take(6)
-        .map(|raw| decode_preview_name(raw, &detected_raw.selected))
+        .map(|entry| decode_preview_name(&entry.raw_name, &detected_raw.selected))
         .collect::<Vec<_>>();
-    let suspicious_reasons =
-        suspicious_encoding_reasons(&detected_raw, &preview_names, ascii_only, &raw_entries);
+    let suspicious_reasons = suspicious_encoding_reasons(&detected_raw, &preview_names, &raw_names);
     Some(EncodingConfirmationContext {
         detected,
         preview_names,
         suspicious_reasons,
+        native_names: false,
     })
 }
 
@@ -131,19 +147,10 @@ pub(crate) fn decode_preview_name(raw_name: &[u8], encoding: &str) -> String {
 pub(crate) fn suspicious_encoding_reasons(
     detected: &smartzip_encoding::EncodingDetectionResult,
     preview_names: &[String],
-    ascii_only: bool,
-    raw_entries: &[&[u8]],
+    raw_names: &[u8],
 ) -> Vec<String> {
     let mut reasons = Vec::new();
-    if ascii_only {
-        return reasons;
-    }
-
-    if raw_entries
-        .iter()
-        .all(|raw| std::str::from_utf8(raw).is_ok())
-        && detected.selected.eq_ignore_ascii_case("utf-8")
-    {
+    if detected.selected.eq_ignore_ascii_case("utf-8") && std::str::from_utf8(raw_names).is_ok() {
         return reasons;
     }
 

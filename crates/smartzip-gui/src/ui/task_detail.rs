@@ -195,10 +195,7 @@ impl View {
         let phase = job.phase;
         let has_task_password = !job.request.settings.passwords.is_empty();
         let percent = job.progress;
-        let result = job
-            .result
-            .as_ref()
-            .map(|r| serde_json::to_string_pretty(r).unwrap_or_default());
+        let can_copy_result = job.result.has_diagnostics();
         if self.detail_state != Some((id, phase)) {
             if self
                 .detail_state
@@ -424,14 +421,22 @@ impl View {
                         el.child(
                             control("copy-result")
                                 .label("复制结果 JSON")
-                                .disabled(result.is_none())
-                                .on_click(move |_, _, cx| {
-                                    if let Some(result) = &result {
+                                .disabled(!can_copy_result)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    let result = this
+                                        .shared
+                                        .read(cx)
+                                        .queue
+                                        .jobs
+                                        .iter()
+                                        .find(|job| job.id == id)
+                                        .and_then(|job| job.result.diagnostics());
+                                    if let Some(Ok(result)) = result {
                                         cx.write_to_clipboard(gpui::ClipboardItem::new_string(
-                                            result.clone(),
+                                            result,
                                         ));
                                     }
-                                }),
+                                })),
                         )
                     }),
             )

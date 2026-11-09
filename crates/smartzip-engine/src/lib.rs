@@ -21,6 +21,7 @@ mod access;
 mod backend_util;
 pub mod budget;
 mod encoding_flow;
+pub use encoding_flow::assess_zip_names;
 mod events;
 mod execution;
 pub mod execution_runtime;

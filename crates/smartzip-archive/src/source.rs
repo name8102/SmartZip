@@ -10,9 +10,15 @@ pub struct InputReader {
     parts: Vec<Part>,
     position: u64,
     length: u64,
+    active: Option<ActivePart>,
+}
+struct ActivePart {
+    index: usize,
+    file: File,
+    position: u64,
 }
 struct Part {
-    file: File,
+    path: PathBuf,
     offset: u64,
     start: u64,
     length: u64,
@@ -20,13 +26,20 @@ struct Part {
 impl InputReader {
     pub fn open(input: &ArchiveInput) -> io::Result<Self> {
         let paths = byte_split_paths(input);
+        let single = if paths.len() == 1 {
+            Some(File::open(&paths[0])?)
+        } else {
+            None
+        };
         let mut parts = Vec::new();
         let mut length: u64 = 0;
         for path in paths {
-            let file = File::open(path)?;
-            let size = file.metadata()?.len();
+            let size = match &single {
+                Some(file) => file.metadata()?.len(),
+                None => std::fs::metadata(&path)?.len(),
+            };
             parts.push(Part {
-                file,
+                path,
                 offset: 0,
                 start: length,
                 length: size,
@@ -68,6 +81,11 @@ impl InputReader {
             parts: sliced,
             position: 0,
             length: end - input.offset,
+            active: single.map(|file| ActivePart {
+                index: 0,
+                file,
+                position: 0,
+            }),
         })
     }
 }
@@ -104,15 +122,31 @@ impl Read for InputReader {
         if bytes.is_empty() || self.position >= self.length {
             return Ok(0);
         }
-        let part = self
+        let index = self
             .parts
-            .iter_mut()
-            .find(|p| self.position >= p.start && self.position < p.start + p.length)
-            .ok_or_else(|| io::Error::other("source mapping missing"))?;
+            .partition_point(|part| part.start + part.length <= self.position);
+        let part = &self.parts[index];
+        if self
+            .active
+            .as_ref()
+            .is_none_or(|active| active.index != index)
+        {
+            self.active = Some(ActivePart {
+                index,
+                file: File::open(&part.path)?,
+                position: 0,
+            });
+        }
+        let active = self.active.as_mut().unwrap();
         let local = self.position - part.start;
-        part.file.seek(SeekFrom::Start(part.offset + local))?;
+        let position = part.offset + local;
+        if active.position != position {
+            active.file.seek(SeekFrom::Start(position))?;
+            active.position = position;
+        }
         let count = (bytes.len() as u64).min(part.length - local) as usize;
-        let n = part.file.read(&mut bytes[..count])?;
+        let n = active.file.read(&mut bytes[..count])?;
+        active.position += n as u64;
         if n == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -166,8 +200,13 @@ pub(crate) fn catalog_id(input: &ArchiveInput, library: &std::path::Path) -> io:
         hash.update(&(name.len() as u64).to_le_bytes());
         hash.update(name.as_bytes());
     }
+    let main = std::fs::metadata(&input.path)?;
     for path in std::iter::once(&input.path).chain(input.volumes.values()) {
-        let metadata = std::fs::metadata(path)?;
+        let metadata = if path == &input.path {
+            main.clone()
+        } else {
+            std::fs::metadata(path)?
+        };
         hash.update(path.as_os_str().as_encoded_bytes());
         hash.update(&metadata.len().to_le_bytes());
         if let Ok(time) = metadata.modified().and_then(|t| {

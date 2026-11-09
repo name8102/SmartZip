@@ -81,10 +81,88 @@ impl InteractionRequest {
 
 pub struct JobOutcome {
     pub status: String,
-    pub detail: serde_json::Value,
+    pub detail: JobDetail,
     pub warnings: Vec<String>,
-    pub backend_router: Option<smartzip_archive::BackendRouter>,
 }
+#[derive(Debug, Default)]
+pub(crate) enum JobDetail {
+    #[default]
+    None,
+    Archive(Arc<crate::archive_browser::ArchiveView>),
+    Extract(Box<smartzip_engine::ExtractWorkflowResult>),
+    Detect(Box<smartzip_engine::FileAwareDetectResult>),
+    Test(Box<smartzip_engine::TestWorkflowResult>),
+}
+
+impl JobDetail {
+    pub(crate) fn report(&self) -> Vec<String> {
+        match self {
+            Self::Detect(result) => {
+                let mut lines = vec![format!("检测到 {} 个内嵌归档候选", result.embedded_count)];
+                lines.extend(result.reason.iter().cloned());
+                lines
+            }
+            Self::Test(result) => integrity_report(&result.files),
+            _ => Vec::new(),
+        }
+    }
+
+    pub(crate) fn has_diagnostics(&self) -> bool {
+        matches!(self, Self::Extract(_) | Self::Detect(_) | Self::Test(_))
+    }
+
+    pub(crate) fn diagnostics(&self) -> Option<serde_json::Result<String>> {
+        Some(match self {
+            Self::Extract(result) => serde_json::to_string_pretty(result),
+            Self::Detect(result) => serde_json::to_string_pretty(result),
+            Self::Test(result) => serde_json::to_string_pretty(result),
+            _ => return None,
+        })
+    }
+}
+
+fn status_from_exit_code(code: i32) -> String {
+    match code {
+        0 => "completed",
+        2 => "partial",
+        130 => "cancelled",
+        _ => "failed",
+    }
+    .into()
+}
+
+fn integrity_report(files: &[smartzip_archive::integrity::TestArchiveReport]) -> Vec<String> {
+    use smartzip_archive::integrity::{Coverage, Integrity};
+    let mut lines = Vec::new();
+    for file in files {
+        let integrity = match file.integrity {
+            Integrity::Intact => "完好",
+            Integrity::Corrupt => "确认损坏",
+            Integrity::Incomplete => "缺少分卷",
+            Integrity::Unknown => "尚不能确定",
+        };
+        let coverage = match file.coverage {
+            Coverage::Complete => "完整",
+            Coverage::Partial => "部分",
+            Coverage::None => "未检查",
+        };
+        lines.push(format!("完整性：{integrity} · 检查范围：{coverage}"));
+        for (count, label) in [
+            (file.confirmed_volumes.len(), "确认损坏的卷"),
+            (file.suspect_groups.len(), "疑似损坏的分卷组"),
+            (file.missing_volumes.len(), "缺失卷"),
+            (file.unreadable_volumes.len(), "无法读取的卷"),
+            (file.unchecked_volumes.len(), "未检查的卷"),
+        ] {
+            if count > 0 {
+                lines.push(format!("{label}：{count}"));
+            }
+        }
+        lines.extend(file.stop_reasons.iter().cloned());
+    }
+    lines
+}
+
 pub enum JobMessage {
     Event(TaskEvent),
     Prompt(InteractionRequest),
@@ -197,9 +275,8 @@ pub fn spawn_job_at(request: JobRequest, queue_position: i64) -> Result<JobHandl
                 Ok(Ok(outcome)) => JobMessage::Finished(outcome),
                 Ok(Err(_)) if worker_token.is_cancelled() => JobMessage::Finished(JobOutcome {
                     status: "cancelled".into(),
-                    detail: serde_json::Value::Null,
+                    detail: JobDetail::None,
                     warnings: vec![],
-                    backend_router: None,
                 }),
                 Ok(Err(error)) => JobMessage::Failed(error),
                 Err(_) => JobMessage::Failed("归档工作线程异常终止".into()),
@@ -585,11 +662,8 @@ async fn run_job_inner(
                 _ => None,
             }));
             (
-                serde_json::to_value(result.status)?
-                    .as_str()
-                    .unwrap_or("failed")
-                    .to_string(),
-                serde_json::to_value(result)?,
+                status_from_exit_code(i32::from(result.status.exit_code())),
+                JobDetail::Extract(Box::new(result)),
             )
         }
         TaskOperation::Detect => {
@@ -606,7 +680,7 @@ async fn run_job_inner(
             } else {
                 "completed"
             };
-            (status.into(), serde_json::to_value(result)?)
+            (status.into(), JobDetail::Detect(Box::new(result)))
         }
         TaskOperation::List => {
             let result = engine
@@ -625,7 +699,12 @@ async fn run_job_inner(
                     recorder,
                 )
                 .await?;
-            ("completed".into(), serde_json::to_value(result)?)
+            (
+                "completed".into(),
+                JobDetail::Archive(Arc::new(crate::archive_browser::ArchiveView::new(
+                    result, backend,
+                ))),
+            )
         }
         TaskOperation::Test => {
             let result = engine
@@ -649,14 +728,8 @@ async fn run_job_inner(
                 )
                 .await?;
             (
-                match result.exit_code {
-                    0 => "completed",
-                    130 => "cancelled",
-                    2 => "partial",
-                    _ => "failed",
-                }
-                .into(),
-                serde_json::to_value(result)?,
+                status_from_exit_code(result.exit_code),
+                JobDetail::Test(Box::new(result)),
             )
         }
         TaskOperation::Recover => unreachable!("recovery is dispatched before new work"),
@@ -665,7 +738,6 @@ async fn run_job_inner(
         status,
         detail,
         warnings,
-        backend_router: (request.operation == TaskOperation::List).then_some(backend),
     })
 }
 

@@ -62,10 +62,10 @@ pub struct BackendRouter {
 
 impl BackendRouter {
     /// Read one validated member through the configured 7-Zip adapter.
-    pub async fn read_member_result(
+    pub async fn read_member(
         &self,
         adapter_id: &str,
-        request: crate::member::MemberReadRequest,
+        request: crate::MemberReadRequest,
         token: CancellationToken,
     ) -> Result<crate::MemberReadResult> {
         let registration =
@@ -73,27 +73,10 @@ impl BackendRouter {
                 .ok_or_else(|| SmartZipError::BackendUnavailable {
                     backend: adapter_id.to_owned(),
                 })?;
-        if registration.adapter.diagnostic_family() != Some("7z") {
-            return Err(SmartZipError::UnsupportedContainer {
-                backend: adapter_id.to_owned(),
-                path: request.archive,
-                container: Some("single-member-read requires 7-Zip".into()),
-            });
-        }
         registration
             .adapter
             .read_member_with_context(request, token)
             .await
-    }
-    pub async fn read_member(
-        &self,
-        adapter_id: &str,
-        request: crate::MemberReadRequest,
-        token: CancellationToken,
-    ) -> Result<Vec<u8>> {
-        self.read_member_result(adapter_id, request, token)
-            .await
-            .map(|r| r.bytes)
     }
     pub fn diagnostics(&self) -> Vec<serde_json::Value> {
         self.adapters.iter().map(|registration| {
@@ -496,7 +479,7 @@ impl BackendRouter {
         // before fallback, so the router owns no second temporary hierarchy.
         ensure_empty_output_dir(&request.output_dir)?;
 
-        for candidate in &plan.candidates {
+        for (index, candidate) in plan.candidates.iter().enumerate() {
             if token.is_cancelled() {
                 return Err(SmartZipError::Cancelled);
             }
@@ -538,24 +521,22 @@ impl BackendRouter {
                             class: error_class(&error).into(),
                         },
                     );
-                    // Backend contract: on Cancelled the process tree is
-                    // already stopped and no longer writing to output_dir.
-                    // Clear and verify before any retry.
-                    clear_attempt_output(&request.output_dir)?;
-                    if let Some(budget) = context.output_budget() {
-                        budget.reset_attempt_usage()?;
-                    }
-                    self.emit(
-                        context.as_ref(),
-                        RouteEvent::BackendAttemptCleaned {
-                            adapter_id: candidate.adapter_id.clone(),
-                        },
-                    );
-                    if matches!(error, SmartZipError::Cancelled) {
-                        return Err(error);
-                    }
+                    // The caller removes the entire staging tree on terminal
+                    // failure. Only clean here when another adapter will reuse it.
                     if !is_retryable(&error) || self.forced_adapter.is_some() {
                         return Err(error);
+                    }
+                    if index + 1 < plan.candidates.len() {
+                        clear_attempt_output(&request.output_dir)?;
+                        if let Some(budget) = context.output_budget() {
+                            budget.reset_attempt_usage()?;
+                        }
+                        self.emit(
+                            context.as_ref(),
+                            RouteEvent::BackendAttemptCleaned {
+                                adapter_id: candidate.adapter_id.clone(),
+                            },
+                        );
                     }
                     self.remember_retryable(
                         context.as_ref(),
@@ -672,7 +653,6 @@ impl ArchiveExecutor for BackendRouter {
         &self,
         request: TestRequest,
         previous: &crate::integrity::BackendTestDiagnostics,
-        multivolume: bool,
         context: std::sync::Arc<TaskExecutionContext>,
     ) -> Result<Option<TestResult>> {
         if self.forced_adapter.is_some() {
@@ -704,9 +684,7 @@ impl ArchiveExecutor for BackendRouter {
                                         Some(ArchiveFormat::Rar) => {
                                             matches!(family, "unrar" | "7z")
                                         }
-                                        Some(ArchiveFormat::Zip) => {
-                                            family == "7z" || family == "native-zip" && !multivolume
-                                        }
+                                        Some(ArchiveFormat::Zip) => family == "7z",
                                         _ => false,
                                     }
                             })
@@ -997,7 +975,11 @@ fn clear_attempt_output(path: &Path) -> Result<()> {
     {
         let entry = entry.map_err(|source| SmartZipError::io(Some(path.to_path_buf()), source))?;
         let entry_path = entry.path();
-        let result = if entry_path.is_dir() {
+        let result = if entry
+            .file_type()
+            .map_err(|e| SmartZipError::io(Some(entry_path.clone()), e))?
+            .is_dir()
+        {
             std::fs::remove_dir_all(&entry_path)
         } else {
             std::fs::remove_file(&entry_path)

@@ -1,6 +1,6 @@
 //! Recursive extraction workflow implementation.
 
-use smartzip_archive::{ArchiveExecutor, ExtractArchiveRequest, NativeZipBackend};
+use smartzip_archive::{ArchiveExecutor, ExtractArchiveRequest};
 use smartzip_core::{
     ArchiveFacts, ArchiveFormat, AttemptId, DecisionId, EncodingMode, NodeId, TaskEvent,
     TaskEventKind, TaskId,
@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::access::prepare_resolved_archive;
 use crate::backend_util::{backend_call, confidence_score};
-use crate::encoding_flow::{encoding_mode_label, resolve_encoding_mode};
+use crate::encoding_flow::{applied_encoding_label, resolve_encoding_mode};
 use crate::events::EventSink;
 use crate::interactive::{
     EmbeddedSelectionChoice, InteractiveEmbeddedPrompter, InteractiveEncodingPrompter,
@@ -1323,7 +1323,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive(
             let mut attempts: VecDeque<_> = candidate_passwords.into_iter().collect();
             let mut saw_password_required = false;
             let committed_output_usage = std::cell::Cell::new(crate::budget::Usage::default());
-            let committed_output_files = std::cell::RefCell::new(None);
+            let mut committed_output_files = None;
             while !terminal_skip && !cancellation.is_cancelled() {
                 let extraction_attempt_id = AttemptId::new();
                 if !enter_stage(
@@ -1452,13 +1452,11 @@ pub(crate) async fn extract_recursive_with_listener_interactive(
                 let encoding = encoding_choice
                     .clone()
                     .expect("encoding skip exits before attempts");
-                candidate_encoding_used = Some(encoding_mode_label(&encoding));
+                candidate_encoding_used = Some(applied_encoding_label(
+                    &encoding,
+                    zip_encoding_assessment.as_ref(),
+                ));
                 let mut budget_reservation = task_budget.reserve_attempt();
-                let attempt_output_usage = std::cell::Cell::new(crate::budget::Usage::default());
-                let attempt_output_inventory = std::cell::RefCell::new(None);
-                let extracted_encrypted = std::cell::Cell::new(None);
-                let committed_has_password = std::cell::Cell::new(false);
-                let committed_password_id = std::cell::Cell::new(None);
                 let result = output_materializer
                     .prepare(
                         MaterializeRequest {
@@ -1494,9 +1492,6 @@ pub(crate) async fn extract_recursive_with_listener_interactive(
                             let facts = &archive_facts;
                             let limits = &request.limits;
                             let budget_reservation = &budget_reservation;
-                            let extracted_encrypted = &extracted_encrypted;
-                            let attempt_output_usage = &attempt_output_usage;
-                            let attempt_output_inventory = &attempt_output_inventory;
                             let task_id = task_id.clone();
                             let node_id = node.id.clone();
                             let generation = node.generation;
@@ -1544,16 +1539,13 @@ pub(crate) async fn extract_recursive_with_listener_interactive(
                                     ),
                                 )
                                 .await?;
-                                attempt_output_usage.set(inventory.usage);
-                                *attempt_output_inventory.borrow_mut() = Some(inventory);
-                                extracted_encrypted.set(extracted.encrypted);
-                                Ok(())
+                                Ok((extracted.encrypted, inventory))
                             }
                         },
                     )
                     .await;
                 let result = match result {
-                    Ok(staged) => {
+                    Ok((staged, (encrypted, inventory))) => {
                         if !enter_stage(
                             execution,
                             &task_id,
@@ -1656,20 +1648,13 @@ pub(crate) async fn extract_recursive_with_listener_interactive(
                                     skipped.push(candidate);
                                     break 'nodes;
                                 }
-                                let has_password = pw_value
-                                    .as_deref()
-                                    .is_some_and(|p| !p.is_empty())
-                                    && (extracted_encrypted.get() == Some(true)
-                                        || saw_password_required
-                                        || saw_wrong_password
-                                        || saw_password_indeterminate
-                                        || (candidate.detected_format == Some(ArchiveFormat::Zip)
-                                            && NativeZipBackend::new()
-                                                .has_encrypted_entries(archive_path)
-                                                .unwrap_or(false)));
+                                let has_password =
+                                    pw_value.as_deref().is_some_and(|p| !p.is_empty())
+                                        && (encrypted == Some(true)
+                                            || saw_password_required
+                                            || saw_wrong_password
+                                            || saw_password_indeterminate);
                                 let password_id = if has_password { password.id } else { None };
-                                committed_has_password.set(has_password);
-                                committed_password_id.set(password_id);
                                 let success = crate::CommitSuccessFacts {
                                     sample_hash: sample_hash.clone(),
                                     file_size: sample_size,
@@ -1685,7 +1670,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive(
                                 };
                                 match staged.prepare_commit(decision, success) {
                                     Ok(mut prepared) => {
-                                        prepared.set_output_usage(attempt_output_usage.get());
+                                        prepared.set_output_usage(inventory.usage);
                                         let intent = prepared.intent().cloned();
                                         if let (Some(execution), Some(intent)) =
                                             (execution, intent.as_ref())
@@ -1741,7 +1726,12 @@ pub(crate) async fn extract_recursive_with_listener_interactive(
                                                 );
                                                     }
                                                 }
-                                                Ok(published.finalize())
+                                                Ok((
+                                                    published.finalize(),
+                                                    inventory,
+                                                    has_password,
+                                                    password_id,
+                                                ))
                                             }
                                             Err(failure) => {
                                                 if intent.as_ref().is_some_and(|intent| {
@@ -1774,11 +1764,13 @@ pub(crate) async fn extract_recursive_with_listener_interactive(
                     Err(failure) => Err(failure),
                 };
                 match result {
-                    Ok(result) => {
-                        *committed_output_files.borrow_mut() = attempt_output_inventory
-                            .borrow()
-                            .as_ref()
-                            .and_then(|inventory| inventory.published_files(&result.layout_plan));
+                    Ok((result, inventory, has_password, password_id)) => {
+                        if request
+                            .recursion_limit
+                            .is_none_or(|limit| candidate.depth < limit)
+                        {
+                            committed_output_files = inventory.published_files(&result.layout_plan);
+                        }
                         for message in &result.layout_plan.warnings {
                             events.push(TaskEvent {
                                 task_id: task_id.clone(),
@@ -1792,8 +1784,8 @@ pub(crate) async fn extract_recursive_with_listener_interactive(
                                 output_relative_path_for(&request.output_dir, &result.output_dir);
                         }
                         actual_output_dir = result.output_dir;
-                        candidate_has_password = committed_has_password.get();
-                        candidate_password_id = committed_password_id.get();
+                        candidate_has_password = has_password;
+                        candidate_password_id = password_id;
                         if candidate_has_password {
                             if let Ok(Some(password_id)) = passwords.record_success(&password) {
                                 candidate_password_id = Some(password_id);
@@ -2273,7 +2265,7 @@ pub(crate) async fn extract_recursive_with_listener_interactive(
                 let root = actual_output_dir.clone();
                 let prefix = output_relative_path.clone();
                 let depth = candidate.depth + 1;
-                let files = committed_output_files.borrow_mut().take();
+                let files = committed_output_files;
                 let token = cancellation.token().child_token();
                 let _cancel_on_drop = token.clone().drop_guard();
                 tokio::task::spawn_blocking(move || {

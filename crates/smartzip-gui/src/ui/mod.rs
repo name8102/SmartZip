@@ -77,8 +77,6 @@ pub struct View {
     member_preview: Entity<crate::member_preview::MemberPreview>,
     member_archive: Option<u64>,
     archive_dir: Vec<String>,
-    archive_cache:
-        std::collections::HashMap<u64, std::sync::Arc<crate::archive_browser::ArchiveBrowser>>,
     archive_positions: std::collections::HashMap<u64, Vec<String>>,
     archive_sort_size: bool,
     preview_visible: bool,
@@ -436,7 +434,6 @@ impl View {
             member_preview: cx.new(|cx| crate::member_preview::MemberPreview::new(window, cx)),
             member_archive: None,
             archive_dir: Vec::new(),
-            archive_cache: Default::default(),
             archive_positions: Default::default(),
             archive_sort_size: false,
             preview_visible: true,

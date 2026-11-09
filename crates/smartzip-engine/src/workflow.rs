@@ -10,7 +10,7 @@ use crate::access::{
     scan_embedded_findings,
 };
 use crate::backend_util::{confidence_score, map_detect_error};
-use crate::encoding_flow::encoding_mode_label;
+use crate::encoding_flow::{applied_encoding_label, encoding_mode_label};
 use crate::events::{EventSink, TaskEventListener};
 use crate::interactive::{InteractiveEncodingPrompter, InteractivePasswordPrompter};
 use crate::password_order::load_password_candidates;
@@ -393,6 +393,10 @@ pub(crate) async fn list_archive_with_listener_interactive(
     .await?;
 
     let listing = outcome.listing;
+    let encoding = applied_encoding_label(
+        &outcome.encoding_mode,
+        resolved.zip_encoding_assessment.as_ref(),
+    );
 
     if let Some(recorder) = history {
         // History follows the logical candidate/request identity, never the
@@ -403,7 +407,7 @@ pub(crate) async fn list_archive_with_listener_interactive(
             crate::history::FileExtractionRow {
                 sample_hash: resolved.sample_hash.as_deref(),
                 file_size: resolved.sample_size,
-                encoding: Some(encoding_mode_label(&outcome.encoding_mode).as_str()),
+                encoding: Some(&encoding),
                 encoding_corrected: resolved.reused_confirmed_encoding
                     || matches!(request.encoding_mode, EncodingMode::Override(_)),
                 ..crate::history::FileExtractionRow::detected(
@@ -450,10 +454,10 @@ pub(crate) async fn list_archive_with_listener_interactive(
         input: resolved.input.clone(),
         task_id,
         path: request.path,
-        detected_format: candidate.detected_format,
+        detected_format: listing.format.or(candidate.detected_format),
         entries: listing.entries,
         encrypted: None,
-        encoding: encoding_mode_label(&outcome.encoding_mode),
+        encoding,
         // Listing alone never authenticates a content password.
         password_id: None,
         used_password: false,

@@ -5,7 +5,6 @@ pub mod diagnostic;
 pub mod integrity;
 mod locator;
 pub mod member;
-pub mod native_zip;
 mod process;
 pub mod router;
 pub mod safety;
@@ -18,10 +17,10 @@ pub mod volume_probe;
 pub mod volumes;
 #[doc(hidden)]
 pub mod worker;
+pub mod zip_names;
 
 pub use backend::{ArchiveAdapter, ArchiveExecutor};
 pub use member::{MemberReadRequest, MemberReadResult, ReadExtent};
-pub use native_zip::NativeZipBackend;
 pub use router::{AdapterRegistration, BackendRouter};
 pub use sevenzip::{SevenZipBackend, SevenZipLocator};
 pub use types::*;

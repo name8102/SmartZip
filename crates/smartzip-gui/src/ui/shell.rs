@@ -71,7 +71,6 @@ impl Render for View {
                 .filter(|j| !j.dismiss_requested)
                 .map(|j| j.id)
                 .collect();
-            self.archive_cache.retain(|id, _| existing.contains(id));
             self.archive_positions.retain(|id, _| existing.contains(id));
             self.member_preview
                 .update(cx, |preview, cx| preview.clear(window, cx));

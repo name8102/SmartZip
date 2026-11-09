@@ -39,7 +39,6 @@ fn member(path: PathBuf, entry: EntryRef, extent: ReadExtent) -> MemberReadReque
         archive: path,
         entry,
         password: None,
-        encoding: EncodingMode::Auto,
         extent,
         input: None,
     }
@@ -72,7 +71,7 @@ async fn indexed_read_prefix_selection_snapshot_and_embedded_source() {
     assert_eq!(list.entries[0].path.to_str().unwrap(), "@a*\n.txt");
     let reference = list.entries[1].native.as_ref().unwrap().reference.clone();
     let prefix = b
-        .read_member_result(
+        .read_member_with_context(
             member(
                 path.clone(),
                 reference.clone(),
@@ -85,7 +84,7 @@ async fn indexed_read_prefix_selection_snapshot_and_embedded_source() {
     assert_eq!(prefix.bytes, b"second");
     assert!(!prefix.complete);
     let full = b
-        .read_member_result(
+        .read_member_with_context(
             member(
                 path.clone(),
                 reference.clone(),
@@ -154,7 +153,7 @@ async fn indexed_read_prefix_selection_snapshot_and_embedded_source() {
     );
     request.input = Some(input);
     assert_eq!(
-        b.read_member_result(request, CancellationToken::new())
+        b.read_member_with_context(request, CancellationToken::new())
             .await
             .unwrap()
             .bytes,
@@ -162,7 +161,7 @@ async fn indexed_read_prefix_selection_snapshot_and_embedded_source() {
     );
     std::fs::write(&path, b"changed source").unwrap();
     assert!(b
-        .read_member_result(
+        .read_member_with_context(
             member(path, reference, ReadExtent::Complete { max_bytes: 0 }),
             CancellationToken::new()
         )
@@ -196,7 +195,7 @@ async fn duplicate_names_are_independently_readable_and_safely_materialized() {
     let mut contents = Vec::new();
     for e in duplicate {
         contents.push(
-            b.read_member_result(
+            b.read_member_with_context(
                 member(
                     path.clone(),
                     e.native.as_ref().unwrap().reference.clone(),
@@ -272,7 +271,7 @@ async fn write_budget_precedes_disk_output_and_cancel_returns_without_writers() 
         )
         .await;
     assert!(matches!(result, Err(SmartZipError::ResourceLimit { .. })));
-    assert_eq!(std::fs::metadata(out.join("data")).unwrap().len(), 0);
+    assert!(!out.join("data").exists());
     let token = CancellationToken::new();
     token.cancel();
     let result = b
@@ -393,4 +392,41 @@ async fn native_test_evidence_and_stream_output_names() {
         assert_eq!(manifest.files[0].relative_path, PathBuf::from("plain"));
         assert!(output.join("plain").is_file());
     }
+}
+
+#[tokio::test]
+#[ignore = "real native runtime"]
+async fn a_file_conflicting_with_an_implicit_directory_is_renamed() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("collision.zip");
+    write_zip(
+        &path,
+        &[
+            ("dir", b"file"),
+            ("dir/item", b"child"),
+            ("dir (2)", b"second"),
+        ],
+    );
+    let output = root.path().join("output");
+    let result = backend()
+        .extract_with_context(
+            ExtractArchiveRequest {
+                archive: path,
+                output_dir: output.clone(),
+                selection: None,
+                format: None,
+                password: None,
+                encoding: EncodingMode::Auto,
+            },
+            context(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.manifest.unwrap().entries, 4);
+    assert_eq!(std::fs::read(output.join("dir/item")).unwrap(), b"child");
+    assert_eq!(std::fs::read(output.join("dir (2)")).unwrap(), b"file");
+    assert_eq!(
+        std::fs::read(output.join("dir (2) (2)")).unwrap(),
+        b"second"
+    );
 }

@@ -107,7 +107,7 @@ fn real_backend_detect_list_test_extract_preserve_source() {
         })
         .unwrap();
         let (outcome, events) = finish(&handle);
-        assert_eq!(outcome.status, "completed", "{}", outcome.detail);
+        assert_eq!(outcome.status, "completed", "{:?}", outcome.detail);
         assert!(
             events
                 .iter()
@@ -115,46 +115,29 @@ fn real_backend_detect_list_test_extract_preserve_source() {
             "missing real backend event"
         );
         if operation == TaskOperation::List {
-            assert_eq!(outcome.detail["entries"][0]["path"], "hello.txt");
-            let router = outcome
-                .backend_router
-                .expect("listing retains its backend registry");
-            let adapter = events
-                .iter()
-                .rev()
-                .find_map(|event| match &event.kind {
-                    TaskEventKind::Route(smartzip_core::RouteEvent::BackendSelected {
-                        adapter_id,
-                    }) => Some(adapter_id),
-                    _ => None,
-                })
-                .unwrap();
+            let JobDetail::Archive(view) = outcome.detail else {
+                panic!("missing archive view")
+            };
+            let children = view.browser.children(&[]);
+            assert_eq!(children[0].path, "hello.txt");
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .unwrap();
             let bytes = runtime
-                .block_on(
-                    router.read_member(
-                        adapter,
-                        smartzip_archive::MemberReadRequest {
-                            archive: archive.clone(),
-                            entry: serde_json::from_value(
-                                outcome.detail["entries"][0]["native"]["reference"].clone(),
-                            )
-                            .unwrap(),
-                            input: Some(
-                                serde_json::from_value(outcome.detail["input"].clone()).unwrap(),
-                            ),
-                            password: None,
-                            encoding: smartzip_core::EncodingMode::Auto,
-                            extent: smartzip_archive::ReadExtent::Complete { max_bytes: 0 },
-                        },
-                        CancellationToken::new(),
-                    ),
-                )
+                .block_on(view.router.read_member(
+                    &view.adapter,
+                    smartzip_archive::MemberReadRequest {
+                        archive: archive.clone(),
+                        entry: children[0].reference.clone().unwrap(),
+                        input: Some(view.input.clone()),
+                        password: None,
+                        extent: smartzip_archive::ReadExtent::Complete { max_bytes: 0 },
+                    },
+                    CancellationToken::new(),
+                ))
                 .unwrap();
-            assert_eq!(bytes, b"GUI runtime acceptance\n");
+            assert_eq!(bytes.bytes, b"GUI runtime acceptance\n");
         }
         assert!(archive.exists());
     }
@@ -285,7 +268,12 @@ fn changed_source_is_kept_after_successful_password_response() {
     assert!(!serde_json::to_string(&events)
         .unwrap()
         .contains("RuntimeFixtureOnly"));
-    assert!(!outcome.detail.to_string().contains("RuntimeFixtureOnly"));
+    assert!(!outcome
+        .detail
+        .diagnostics()
+        .unwrap()
+        .unwrap()
+        .contains("RuntimeFixtureOnly"));
 }
 
 #[test]
@@ -307,11 +295,16 @@ fn real_backend_temporary_password_is_not_persisted() {
     })
     .unwrap();
     let (outcome, events) = finish(&handle);
-    assert_eq!(outcome.status, "completed", "{}", outcome.detail);
+    assert_eq!(outcome.status, "completed", "{:?}", outcome.detail);
     assert!(!serde_json::to_string(&events)
         .unwrap()
         .contains("RuntimeFixtureOnly"));
-    assert!(!outcome.detail.to_string().contains("RuntimeFixtureOnly"));
+    assert!(!outcome
+        .detail
+        .diagnostics()
+        .unwrap()
+        .unwrap()
+        .contains("RuntimeFixtureOnly"));
     let db = smartzip_db::SmartZipDb::open_read_only(&database).unwrap();
     assert!(
         smartzip_db::password::PasswordRepository::new(db.connection())

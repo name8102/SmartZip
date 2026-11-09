@@ -357,7 +357,6 @@ pub(crate) async fn run(
                     let mut future = std::pin::pin!(backend.diagnose_test_with_context(
                         test_request,
                         &previous,
-                        report.volumes.family != VolumeFamily::Single,
                         diagnostic_context.clone()
                     ));
                     let result = tokio::select! {

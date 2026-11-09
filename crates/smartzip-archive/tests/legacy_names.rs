@@ -76,14 +76,13 @@ async fn legacy_zip_names_and_contents_match_for_plain_and_encrypted_entries() {
                         .clone(),
                     input: None,
                     password: password.clone(),
-                    encoding: encoding.clone(),
                     extent: smartzip_archive::ReadExtent::Complete { max_bytes: 1024 },
                 },
                 tokio_util::sync::CancellationToken::new(),
             )
             .await
             .unwrap();
-        assert_eq!(preview, b"verified fixture contents\n");
+        assert_eq!(preview.bytes, b"verified fixture contents\n");
         let output_dir = root.path().join("output");
         backend
             .extract_with_context(

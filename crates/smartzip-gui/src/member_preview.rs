@@ -19,15 +19,10 @@ use tokio_util::sync::CancellationToken;
 
 #[derive(Clone)]
 pub struct MemberSource {
-    pub archive: PathBuf,
+    pub archive: Arc<crate::archive_browser::ArchiveView>,
     pub member: PathBuf,
-    pub backend: String,
-    pub router: smartzip_archive::BackendRouter,
-    pub encoding: smartzip_core::EncodingMode,
     pub entry: Option<smartzip_archive::EntryRef>,
-    pub input: Option<smartzip_core::ArchiveInput>,
     pub allow_password: bool,
-    pub max_bytes: usize,
 }
 
 enum Content {
@@ -142,17 +137,14 @@ impl MemberPreview {
                     .build()
                     .map_err(|e| e.to_string())?;
                 let bytes = runtime
-                    .block_on(source.router.read_member(
-                        &source.backend,
+                    .block_on(source.archive.router.read_member(
+                        &source.archive.adapter,
                         smartzip_archive::MemberReadRequest {
-                            archive: source.archive,
+                            archive: source.archive.path.clone(),
                             entry,
-                            input: source.input,
+                            input: Some(source.archive.input.clone()),
                             password,
-                            encoding: source.encoding,
-                            extent: smartzip_archive::ReadExtent::Complete {
-                                max_bytes: source.max_bytes,
-                            },
+                            extent: smartzip_archive::ReadExtent::Complete { max_bytes: 0 },
                         },
                         token.clone(),
                     ))
@@ -160,7 +152,7 @@ impl MemberPreview {
                 if token.is_cancelled() {
                     return Err("已停止预览".into());
                 }
-                decode(&bytes)
+                decode(&bytes.bytes)
             })();
             let _ = tx.send((generation, result));
         });

@@ -659,93 +659,115 @@ async fn preview_encodings(
     verbose_routing: bool,
     cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    struct PreviewPrompter {
-        delegate: StdinPrompter,
-        last: Mutex<Option<String>>,
-    }
-    #[async_trait]
-    impl InteractivePasswordPrompter for PreviewPrompter {
-        async fn prompt(&self, path: &Path) -> Option<String> {
-            let value = self.delegate.prompt(path).await;
-            *self.last.lock().unwrap() = value.clone();
-            value
-        }
-    }
-    let candidates = encoding_preview_candidates();
-    let mut previews = Vec::new();
-    let mut services = policy.services(db.map(SmartZipDb::connection));
+    // Resolve input, volumes and access once. Encoding variants are views of
+    // that catalog, not independent archive operations.
+    let mut resolved = policy.resolved().clone();
+    resolved.values.extraction.encoding.mode = "backend".into();
+    let listing_policy = smartzip_engine::CompiledRunPolicy::compile(resolved)?;
     let engine = SmartZipEngine::default()
         .with_cancellation_token(cancellation.clone())
-        .with_run_policy(policy.clone());
+        .with_run_policy(listing_policy);
+    let mut services = policy.services(db.map(SmartZipDb::connection));
     services.history = None;
     if let Some(store) = &mut services.known {
         store.writable = false;
     }
     let recorder = services.stores();
     let control = StdinLock::configured(cancellation.clone(), policy, json);
-    let prompt = PreviewPrompter {
-        delegate: StdinPrompter {
-            lock: control.clone(),
-        },
-        last: Mutex::new(None),
+    let prompt = StdinPrompter {
+        lock: control.clone(),
     };
-    let mut manual: Vec<_> = password.into_iter().collect();
-
-    for encoding in candidates {
-        let mode = match *encoding {
-            "auto" => EncodingMode::Auto,
-            other => EncodingMode::Override(other.to_string()),
-        };
+    let listing = engine
+        .list_archive_with_listener_interactive(
+            backend,
+            &services.passwords,
+            ListArchiveRequest {
+                path,
+                scanner: ScannerConfig::default(),
+                encoding_mode: EncodingMode::Auto,
+                password_candidates: PasswordCandidateRequest {
+                    manual: password.into_iter().collect(),
+                    include_empty: true,
+                },
+            },
+            control
+                .interactive
+                .then_some(&prompt as &dyn InteractivePasswordPrompter),
+            None,
+            task_listener(json, verbose_routing, policy),
+            services
+                .has_stores()
+                .then_some(&recorder as &dyn smartzip_engine::history::TaskHistoryRecorder),
+        )
+        .await?;
+    let is_zip = listing.detected_format == Some(smartzip_core::ArchiveFormat::Zip);
+    let raw = is_zip.then(|| {
+        smartzip_archive::zip_names::read(&listing.input).and_then(|names| {
+            if names.len() != listing.entries.len() {
+                return Err(smartzip_core::SmartZipError::BackendProtocolError {
+                    backend: "zip-names".into(),
+                    detail: "ZIP metadata and native index count differ".into(),
+                });
+            }
+            Ok(names)
+        })
+    });
+    let auto = raw
+        .as_ref()
+        .and_then(|raw| raw.as_ref().ok())
+        .and_then(|names| smartzip_engine::assess_zip_names(names));
+    let candidates = if is_zip {
+        encoding_preview_candidates()
+    } else {
+        &["auto"]
+    };
+    let mut previews = Vec::with_capacity(candidates.len());
+    for &encoding in candidates {
         if cancellation.is_cancelled() {
             return Err(smartzip_core::SmartZipError::Cancelled.into());
         }
-        let listing = engine
-            .list_archive_with_listener_interactive(
-                backend,
-                &services.passwords,
-                ListArchiveRequest {
-                    path: path.clone(),
-                    scanner: ScannerConfig::default(),
-                    encoding_mode: mode,
-                    password_candidates: PasswordCandidateRequest {
-                        manual: manual.clone(),
-                        include_empty: true,
-                        ..Default::default()
-                    },
-                },
-                control
-                    .interactive
-                    .then_some(&prompt as &dyn InteractivePasswordPrompter),
-                None,
-                task_listener(json, verbose_routing, policy),
-                services
-                    .has_stores()
-                    .then_some(&recorder as &dyn smartzip_engine::history::TaskHistoryRecorder),
-            )
-            .await;
-        if listing.is_ok() {
-            if let Some(value) = prompt.last.lock().unwrap().take() {
-                manual.insert(0, value);
+        let applied = if encoding == "auto" {
+            auto.as_ref()
+                .and_then(|assessment| match &assessment.detected.selected {
+                    EncodingMode::Override(encoding) => Some(encoding.as_str()),
+                    EncodingMode::Auto => None,
+                })
+        } else {
+            Some(encoding)
+        };
+        let names = match (applied, &raw) {
+            (Some(applied), Some(raw)) => {
+                raw.as_ref().map_err(ToString::to_string).and_then(|names| {
+                    names
+                        .iter()
+                        .map(|name| {
+                            name.decode(applied)
+                                .map(std::borrow::Cow::into_owned)
+                                .ok_or_else(|| format!("ZIP name cannot be decoded as {applied}"))
+                        })
+                        .collect::<Result<Vec<_>, _>>()
+                })
             }
-        }
-        match listing {
-            Ok(listing) => previews.push(EncodingPreviewEntry {
-                encoding: encoding.to_string(),
+            _ => Ok(listing
+                .entries
+                .iter()
+                .map(|entry| entry.path.display().to_string())
+                .collect()),
+        };
+        previews.push(match names {
+            Ok(names) => EncodingPreviewEntry {
+                encoding: encoding.into(),
                 ok: true,
-                names: listing
-                    .entries
-                    .into_iter()
-                    .map(|entry| entry.path.display().to_string())
-                    .collect(),
+                names,
                 error: None,
-            }),
-            Err(error) => previews.push(EncodingPreviewEntry {
-                encoding: encoding.to_string(),
+            },
+            Err(error) => EncodingPreviewEntry {
+                encoding: encoding.into(),
                 ok: false,
                 names: Vec::new(),
-                error: Some(error.to_string()),
-            }),
-        }
+                error: Some(error),
+            },
+        });
     }
 
     if cancellation.is_cancelled() {

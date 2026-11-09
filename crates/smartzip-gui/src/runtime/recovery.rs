@@ -109,15 +109,10 @@ pub(super) async fn run(
     match result {
         Ok(result) => {
             execution.release_task(&task_id);
-            let status = serde_json::to_value(result.status)?
-                .as_str()
-                .unwrap_or("failed")
-                .to_owned();
             Ok(JobOutcome {
-                status,
-                detail: serde_json::to_value(result)?,
+                status: status_from_exit_code(i32::from(result.status.exit_code())),
+                detail: JobDetail::Extract(Box::new(result)),
                 warnings: vec!["已按原任务配置恢复；临时密码未保存，源归档不会追补回收。".into()],
-                backend_router: None,
             })
         }
         Err(error) => {

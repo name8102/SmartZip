@@ -122,14 +122,14 @@ impl OutputMaterializer {
         }
     }
 
-    pub(crate) async fn prepare<F, Fut>(
+    pub(crate) async fn prepare<T, F, Fut>(
         &self,
         request: MaterializeRequest,
         extract_into: F,
-    ) -> std::result::Result<StagedOutput, MaterializeFailure>
+    ) -> std::result::Result<(StagedOutput, T), MaterializeFailure>
     where
         F: FnOnce(PathBuf) -> Fut,
-        Fut: Future<Output = Result<()>>,
+        Fut: Future<Output = Result<T>>,
     {
         let parent = request
             .output_dir
@@ -152,29 +152,32 @@ impl OutputMaterializer {
             })?;
         let temp_path = temp.path().to_path_buf();
 
-        if let Err(error) = extract_into(temp_path.clone()).await {
-            if self.preserve_temp_on_failure {
-                let preserved = temp.keep();
+        let extracted = match extract_into(temp_path.clone()).await {
+            Ok(extracted) => extracted,
+            Err(error) => {
+                if self.preserve_temp_on_failure {
+                    let preserved = temp.keep();
+                    return Err(MaterializeFailure {
+                        error,
+                        preserved_temp_dir: Some(preserved),
+                        kind: MaterializeFailureKind::ExtractFailed,
+                    });
+                }
+                let preserved_temp_dir = cleanup_staging(temp);
+                let error = match &preserved_temp_dir {
+                    Some(path) => SmartZipError::io(
+                        Some(path.clone()),
+                        std::io::Error::other(format!("{error}; temporary output cleanup failed")),
+                    ),
+                    None => error,
+                };
                 return Err(MaterializeFailure {
                     error,
-                    preserved_temp_dir: Some(preserved),
+                    preserved_temp_dir,
                     kind: MaterializeFailureKind::ExtractFailed,
                 });
             }
-            let preserved_temp_dir = cleanup_staging(temp);
-            let error = match &preserved_temp_dir {
-                Some(path) => SmartZipError::io(
-                    Some(path.clone()),
-                    std::io::Error::other(format!("{error}; temporary output cleanup failed")),
-                ),
-                None => error,
-            };
-            return Err(MaterializeFailure {
-                error,
-                preserved_temp_dir,
-                kind: MaterializeFailureKind::ExtractFailed,
-            });
-        }
+        };
 
         let archive_stem = request
             .archive_stem
@@ -191,12 +194,15 @@ impl OutputMaterializer {
             single_root_name_policy: request.single_root_name_policy,
         });
 
-        Ok(StagedOutput {
-            request,
-            temp,
-            layout_plan,
-            preserve_temp_on_failure: self.preserve_temp_on_failure,
-        })
+        Ok((
+            StagedOutput {
+                request,
+                temp,
+                layout_plan,
+                preserve_temp_on_failure: self.preserve_temp_on_failure,
+            },
+            extracted,
+        ))
     }
 }
 
@@ -989,7 +995,7 @@ mod tests {
         let output = root.path().join("archive-d0");
 
         let result = OutputMaterializer::default()
-            .prepare(
+            .prepare::<(), _, _>(
                 MaterializeRequest {
                     output_dir: output.clone(),
                     archive_path: output.clone(),
@@ -1005,6 +1011,7 @@ mod tests {
             )
             .await
             .unwrap()
+            .0
             .commit(None)
             .unwrap();
 
@@ -1023,8 +1030,8 @@ mod tests {
     async fn uncommitted_stage_keeps_output_private_and_cleans_on_drop() {
         let root = tempfile::tempdir().unwrap();
         let output = root.path().join("archive");
-        let staged = OutputMaterializer::default()
-            .prepare(
+        let (staged, ()) = OutputMaterializer::default()
+            .prepare::<(), _, _>(
                 MaterializeRequest {
                     output_dir: output.clone(),
                     archive_path: output.clone(),
@@ -1053,8 +1060,8 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let output = root.path().join("archive");
         std::fs::create_dir(&output).unwrap();
-        let staged = OutputMaterializer::default()
-            .prepare(
+        let (staged, ()) = OutputMaterializer::default()
+            .prepare::<(), _, _>(
                 MaterializeRequest {
                     output_dir: output.clone(),
                     archive_path: output.clone(),
@@ -1087,8 +1094,8 @@ mod tests {
         let output = root.path().join("archive");
         std::fs::create_dir(&output).unwrap();
         std::fs::write(output.join("old"), b"old").unwrap();
-        let staged = OutputMaterializer::default()
-            .prepare(
+        let (staged, ()) = OutputMaterializer::default()
+            .prepare::<(), _, _>(
                 MaterializeRequest {
                     output_dir: output.clone(),
                     archive_path: output.clone(),
@@ -1130,8 +1137,8 @@ mod tests {
     async fn stateless_commit_does_not_create_recovery_marker() {
         let root = tempfile::tempdir().unwrap();
         let output = root.path().join("output");
-        let staged = OutputMaterializer::default()
-            .prepare(
+        let (staged, ()) = OutputMaterializer::default()
+            .prepare::<(), _, _>(
                 MaterializeRequest {
                     output_dir: output.clone(),
                     archive_path: output.clone(),
@@ -1165,7 +1172,7 @@ mod tests {
         std::fs::write(output.join("old.txt"), b"old").unwrap();
 
         let result = OutputMaterializer::default()
-            .prepare(
+            .prepare::<(), _, _>(
                 MaterializeRequest {
                     output_dir: output.clone(),
                     archive_path: output.clone(),
@@ -1183,6 +1190,7 @@ mod tests {
             )
             .await
             .unwrap()
+            .0
             .commit(None)
             .unwrap();
 
@@ -1206,7 +1214,7 @@ mod tests {
         std::fs::write(output.join("old.txt"), b"old").unwrap();
 
         let result = OutputMaterializer::default()
-            .prepare(
+            .prepare::<(), _, _>(
                 MaterializeRequest {
                     output_dir: output.clone(),
                     archive_path: output.clone(),
@@ -1235,7 +1243,7 @@ mod tests {
         let output = root.path().join("archive-d0");
 
         let result = OutputMaterializer::new(true)
-            .prepare(
+            .prepare::<(), _, _>(
                 MaterializeRequest {
                     output_dir: output.clone(),
                     archive_path: output.clone(),
@@ -1269,7 +1277,7 @@ mod tests {
         let output = root.path().join("my-archive");
 
         let result = OutputMaterializer::default()
-            .prepare(
+            .prepare::<(), _, _>(
                 MaterializeRequest {
                     output_dir: output.clone(),
                     archive_path: output.clone(),
@@ -1288,6 +1296,7 @@ mod tests {
             )
             .await
             .unwrap()
+            .0
             .commit(None)
             .unwrap();
 
@@ -1310,7 +1319,7 @@ mod tests {
         let output = root.path().join("output");
 
         let result = OutputMaterializer::default()
-            .prepare(
+            .prepare::<(), _, _>(
                 MaterializeRequest {
                     output_dir: output.clone(),
                     archive_path: output.clone(),
@@ -1329,6 +1338,7 @@ mod tests {
             )
             .await
             .unwrap()
+            .0
             .commit(None)
             .unwrap();
 
@@ -1349,7 +1359,7 @@ mod tests {
         let output = root.path().join("output");
 
         let result = OutputMaterializer::default()
-            .prepare(
+            .prepare::<(), _, _>(
                 MaterializeRequest {
                     output_dir: output.clone(),
                     archive_path: output.clone(),
@@ -1365,6 +1375,7 @@ mod tests {
             )
             .await
             .unwrap()
+            .0
             .commit(None)
             .unwrap();
 
@@ -1383,7 +1394,7 @@ mod tests {
         std::fs::create_dir_all(&output).unwrap();
 
         let _result = OutputMaterializer::default()
-            .prepare(
+            .prepare::<(), _, _>(
                 MaterializeRequest {
                     output_dir: output.join("download"),
                     archive_path: output.clone(),
@@ -1402,6 +1413,7 @@ mod tests {
             )
             .await
             .unwrap()
+            .0
             .commit(None)
             .unwrap();
 
