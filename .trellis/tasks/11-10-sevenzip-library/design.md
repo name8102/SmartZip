@@ -6,13 +6,15 @@
 
 **首选直接 Rust FFI 调用官方 7-Zip 原生库，不增加 C++ 桥接层。**
 
+上层不按旧 CLI 命令形状保留：以来源视图、成员身份、执行计划和结果证据重设计，具体能力与组件契约统一记录在[能力驱动的组件设计](capability-design.md)。
+
 7-Zip 导出 C 函数，创建 COM 风格对象；Rust 可以声明导出函数、vtable 和回调，直接实现输入/输出流。Linux 原型已通过动态加载、创建 handler、结构化列举、校验、索引读取及取消检查，见[复现记录](research/README.md)。
 
 推荐的产品组合：
 
 - 官方最新版全格式库 + 私有 Rust ABI 模块 + 安全的 `Library` / `ArchiveSession` 封装。
 - 用一个 SmartZip 自有 worker 承载原生调用，保持当前后端可终止的生命周期；与 CLI/GUI 之间使用私有结构化协议。**调用语言与进程隔离是两个独立选择**：worker 内仍是 Rust 直接 FFI，不是调用 7-Zip CLI。
-- 复用 engine/router、密码服务、分卷解析和 `OutputMaterializer`，不重新实现任务系统或输出事务。
+- 复用 engine/router、密码服务、分卷解析和 `OutputMaterializer` 的职责；调整它们的输入输出，以使用范围来源、索引选择、写前预算和逐项证据，不重建一套任务系统。
 - 以条目索引取代名字选择器；以结构化状态取代 `-slt`、stderr 关键词、进度行和退出码推断。
 - 保留 ZIP 原始名称元数据读取，移除因 CLI 名称限制产生的第二套 ZIP 载荷解压路径。
 
@@ -72,7 +74,7 @@ Linux 构建入口见[官方 makefile](https://github.com/ip7z/7zip/blob/26.06/C
 
 ## 4. 直接 Rust FFI 的边界
 
-建议新增一个 `smartzip-sevenzip` crate，既承载私有 `ffi` 模块，也提供安全 session 和 worker 入口。不要再拆一层只转发函数的公开 sys crate。
+建议新增一个 `smartzip-sevenzip` crate，承载私有 `ffi` 模块和安全 session。worker 二进制由现有 `smartzip-archive` crate 装配来源、writer 和协议；FFI crate 不依赖 engine/GUI 或上层输出事务。不要再拆一层只转发函数的公开 sys crate。依赖方向与预算注入见[组件设计 2.5](capability-design.md#25-依赖方向与注入边界)。
 
 ```text
 CLI / GUI → engine → BackendRouter → SevenZipLibraryAdapter
@@ -89,14 +91,13 @@ CLI / GUI → engine → BackendRouter → SevenZipLibraryAdapter
 
 ```text
 Library::load(absolute_path) → RuntimeInfo / formats / codecs
-Library::open(source, open_options, control) → ArchiveSession
-ArchiveSession::entries() → EntryMetadata[]
-ArchiveSession::test(control) → NativeTestReport
-ArchiveSession::extract(output_sink, control) → NativeExtractReport
-ArchiveSession::read_member(index, byte_limit, control) → bytes
+Library::open(input_stream, volume_provider, open_options, control) → ArchiveSession
+ArchiveSession::entries() → NativeEntryMetadata[]
+ArchiveSession::extract(indices, Test | Extract, stream_factory, control) → NativeRunReport
+ArchiveSession::try_item_stream(index) → optional native input stream
 ```
 
-这是职责草图，不冻结函数签名。一个 session 串行操作；每个密码尝试建立新 session。元数据、安全预检和提取在同一次打开中完成，不跨任务持久缓存 handler。
+这是底层安全封装的职责草图；NameView、Full/Prefix、预算和 manifest 由 archive 层的计划/stream factory 组合，不反向进入 FFI crate。executor/adapter 对调用方提供 Catalog 与 Plan，不暴露 COM。一个 session 串行操作；不同凭据尝试建立新 session。元数据、安全预检和提取在同一次执行中共享打开状态，不跨任务持久缓存 handler。已验证成员的定向重试由同一输出 attempt 管理，见[组件设计 3.3](capability-design.md#33-密码处理验证到哪里证据就到哪里)。
 
 ### 4.1 ABI 必须显式处理的事实
 
@@ -133,7 +134,7 @@ ArchiveSession::read_member(index, byte_limit, control) → bytes
 | 主进程直接 FFI | 最短调用链，适合原型；协作取消必须等待库实际返回。进程内不能安全强杀一个线程，库 crash 会结束宿主 |
 | **worker 内直接 FFI** | 保留可靠停止与故障隔离，增加 worker 打包和私有 IPC；首版选此，不加常驻池/守护服务 |
 
-首版每次 adapter 操作一个 worker；一次 extract 内的 open/preflight/extract 同进程同 session。并发由现有调度器准入，计入现有 backend_processes，不另加固定并发上限。只有测到启动成本后才考虑复用 worker。
+首版每次 native 执行 lease 一个 worker；同一计划的 open/preflight/批量 extract 同进程同 session。目录浏览和等待人工输入只保留 Catalog/计划/已验证产物值状态，不占用 worker。并发由现有调度器准入，计入现有 backend_processes，不另加固定并发上限。只有测到启动成本后才考虑常驻 worker 复用。
 
 协议用长度分帧的类型化消息：请求、元数据、进度、条目结果、成员字节块、最终结果；与应用一起更新，不维护跨版本协议兼容。请求包含密码时只走私有管道，不放 argv、环境变量或临时文件。OS 路径按 Windows 原生宽字符/Unix 原生字节无损编码；归档显示名称是独立字段。
 
@@ -155,9 +156,9 @@ worker 控制线程接收取消、设置共享标记；输入 Read/Seek、输出
 
 `GetNumberOfItems` / `GetProperty` 返回索引、path、类型、size/pack size、encrypted、method、CRC、时间与链接信息。缺失值保留 unknown，不把无属性当 false/0。不会为 unknown size 伪造精确进度。
 
-`ArchiveEntry` 增加 `index` 和明确 `EntryKind`；预览携带 **来源快照 + adapter/解码上下文 + index**，重开时检查来源未变。来源身份复用现有 fingerprint/generation，避免为每次 list 再完整哈希。路径仅用于显示和输出映射；重复名称仍可以按索引分别预览。删除 CLI 专用的 `@`、通配符、换行选择器限制，路径安全规则独立保留。
+`ArchiveEntry` 增加 `index` 和明确 `EntryKind`；以 **CatalogId + index** 形成 EntryRef，Catalog 绑定来源快照和 adapter/目录代次，重开时检查来源未变。编码视图单独版本化，切换显示名不改变成员身份；输出计划绑定视图 revision。来源身份复用现有 fingerprint/generation，避免为每次 list 再完整哈希。重复名称可以独立选择、预览与编译提取计划；不同 adapter 索引不直接互换。删除 CLI 专用的 `@`、通配符、换行选择器限制，读内容与写路径的安全规则分开。
 
-成员读取调用 `Extract(&index, 1, testMode=0, callback)`，GetStream 仅为目标项返回受限内存流，检查实际写出字节和最终 operation result。solid 7z 可能解码同块前面的条目，只为目标积累结果。支持选定成员不要求随机访问；分卷也交同一来源层处理，移除当前“分卷需先解压”的统一拒绝。
+单成员读取调用 `Extract(&index, 1, testMode=0, callback)`；多成员请求编译为升序索引一次执行，为各目标返回独立流。完整读取检查实际写出字节和最终 operation result；前缀读取以 PreviewSatisfied 与部分验证范围返回。solid 7z 可能解码同块前面的条目，按块合批而不为每项重复开启解码。分卷交同一来源层处理，移除当前“分卷需先解压”的统一拒绝。详见[浏览与预览设计](capability-design.md#31-浏览与预览)。
 
 ### 6.3 test、错误与密码
 
@@ -200,11 +201,11 @@ Windows ZIP handler 有 `ISetProperties("cp")`，但 Unix 通用转换函数存�
 
 ### 7.2 安全输出与原有行为
 
-所有输出仍只写 `OutputMaterializer` 借出的 attempt 目录。adapter 不创建第二层 staging，不负责最终覆盖、重命名或提交。失败/取消后先停写和关闭句柄，再由唯一 owner 清理。
+所有输出仍只写 `OutputMaterializer` 借出的 attempt 目录。adapter 不创建第二层 staging，不负责最终覆盖、重命名或提交。失败/取消后先停写和关闭句柄，再由唯一 owner 清理。原生 writer 在写入前获得全局预算额度并随写生成 manifest，替代库路径的轮询计数和完成后 inventory 重建；同 attempt 凭据重试可复用已验证成员，提交仍要求整个请求完成。完整契约见[组件设计第 3 节](capability-design.md#3-组件改造)。
 
 GetStream 不直接信任 archive path；预检全部解码名称、父组件和条目类型，写入时核对受控目录句柄，阻止越界、父链接替换与 reparse 跳转。保持现有安全相对符号链接/悬空链接行为：普通项先写，链接延后创建，后续载荷不得沿链接写盘；硬链接目标必须是 attempt 内已验证的成员。设备/FIFO 等特殊项明确报不支持。编码造成的路径冲突、重复输出项和文件/目录冲突在写入前报明确冲突，不照搬 `-y` 静默覆盖。
 
-资源预算沿用用户配置；0 继续不限。只在实际读取、写入、成员数量和磁盘空间等相关位置计费，不新增假设性的压缩比、总大小或固定内存上限。
+资源预算沿用用户配置；0 继续不限。只在实际读取、写入、创建数量和磁盘空间等相关位置计费，不新增假设性的压缩比、总大小或固定内存上限。全局额度在 worker 间仲裁，不能各自使用完整剩余额度。
 
 ### 7.3 分卷输入契约
 
@@ -254,11 +255,12 @@ GetStream 不直接信任 archive path；预检全部解码名称、父组件和
 
 | 切片 | 交付和针对性验收 |
 | --- | --- |
-| 1. ABI 与安全 session | 实现跨平台绑定、所有权和多接口回调；真实库验证 plain/encrypted、None/空密码/Unicode 密码、非 BMP 名、HRESULT+逐项结果、取消、流 I/O 错误；平台布局用官方头文件作对照 |
-| 2. 输入与输出契约 | 实现完整库、raw ZIP 映射、受控输出流、分卷来源；真实 RAR4/5、7z solid/raw split、ZIP raw/spanned、缺卷、乱序/任意卷入口和未知后缀；旧编码至少 GB18030/Shift-JIS，list/extract/preview 名称一致 |
-| 3. worker 与 adapter | 接 probe/list/test/extract/read_member、结构化协议与路由能力；取消/超时/worker crash/父进程退出后无继续写盘，清理后才能重试；权限、磁盘满与实际输出预算错误分类正确 |
-| 4. 消费端与删除旧逻辑 | engine 密码尝试、test JSON/coverage、GUI 索引预览、配置/doctor 全链切换，删除第 9 节旧实现与测试；用真实后端验证事务清理、覆盖回滚及恢复 |
-| 5. 平台交付 | Nix 两架构、Linux bundle、macOS 两架构和 Windows x64 的安装布局/加载/运行冒烟；确认 RAR 解码实际可用、运行不依赖 7z/7zz PATH，许可证及源码材料齐全 |
+| 1. 领域契约、ABI 与安全 session | 定义 Source/Catalog/EntryRef/NameView/Plan/Report 并实现跨平台绑定；验证 plain/encrypted、空/Unicode 密码、非 BMP 名、多接口回调、逐项结果、流 I/O 错误；平台布局用官方头文件作对照 |
+| 2. 来源与目录 | 实现 Slice、完整库、raw ZIP 名称视图与分卷来源；真实 RAR4/5、7z/raw split、ZIP raw/spanned、缺卷/乱序入口、嵌入式免 carve；旧编码至少 GB18030/Shift-JIS，切换视图保留成员身份 |
+| 3. 计划与受控输出 | 批量索引选择、writer、全局写前额度和 manifest，验证多 worker 总预算、solid 合批、重复名称、路径与实际 I/O；库路径不再轮询重建产出 |
+| 4. worker、路由与访问 | 结构化协议、按计划能力路由、有范围的密码证据与定向重试；取消/超时/crash/父进程退出后无继续写盘；等待输入释放执行 lease，保留产物仍计费 |
+| 5. 消费端与删除旧逻辑 | engine/test JSON/coverage、GUI 选择提取与 Full/Prefix 预览、配置/doctor 全链切换，删除第 9 节旧实现与测试；验证 mixed-password、事务回滚、恢复与嵌套来源策略 |
+| 6. 平台交付 | Nix 两架构、Linux bundle、macOS 两架构和 Windows x64 的安装布局/加载/运行冒烟；确认 RAR 解码实际可用、运行不依赖 7z/7zz PATH，许可证及源码材料齐全 |
 
 本轮未做 RAR/分卷、旧编码映射、真实文件安全落盘、Rust 密码回调、worker IPC/强制终止、Windows/macOS 或性能验收；这些是对应切片的验收项。跨平台 smoke 与 ABI 检查通过后再宣告该平台已迁移。
 
