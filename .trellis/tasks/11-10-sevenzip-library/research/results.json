@@ -1,0 +1,124 @@
+{
+  "platform": "x86_64-linux",
+  "rustc": "1.98.1",
+  "cxx": "GCC 16.2.0",
+  "library_version": "26.06",
+  "source_commit": "d3296e39e1f1f92c7b41c0c3848e65640428d42d",
+  "library_build_note": "Format7zF makefile.gcc; CFLAGS_WARN=-Wno-error=array-bounds after default -Werror failed in HandlerCont.cpp",
+  "fixture_cli": "7zz 26.04 (fixture generation only)",
+  "direct_rust": {
+    "cases": [
+      {
+        "case": "plain.zip",
+        "exit": 0,
+        "stdout": "version=26.06 wchar=4 variant=16\ninterface_type=0\nformats=60\nitems=3\nitem=0 name=中文\nPath = injected.txt\nitem=1 name=duplicate.txt\nitem=2 name=duplicate.txt\nstream index=0 mode=1\noperation_result=0\nstream index=1 mode=1\noperation_result=0\nstream index=2 mode=1\noperation_result=0\nextract_hresult=0x00000000 results=3 failures=0 bytes=0\n"
+      },
+      {
+        "case": "plain.7z",
+        "exit": 0,
+        "stdout": "version=26.06 wchar=4 variant=16\ninterface_type=0\nformats=60\nitems=1\nitem=0 name=payload.txt\nstream index=0 mode=1\noperation_result=0\nextract_hresult=0x00000000 results=1 failures=0 bytes=0\n"
+      },
+      {
+        "case": "plain.tar",
+        "exit": 0,
+        "stdout": "version=26.06 wchar=4 variant=16\ninterface_type=0\nformats=60\nitems=1\nitem=0 name=payload.txt\nstream index=0 mode=1\noperation_result=0\nextract_hresult=0x00000000 results=1 failures=0 bytes=0\n"
+      },
+      {
+        "case": "plain.gz",
+        "exit": 0,
+        "stdout": "version=26.06 wchar=4 variant=16\ninterface_type=0\nformats=60\nitems=1\nstream index=0 mode=1\noperation_result=0\nextract_hresult=0x00000000 results=1 failures=0 bytes=0\n"
+      },
+      {
+        "case": "plain.xz",
+        "exit": 0,
+        "stdout": "version=26.06 wchar=4 variant=16\ninterface_type=0\nformats=60\nitems=1\nstream index=0 mode=1\noperation_result=0\nextract_hresult=0x00000000 results=1 failures=0 bytes=0\n"
+      },
+      {
+        "case": "exact-index-read",
+        "exit": 0,
+        "stdout": "version=26.06 wchar=4 variant=16\ninterface_type=0\nformats=60\nitems=3\nitem=0 name=中文\nPath = injected.txt\nitem=1 name=duplicate.txt\nitem=2 name=duplicate.txt\nstream index=0 mode=0\noperation_result=0\nextract_hresult=0x00000000 results=1 failures=0 bytes=23552\n"
+      },
+      {
+        "case": "crc-error",
+        "exit": 4,
+        "stdout": "version=26.06 wchar=4 variant=16\ninterface_type=0\nformats=60\nitems=3\nitem=0 name=中文\nPath = injected.txt\nitem=1 name=duplicate.txt\nitem=2 name=duplicate.txt\nstream index=0 mode=1\noperation_result=3\nstream index=1 mode=1\noperation_result=0\nstream index=2 mode=1\noperation_result=0\nextract_hresult=0x00000000 results=3 failures=1 bytes=0\n"
+      },
+      {
+        "case": "callback-cancel",
+        "exit": 4,
+        "stdout": "version=26.06 wchar=4 variant=16\ninterface_type=0\nformats=60\nitems=3\nitem=0 name=中文\nPath = injected.txt\nitem=1 name=duplicate.txt\nitem=2 name=duplicate.txt\nextract_hresult=0x80004004 results=0 failures=0 bytes=0\n"
+      }
+    ],
+    "passed": 8
+  },
+  "cpp_control": {
+    "cases": [
+      {
+        "case": "plain.zip",
+        "exit": 0,
+        "stdout": "version=26.06 wchar=4 variant=16\ninterface_type=0\nformats=60\nformat=zip\nitems=3\nitem=0 name=中文\nPath = injected.txt\nitem=1 name=duplicate.txt\nitem=2 name=duplicate.txt\nstream index=0 mode=1\noperation_result=0\nstream index=1 mode=1\noperation_result=0\nstream index=2 mode=1\noperation_result=0\nextract_hresult=0x00000000 results=3 failures=0 bytes=0\n"
+      },
+      {
+        "case": "plain.7z",
+        "exit": 0,
+        "stdout": "version=26.06 wchar=4 variant=16\ninterface_type=0\nformats=60\nformat=7z\nitems=1\nitem=0 name=payload.txt\nstream index=0 mode=1\noperation_result=0\nextract_hresult=0x00000000 results=1 failures=0 bytes=0\n"
+      },
+      {
+        "case": "plain.tar",
+        "exit": 0,
+        "stdout": "version=26.06 wchar=4 variant=16\ninterface_type=0\nformats=60\nformat=tar\nitems=1\nitem=0 name=payload.txt\nstream index=0 mode=1\noperation_result=0\nextract_hresult=0x00000000 results=1 failures=0 bytes=0\n"
+      },
+      {
+        "case": "plain.gz",
+        "exit": 0,
+        "stdout": "version=26.06 wchar=4 variant=16\ninterface_type=0\nformats=60\nformat=gzip\nitems=1\nitem=0 name=\nstream index=0 mode=1\noperation_result=0\nextract_hresult=0x00000000 results=1 failures=0 bytes=0\n"
+      },
+      {
+        "case": "plain.xz",
+        "exit": 0,
+        "stdout": "version=26.06 wchar=4 variant=16\ninterface_type=0\nformats=60\nformat=xz\nitems=1\nitem=0 name=\nstream index=0 mode=1\noperation_result=0\nextract_hresult=0x00000000 results=1 failures=0 bytes=0\n"
+      },
+      {
+        "case": "exact-index-read",
+        "exit": 0,
+        "stdout": "version=26.06 wchar=4 variant=16\ninterface_type=0\nformats=60\nformat=zip\nitems=3\nitem=0 name=中文\nPath = injected.txt\nitem=1 name=duplicate.txt\nitem=2 name=duplicate.txt\nstream index=0 mode=0\noperation_result=0\nextract_hresult=0x00000000 results=1 failures=0 bytes=23552\n"
+      },
+      {
+        "case": "data-password-correct",
+        "exit": 0,
+        "stdout": "version=26.06 wchar=4 variant=16\ninterface_type=0\nformats=60\nformat=7z\nitems=1\nitem=0 name=payload.txt\nstream index=0 mode=1\noperation_result=0\nextract_hresult=0x00000000 results=1 failures=0 bytes=0\n"
+      },
+      {
+        "case": "data-password-wrong",
+        "exit": 4,
+        "stdout": "version=26.06 wchar=4 variant=16\ninterface_type=0\nformats=60\nformat=7z\nitems=1\nitem=0 name=payload.txt\nstream index=0 mode=1\noperation_result=2\nextract_hresult=0x00000000 results=1 failures=1 bytes=0\n"
+      },
+      {
+        "case": "header-password-missing",
+        "exit": 3,
+        "stdout": "version=26.06 wchar=4 variant=16\ninterface_type=0\nformats=60\nopen_hresult=0x80004004 password_requested=1\n"
+      },
+      {
+        "case": "header-password-correct",
+        "exit": 0,
+        "stdout": "version=26.06 wchar=4 variant=16\ninterface_type=0\nformats=60\nformat=7z\nitems=1\nitem=0 name=payload.txt\nstream index=0 mode=1\noperation_result=0\nextract_hresult=0x00000000 results=1 failures=0 bytes=0\n"
+      },
+      {
+        "case": "header-password-wrong",
+        "exit": 3,
+        "stdout": "version=26.06 wchar=4 variant=16\ninterface_type=0\nformats=60\nopen_hresult=0x00000001 password_requested=1\n"
+      },
+      {
+        "case": "crc-error",
+        "exit": 4,
+        "stdout": "version=26.06 wchar=4 variant=16\ninterface_type=0\nformats=60\nformat=zip\nitems=3\nitem=0 name=中文\nPath = injected.txt\nitem=1 name=duplicate.txt\nitem=2 name=duplicate.txt\nstream index=0 mode=1\noperation_result=3\nstream index=1 mode=1\noperation_result=0\nstream index=2 mode=1\noperation_result=0\nextract_hresult=0x00000000 results=3 failures=1 bytes=0\n"
+      },
+      {
+        "case": "callback-cancel",
+        "exit": 4,
+        "stdout": "version=26.06 wchar=4 variant=16\ninterface_type=0\nformats=60\nformat=zip\nitems=3\nitem=0 name=中文\nPath = injected.txt\nitem=1 name=duplicate.txt\nitem=2 name=duplicate.txt\nextract_hresult=0x80004004 results=0 failures=0 bytes=0\n"
+      }
+    ],
+    "passed": 13
+  }
+}

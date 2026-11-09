@@ -12,3 +12,4 @@
 - `embedded-archive-detection.md`
 - `gpui-verification.md`
 - `tech-evaluation.md`
+- [7-Zip 原生库替换 CLI：研究与迁移设计](../../.trellis/tasks/11-10-sevenzip-library/design.md)（直接 Rust FFI、Linux 原型与跨平台迁移边界）
